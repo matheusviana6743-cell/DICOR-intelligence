@@ -12799,9 +12799,6 @@ async def main():
     await start_web_server()
     await bot.start(DISCORD_TOKEN)
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
 
 # =====================================================
 # PATCH FINAL — AJUSTES DE MANDADOS, DOSSIÊ E CATÁLOGO
@@ -13534,3 +13531,7 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     print(f'Catálogo rodando na porta {PORT} | rotas: /, /catalogo, /catalogo.html, /health')
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
