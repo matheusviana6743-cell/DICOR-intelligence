@@ -168,10 +168,20 @@ SERVER_BACKUP_PUBLIC_URL = os.getenv("SERVER_BACKUP_PUBLIC_URL", "").strip()
 # Coloque no .env/Railway para escolher o canal que receberá PDF + DOCX:
 # DOSSIE_CHANNEL_ID=ID_DO_CANAL_DOS_DOSSIES
 DOSSIE_CHANNEL_ID = env_int("DOSSIE_CHANNEL_ID", BACKUP_CHANNEL_ID)
+# Canal-cofre para cópias das assinaturas. Use um canal privado.
+ASSINATURAS_BACKUP_CHANNEL_ID = env_int(
+    "ASSINATURAS_BACKUP_CHANNEL_ID",
+    DOSSIE_CHANNEL_ID or BACKUP_CHANNEL_ID or LOGS_CHANNEL_ID,
+)
 DOSSIE_HISTORY_LIMIT = env_int("DOSSIE_HISTORY_LIMIT", 0)  # 0 = varrer todo o histórico disponível
 DOSSIE_ENVIAR_NA_MESA = os.getenv("DOSSIE_ENVIAR_NA_MESA", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 DOSSIE_SKIP_BOT_BOILERPLATE = os.getenv("DOSSIE_SKIP_BOT_BOILERPLATE", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 DOSSIE_PROGRESS_INTERVAL = env_float("DOSSIE_PROGRESS_INTERVAL", 2)
+# Otimização visual sem mudar o modelo: reduz somente a resolução interna das fotos
+# para o tamanho realmente exibido no PDF/DOCX.
+DOSSIE_IMAGEM_MAX_PX = max(700, env_int("DOSSIE_IMAGEM_MAX_PX", 1100))
+DOSSIE_IMAGEM_QUALIDADE = min(92, max(55, env_int("DOSSIE_IMAGEM_QUALIDADE", 76)))
+DOSSIE_LINK_FALLBACK = os.getenv("DOSSIE_LINK_FALLBACK", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 
 # Controle de quem pode fechar mesas
 # Opção 1: coloque o ID do cargo Inspetor. Quem tiver esse cargo ou cargo acima poderá fechar.
@@ -221,7 +231,10 @@ CARGOS_EQUIPE_IDS = list(dict.fromkeys((_ids_env("CARGOS_EQUIPE_IDS") or CARGOS_
 CARGOS_FECHAR_MESA_IDS = list(dict.fromkeys(_ids_env("CARGOS_FECHAR_MESA_IDS") + sorted(CARGOS_AUTORIZADORES)))
 
 BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
+# Em produção, monte um Railway Volume em /data e use DICOR_DATA_DIR=/data.
+# Assim assinaturas, contadores, procurados, boletins e dossiês sobrevivem aos deploys.
+_DICOR_DATA_DIR_ENV = os.getenv("DICOR_DATA_DIR", "").strip()
+DATA_DIR = Path(_DICOR_DATA_DIR_ENV).expanduser() if _DICOR_DATA_DIR_ENV else (BASE_DIR / "data")
 PUBLIC_DIR = BASE_DIR / "public"
 UPLOADS_DIR = PUBLIC_DIR / "uploads"
 BACKUP_DIR = BASE_DIR / "backups"
@@ -2174,7 +2187,11 @@ class PainelProcuradosView(View):
         if not ativos:
             texto = "Nenhum procurado ativo cadastrado."
         else:
-            linhas = [f"• **{p.get('nome','Sem nome')}** — RG: `{p.get('rg','')}`" for p in ativos[:20]]
+            linhas = [
+                f"• **{p.get('nome','Sem nome')}** — RG: `{p.get('rg','')}`\n"
+                f"  📍 **Último avistamento:** {p.get('ultimo_avistamento') or 'Não informado'}"
+                for p in ativos[:20]
+            ]
             texto = "\n".join(linhas)
             if len(ativos) > 20:
                 texto += f"\n... e mais {len(ativos)-20} no catálogo."
@@ -11610,6 +11627,18 @@ async def assinaturas(
         "alterado_por_nome": str(interaction.user),
     }
     salvar_assinaturas_dossie(dados)
+    try:
+        info_backup = await _espelhar_assinatura_no_discord(
+            interaction.guild,
+            chave,
+            dados[chave],
+            Path(destino),
+        )
+        if info_backup:
+            dados[chave].update(info_backup)
+            salvar_assinaturas_dossie(dados)
+    except Exception as erro_backup:
+        await enviar_log(f"⚠️ Assinatura salva localmente, mas o backup no Discord falhou: {erro_backup}")
     await enviar_log(
         f"✍️ Assinatura `{rotulo}` cadastrada/substituída | pessoa `{vinculada.id}` | por `{interaction.user.id}` | {agora_br()}"
     )
@@ -15705,8 +15734,8 @@ def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float) -> None:
     try:
         pf = caminho_brasao_pf()
         dicor = caminho_brasao_dicor()
-        logo = 2.35 * cm
-        y = altura - 3.15 * cm
+        logo = 2.85 * cm
+        y = altura - 3.65 * cm
         if pf and Path(pf).exists():
             c.drawImage(str(pf), 1.30 * cm, y, width=logo, height=logo, preserveAspectRatio=True, mask='auto')
         if dicor and Path(dicor).exists():
@@ -15715,11 +15744,11 @@ def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float) -> None:
         traceback.print_exc()
 
     c.setFillColor(cores['dourado_claro'])
-    c.setFont('Courier-Bold', 11.2)
-    c.drawCentredString(largura / 2, altura - 1.55 * cm, 'POLÍCIA FEDERAL  •  DICOR')
+    c.setFont('Courier-Bold', 13.4)
+    c.drawCentredString(largura / 2, altura - 1.50 * cm, 'POLÍCIA FEDERAL  •  DICOR')
     c.setFillColor(cores['branco'])
-    c.setFont('Courier-Bold', 8.7)
-    c.drawCentredString(largura / 2, altura - 2.00 * cm, 'CAPITAL MORADA DO VALLEY')
+    c.setFont('Courier-Bold', 9.5)
+    c.drawCentredString(largura / 2, altura - 2.02 * cm, 'CAPITAL MORADA DO VALLEY')
 
 
 def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> None:
@@ -15772,7 +15801,7 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
         c.setStrokeColor(cores['dourado_claro'])
         c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
         c.setFillColor(cores['branco'])
-        c.setFont('Courier-Bold', 12.0)
+        c.setFont('Courier-Bold', 14.0)
         texto_titulo = titulo + (' - CONTINUAÇÃO' if continuacao else '')
         c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, texto_titulo[:86])
         return faixa_y - 0.35 * cm
@@ -15878,27 +15907,27 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
     y = paragrafo(texto_oficial, y)
 
     assinatura = obter_assinatura_comparecimento(registro.get('autorizado_por_id'))
-    y = quebra(y, 3.05 * cm)
+    y = quebra(y, 3.65 * cm)
     nome = str(assinatura.get('nome') or registro.get('autorizado_por_nome') or 'Autoridade Competente')
     cargo = str(assinatura.get('cargo') or registro.get('autorizado_por_cargo') or 'Autoridade Competente')
     arq = assinatura.get('arquivo')
     if arq and Path(str(arq)).exists():
         try:
-            c.drawImage(str(arq), largura / 2 - 2.8 * cm, y - 1.00 * cm, width=5.6 * cm, height=0.95 * cm, preserveAspectRatio=True, mask='auto')
+            c.drawImage(str(arq), largura / 2 - 3.45 * cm, y - 1.35 * cm, width=6.9 * cm, height=1.35 * cm, preserveAspectRatio=True, mask='auto')
         except Exception:
             traceback.print_exc()
     else:
         c.setFillColor(cores['texto_suave'])
-        c.setFont('Courier-Oblique', 9.0)
-        c.drawCentredString(largura / 2, y - 0.68 * cm, nome[:54])
+        c.setFont('Courier-Oblique', 11.0)
+        c.drawCentredString(largura / 2, y - 0.92 * cm, nome[:54])
     c.setStrokeColor(cores['texto_suave'])
-    c.line(largura / 2 - 3.9 * cm, y - 1.15 * cm, largura / 2 + 3.9 * cm, y - 1.15 * cm)
+    c.line(largura / 2 - 4.25 * cm, y - 1.52 * cm, largura / 2 + 4.25 * cm, y - 1.52 * cm)
     c.setFillColor(cores['texto'])
-    c.setFont('Courier-Bold', 9.1)
-    c.drawCentredString(largura / 2, y - 1.53 * cm, nome[:64])
-    c.setFont('Courier', 8.5)
-    c.drawCentredString(largura / 2, y - 1.88 * cm, cargo[:64])
-    c.drawCentredString(largura / 2, y - 2.22 * cm, f'Autorizado em: {registro.get("autorizado_em") or agora_br()}')
+    c.setFont('Courier-Bold', 10.4)
+    c.drawCentredString(largura / 2, y - 1.92 * cm, nome[:64])
+    c.setFont('Courier', 9.3)
+    c.drawCentredString(largura / 2, y - 2.31 * cm, cargo[:64])
+    c.drawCentredString(largura / 2, y - 2.68 * cm, f'Autorizado em: {registro.get("autorizado_em") or agora_br()}')
     c.save()
 
 
@@ -15937,7 +15966,7 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
         c.setStrokeColor(cores['dourado_claro'])
         c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
         c.setFillColor(cores['branco'])
-        c.setFont('Courier-Bold', 11.2)
+        c.setFont('Courier-Bold', 13.2)
         tt = titulo + (' - CONTINUAÇÃO' if continuacao else '')
         c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, tt[:88])
         return faixa_y - 0.35 * cm
@@ -16345,6 +16374,399 @@ async def atualizar_hierarquia_diretor_dicor_apos_patch():
         await enviar_hierarquia_substituindo_anterior()
     except Exception as erro:
         await enviar_log(f'⚠️ Falha ao atualizar hierarquia com Diretor DICOR: {erro}')
+
+
+# =====================================================
+# PATCH FINAL — PERSISTÊNCIA DE ASSINATURAS E DOSSIÊ LEVE
+# =====================================================
+import copy as _copy_dicor
+
+_ASSINATURAS_RESTAURADAS_NESTA_SESSAO = False
+_ASSINATURAS_BACKUP_LOCK = asyncio.Lock()
+_ASSINATURA_BACKUP_MARKER = 'DICOR_SIGNATURE_BACKUP_V1'
+
+
+def _parse_assinatura_backup_marker(content: str) -> Dict[str, str]:
+    resultado: Dict[str, str] = {}
+    texto = str(content or '')
+    if _ASSINATURA_BACKUP_MARKER not in texto:
+        return resultado
+    for linha in texto.splitlines():
+        if '=' not in linha:
+            continue
+        chave, valor = linha.split('=', 1)
+        resultado[chave.strip().lower()] = valor.strip()
+    return resultado
+
+
+async def _canal_backup_assinaturas(guild: Optional[discord.Guild]):
+    if guild is None:
+        return None
+    canal = guild.get_channel(int(ASSINATURAS_BACKUP_CHANNEL_ID or 0))
+    if canal is None and ASSINATURAS_BACKUP_CHANNEL_ID:
+        try:
+            canal = await guild.fetch_channel(int(ASSINATURAS_BACKUP_CHANNEL_ID))
+        except Exception:
+            canal = None
+    return canal if canal and hasattr(canal, 'send') else None
+
+
+async def _espelhar_assinatura_no_discord(
+    guild: Optional[discord.Guild],
+    slot: str,
+    registro: Dict[str, Any],
+    caminho: Path,
+) -> Dict[str, Any]:
+    """Guarda uma cópia da assinatura em um canal privado do Discord.
+
+    Isso funciona como segunda camada de persistência além do Railway Volume.
+    """
+    if guild is None or not caminho.exists():
+        return {}
+    canal = await _canal_backup_assinaturas(guild)
+    if canal is None:
+        return {}
+
+    # Apaga somente a cópia anterior do mesmo slot, quando conhecida.
+    antigo_id = registro.get('backup_message_id')
+    antigo_canal_id = registro.get('backup_channel_id')
+    if antigo_id and antigo_canal_id:
+        try:
+            canal_antigo = await obter_canal_bot(antigo_canal_id)
+            if canal_antigo:
+                antigo = await canal_antigo.fetch_message(int(antigo_id))
+                await antigo.delete(reason='Assinatura DICOR substituída por uma versão mais recente')
+        except Exception:
+            pass
+
+    conteudo = (
+        f'{_ASSINATURA_BACKUP_MARKER}\n'
+        f'slot={slot}\n'
+        f'usuario_id={registro.get("usuario_id", "")}\n'
+        f'nome={registro.get("nome", "")}\n'
+        f'cargo={registro.get("cargo", "")}\n'
+        f'data={registro.get("data", agora_br())}'
+    )
+    mensagem = await canal.send(
+        content=conteudo,
+        file=discord.File(str(caminho), filename=f'assinatura_{slot}{caminho.suffix.lower()}'),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    anexo = mensagem.attachments[0] if mensagem.attachments else None
+    return {
+        'backup_channel_id': mensagem.channel.id,
+        'backup_message_id': mensagem.id,
+        'backup_url': anexo.url if anexo else '',
+        'backup_filename': anexo.filename if anexo else caminho.name,
+        'backup_em': agora_br(),
+    }
+
+
+async def _baixar_anexo_assinatura(anexo: discord.Attachment, slot: str) -> Optional[Path]:
+    try:
+        ASSINATURAS_DOSSIE_DIR.mkdir(parents=True, exist_ok=True)
+        ext = Path(anexo.filename or '').suffix.lower()
+        if ext not in {'.png', '.jpg', '.jpeg', '.webp'}:
+            ext = '.png'
+        destino = ASSINATURAS_DOSSIE_DIR / f'{slot}{ext}'
+        await anexo.save(str(destino))
+        return destino if destino.exists() else None
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha ao restaurar assinatura `{slot}` do Discord: {erro}')
+        return None
+
+
+async def _restaurar_assinaturas_do_discord(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    canal = await _canal_backup_assinaturas(guild)
+    if canal is None or not hasattr(canal, 'history'):
+        return 0
+
+    dados = carregar_assinaturas_dossie()
+    encontrados: Dict[str, discord.Message] = {}
+    try:
+        async for msg in canal.history(limit=300):
+            if bot.user and msg.author.id != bot.user.id:
+                continue
+            meta = _parse_assinatura_backup_marker(msg.content)
+            slot = meta.get('slot', '')
+            if slot in {'delegado_geral', 'delegado_dicor', 'inspetor_predador', 'inspetor_baiano'} and msg.attachments:
+                encontrados.setdefault(slot, msg)
+    except Exception as erro:
+        await enviar_log(f'⚠️ Não consegui consultar o cofre de assinaturas: {erro}')
+        return 0
+
+    restauradas = 0
+    for slot, msg in encontrados.items():
+        registro = dict(dados.get(slot) or {})
+        caminho_atual = caminho_assinatura_registrada(registro)
+        if caminho_atual and caminho_atual.exists():
+            # Atualiza somente os metadados do backup.
+            anexo = msg.attachments[0]
+            registro.update({
+                'backup_channel_id': msg.channel.id,
+                'backup_message_id': msg.id,
+                'backup_url': anexo.url,
+                'backup_filename': anexo.filename,
+            })
+            dados[slot] = registro
+            continue
+
+        meta = _parse_assinatura_backup_marker(msg.content)
+        destino = await _baixar_anexo_assinatura(msg.attachments[0], slot)
+        if not destino:
+            continue
+        registro.update({
+            'nome': registro.get('nome') or meta.get('nome') or slot,
+            'usuario_id': registro.get('usuario_id') or meta.get('usuario_id') or '',
+            'cargo': registro.get('cargo') or meta.get('cargo') or '',
+            'data': registro.get('data') or meta.get('data') or agora_br(),
+            'arquivo': caminho_relativo_base(destino),
+            'backup_channel_id': msg.channel.id,
+            'backup_message_id': msg.id,
+            'backup_url': msg.attachments[0].url,
+            'backup_filename': msg.attachments[0].filename,
+            'restaurada_em': agora_br(),
+        })
+        dados[slot] = registro
+        restauradas += 1
+
+    salvar_assinaturas_dossie(dados)
+    return restauradas
+
+
+async def _garantir_backup_assinaturas_locais(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    dados = carregar_assinaturas_dossie()
+    alteradas = 0
+    for slot, registro_raw in list(dados.items()):
+        if slot not in {'delegado_geral', 'delegado_dicor', 'inspetor_predador', 'inspetor_baiano'}:
+            continue
+        registro = dict(registro_raw or {})
+        caminho = caminho_assinatura_registrada(registro)
+        if not caminho or not caminho.exists() or registro.get('backup_message_id'):
+            continue
+        try:
+            info = await _espelhar_assinatura_no_discord(guild, slot, registro, caminho)
+            if info:
+                registro.update(info)
+                dados[slot] = registro
+                alteradas += 1
+        except Exception as erro:
+            await enviar_log(f'⚠️ Não consegui copiar a assinatura `{slot}` para o cofre: {erro}')
+    if alteradas:
+        salvar_assinaturas_dossie(dados)
+    return alteradas
+
+
+@bot.listen('on_ready')
+async def persistir_e_restaurar_assinaturas_dicor():
+    global _ASSINATURAS_RESTAURADAS_NESTA_SESSAO
+    if _ASSINATURAS_RESTAURADAS_NESTA_SESSAO:
+        return
+    async with _ASSINATURAS_BACKUP_LOCK:
+        if _ASSINATURAS_RESTAURADAS_NESTA_SESSAO:
+            return
+        _ASSINATURAS_RESTAURADAS_NESTA_SESSAO = True
+        try:
+            guild = bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if bot.guilds else None)
+            restauradas = await _restaurar_assinaturas_do_discord(guild)
+            espelhadas = await _garantir_backup_assinaturas_locais(guild)
+            await enviar_log(
+                f'✍️ Persistência de assinaturas verificada | restauradas `{restauradas}` | '
+                f'novos backups `{espelhadas}` | diretório `{DATA_DIR}`'
+            )
+        except Exception as erro:
+            await enviar_log(f'⚠️ Falha na persistência automática das assinaturas: {erro}')
+
+
+# ---------- Otimização das fotos do dossiê ----------
+def _otimizar_imagem_dossie(caminho: Any, pasta_cache: Path, cache: Dict[str, str]) -> Any:
+    if PILImage is None or not caminho:
+        return caminho
+    try:
+        origem = Path(str(caminho))
+        if not origem.exists() or not origem.is_file():
+            return caminho
+        chave = str(origem.resolve())
+        if chave in cache:
+            return cache[chave]
+
+        pasta_cache.mkdir(parents=True, exist_ok=True)
+        nome_hash = secrets.token_hex(4) + '_' + re.sub(r'[^A-Za-z0-9_.-]+', '_', origem.stem)[:55] + '.jpg'
+        destino = pasta_cache / nome_hash
+
+        from PIL import ImageOps as _ImageOps
+        with PILImage.open(origem) as img:
+            img = _ImageOps.exif_transpose(img)
+            # Fotos são exibidas em meia página; 1100 px preserva nitidez e reduz muito o peso.
+            img.thumbnail((DOSSIE_IMAGEM_MAX_PX, DOSSIE_IMAGEM_MAX_PX), PILImage.Resampling.LANCZOS)
+            if img.mode in {'RGBA', 'LA'} or ('transparency' in img.info):
+                rgba = img.convert('RGBA')
+                fundo = PILImage.new('RGB', rgba.size, (247, 243, 233))
+                fundo.paste(rgba, mask=rgba.getchannel('A'))
+                img = fundo
+            else:
+                img = img.convert('RGB')
+            img.save(
+                destino,
+                format='JPEG',
+                quality=DOSSIE_IMAGEM_QUALIDADE,
+                optimize=True,
+                progressive=True,
+                subsampling='4:2:0',
+            )
+        if destino.exists() and destino.stat().st_size > 0:
+            cache[chave] = str(destino)
+            return str(destino)
+    except Exception:
+        return caminho
+    return caminho
+
+
+def _dados_dossie_otimizados(dados: Dict[str, Any], pasta_saida: Path) -> Dict[str, Any]:
+    novo = _copy_dicor.deepcopy(dados)
+    pasta_cache = pasta_saida / '_imagens_otimizadas'
+    cache: Dict[str, str] = {}
+
+    for ev in novo.get('evidencias', []) or []:
+        if isinstance(ev, dict) and ev.get('tipo') == 'imagem' and ev.get('local'):
+            ev['local'] = _otimizar_imagem_dossie(ev.get('local'), pasta_cache, cache)
+
+    for chave_lista in ('liderancas', 'integrantes', 'informantes'):
+        for pessoa in novo.get(chave_lista, []) or []:
+            if isinstance(pessoa, dict) and pessoa.get('foto'):
+                pessoa['foto'] = _otimizar_imagem_dossie(pessoa.get('foto'), pasta_cache, cache)
+    return novo
+
+
+_gerar_pdf_dossie_modelo_aprovado = gerar_pdf_dossie
+_gerar_docx_dossie_modelo_aprovado = gerar_docx_dossie
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    """Mantém exatamente o modelo aprovado e troca somente as fotos internas por cópias leves."""
+    caminho_pdf = Path(caminho_pdf)
+    dados_leves = _dados_dossie_otimizados(dados, caminho_pdf.parent)
+    _gerar_pdf_dossie_modelo_aprovado(dados_leves, caminho_pdf)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """Mantém as mesmas seções e imagens, usando cópias comprimidas para caber no Discord."""
+    caminho_docx = Path(caminho_docx)
+    dados_leves = _dados_dossie_otimizados(dados, caminho_docx.parent)
+    _gerar_docx_dossie_modelo_aprovado(dados_leves, caminho_docx)
+
+
+# ---------- Envio com fallback por link ----------
+_enviar_arquivos_dossie_anterior = enviar_arquivos_dossie_destino
+
+
+async def enviar_arquivos_dossie_destino(
+    destino,
+    dados_dossie: Dict[str, Any],
+    arquivos: Dict[str, str],
+    nome_pdf: str,
+    nome_docx: str,
+    canal_mesa: discord.TextChannel,
+    usuario: discord.abc.User,
+    titulo: str = '🏛️ DOSSIÊ OPERACIONAL AUTOMÁTICO DICOR',
+) -> Optional[discord.Message]:
+    """Anexa os arquivos leves. Se algum ainda superar o limite, oferece download público."""
+    if not destino or not hasattr(destino, 'send'):
+        return None
+
+    limite = int(getattr(getattr(destino, 'guild', None), 'filesize_limit', 25 * 1024 * 1024) or 25 * 1024 * 1024)
+    itens = []
+    if arquivos.get('pdf'):
+        itens.append((Path(arquivos['pdf']), nome_pdf, 'PDF'))
+    if arquivos.get('docx'):
+        itens.append((Path(arquivos['docx']), nome_docx, 'DOCX'))
+
+    primeiro: Optional[discord.Message] = None
+    enviados = 0
+    links = []
+    falhas = []
+    embed = discord.Embed(
+        title=titulo,
+        description='Documento oficial gerado sem alteração do modelo visual.',
+        color=discord.Color.from_rgb(0, 43, 91),
+    )
+    embed.add_field(name='Processo', value=f"`{dados_dossie.get('processo', 'Não informado')}`", inline=True)
+    embed.add_field(name='Investigação', value=f"`{dados_dossie.get('numero_investigacao', 'Não informado')}`", inline=True)
+    embed.add_field(name='Encerrada por', value=getattr(usuario, 'mention', str(usuario)), inline=False)
+
+    for caminho, nome, rotulo in itens:
+        try:
+            if not caminho.exists() or caminho.stat().st_size <= 0:
+                raise RuntimeError('arquivo inexistente ou vazio')
+            tamanho = caminho.stat().st_size
+            if tamanho <= limite:
+                msg = await destino.send(
+                    content=(f'📄 **Dossiê DICOR em {rotulo} — {tamanho / 1024 / 1024:.1f} MB**'),
+                    embed=embed if enviados == 0 and not primeiro else None,
+                    file=discord.File(str(caminho), filename=nome),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                primeiro = primeiro or msg
+                enviados += 1
+                continue
+
+            url = dossie_download_url(caminho, nome) if DOSSIE_LINK_FALLBACK else ''
+            if url and url_discord_valida(url):
+                links.append((rotulo, url, tamanho))
+            else:
+                falhas.append(f'{rotulo} ainda possui {tamanho / 1024 / 1024:.1f} MB e não há URL pública configurada.')
+        except Exception as erro:
+            falhas.append(f'{rotulo}: {erro}')
+
+    if links:
+        view = discord.ui.View(timeout=None)
+        for rotulo, url, tamanho in links:
+            view.add_item(discord.ui.Button(
+                label=f'Baixar {rotulo} ({tamanho / 1024 / 1024:.1f} MB)',
+                emoji='⬇️',
+                style=discord.ButtonStyle.link,
+                url=url,
+            ))
+        msg_link = await destino.send(
+            content='📦 **Arquivo preservado integralmente para download:**',
+            embed=embed if primeiro is None else None,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        primeiro = primeiro or msg_link
+        enviados += len(links)
+
+    if falhas:
+        await destino.send('⚠️ **Avisos do dossiê:**\n' + '\n'.join(f'• {x}' for x in falhas)[:1800])
+    if enviados == 0:
+        raise RuntimeError('Nenhum arquivo do dossiê pôde ser anexado ou disponibilizado por link.')
+    return primeiro
+
+
+# ---------- Limpeza reforçada de permissões ----------
+_apagar_paineis_permissao_base = _apagar_paineis_permissao_apos_veredito
+
+
+async def _apagar_paineis_permissao_apos_veredito(
+    solicitacao: Optional[Dict[str, Any]],
+    interaction: Optional[discord.Interaction] = None,
+) -> None:
+    await _apagar_paineis_permissao_base(solicitacao, interaction)
+    # Segunda tentativa curta cobre o caso em que outro callback ainda estava editando a mensagem.
+    await asyncio.sleep(0.6)
+    msg = getattr(interaction, 'message', None) if interaction else None
+    if msg is not None:
+        try:
+            await msg.delete(reason='Painel de permissão removido após autorizar/negar')
+        except discord.NotFound:
+            pass
+        except Exception:
+            pass
+
 
 if __name__ == '__main__':
     asyncio.run(main())
