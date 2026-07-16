@@ -11810,10 +11810,8 @@ async def executar_aprovacao_autorizacao(interaction: discord.Interaction, solic
             atendimento = {"numero": (solicitacao.get("dados") or {}).get("processo"), "id": None}
         registro = dict(solicitacao.get("dados") or {})
         assinatura_autorizador = obter_assinatura_comparecimento(autorizador.id)
-        if not assinatura_autorizador.get("arquivo"):
-            raise RuntimeError(
-                "A assinatura desta autoridade não está cadastrada. Use /assinaturas, vincule a pessoa correta e tente Autorizar novamente."
-            )
+        # Usa a imagem cadastrada quando existir. Sem imagem, o PDF mantém
+        # a assinatura textual com o nome/cargo exatos de quem autorizou.
         registro.update({
             "autorizado_por_id": autorizador.id,
             "autorizado_por_nome": str(autorizador),
@@ -13533,5 +13531,1991 @@ async def start_web_server():
     print(f'Catálogo rodando na porta {PORT} | rotas: /, /catalogo, /catalogo.html, /health')
 
 
-if __name__ == "__main__":
+
+# =====================================================
+# PATCH FINAL — RAILWAY HEALTHCHECK + AUTORIZAÇÃO NO TÓPICO DE ORIGEM
+# =====================================================
+_WEB_RUNNER_DICOR = None
+_WEB_SITE_DICOR = None
+
+
+async def _adicionar_administradores_ao_topico(canal: Any, guild: Optional[discord.Guild]) -> None:
+    """Em thread privada, adiciona os administradores autorizadores para garantir acesso real."""
+    if guild is None or not isinstance(canal, discord.Thread):
+        return
+    try:
+        if not canal.is_private():
+            return
+    except Exception:
+        return
+
+    for membro in guild.members:
+        try:
+            if membro.bot or not usuario_e_administrador(membro):
+                continue
+            await canal.add_user(membro)
+        except discord.HTTPException:
+            # Quem já está na thread ou tem acesso administrativo pode gerar HTTPException inofensiva.
+            continue
+        except Exception as erro:
+            await enviar_log(
+                f"⚠️ Não consegui adicionar administrador `{getattr(membro, 'id', 0)}` "
+                f"à thread `{getattr(canal, 'id', 0)}`: {type(erro).__name__}: {erro}"
+            )
+
+
+async def _resolver_canal_autorizacao_origem(
+    interaction: discord.Interaction,
+    contexto: Optional[Dict[str, Any]] = None,
+):
+    """Prioriza exatamente o canal/thread onde o botão ou modal foi usado.
+
+    Em pedidos vinculados a boletins, usa também `area_id` como garantia. O canal
+    central fica apenas como último fallback técnico, nunca como destino principal.
+    """
+    contexto = contexto or {}
+    candidatos: List[Any] = []
+
+    canal_interacao = getattr(interaction, 'channel', None)
+    if canal_interacao is not None:
+        candidatos.append(canal_interacao)
+
+    for chave in ('area_id', 'topico_id', 'thread_id', 'canal_solicitante_id', 'canal_provisorio_id'):
+        cid = contexto.get(chave)
+        if cid:
+            candidatos.append(await obter_canal_bot(cid))
+
+    # Fallback somente se a origem tiver sido apagada ou não permitir envio.
+    if AUTORIZACOES_CHANNEL_ID:
+        candidatos.append(await obter_canal_bot(AUTORIZACOES_CHANNEL_ID))
+
+    vistos = set()
+    for canal in candidatos:
+        cid = getattr(canal, 'id', None)
+        if not canal or not cid or cid in vistos:
+            continue
+        vistos.add(cid)
+        if hasattr(canal, 'send'):
+            return canal
+    return None
+
+
+async def criar_solicitacao_autorizacao(
+    interaction: discord.Interaction,
+    tipo: str,
+    dados: Dict[str, Any],
+    contexto: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Cria o painel de autorização no mesmo tópico/canal onde foi solicitado."""
+    contexto = dict(contexto or {})
+    canal = await _resolver_canal_autorizacao_origem(interaction, contexto)
+    if canal is None:
+        raise RuntimeError('Não encontrei o tópico/canal onde a autorização foi solicitada.')
+
+    await _adicionar_administradores_ao_topico(canal, interaction.guild)
+
+    codigo = f"AUT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
+    titulos = {
+        'procurado_painel': '🚨 Autorizar criação de procurado',
+        'procurado_boletim': '🚨 Autorizar procurado do boletim',
+        'procurado_retirada': '📁 Autorizar retirada de procurado',
+        'comparecimento': '📩 Autorizar mandado/comparecimento',
+    }
+
+    solicitacao = {
+        'id': codigo,
+        'tipo': tipo,
+        'status': 'PENDENTE',
+        'dados': dados,
+        'contexto': contexto,
+        'solicitante_id': interaction.user.id,
+        'solicitante_nome': str(interaction.user),
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': getattr(interaction.channel, 'id', None),
+        'mensagem_id': None,
+        'canal_autorizacao_id': getattr(canal, 'id', None),
+        'autorizacao_na_origem': True,
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    embed = discord.Embed(
+        title=titulos.get(tipo, '🔐 Solicitação de autorização'),
+        description=resumo_dados_autorizacao(tipo, dados),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name='Solicitação', value=f'`{codigo}`', inline=True)
+    embed.add_field(
+        name='Solicitado por',
+        value=f'{interaction.user.mention}\n`{interaction.user.id}`',
+        inline=True,
+    )
+    embed.add_field(name='Data e horário', value=agora_br(), inline=False)
+    embed.add_field(
+        name='Local da decisão',
+        value=f'<#{getattr(canal, "id", 0)}>',
+        inline=False,
+    )
+    embed.set_footer(text='Somente Inspetor, Vice-Diretor ou Diretor pode decidir')
+
+    mensagem = await canal.send(
+        content=(
+            f'{mencoes_inspetor_mais(interaction.guild)}\n'
+            '🔐 **Nova solicitação aguardando decisão neste tópico.**'
+        ),
+        embed=embed,
+        view=AutorizacaoCentralView(),
+        allowed_mentions=discord.AllowedMentions(
+            roles=True,
+            users=True,
+            everyone=False,
+        ),
+    )
+
+    solicitacao['mensagem_id'] = mensagem.id
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    await enviar_log(
+        f'🔐 Solicitação criada no tópico de origem | ID `{codigo}` | tipo `{tipo}` | '
+        f'solicitante `{interaction.user.id}` | canal `{getattr(canal, "id", 0)}` | '
+        f'mensagem `{mensagem.id}` | {agora_br()}'
+    )
+    return solicitacao
+
+
+async def pagina_inicial(request: web.Request) -> web.StreamResponse:
+    gerar_catalogo_html()
+    return web.FileResponse(CATALOGO_HTML)
+
+
+async def healthcheck_http(request: web.Request) -> web.Response:
+    return web.json_response({
+        'ok': True,
+        'servico': 'dicor-intelligence',
+        'discord_ready': bool(bot.is_ready()),
+        'porta': int(os.getenv('PORT', str(PORT)) or PORT),
+        'hora': agora_br(),
+    })
+
+
+async def start_web_server():
+    """Abre o HTTP antes da conexão com o Discord e mantém referência do runner."""
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+    if _WEB_RUNNER_DICOR is not None:
+        return
+
+    gerar_catalogo_html()
+    app = web.Application()
+    app.router.add_get('/', pagina_inicial)
+    app.router.add_get('/index.html', pagina_inicial)
+    app.router.add_get('/catalogo', pagina_inicial)
+    app.router.add_get('/catalogo.html', pagina_inicial)
+    app.router.add_get('/health', healthcheck_http)
+    app.router.add_get('/healthz', healthcheck_http)
+    app.router.add_get('/dossies/{caminho:.+}', baixar_dossie_http)
+    app.router.add_get('/backups/{caminho:.+}', baixar_backup_http)
+    app.router.add_post('/api/catalogo/apagar', api_apagar_procurado)
+    app.router.add_static('/uploads/', path=str(UPLOADS_DIR), show_index=False)
+
+    porta = int(os.getenv('PORT', str(PORT)) or PORT)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=porta)
+    await site.start()
+
+    _WEB_RUNNER_DICOR = runner
+    _WEB_SITE_DICOR = site
+    print(f'✅ HTTP DICOR ativo em 0.0.0.0:{porta} | health: /health | catálogo: /catalogo', flush=True)
+
+
+
+# =====================================================
+# PATCH FINAL — SOMENTE BOLETINS E AUTORIZAÇÕES NO TÓPICO
+# =====================================================
+
+def _campos_embed_mensagem(mensagem: Optional[discord.Message]) -> Dict[str, str]:
+    campos: Dict[str, str] = {}
+    if mensagem is None:
+        return campos
+    for embed in getattr(mensagem, 'embeds', []) or []:
+        for field in getattr(embed, 'fields', []) or []:
+            campos[str(field.name or '').strip().lower()] = str(field.value or '').strip()
+    return campos
+
+
+def _descricao_embed_mensagem(mensagem: Optional[discord.Message]) -> str:
+    partes: List[str] = []
+    if mensagem is None:
+        return ''
+    for embed in getattr(mensagem, 'embeds', []) or []:
+        if getattr(embed, 'title', None):
+            partes.append(str(embed.title))
+        if getattr(embed, 'description', None):
+            partes.append(str(embed.description))
+    return '\n'.join(partes)
+
+
+def _extrair_valor_markdown(texto: str, rotulo: str) -> str:
+    padrao = rf"\*\*{re.escape(rotulo)}:\*\*\s*(.*?)(?=\n\*\*[^\n]+:\*\*|\Z)"
+    m = re.search(padrao, str(texto or ''), flags=re.I | re.S)
+    if not m:
+        return ''
+    valor = m.group(1).strip()
+    valor = valor.replace('`', '').replace('**', '').strip()
+    return valor
+
+
+def _codigo_autorizacao_da_mensagem(mensagem: Optional[discord.Message]) -> str:
+    campos = _campos_embed_mensagem(mensagem)
+    valor = campos.get('solicitação') or campos.get('solicitacao') or ''
+    m = re.search(r'AUT-\d{14}-[A-F0-9]{6}', valor, flags=re.I)
+    if m:
+        return m.group(0).upper()
+    texto = (getattr(mensagem, 'content', '') or '') + '\n' + _descricao_embed_mensagem(mensagem)
+    m = re.search(r'AUT-\d{14}-[A-F0-9]{6}', texto, flags=re.I)
+    return m.group(0).upper() if m else ''
+
+
+def _solicitante_id_da_mensagem(mensagem: Optional[discord.Message]) -> Optional[int]:
+    campos = _campos_embed_mensagem(mensagem)
+    valor = campos.get('solicitado por', '')
+    numeros = re.findall(r'\d{15,22}', valor)
+    if not numeros:
+        return None
+    try:
+        return int(numeros[-1])
+    except Exception:
+        return None
+
+
+def _tipo_autorizacao_boletim_da_mensagem(mensagem: Optional[discord.Message]) -> str:
+    texto = _descricao_embed_mensagem(mensagem).lower()
+    if 'mandado' in texto or 'comparecimento' in texto:
+        return 'comparecimento'
+    if 'procurado' in texto:
+        return 'procurado_boletim'
+    return ''
+
+
+def _dados_autorizacao_boletim_da_mensagem(
+    mensagem: Optional[discord.Message],
+    tipo: str,
+    atendimento: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    descricao = _descricao_embed_mensagem(mensagem)
+    atendimento = atendimento or {}
+    if tipo == 'comparecimento':
+        processo = _extrair_valor_markdown(descricao, 'Processo') or atendimento.get('numero') or 'Não informado'
+        return {
+            'id': f'CMP-REC-{getattr(mensagem, "id", data_caso())}',
+            'numero': proximo_numero_comparecimento(),
+            'boletim': atendimento.get('numero') or processo,
+            'processo': processo,
+            'nome': _extrair_valor_markdown(descricao, 'Convocado') or 'Não informado',
+            'rg': _extrair_valor_markdown(descricao, 'RG') or 'Não informado',
+            'motivo': _extrair_valor_markdown(descricao, 'Motivo') or 'Não informado',
+            'data_hora': _extrair_valor_markdown(descricao, 'Data/Horário') or 'Não informado',
+            'local': _extrair_valor_markdown(descricao, 'Local') or 'Sede da Polícia Federal - DICOR',
+            'data_expedicao': agora_br(),
+            'data': agora_br(),
+        }
+    if tipo == 'procurado_boletim':
+        boletim = _extrair_valor_markdown(descricao, 'Boletim') or atendimento.get('numero') or 'Não informado'
+        return {
+            'nome': _extrair_valor_markdown(descricao, 'Nome') or 'Não informado',
+            'rg': _extrair_valor_markdown(descricao, 'RG') or 'Não informado',
+            'crimes': _extrair_valor_markdown(descricao, 'Crimes') or 'Não informado',
+            'caracteristicas': _extrair_valor_markdown(descricao, 'Características') or 'Não informado',
+            'outras': _extrair_valor_markdown(descricao, 'Outras informações') or 'Não informado',
+            'numero_boletim': boletim,
+            'boletim': boletim,
+        }
+    return {}
+
+
+async def _atendimento_da_mensagem_autorizacao(
+    interaction: discord.Interaction,
+    tipo: str,
+) -> Optional[Dict[str, Any]]:
+    canal_id = getattr(getattr(interaction, 'channel', None), 'id', 0)
+    atendimento = buscar_atendimento_por_area(canal_id)
+    if atendimento:
+        return atendimento
+
+    descricao = _descricao_embed_mensagem(getattr(interaction, 'message', None))
+    numero = ''
+    if tipo == 'comparecimento':
+        numero = _extrair_valor_markdown(descricao, 'Processo')
+    elif tipo == 'procurado_boletim':
+        numero = _extrair_valor_markdown(descricao, 'Boletim')
+    if numero:
+        atendimento = buscar_atendimento_por_numero(numero)
+        if atendimento:
+            return atendimento
+
+    try:
+        return await garantir_atendimento_interaction(interaction)
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Falha ao localizar atendimento pela autorização `{getattr(getattr(interaction, "message", None), "id", 0)}`: '
+            f'{type(erro).__name__}: {erro}'
+        )
+        return None
+
+
+async def _recuperar_autorizacao_boletim_da_mensagem(
+    interaction: discord.Interaction,
+) -> Optional[Dict[str, Any]]:
+    """Reconstrói uma autorização de boletim após redeploy/perda do JSON do Railway.
+
+    O painel do Discord contém código, tipo e dados suficientes para regravar a
+    solicitação. Assim os botões antigos deixam de retornar "não encontrada".
+    """
+    mensagem = getattr(interaction, 'message', None)
+    tipo = _tipo_autorizacao_boletim_da_mensagem(mensagem)
+    if tipo not in {'comparecimento', 'procurado_boletim'}:
+        return None
+
+    atendimento = await _atendimento_da_mensagem_autorizacao(interaction, tipo)
+    dados = _dados_autorizacao_boletim_da_mensagem(mensagem, tipo, atendimento)
+    if not dados:
+        return None
+
+    codigo = _codigo_autorizacao_da_mensagem(mensagem)
+    if not codigo:
+        codigo = f'AUT-REC-{getattr(mensagem, "id", data_caso())}'
+
+    solicitante_id = _solicitante_id_da_mensagem(mensagem)
+    solicitante = None
+    if interaction.guild and solicitante_id:
+        solicitante = interaction.guild.get_member(solicitante_id)
+
+    solicitacao = {
+        'id': codigo,
+        'tipo': tipo,
+        'status': 'PENDENTE',
+        'dados': dados,
+        'contexto': {
+            'atendimento_id': atendimento.get('id') if atendimento else None,
+            'area_id': atendimento.get('area_id') if atendimento else getattr(interaction.channel, 'id', None),
+        },
+        'solicitante_id': solicitante_id,
+        'solicitante_nome': str(solicitante) if solicitante else f'Usuário {solicitante_id or "não identificado"}',
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': atendimento.get('area_id') if atendimento else getattr(interaction.channel, 'id', None),
+        'mensagem_id': getattr(mensagem, 'id', None),
+        'canal_autorizacao_id': getattr(interaction.channel, 'id', None),
+        'recuperada_do_painel': True,
+        'recuperada_em': agora_br(),
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    if atendimento:
+        if tipo == 'comparecimento':
+            atendimento.update({
+                'comparecimento_status': 'aguardando_autorizacao',
+                'comparecimento_solicitado': dados,
+                'comparecimento_autorizacao_id': codigo,
+            })
+        else:
+            atendimento.update({
+                'procurado_status': 'aguardando_autorizacao',
+                'procurado_solicitado': dados,
+                'procurado_autorizacao_id': codigo,
+            })
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    await enviar_log(
+        f'♻️ Autorização de boletim recuperada do próprio painel | ID `{codigo}` | '
+        f'tipo `{tipo}` | mensagem `{getattr(mensagem, "id", 0)}` | '
+        f'atendimento `{(atendimento or {}).get("id")}` | {agora_br()}'
+    )
+    return solicitacao
+
+
+async def _buscar_autorizacao_da_interacao(
+    interaction: discord.Interaction,
+) -> Optional[Dict[str, Any]]:
+    mensagem_id = getattr(getattr(interaction, 'message', None), 'id', 0)
+    todos = carregar_autorizacoes()
+
+    solicitacao = next(
+        (item for item in todos.values() if str(item.get('mensagem_id')) == str(mensagem_id)),
+        None,
+    )
+    if solicitacao:
+        return solicitacao
+
+    codigo = _codigo_autorizacao_da_mensagem(getattr(interaction, 'message', None))
+    if codigo and codigo in todos:
+        solicitacao = todos[codigo]
+        solicitacao['mensagem_id'] = mensagem_id
+        solicitacao['canal_autorizacao_id'] = getattr(interaction.channel, 'id', None)
+        todos[codigo] = solicitacao
+        salvar_autorizacoes(todos)
+        return solicitacao
+
+    return await _recuperar_autorizacao_boletim_da_mensagem(interaction)
+
+
+async def _canal_topico_do_atendimento(
+    interaction: discord.Interaction,
+    contexto: Dict[str, Any],
+):
+    """Para boletins, o destino obrigatório é a área/thread do atendimento."""
+    for chave in ('area_id', 'thread_id', 'canal_atendimento_id'):
+        cid = contexto.get(chave)
+        if cid:
+            canal = await obter_canal_bot(cid)
+            if canal is not None and hasattr(canal, 'send'):
+                return canal
+
+    atendimento_id = contexto.get('atendimento_id')
+    if atendimento_id:
+        atendimento = next(
+            (a for a in carregar_atendimentos_boletins() if str(a.get('id')) == str(atendimento_id)),
+            None,
+        )
+        if atendimento:
+            for chave in ('area_id', 'thread_id', 'canal_atendimento_id'):
+                cid = atendimento.get(chave)
+                if cid:
+                    canal = await obter_canal_bot(cid)
+                    if canal is not None and hasattr(canal, 'send'):
+                        contexto['area_id'] = getattr(canal, 'id', cid)
+                        return canal
+
+    canal_atual = getattr(interaction, 'channel', None)
+    if canal_atual is not None and hasattr(canal_atual, 'send'):
+        return canal_atual
+    return None
+
+
+async def criar_solicitacao_autorizacao(
+    interaction: discord.Interaction,
+    tipo: str,
+    dados: Dict[str, Any],
+    contexto: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Solicitações dos boletins ficam obrigatoriamente no tópico do boletim."""
+    contexto = dict(contexto or {})
+
+    if tipo in {'comparecimento', 'procurado_boletim'}:
+        canal = await _canal_topico_do_atendimento(interaction, contexto)
+    else:
+        canal = await _resolver_canal_autorizacao_origem(interaction, contexto)
+
+    if canal is None:
+        raise RuntimeError('Não encontrei o tópico do boletim para enviar a autorização.')
+
+    await _adicionar_administradores_ao_topico(canal, interaction.guild)
+
+    codigo = f"AUT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
+    titulos = {
+        'procurado_painel': '🚨 Autorizar criação de procurado',
+        'procurado_boletim': '🚨 Autorizar procurado do boletim',
+        'procurado_retirada': '📁 Autorizar retirada de procurado',
+        'comparecimento': '📩 Autorizar mandado/comparecimento',
+    }
+    solicitacao = {
+        'id': codigo,
+        'tipo': tipo,
+        'status': 'PENDENTE',
+        'dados': dados,
+        'contexto': contexto,
+        'solicitante_id': interaction.user.id,
+        'solicitante_nome': str(interaction.user),
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': getattr(canal, 'id', None),
+        'mensagem_id': None,
+        'canal_autorizacao_id': getattr(canal, 'id', None),
+        'autorizacao_na_origem': True,
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    embed = discord.Embed(
+        title=titulos.get(tipo, '🔐 Solicitação de autorização'),
+        description=resumo_dados_autorizacao(tipo, dados),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name='Solicitação', value=f'`{codigo}`', inline=True)
+    embed.add_field(
+        name='Solicitado por',
+        value=f'{interaction.user.mention}\n`{interaction.user.id}`',
+        inline=True,
+    )
+    embed.add_field(name='Data e horário', value=agora_br(), inline=False)
+    embed.set_footer(text='Somente Inspetor, Vice-Diretor ou Diretor pode decidir')
+
+    mensagem = await canal.send(
+        content=(
+            f'{mencoes_inspetor_mais(interaction.guild)}\n'
+            '🔐 **Nova solicitação aguardando decisão neste tópico.**'
+        ),
+        embed=embed,
+        view=AutorizacaoCentralView(),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+    )
+
+    solicitacao['mensagem_id'] = mensagem.id
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    await enviar_log(
+        f'🔐 Solicitação criada no tópico do boletim | ID `{codigo}` | tipo `{tipo}` | '
+        f'canal `{getattr(canal, "id", 0)}` | mensagem `{mensagem.id}` | {agora_br()}'
+    )
+    return solicitacao
+
+
+class AutorizacaoCentralView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _decidir(self, interaction: discord.Interaction, aprovado: bool) -> None:
+        if not usuario_e_administrador(interaction.user):
+            await enviar_log(
+                f'🚫 Tentativa de decisão sem cargo autorizado | usuário `{interaction.user.id}` | '
+                f'mensagem `{getattr(getattr(interaction, "message", None), "id", 0)}`'
+            )
+            return await interaction.response.send_message(
+                '❌ Somente Inspetor, Vice-Diretor ou Diretor pode decidir.',
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        solicitacao = await _buscar_autorizacao_da_interacao(interaction)
+        if not solicitacao:
+            return await interaction.followup.send(
+                '❌ Não foi possível reconstruir esta solicitação. Refaça o pedido pelo painel do boletim.',
+                ephemeral=True,
+            )
+
+        todos = carregar_autorizacoes()
+        status = str(solicitacao.get('status') or 'PENDENTE').upper()
+        if status not in {'PENDENTE', 'PROCESSANDO'}:
+            return await interaction.followup.send(
+                f'⚠️ Esta solicitação já está `{status}`.',
+                ephemeral=True,
+            )
+
+        solicitacao['status'] = 'PROCESSANDO'
+        todos[solicitacao['id']] = solicitacao
+        salvar_autorizacoes(todos)
+
+        try:
+            resultado = ''
+            if aprovado:
+                resultado = await executar_aprovacao_autorizacao(interaction, solicitacao)
+                solicitacao['status'] = 'APROVADO'
+            else:
+                await registrar_negacao_contexto(solicitacao, interaction.user)
+                solicitacao['status'] = 'NEGADO'
+
+            solicitacao.update({
+                'decidido_por_id': interaction.user.id,
+                'decidido_por_nome': str(interaction.user),
+                'decidido_por_cargo': cargo_autorizador(interaction.user),
+                'decidido_em': agora_br(),
+                'resultado': resultado,
+            })
+            todos = carregar_autorizacoes()
+            todos[solicitacao['id']] = solicitacao
+            salvar_autorizacoes(todos)
+
+            await enviar_log(
+                f"{'✅' if aprovado else '❌'} Autorização de boletim decidida | "
+                f"ID `{solicitacao['id']}` | tipo `{solicitacao.get('tipo')}` | "
+                f"autoridade `{interaction.user.id}` | resultado `{solicitacao['status']}` | {agora_br()}"
+            )
+
+            try:
+                await interaction.message.delete(
+                    reason=f"Solicitação {solicitacao['status'].lower()} e registrada"
+                )
+            except Exception as erro_delete:
+                await enviar_log(
+                    f'⚠️ Solicitação decidida, mas a mensagem `{getattr(interaction.message, "id", 0)}` '
+                    f'não foi apagada: {type(erro_delete).__name__}: {erro_delete}'
+                )
+
+            await interaction.followup.send(
+                (f'✅ Solicitação aprovada. {resultado}' if aprovado else '❌ Solicitação negada.')[:1900],
+                ephemeral=True,
+            )
+        except Exception as erro:
+            solicitacao['status'] = 'PENDENTE'
+            solicitacao['ultima_falha'] = f'{type(erro).__name__}: {erro}'
+            solicitacao['ultima_falha_em'] = agora_br()
+            todos = carregar_autorizacoes()
+            todos[solicitacao['id']] = solicitacao
+            salvar_autorizacoes(todos)
+
+            await enviar_log(
+                f'❌ Erro na autorização de boletim `{solicitacao.get("id")}` | '
+                f'{type(erro).__name__}: {erro}\n```{traceback.format_exc()[-1500:]}```'
+            )
+            await interaction.followup.send(
+                f'❌ Não foi possível concluir a autorização: `{type(erro).__name__}: {erro}`'[:1900],
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label='Autorizar', emoji='✅', style=discord.ButtonStyle.green,
+        custom_id='dicor_auth_aprovar',
+    )
+    async def aprovar(self, interaction: discord.Interaction, button: Button):
+        await self._decidir(interaction, True)
+
+    @discord.ui.button(
+        label='Negar', emoji='❌', style=discord.ButtonStyle.red,
+        custom_id='dicor_auth_negar',
+    )
+    async def negar(self, interaction: discord.Interaction, button: Button):
+        await self._decidir(interaction, False)
+
+
+async def main():
+    """Inicia primeiro o HTTP do Railway; depois conecta o bot ao Discord."""
+    carregar_boletins_pendentes_memoria()
+    carregar_cadastros_pendentes_memoria()
+    garantir_56_organizacoes()
+    garantir_senha_catalogo()
+
+    try:
+        await start_web_server()
+    except Exception as erro_web:
+        print(
+            f'❌ FALHA AO ABRIR HTTP/HEALTHCHECK: {type(erro_web).__name__}: {erro_web}',
+            flush=True,
+        )
+        traceback.print_exc()
+        raise
+
+    if not DISCORD_TOKEN or DISCORD_TOKEN == 'COLE_O_TOKEN_DO_BOT_AQUI':
+        print(
+            '❌ DISCORD_TOKEN ausente ou inválido. O /health continuará ativo, mas o bot ficará offline.',
+            flush=True,
+        )
+        await asyncio.Event().wait()
+        return
+
+    try:
+        await bot.start(DISCORD_TOKEN)
+    except discord.LoginFailure as erro_login:
+        print(f'❌ TOKEN DO DISCORD INVÁLIDO: {erro_login}', flush=True)
+        traceback.print_exc()
+        # Mantém o HTTP ativo para o Railway não entrar em loop de deploy.
+        await asyncio.Event().wait()
+    except Exception as erro_bot:
+        print(
+            f'❌ FALHA FATAL AO INICIAR BOT: {type(erro_bot).__name__}: {erro_bot}',
+            flush=True,
+        )
+        traceback.print_exc()
+        # Preserva o endpoint de diagnóstico.
+        await asyncio.Event().wait()
+
+
+
+# =====================================================
+# PATCH FINAL — BOLETINS: RODÍZIO SEM REPETIÇÃO,
+# AUTORIZAÇÕES NO PRÓPRIO TÓPICO E FOTOS OBRIGATÓRIAS
+# =====================================================
+
+_BOLETIM_RODIZIO_LOCK_FINAL = asyncio.Lock()
+_criar_solicitacao_autorizacao_base = criar_solicitacao_autorizacao
+_executar_aprovacao_autorizacao_base = executar_aprovacao_autorizacao
+_resumo_dados_autorizacao_base = resumo_dados_autorizacao
+
+
+def _arquivo_upload_procurado_existe(valor: Any) -> bool:
+    """Confere se a imagem obrigatória realmente foi salva no servidor."""
+    caminho = str(valor or '').strip()
+    if not caminho:
+        return False
+    try:
+        p = Path(caminho)
+        candidatos = [p]
+        if not p.is_absolute():
+            candidatos.extend([
+                BASE_DIR / p,
+                PUBLIC_DIR / p,
+                UPLOADS_DIR / p.name,
+            ])
+        return any(c.exists() and c.is_file() and c.stat().st_size > 0 for c in candidatos)
+    except Exception:
+        return False
+
+
+def _fotos_procurado_validas(dados: Dict[str, Any]) -> bool:
+    return (
+        _arquivo_upload_procurado_existe(dados.get('foto_individuo'))
+        and _arquivo_upload_procurado_existe(dados.get('foto_rg'))
+    )
+
+
+def _usuario_pode_operar_atendimento_boletim(
+    interaction: discord.Interaction,
+    atendimento: Optional[Dict[str, Any]],
+) -> bool:
+    if not atendimento or not isinstance(interaction.user, discord.Member):
+        return False
+    if usuario_e_administrador(interaction.user):
+        return True
+    return int(atendimento.get('agente_id') or 0) == int(interaction.user.id)
+
+
+async def escolher_agente_rodizio(
+    guild: discord.Guild,
+    numero: str,
+) -> Optional[discord.Member]:
+    """Escolhe um agente sem repetir enquanto ainda houver alguém no ciclo.
+
+    A fila e os usados são persistidos em JSON. O lock impede que dois boletins
+    criados ao mesmo tempo recebam o mesmo agente por condição de corrida.
+    """
+    async with _BOLETIM_RODIZIO_LOCK_FINAL:
+        elegiveis = membros_elegiveis_rodizio(guild)
+        if not elegiveis:
+            await enviar_log(
+                f'⚠️ Nenhum agente elegível para o rodízio do boletim `{numero}`. '
+                'Confira BOLETIM_RODIZIO_CARGOS_IDS e os cargos dos membros.'
+            )
+            return None
+
+        por_id = {m.id: m for m in elegiveis}
+        ids_atuais = list(por_id)
+        estado = carregar_rodizio_boletim()
+
+        usados = []
+        for valor in estado.get('ciclo_usados', []):
+            try:
+                uid = int(valor)
+                if uid in por_id and uid not in usados:
+                    usados.append(uid)
+            except Exception:
+                continue
+
+        fila = []
+        for valor in estado.get('fila_ids', []):
+            try:
+                uid = int(valor)
+                if uid in por_id and uid not in usados and uid not in fila:
+                    fila.append(uid)
+            except Exception:
+                continue
+
+        # Agentes novos entram no ciclo atual sem causar repetição.
+        faltantes = [uid for uid in ids_atuais if uid not in usados and uid not in fila]
+        if faltantes:
+            secrets.SystemRandom().shuffle(faltantes)
+            fila.extend(faltantes)
+
+        # Todos já foram usados: inicia ciclo novo.
+        if not fila:
+            usados = []
+            fila = ids_atuais[:]
+            secrets.SystemRandom().shuffle(fila)
+            ultimo_id = int(estado.get('ultimo_id', 0) or 0)
+            if len(fila) > 1 and fila[0] == ultimo_id:
+                fila.append(fila.pop(0))
+            estado['ciclo_numero'] = int(estado.get('ciclo_numero', 0) or 0) + 1
+
+        escolhido_id = fila.pop(0)
+        usados.append(escolhido_id)
+        escolhido = por_id[escolhido_id]
+
+        historico = estado.get('historico', [])
+        if not isinstance(historico, list):
+            historico = []
+        historico.append({
+            'numero': numero,
+            'agente_id': escolhido.id,
+            'agente_nome': str(escolhido),
+            'data': agora_br(),
+            'ciclo': int(estado.get('ciclo_numero', 1) or 1),
+        })
+        estado.update({
+            'ultimo_id': escolhido.id,
+            'fila_ids': fila,
+            'ciclo_usados': usados,
+            'ultima_atribuicao': agora_br(),
+            'historico': historico[-2000:],
+            'agentes_elegiveis': ids_atuais,
+        })
+        salvar_rodizio_boletim(estado)
+
+        await enviar_log(
+            '🔁 **Rodízio automático de boletim**\n'
+            f'Boletim: `{numero}`\n'
+            f'Agente escolhido: {escolhido.mention} (`{escolhido.id}`)\n'
+            f'Ciclo: `{estado.get("ciclo_numero", 1)}`\n'
+            f'Agentes ainda não usados no ciclo: `{len(fila)}`'
+        )
+        return escolhido
+
+
+def texto_painel_boletim(atendimento: Dict[str, Any]) -> str:
+    agente = (
+        f"<@{atendimento.get('agente_id')}>"
+        if atendimento.get('agente_id')
+        else '**Nenhum agente elegível encontrado**'
+    )
+    return (
+        '🛠️ **PAINEL DO BOLETIM**\n'
+        f"**Boletim:** Nº `{numero_curto_boletim(atendimento.get('numero'))}`\n"
+        f'**Agente responsável pelo rodízio:** {agente}\n'
+        f"**Status:** {atendimento.get('status', 'EM ATENDIMENTO')}\n\n"
+        'O responsável foi definido automaticamente pelo rodízio. '
+        'O mesmo agente não será repetido antes dos demais agentes elegíveis.'
+    )
+
+
+async def criar_area_atendimento_boletim(
+    message: discord.Message,
+) -> Optional[Dict[str, Any]]:
+    """Cria o canal privado e entrega automaticamente o boletim pelo rodízio."""
+    if buscar_atendimento_por_mensagem(message.id):
+        return None
+
+    numero = numero_boletim_de_texto(
+        coletar_texto_embed(message) or message.content or ''
+    )
+    existente = buscar_atendimento_por_numero(numero)
+    if existente:
+        await enviar_log(
+            f'⚠️ Atendimento duplicado ignorado | boletim `{numero}` | mensagem `{message.id}`'
+        )
+        return None
+    if not message.guild:
+        return None
+
+    agente = await escolher_agente_rodizio(message.guild, numero)
+
+    base_atendimento = message.guild.get_channel(BOLETIM_ATENDIMENTO_CHANNEL_ID)
+    categoria = None
+    if isinstance(base_atendimento, discord.CategoryChannel):
+        categoria = base_atendimento
+    elif isinstance(base_atendimento, (discord.TextChannel, discord.ForumChannel)):
+        categoria = base_atendimento.category
+
+    overwrites: Dict[Any, discord.PermissionOverwrite] = {
+        message.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if message.guild.me:
+        overwrites[message.guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            attach_files=True,
+            embed_links=True,
+        )
+    for cargo_id in CARGOS_AUTORIZADORES:
+        cargo = message.guild.get_role(cargo_id)
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+            )
+    if agente:
+        overwrites[agente] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        )
+
+    area = await message.guild.create_text_channel(
+        name=f'boletim-{numero_curto_boletim(numero)}'[:95],
+        category=categoria,
+        overwrites=overwrites,
+        reason=f'Atendimento privado e rodízio automático do boletim {numero}',
+    )
+
+    texto_original = coletar_texto_embed(message) or message.content or 'Sem texto.'
+    pasta = BOLETIM_ARQUIVOS_DIR / numero.replace('/', '-')
+    anexos = await arquivos_para_reenvio_de_mensagens([message], pasta, numero)
+    mencoes_admin = mencoes_inspetor_mais(message.guild)
+    mencao_agente = agente.mention if agente else 'Nenhum agente elegível encontrado'
+
+    abertura = (
+        f'{mencoes_admin} {agente.mention if agente else ""}\n'
+        '📋 **NOVO BOLETIM — RODÍZIO AUTOMÁTICO**\n'
+        '━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+        f'**Boletim:** Nº `{numero_curto_boletim(numero)}`\n'
+        f'**Agente responsável:** {mencao_agente}\n'
+        f'**Autor do boletim:** {message.author.mention if message.author else "Não identificado"}\n'
+        f'**Data de recebimento:** {agora_br()}\n'
+        f'**Mensagem original:** {message.jump_url}\n\n'
+        'O agente foi definido automaticamente. Não haverá repetição enquanto '
+        'existirem outros agentes elegíveis ainda não utilizados no ciclo.'
+    )
+    await area.send(
+        abertura,
+        allowed_mentions=discord.AllowedMentions(
+            roles=True, users=True, everyone=False,
+        ),
+    )
+
+    texto_completo = (
+        '📄 **BOLETIM ORIGINAL COMPLETO**\n'
+        '━━━━━━━━━━━━━━━━━━━━━━━\n'
+        f'{cortar_discord(texto_original, 1650)}\n\n'
+        f'📎 **Anexos preservados:** `{len(anexos)}`'
+    )
+    if anexos:
+        await enviar_texto_com_anexos_path(
+            area,
+            texto_completo,
+            anexos,
+            f'📎 Anexos restantes do boletim {numero}',
+        )
+    else:
+        await area.send(texto_completo)
+
+    atendimento = {
+        'id': f'ATD-{message.id}',
+        'numero': numero,
+        'mensagem_original_id': message.id,
+        'mensagem_original_url': message.jump_url,
+        'canal_origem_id': message.channel.id,
+        'area_id': area.id,
+        'thread_id': None,
+        'canal_atendimento_id': area.id,
+        'painel_msg_id': None,
+        'agente_id': agente.id if agente else None,
+        'agente_nome': str(agente) if agente else 'Nenhum agente elegível',
+        'agente_atribuido_por': 'RODIZIO_AUTOMATICO',
+        'agente_atribuido_em': agora_br(),
+        'autor_id': message.author.id if message.author else None,
+        'autor_nome': str(message.author) if message.author else 'Não identificado',
+        'status': 'EM ATENDIMENTO' if agente else 'SEM AGENTE ELEGÍVEL',
+        'data_criacao': agora_br(),
+        'anexos_salvos': [str(p) for p in anexos],
+        'historico': [{
+            'acao': 'Área privada criada e agente atribuído pelo rodízio',
+            'usuario': 'Sistema',
+            'agente_id': agente.id if agente else None,
+            'agente_nome': str(agente) if agente else None,
+            'data': agora_br(),
+        }],
+        'comparecimento_status': 'não solicitado',
+        'procurado_status': 'não solicitado',
+    }
+    lista = carregar_atendimentos_boletins()
+    lista.append(atendimento)
+    salvar_atendimentos_boletins(lista)
+
+    painel_msg = await area.send(
+        texto_painel_boletim(atendimento),
+        view=BoletimAtendimentoView(),
+    )
+    atendimento['painel_msg_id'] = painel_msg.id
+    atualizar_atendimento_boletim('id', atendimento['id'], atendimento)
+
+    await enviar_log(
+        '📋 **Boletim entregue pelo rodízio**\n'
+        f'Boletim: `{numero}`\n'
+        f'Área: <#{area.id}> (`{area.id}`)\n'
+        f'Autor: `{atendimento.get("autor_id")}`\n'
+        f'Agente: `{atendimento.get("agente_id")}`\n'
+        f'Data: {agora_br()}'
+    )
+    return atendimento
+
+
+def resumo_dados_autorizacao(tipo: str, dados: Dict[str, Any]) -> str:
+    base = _resumo_dados_autorizacao_base(tipo, dados)
+    if tipo == 'procurado_boletim':
+        fotos_ok = _fotos_procurado_validas(dados)
+        base += (
+            '\n\n📸 **FOTOS OBRIGATÓRIAS**\n'
+            f'• Foto do indivíduo: {"✅ Confirmada" if _arquivo_upload_procurado_existe(dados.get("foto_individuo")) else "❌ Ausente"}\n'
+            f'• Foto do RG: {"✅ Confirmada" if _arquivo_upload_procurado_existe(dados.get("foto_rg")) else "❌ Ausente"}\n'
+            f'• Publicação liberada: {"✅ Sim" if fotos_ok else "❌ Não"}'
+        )
+    return base
+
+
+async def _imagens_enviadas_depois_da_mensagem(
+    canal: Any,
+    mensagem_inicio_id: int,
+) -> List[discord.Attachment]:
+    imagens: List[discord.Attachment] = []
+    vistos = set()
+    try:
+        async for msg in canal.history(limit=150, oldest_first=True):
+            if int(getattr(msg, 'id', 0)) <= int(mensagem_inicio_id or 0):
+                continue
+            if getattr(msg.author, 'bot', False):
+                continue
+            for anexo in msg.attachments:
+                chave = (getattr(anexo, 'id', 0), anexo.filename, anexo.size)
+                if chave in vistos:
+                    continue
+                if tipo_anexo_dossie(anexo) != 'imagem':
+                    continue
+                vistos.add(chave)
+                imagens.append(anexo)
+    except Exception as erro:
+        await enviar_log(
+            f'❌ Falha ao localizar fotos obrigatórias no boletim: {type(erro).__name__}: {erro}'
+        )
+    return imagens
+
+
+class SolicitarAutorizacaoProcuradoComFotosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Validar Fotos e Pedir Autorização',
+        emoji='📸',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_bo_validar_fotos_autorizar_v3',
+    )
+    async def validar_fotos(
+        self,
+        interaction: discord.Interaction,
+        button: Button,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.followup.send(
+                '❌ Atendimento do boletim não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.followup.send(
+                '❌ Apenas o agente responsável ou a administração pode enviar este pedido.',
+                ephemeral=True,
+            )
+        if str(atendimento.get('procurado_status', '')).lower() not in {
+            'aguardando_fotos',
+            'autorizado_aguardando_fotos',
+        }:
+            return await interaction.followup.send(
+                '⚠️ Este pedido já foi enviado para autorização ou já foi concluído.',
+                ephemeral=True,
+            )
+
+        inicio_id = int(
+            atendimento.get('procurado_fotos_inicio_msg_id')
+            or getattr(interaction.message, 'id', 0)
+            or 0
+        )
+        imagens = await _imagens_enviadas_depois_da_mensagem(
+            interaction.channel,
+            inicio_id,
+        )
+        if len(imagens) < 2:
+            return await interaction.followup.send(
+                '❌ **Faltam as fotos obrigatórias.**\n'
+                'Envie, após a mensagem de solicitação:\n'
+                '1. **Foto do indivíduo**\n'
+                '2. **Foto do RG**\n\n'
+                'Depois clique novamente neste botão.',
+                ephemeral=True,
+            )
+
+        dados = dict(atendimento.get('procurado_solicitado') or {})
+        if not dados or not limpar_rg(dados.get('rg')):
+            return await interaction.followup.send(
+                '❌ Os dados do procurado não foram encontrados. Refaça o pedido.',
+                ephemeral=True,
+            )
+
+        try:
+            foto_ind = await salvar_anexo_publico(
+                imagens[0], f'boletim-individuo-{dados.get("rg")}'
+            )
+            foto_rg = await salvar_anexo_publico(
+                imagens[1], f'boletim-rg-{dados.get("rg")}'
+            )
+        except Exception as erro:
+            await registrar_erro_interacao(
+                'validar_fotos_procurado_boletim', interaction, erro
+            )
+            return
+
+        dados.update({
+            'foto_individuo': foto_ind,
+            'foto_rg': foto_rg,
+            'foto_individuo_anexo_id': getattr(imagens[0], 'id', None),
+            'foto_rg_anexo_id': getattr(imagens[1], 'id', None),
+            'fotos_confirmadas_em': agora_br(),
+            'fotos_confirmadas_por_id': interaction.user.id,
+        })
+        if not _fotos_procurado_validas(dados):
+            return await interaction.followup.send(
+                '❌ As imagens não foram salvas corretamente. O pedido não foi enviado para autorização.',
+                ephemeral=True,
+            )
+
+        atendimento.update({
+            'procurado_solicitado': dados,
+            'procurado_status': 'aguardando_autorizacao',
+            'procurado_foto_individuo': foto_ind,
+            'procurado_foto_rg': foto_rg,
+        })
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+        solicitacao = await criar_solicitacao_autorizacao(
+            interaction=interaction,
+            tipo='procurado_boletim',
+            dados=dados,
+            contexto={
+                'atendimento_id': atendimento.get('id'),
+                'area_id': atendimento.get('area_id'),
+            },
+        )
+        atendimento['procurado_autorizacao_id'] = solicitacao['id']
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+        try:
+            await interaction.message.edit(
+                content=(
+                    '✅ **Fotos obrigatórias confirmadas.**\n'
+                    f'• Foto do indivíduo: `{Path(foto_ind).name}`\n'
+                    f'• Foto do RG: `{Path(foto_rg).name}`\n'
+                    f'• Solicitação: `{solicitacao["id"]}`\n\n'
+                    'O pedido foi enviado para decisão neste mesmo tópico.'
+                ),
+                view=None,
+            )
+        except Exception:
+            pass
+
+        await interaction.followup.send(
+            f'✅ Fotos validadas e solicitação `{solicitacao["id"]}` enviada para autorização.',
+            ephemeral=True,
+        )
+
+
+async def solicitar_autorizacao_procurado_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    """Primeiro exige as duas fotos; só depois cria a autorização."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    atendimento = await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        return await interaction.followup.send(
+            '❌ Atendimento não encontrado.', ephemeral=True
+        )
+    if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+        return await interaction.followup.send(
+            '❌ Apenas o agente responsável pelo rodízio ou a administração pode solicitar o cadastro.',
+            ephemeral=True,
+        )
+    if procurar_por_rg(dados.get('rg')):
+        return await interaction.followup.send(
+            '❌ Já existe procurado cadastrado com esse RG.', ephemeral=True
+        )
+
+    status = str(atendimento.get('procurado_status', '')).lower()
+    if status in {
+        'aguardando_fotos',
+        'aguardando_autorizacao',
+        'autorizado',
+        'autorizado_aguardando_fotos',
+        'publicado',
+    }:
+        return await interaction.followup.send(
+            f'⚠️ Já existe um pedido de procurado neste boletim com status `{status}`.',
+            ephemeral=True,
+        )
+
+    atendimento.update({
+        'procurado_solicitado': dict(dados),
+        'procurado_status': 'aguardando_fotos',
+        'procurado_solicitado_por_id': interaction.user.id,
+        'procurado_solicitado_por_nome': str(interaction.user),
+        'procurado_solicitado_em': agora_br(),
+    })
+    historico = atendimento.get('historico', []) or []
+    historico.append({
+        'acao': 'Cadastro de procurado aguardando fotos obrigatórias',
+        'usuario': str(interaction.user),
+        'usuario_id': interaction.user.id,
+        'data': agora_br(),
+        'rg': dados.get('rg'),
+    })
+    atendimento['historico'] = historico[-1000:]
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    prompt = await interaction.channel.send(
+        '📸 **FOTOS OBRIGATÓRIAS PARA O PROCURADO**\n'
+        '━━━━━━━━━━━━━━━━━━━━━━━\n'
+        f'**Nome:** {dados.get("nome", "Não informado")}\n'
+        f'**RG:** `{dados.get("rg", "Não informado")}`\n\n'
+        'Envie **depois desta mensagem**, nesta ordem:\n'
+        '1. **Foto do indivíduo**\n'
+        '2. **Foto do RG**\n\n'
+        'Após anexar as duas imagens, clique em **Validar Fotos e Pedir Autorização**.\n'
+        '⚠️ Sem as duas fotos, o pedido não será enviado e o procurado não será publicado, mesmo que exista autorização antiga.',
+        view=SolicitarAutorizacaoProcuradoComFotosView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    atendimento['procurado_fotos_inicio_msg_id'] = prompt.id
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    await interaction.followup.send(
+        '📸 Envie a **foto do indivíduo** e a **foto do RG** no tópico. '
+        'Depois use o botão enviado pelo bot.',
+        ephemeral=True,
+    )
+
+
+async def _canal_exato_autorizacao_boletim(
+    interaction: discord.Interaction,
+    contexto: Dict[str, Any],
+):
+    atendimento_id = contexto.get('atendimento_id')
+    atendimento = None
+    if atendimento_id:
+        atendimento = next(
+            (
+                a for a in carregar_atendimentos_boletins()
+                if str(a.get('id')) == str(atendimento_id)
+            ),
+            None,
+        )
+    if atendimento:
+        area_id = int(atendimento.get('area_id') or 0)
+        canal = await obter_canal_bot(area_id) if area_id else None
+        if canal is not None and hasattr(canal, 'send'):
+            contexto['area_id'] = area_id
+            return canal
+
+    area_id = int(contexto.get('area_id') or 0)
+    if area_id:
+        canal = await obter_canal_bot(area_id)
+        if canal is not None and hasattr(canal, 'send'):
+            return canal
+
+    canal_atual = getattr(interaction, 'channel', None)
+    if canal_atual is not None and hasattr(canal_atual, 'send'):
+        return canal_atual
+    return None
+
+
+async def _solicitacao_pendente_mesmo_boletim(
+    tipo: str,
+    atendimento_id: Any,
+) -> Optional[Dict[str, Any]]:
+    for item in carregar_autorizacoes().values():
+        if str(item.get('tipo')) != str(tipo):
+            continue
+        if str((item.get('contexto') or {}).get('atendimento_id')) != str(atendimento_id):
+            continue
+        if str(item.get('status') or '').upper() in {'PENDENTE', 'PROCESSANDO'}:
+            return item
+    return None
+
+
+class AutorizacaoBoletimViewV3(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Autorizar',
+        emoji='✅',
+        style=discord.ButtonStyle.green,
+        custom_id='dicor_bo_auth_aprovar_v3',
+    )
+    async def aprovar(self, interaction: discord.Interaction, button: Button):
+        await _decidir_autorizacao_persistente(interaction, True)
+
+    @discord.ui.button(
+        label='Negar',
+        emoji='❌',
+        style=discord.ButtonStyle.red,
+        custom_id='dicor_bo_auth_negar_v3',
+    )
+    async def negar(self, interaction: discord.Interaction, button: Button):
+        await _decidir_autorizacao_persistente(interaction, False)
+
+
+async def criar_solicitacao_autorizacao(
+    interaction: discord.Interaction,
+    tipo: str,
+    dados: Dict[str, Any],
+    contexto: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Para boletins, envia uma única autorização no próprio tópico."""
+    if tipo not in {'comparecimento', 'procurado_boletim'}:
+        return await _criar_solicitacao_autorizacao_base(
+            interaction, tipo, dados, contexto
+        )
+
+    contexto = dict(contexto or {})
+    canal = await _canal_exato_autorizacao_boletim(interaction, contexto)
+    if canal is None:
+        raise RuntimeError(
+            'Não encontrei o tópico/canal do boletim para enviar a autorização.'
+        )
+    await _adicionar_administradores_ao_topico(canal, interaction.guild)
+
+    existente = await _solicitacao_pendente_mesmo_boletim(
+        tipo, contexto.get('atendimento_id')
+    )
+    if existente:
+        mensagem_existente = None
+        try:
+            canal_existente = await obter_canal_bot(
+                int(existente.get('canal_autorizacao_id') or getattr(canal, 'id', 0) or 0)
+            )
+            if canal_existente and existente.get('mensagem_id') and hasattr(canal_existente, 'fetch_message'):
+                mensagem_existente = await canal_existente.fetch_message(
+                    int(existente.get('mensagem_id'))
+                )
+        except Exception:
+            mensagem_existente = None
+
+        if mensagem_existente is not None:
+            # Não cria mensagem duplicada. Reutiliza a solicitação realmente visível.
+            await enviar_log(
+                f'⚠️ Solicitação duplicada bloqueada | ID `{existente.get("id")}` | '
+                f'tipo `{tipo}` | atendimento `{contexto.get("atendimento_id")}`'
+            )
+            return existente
+
+        # Registro órfão: libera uma nova mensagem no próprio tópico.
+        todos_stale = carregar_autorizacoes()
+        existente['status'] = 'CANCELADO_ORFAO'
+        existente['cancelado_em'] = agora_br()
+        existente['motivo_cancelamento'] = 'Mensagem de autorização não encontrada no tópico.'
+        todos_stale[existente['id']] = existente
+        salvar_autorizacoes(todos_stale)
+
+    codigo = (
+        f"AUT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-"
+        f'{secrets.token_hex(3).upper()}'
+    )
+    titulos = {
+        'procurado_boletim': '🚨 Autorizar procurado do boletim',
+        'comparecimento': '📩 Autorizar mandado/comparecimento',
+    }
+    solicitacao = {
+        'id': codigo,
+        'tipo': tipo,
+        'status': 'PENDENTE',
+        'dados': dict(dados),
+        'contexto': contexto,
+        'solicitante_id': interaction.user.id,
+        'solicitante_nome': str(interaction.user),
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': getattr(canal, 'id', None),
+        'canal_autorizacao_id': getattr(canal, 'id', None),
+        'mensagem_id': None,
+        'autorizacao_na_origem': True,
+        'versao_fluxo': 'BOLETIM_V3',
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    embed = discord.Embed(
+        title=titulos.get(tipo, '🔐 Solicitação de autorização'),
+        description=resumo_dados_autorizacao(tipo, dados),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name='Solicitação', value=f'`{codigo}`', inline=True)
+    embed.add_field(
+        name='Solicitado por',
+        value=f'{interaction.user.mention}\n`{interaction.user.id}`',
+        inline=True,
+    )
+    embed.add_field(
+        name='Atendimento',
+        value=f'`{contexto.get("atendimento_id") or "Não identificado"}`',
+        inline=False,
+    )
+    embed.add_field(name='Data e horário', value=agora_br(), inline=False)
+    embed.set_footer(
+        text='Decisão no próprio tópico • Inspetor, Vice-Diretor ou Diretor'
+    )
+
+    mensagem = await canal.send(
+        content=(
+            f'{mencoes_inspetor_mais(interaction.guild)}\n'
+            '🔐 **Nova solicitação aguardando decisão neste tópico.**'
+        ),
+        embed=embed,
+        view=AutorizacaoBoletimViewV3(),
+        allowed_mentions=discord.AllowedMentions(
+            roles=True, users=True, everyone=False,
+        ),
+    )
+    solicitacao['mensagem_id'] = mensagem.id
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    await enviar_log(
+        f'🔐 Autorização de boletim criada no próprio tópico | '
+        f'ID `{codigo}` | tipo `{tipo}` | canal `{getattr(canal, "id", 0)}` | '
+        f'mensagem `{mensagem.id}` | {agora_br()}'
+    )
+    return solicitacao
+
+
+async def _buscar_autorizacao_persistente(
+    interaction: discord.Interaction,
+) -> Optional[Dict[str, Any]]:
+    mensagem = getattr(interaction, 'message', None)
+    mensagem_id = int(getattr(mensagem, 'id', 0) or 0)
+    todos = carregar_autorizacoes()
+
+    for item in todos.values():
+        if str(item.get('mensagem_id')) == str(mensagem_id):
+            return item
+
+    codigo = _codigo_autorizacao_da_mensagem(mensagem)
+    if codigo and codigo in todos:
+        item = todos[codigo]
+        item['mensagem_id'] = mensagem_id
+        item['canal_autorizacao_id'] = getattr(interaction.channel, 'id', None)
+        todos[codigo] = item
+        salvar_autorizacoes(todos)
+        return item
+
+    # Reconstrução segura pelo atendimento do canal. Evita o erro
+    # "Solicitação não encontrada no banco persistente" depois de redeploy.
+    atendimento = buscar_atendimento_por_area(
+        getattr(interaction.channel, 'id', 0)
+    )
+    tipo = _tipo_autorizacao_boletim_da_mensagem(mensagem)
+    if tipo not in {'comparecimento', 'procurado_boletim'}:
+        return None
+    if not atendimento:
+        atendimento = await _atendimento_da_mensagem_autorizacao(
+            interaction, tipo
+        )
+    if not atendimento:
+        return None
+
+    dados = (
+        dict(atendimento.get('procurado_solicitado') or {})
+        if tipo == 'procurado_boletim'
+        else dict(atendimento.get('comparecimento_solicitado') or {})
+    )
+    if not dados:
+        dados = _dados_autorizacao_boletim_da_mensagem(
+            mensagem, tipo, atendimento
+        )
+    if not dados:
+        return None
+
+    codigo = codigo or f'AUT-REC-{mensagem_id}'
+    item = {
+        'id': codigo,
+        'tipo': tipo,
+        'status': 'PENDENTE',
+        'dados': dados,
+        'contexto': {
+            'atendimento_id': atendimento.get('id'),
+            'area_id': atendimento.get('area_id'),
+        },
+        'solicitante_id': (
+            atendimento.get('procurado_solicitado_por_id')
+            if tipo == 'procurado_boletim'
+            else atendimento.get('comparecimento_solicitado_por_id')
+        ),
+        'solicitante_nome': (
+            atendimento.get('procurado_solicitado_por_nome')
+            if tipo == 'procurado_boletim'
+            else atendimento.get('comparecimento_solicitado_por_nome')
+        ),
+        'solicitado_em': agora_br(),
+        'mensagem_id': mensagem_id,
+        'canal_autorizacao_id': getattr(interaction.channel, 'id', None),
+        'canal_solicitante_id': getattr(interaction.channel, 'id', None),
+        'recuperada_do_topico': True,
+        'recuperada_em': agora_br(),
+    }
+    todos[codigo] = item
+    salvar_autorizacoes(todos)
+    await enviar_log(
+        f'♻️ Autorização reconstruída pelo tópico do boletim | '
+        f'ID `{codigo}` | tipo `{tipo}` | atendimento `{atendimento.get("id")}`'
+    )
+    return item
+
+
+async def _publicar_procurado_boletim_aprovado(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+) -> str:
+    """Publica somente quando as duas imagens obrigatórias existem."""
+    if not _fotos_procurado_validas(dados):
+        raise RuntimeError(
+            'FOTOS_OBRIGATORIAS_AUSENTES: foto do indivíduo e foto do RG são obrigatórias.'
+        )
+    if procurar_por_rg(dados.get('rg')):
+        raise RuntimeError('Já existe procurado cadastrado com esse RG.')
+
+    registro = {
+        'id': data_caso(),
+        'caso': f'DICOR-{data_caso()}',
+        'data': agora_br(),
+        'status': 'A PROCURAR',
+        'nome': dados.get('nome', 'Não informado'),
+        'rg': dados.get('rg', 'Não informado'),
+        'caracteristicas': dados.get('caracteristicas', 'Não informado'),
+        'crimes': dados.get('crimes', 'Não informado'),
+        'numero_boletim': atendimento.get('numero'),
+        'boletim': atendimento.get('numero'),
+        'ultimo_avistamento': (
+            dados.get('outras') or 'Vinculado ao boletim de ocorrência.'
+        ),
+        'informacoes': dados.get('outras', 'Não informado'),
+        'foto_individuo': dados.get('foto_individuo'),
+        'foto_rg': dados.get('foto_rg'),
+        'autor_id': atendimento.get('procurado_solicitado_por_id'),
+        'autor_nome': atendimento.get('procurado_solicitado_por_nome'),
+        'autorizado_por_id': autorizador.id,
+        'autorizado_por_nome': str(autorizador),
+        'autorizado_por_cargo': cargo_autorizador(autorizador),
+        'autorizado_em': agora_br(),
+        'agente_boletim_id': atendimento.get('agente_id'),
+        'agente_boletim_nome': atendimento.get('agente_nome'),
+        'mensagem_id': None,
+        'mensagem_url': None,
+    }
+    msg = await postar_procurado_oficial(registro)
+    if not msg:
+        raise RuntimeError('Não foi possível publicar o procurado no canal oficial.')
+    registro['mensagem_id'] = msg.id
+    registro['mensagem_url'] = msg.jump_url
+    await salvar_procurado_catalogo(registro)
+
+    atendimento.update({
+        'procurado_status': 'publicado',
+        'procurado_publicacao_id': msg.id,
+        'procurado_publicacao_url': msg.jump_url,
+        'procurado_autorizado_por_id': autorizador.id,
+        'procurado_autorizado_por_nome': str(autorizador),
+        'procurado_autorizado_por_cargo': cargo_autorizador(autorizador),
+        'procurado_autorizado_em': agora_br(),
+    })
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    area = await obter_canal_bot(atendimento.get('area_id'))
+    if area and hasattr(area, 'send'):
+        await area.send(
+            '✅ **PROCURADO PUBLICADO**\n'
+            f'**Nome:** {dados.get("nome", "Não informado")}\n'
+            f'**RG:** `{dados.get("rg", "Não informado")}`\n'
+            '📸 Foto do indivíduo: ✅\n'
+            '🪪 Foto do RG: ✅\n'
+            f'**Autorizado por:** {autorizador.mention}\n'
+            f'**Publicação:** {msg.jump_url}'
+        )
+    await enviar_log(
+        f'🚨 Procurado publicado via boletim `{atendimento.get("numero")}` | '
+        f'RG `{dados.get("rg")}` | autorizador `{autorizador.id}` | '
+        f'fotos obrigatórias `OK` | mensagem `{msg.id}`'
+    )
+    return msg.jump_url
+
+
+async def executar_aprovacao_autorizacao(
+    interaction: discord.Interaction,
+    solicitacao: Dict[str, Any],
+) -> str:
+    if solicitacao.get('tipo') != 'procurado_boletim':
+        return await _executar_aprovacao_autorizacao_base(
+            interaction, solicitacao
+        )
+
+    contexto = solicitacao.get('contexto') or {}
+    atendimento = next(
+        (
+            a for a in carregar_atendimentos_boletins()
+            if str(a.get('id')) == str(contexto.get('atendimento_id'))
+        ),
+        None,
+    )
+    if not atendimento:
+        atendimento = buscar_atendimento_por_area(
+            getattr(interaction.channel, 'id', 0)
+        )
+    if not atendimento:
+        raise RuntimeError('Atendimento do boletim não encontrado.')
+
+    dados = dict(atendimento.get('procurado_solicitado') or {})
+    dados.update(dict(solicitacao.get('dados') or {}))
+    autorizador = interaction.user
+
+    atendimento.update({
+        'procurado_solicitado': dados,
+        'procurado_autorizado_por_id': autorizador.id,
+        'procurado_autorizado_por_nome': str(autorizador),
+        'procurado_autorizado_por_cargo': cargo_autorizador(autorizador),
+        'procurado_autorizado_em': agora_br(),
+    })
+
+    if not _fotos_procurado_validas(dados):
+        atendimento['procurado_status'] = 'autorizado_aguardando_fotos'
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+        area = await obter_canal_bot(atendimento.get('area_id'))
+        if area and hasattr(area, 'send'):
+            prompt = await area.send(
+                '⚠️ **AUTORIZAÇÃO CONCEDIDA, MAS O PROCURADO NÃO FOI PUBLICADO.**\n'
+                'As duas fotos obrigatórias não foram encontradas:\n'
+                '1. Foto do indivíduo\n'
+                '2. Foto do RG\n\n'
+                'Envie as duas imagens depois desta mensagem e clique no botão. '
+                'Sem elas, o procurado continuará bloqueado.',
+                view=FotoProcuradoBoletimView(),
+            )
+            atendimento['procurado_fotos_inicio_msg_id'] = prompt.id
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+        return 'Autorizado, porém bloqueado até o envio da foto do indivíduo e da foto do RG.'
+
+    atendimento['procurado_status'] = 'autorizado'
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    return await _publicar_procurado_boletim_aprovado(
+        atendimento, dados, autorizador
+    )
+
+
+class FotoProcuradoBoletimView(View):
+    """Compatibilidade para autorizações antigas que ainda não tinham fotos."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Confirmar Fotos e Publicar',
+        emoji='📸',
+        style=discord.ButtonStyle.green,
+        custom_id='dic_bo_confirmar_fotos_procurado',
+    )
+    async def confirmar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.followup.send(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.followup.send(
+                '❌ Apenas o agente responsável ou a administração pode confirmar as fotos.',
+                ephemeral=True,
+            )
+        if str(atendimento.get('procurado_status', '')).lower() not in {
+            'autorizado',
+            'autorizado_aguardando_fotos',
+        }:
+            return await interaction.followup.send(
+                '❌ O cadastro não está autorizado para publicação.', ephemeral=True
+            )
+
+        inicio_id = int(
+            atendimento.get('procurado_fotos_inicio_msg_id')
+            or getattr(interaction.message, 'id', 0)
+            or 0
+        )
+        imagens = await _imagens_enviadas_depois_da_mensagem(
+            interaction.channel, inicio_id
+        )
+        if len(imagens) < 2:
+            return await interaction.followup.send(
+                '❌ Envie a foto do indivíduo e a foto do RG depois da mensagem do bot.',
+                ephemeral=True,
+            )
+
+        dados = dict(atendimento.get('procurado_solicitado') or {})
+        foto_ind = await salvar_anexo_publico(
+            imagens[0], f'boletim-individuo-{dados.get("rg")}'
+        )
+        foto_rg = await salvar_anexo_publico(
+            imagens[1], f'boletim-rg-{dados.get("rg")}'
+        )
+        dados.update({
+            'foto_individuo': foto_ind,
+            'foto_rg': foto_rg,
+            'fotos_confirmadas_em': agora_br(),
+            'fotos_confirmadas_por_id': interaction.user.id,
+        })
+        if not _fotos_procurado_validas(dados):
+            return await interaction.followup.send(
+                '❌ Não consegui salvar as duas fotos. Nada foi publicado.',
+                ephemeral=True,
+            )
+        atendimento['procurado_solicitado'] = dados
+        atendimento['procurado_status'] = 'autorizado'
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+        autorizador_id = int(atendimento.get('procurado_autorizado_por_id') or 0)
+        autorizador = (
+            interaction.guild.get_member(autorizador_id)
+            if interaction.guild and autorizador_id
+            else None
+        )
+        if not isinstance(autorizador, discord.Member):
+            return await interaction.followup.send(
+                '❌ A autoridade que aprovou não foi localizada. Nada foi publicado.',
+                ephemeral=True,
+            )
+        url = await _publicar_procurado_boletim_aprovado(
+            atendimento, dados, autorizador
+        )
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+        await interaction.followup.send(
+            f'✅ As duas fotos foram validadas e o procurado foi publicado: {url}',
+            ephemeral=True,
+        )
+
+
+async def _decidir_autorizacao_persistente(
+    interaction: discord.Interaction,
+    aprovado: bool,
+) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Somente Inspetor, Vice-Diretor ou Diretor pode decidir.',
+            ephemeral=True,
+        )
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    solicitacao = await _buscar_autorizacao_persistente(interaction)
+    if not solicitacao:
+        return await interaction.followup.send(
+            '❌ Não consegui localizar nem reconstruir esta solicitação. '
+            'Refaça o pedido dentro deste tópico.',
+            ephemeral=True,
+        )
+
+    todos = carregar_autorizacoes()
+    status = str(solicitacao.get('status') or 'PENDENTE').upper()
+    if status not in {'PENDENTE', 'PROCESSANDO'}:
+        return await interaction.followup.send(
+            f'⚠️ Esta solicitação já está `{status}`.', ephemeral=True
+        )
+
+    solicitacao['status'] = 'PROCESSANDO'
+    todos[solicitacao['id']] = solicitacao
+    salvar_autorizacoes(todos)
+
+    try:
+        resultado = ''
+        if aprovado:
+            resultado = await executar_aprovacao_autorizacao(
+                interaction, solicitacao
+            )
+            solicitacao['status'] = 'APROVADO'
+        else:
+            await registrar_negacao_contexto(solicitacao, interaction.user)
+            solicitacao['status'] = 'NEGADO'
+
+        solicitacao.update({
+            'decidido_por_id': interaction.user.id,
+            'decidido_por_nome': str(interaction.user),
+            'decidido_por_cargo': cargo_autorizador(interaction.user),
+            'decidido_em': agora_br(),
+            'resultado': resultado,
+        })
+        todos = carregar_autorizacoes()
+        todos[solicitacao['id']] = solicitacao
+        salvar_autorizacoes(todos)
+
+        await enviar_log(
+            f"{'✅' if aprovado else '❌'} Autorização decidida no tópico | "
+            f"ID `{solicitacao['id']}` | tipo `{solicitacao.get('tipo')}` | "
+            f"autoridade `{interaction.user.id}` | status `{solicitacao['status']}`"
+        )
+        try:
+            await interaction.message.delete(
+                reason=f"Solicitação {solicitacao['status'].lower()}"
+            )
+        except Exception as erro_delete:
+            await enviar_log(
+                f'⚠️ Decisão registrada, mas não consegui apagar o painel '
+                f'`{getattr(interaction.message, "id", 0)}`: {erro_delete}'
+            )
+        await interaction.followup.send(
+            (
+                f'✅ Solicitação aprovada. {resultado}'
+                if aprovado
+                else '❌ Solicitação negada.'
+            )[:1900],
+            ephemeral=True,
+        )
+    except Exception as erro:
+        solicitacao['status'] = 'PENDENTE'
+        solicitacao['ultima_falha'] = f'{type(erro).__name__}: {erro}'
+        solicitacao['ultima_falha_em'] = agora_br()
+        todos = carregar_autorizacoes()
+        todos[solicitacao['id']] = solicitacao
+        salvar_autorizacoes(todos)
+        await enviar_log(
+            f'❌ Erro ao decidir autorização `{solicitacao.get("id")}` | '
+            f'{type(erro).__name__}: {erro}\n'
+            f'```{traceback.format_exc()[-1600:]}```'
+        )
+        await interaction.followup.send(
+            f'❌ Não foi possível concluir: `{type(erro).__name__}: {erro}`'[:1900],
+            ephemeral=True,
+        )
+
+
+class AutorizacaoCentralView(View):
+    """Compatibilidade corrigida para painéis antigos com os IDs originais."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Autorizar',
+        emoji='✅',
+        style=discord.ButtonStyle.green,
+        custom_id='dicor_auth_aprovar',
+    )
+    async def aprovar(self, interaction: discord.Interaction, button: Button):
+        await _decidir_autorizacao_persistente(interaction, True)
+
+    @discord.ui.button(
+        label='Negar',
+        emoji='❌',
+        style=discord.ButtonStyle.red,
+        custom_id='dicor_auth_negar',
+    )
+    async def negar(self, interaction: discord.Interaction, button: Button):
+        await _decidir_autorizacao_persistente(interaction, False)
+
+
+class BoletimAtendimentoView(View):
+    """Painel sem escolha manual: o agente vem exclusivamente do rodízio."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Finalizar Boletim',
+        emoji='✅',
+        style=discord.ButtonStyle.green,
+        custom_id='dic_bo_finalizar',
+    )
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.response.send_message(
+                '❌ Apenas o agente responsável pelo rodízio ou a administração pode finalizar.',
+                ephemeral=True,
+            )
+        if atendimento.get('status') == 'FINALIZADO':
+            return await interaction.response.send_message(
+                '⚠️ Este boletim já foi finalizado.', ephemeral=True
+            )
+        await interaction.response.send_modal(FinalizarBoletimAtendimentoModal())
+
+    @discord.ui.button(
+        label='Solicitar Comparecimento',
+        emoji='📩',
+        style=discord.ButtonStyle.secondary,
+        custom_id='dic_bo_comparecimento',
+    )
+    async def comparecimento(self, interaction: discord.Interaction, button: Button):
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.response.send_message(
+                '❌ Apenas o agente responsável pelo rodízio ou a administração pode solicitar.',
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(ComparecimentoBoletimModal())
+
+    @discord.ui.button(
+        label='Cadastrar como Procurado',
+        emoji='🚨',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_bo_cadastrar_procurado',
+    )
+    async def cadastrar_procurado(
+        self, interaction: discord.Interaction, button: Button
+    ):
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.response.send_message(
+                '❌ Apenas o agente responsável pelo rodízio ou a administração pode solicitar.',
+                ephemeral=True,
+            )
+        texto = ''
+        try:
+            canal_origem = interaction.guild.get_channel(
+                int(atendimento.get('canal_origem_id') or 0)
+            )
+            if canal_origem and atendimento.get('mensagem_original_id'):
+                msg = await canal_origem.fetch_message(
+                    int(atendimento.get('mensagem_original_id'))
+                )
+                texto = coletar_texto_embed(msg)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui pré-preencher procurado do boletim '
+                f'`{atendimento.get("numero")}`: {erro}'
+            )
+        await interaction.response.send_modal(
+            ProcuradoBoletimModal(extrair_dados_procurado_de_texto(texto))
+        )
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item,
+    ) -> None:
+        await registrar_erro_interacao(
+            'BoletimAtendimentoViewRodizioFinal', interaction, error
+        )
+
+
+@bot.listen('on_ready')
+async def persistencia_views_boletim_fluxo_final():
+    """Registra somente as Views novas que não existem nos listeners antigos."""
+    try:
+        bot.add_view(SolicitarAutorizacaoProcuradoComFotosView())
+        bot.add_view(AutorizacaoBoletimViewV3())
+        await enviar_log(
+            '✅ Views finais de boletins carregadas: rodízio, fotos obrigatórias e autorização no tópico.'
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Falha ao carregar Views finais dos boletins: {type(erro).__name__}: {erro}'
+        )
+
+if __name__ == '__main__':
     asyncio.run(main())
