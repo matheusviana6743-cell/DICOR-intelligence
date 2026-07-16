@@ -105,7 +105,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = env_int("GUILD_ID", 0)
 
 # Procurados
-PROCURADOS_CHANNEL_ID = env_int("PROCURADOS_CHANNEL_ID", 0)
+PROCURADOS_CHANNEL_ID = env_int("PROCURADOS_CHANNEL_ID", 1490200533980545097)
 HISTORICO_PROCURADOS_ID = env_int("HISTORICO_PROCURADOS_ID", 1490200536207855857)
 LOGS_CHANNEL_ID = env_int("LOGS_CHANNEL_ID", 1490205503228477610)
 PROCURADOS_TEMP_CATEGORY_ID = env_int("PROCURADOS_TEMP_CATEGORY_ID", 0)
@@ -2059,7 +2059,14 @@ class BuscarModificarProcuradoModal(Modal, title="Modificar Procurado"):
             )
             return
 
-        await interaction.response.send_modal(EditarCrimesProcuradoModal(encontrado))
+        # O Discord não permite abrir um segundo modal diretamente a partir do envio
+        # de outro modal. Por isso, mostramos um botão intermediário privado.
+        await interaction.response.send_message(
+            f"✅ Procurado localizado: **{encontrado.get('nome', 'Sem nome')}** — RG: `{encontrado.get('rg', '')}`\n"
+            "Clique abaixo para abrir a edição dos crimes.",
+            view=AbrirEdicaoProcuradoView(encontrado),
+            ephemeral=True,
+        )
 
 
 class EditarCrimesProcuradoModal(Modal):
@@ -2170,6 +2177,40 @@ class EditarCrimesProcuradoModal(Modal):
             f"🔗 {CATALOG_PUBLIC_URL}",
             ephemeral=True,
         )
+
+
+class AbrirEdicaoProcuradoView(View):
+    def __init__(self, registro: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.registro = dict(registro)
+
+    @discord.ui.button(
+        label="Abrir edição de crimes",
+        emoji="✏️",
+        style=discord.ButtonStyle.primary,
+    )
+    async def abrir_edicao(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await interaction.response.send_message(
+                "❌ Apenas a equipe DICOR pode modificar procurados.",
+                ephemeral=True,
+            )
+            return
+
+        # Confirma novamente se o registro ainda existe antes de abrir o modal.
+        alvo = limpar_rg(self.registro.get("rg", ""))
+        registro_atual = next(
+            (p for p in carregar_procurados() if limpar_rg(p.get("rg", "")) == alvo),
+            None,
+        )
+        if not registro_atual:
+            await interaction.response.send_message(
+                "❌ Esse procurado não existe mais no catálogo.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(EditarCrimesProcuradoModal(registro_atual))
 
 
 class PainelProcuradosView(View):
@@ -16926,6 +16967,224 @@ async def _apagar_paineis_permissao_apos_veredito(
         except Exception:
             pass
 
+
+
+# =====================================================
+# PATCH FINAL — RETIRADA DE PROCURADOS E HIERARQUIA ÚNICA
+# =====================================================
+PROCURADOS_ATIVOS_FIXO_ID = 1490200533980545097
+PROCURADOS_ARQUIVADOS_FIXO_ID = 1490200536207855857
+_HIERARQUIA_UNICA_LOCK = asyncio.Lock()
+
+
+async def _obter_canal_seguro(canal_id: int):
+    canal = bot.get_channel(int(canal_id or 0))
+    if canal is not None:
+        return canal
+    try:
+        return await bot.fetch_channel(int(canal_id))
+    except Exception:
+        return None
+
+
+async def arquivar_procurado_discord(
+    registro: Dict[str, Any],
+    motivo: str,
+    retirado_por: str,
+) -> discord.Message:
+    """Copia o procurado para Arquivados e só depois apaga a postagem de Ativos."""
+    canal_arquivados = await _obter_canal_seguro(PROCURADOS_ARQUIVADOS_FIXO_ID)
+    canal_ativos = await _obter_canal_seguro(PROCURADOS_ATIVOS_FIXO_ID)
+    if canal_arquivados is None or not hasattr(canal_arquivados, 'send'):
+        raise RuntimeError(f'Canal de procurados arquivados `{PROCURADOS_ARQUIVADOS_FIXO_ID}` não encontrado.')
+    if canal_ativos is None or not hasattr(canal_ativos, 'fetch_message'):
+        raise RuntimeError(f'Canal de procurados ativos `{PROCURADOS_ATIVOS_FIXO_ID}` não encontrado.')
+
+    mensagem_original = None
+    mid = registro.get('mensagem_id') or registro.get('mensagem_original_id')
+    if mid:
+        try:
+            mensagem_original = await canal_ativos.fetch_message(int(mid))
+        except Exception:
+            mensagem_original = None
+
+    # Compatibilidade com registros antigos sem mensagem_id: encontra pelo RG/nome.
+    if mensagem_original is None:
+        rg_alvo = limpar_rg(registro.get('rg', ''))
+        nome_alvo = normalizar_busca(registro.get('nome', ''))
+        try:
+            async for msg in canal_ativos.history(limit=None, oldest_first=False):
+                texto_msg = coletar_texto_embed(msg)
+                if ((rg_alvo and rg_alvo in limpar_rg(texto_msg)) or
+                        (nome_alvo and nome_alvo in normalizar_busca(texto_msg))):
+                    mensagem_original = msg
+                    break
+        except Exception as erro:
+            await enviar_log(f'⚠️ Erro ao procurar postagem ativa do RG `{registro.get("rg")}`: {erro}')
+
+    arquivos: List[discord.File] = []
+    links_extras: List[str] = []
+    embeds_copia = []
+    texto_original = ''
+    if mensagem_original is not None:
+        texto_original = mensagem_original.content or ''
+        try:
+            embeds_copia = [discord.Embed.from_dict(e.to_dict()) for e in mensagem_original.embeds[:10]]
+        except Exception:
+            embeds_copia = []
+        for anexo in mensagem_original.attachments[:10]:
+            try:
+                arquivos.append(await anexo.to_file(use_cached=True))
+            except Exception:
+                links_extras.append(anexo.url)
+    if not arquivos:
+        arquivos = arquivos_locais_procurado(registro)
+
+    texto_arquivado = cortar_discord(
+        '📁 **PROCURADO ARQUIVADO**\n\n'
+        f'**Nome:** {registro.get("nome", "Não informado")}\n'
+        f'**RG:** {registro.get("rg", "Não informado")}\n'
+        f'**Último avistamento:** {registro.get("ultimo_avistamento") or registro.get("informacoes") or "Não informado"}\n'
+        f'**Características:** {registro.get("caracteristicas", "Não informado")}\n'
+        f'**Crimes:**\n{valor_crimes_registro(registro)}\n\n'
+        f'**Motivo da retirada:** {motivo}\n'
+        f'**Retirado por:** {retirado_por}\n'
+        f'**Data da retirada:** {agora_br()}\n'
+        f'**Autor original:** {registro.get("autor_nome", "Não informado")}\n'
+        f'**Data original:** {registro.get("data", "Não informado")}\n'
+        + ('\n**Links adicionais:**\n' + '\n'.join(links_extras) if links_extras else ''),
+        1900,
+    )
+
+    kwargs: Dict[str, Any] = {'content': texto_arquivado, 'files': arquivos}
+    if embeds_copia:
+        kwargs['embeds'] = embeds_copia
+    mensagem_arquivada = await canal_arquivados.send(**kwargs)
+
+    # Apaga obrigatoriamente da aba de ativos somente após arquivamento confirmado.
+    if mensagem_original is not None:
+        try:
+            await mensagem_original.delete(reason='Procurado retirado: movido para Procurados Arquivados')
+        except Exception as erro:
+            # Evita marcar como retirado se ainda continua visível nos ativos.
+            try:
+                await mensagem_arquivada.delete(reason='Rollback: não foi possível apagar o procurado ativo')
+            except Exception:
+                pass
+            raise RuntimeError(f'O registro foi copiado, mas não consegui apagar da aba de procurados ativos: {erro}')
+    else:
+        # Sem postagem localizada, o processo não deve fingir sucesso.
+        try:
+            await mensagem_arquivada.delete(reason='Rollback: postagem ativa não localizada')
+        except Exception:
+            pass
+        raise RuntimeError('A postagem do procurado não foi localizada no canal de ativos; nada foi alterado.')
+
+    return mensagem_arquivada
+
+
+async def apagar_mensagem_original_procurado(registro: Dict[str, Any], guild: Optional[discord.Guild]) -> bool:
+    """Confirma que não restou cópia do procurado no canal oficial de ativos."""
+    canal = await _obter_canal_seguro(PROCURADOS_ATIVOS_FIXO_ID)
+    if canal is None:
+        return False
+    rg = limpar_rg(registro.get('rg', ''))
+    nome = normalizar_busca(registro.get('nome', ''))
+    apagou = False
+    ids = {str(x) for x in (registro.get('mensagem_id'), registro.get('mensagem_original_id')) if x}
+    try:
+        async for msg in canal.history(limit=None, oldest_first=False):
+            texto_msg = coletar_texto_embed(msg)
+            corresponde = str(msg.id) in ids
+            if not corresponde:
+                corresponde = bool((rg and rg in limpar_rg(texto_msg)) or (nome and nome in normalizar_busca(texto_msg)))
+            if corresponde:
+                try:
+                    await msg.delete(reason='Limpeza final após retirada do procurado')
+                    apagou = True
+                except discord.NotFound:
+                    apagou = True
+                except Exception as erro:
+                    await enviar_log(f'⚠️ Não consegui apagar cópia ativa `{msg.id}`: {erro}')
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha na verificação final do canal de procurados ativos: {erro}')
+    return apagou
+
+
+async def enviar_hierarquia_substituindo_anterior() -> None:
+    """Mantém exatamente uma mensagem oficial de hierarquia e elimina duplicadas."""
+    if not HIERARQUIA_CHANNEL_ID or bot.user is None:
+        return
+    async with _HIERARQUIA_UNICA_LOCK:
+        canal = await _obter_canal_seguro(HIERARQUIA_CHANNEL_ID)
+        if canal is None or not hasattr(canal, 'history'):
+            await enviar_log(f'⚠️ Canal de hierarquia `{HIERARQUIA_CHANNEL_ID}` não encontrado.')
+            return
+
+        conteudo = montar_mensagem_hierarquia_dicor(canal.guild)
+        controle = _json_dict(HIERARQUIA_MENSAGEM_JSON)
+        salvo_id = int(controle.get('mensagem_id') or 0)
+        candidatas: List[discord.Message] = []
+
+        # Procura todas as mensagens oficiais do próprio bot, não apenas a ID salva.
+        try:
+            async for msg in canal.history(limit=300, oldest_first=False):
+                if msg.author.id != bot.user.id:
+                    continue
+                texto = (msg.content or '').upper()
+                if 'HIERARQUIA OFICIAL' in texto and 'DICOR' in texto:
+                    candidatas.append(msg)
+        except Exception as erro:
+            await enviar_log(f'⚠️ Falha ao procurar hierarquias duplicadas: {erro}')
+
+        principal = None
+        if salvo_id:
+            principal = next((m for m in candidatas if m.id == salvo_id), None)
+            if principal is None:
+                try:
+                    msg_salva = await canal.fetch_message(salvo_id)
+                    if msg_salva.author.id == bot.user.id:
+                        principal = msg_salva
+                        candidatas.append(msg_salva)
+                except Exception:
+                    pass
+        if principal is None and candidatas:
+            principal = max(candidatas, key=lambda m: m.id)
+
+        if principal is None:
+            principal = await canal.send(
+                conteudo,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        else:
+            await principal.edit(
+                content=conteudo,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+
+        # Apaga todas as outras mensagens oficiais duplicadas.
+        vistos = set()
+        for msg in candidatas:
+            if msg.id in vistos or msg.id == principal.id:
+                continue
+            vistos.add(msg.id)
+            try:
+                await msg.delete(reason='Remoção de hierarquia DICOR duplicada')
+            except discord.NotFound:
+                pass
+            except Exception as erro:
+                await enviar_log(f'⚠️ Não consegui apagar hierarquia duplicada `{msg.id}`: {erro}')
+
+        _salvar_dict(HIERARQUIA_MENSAGEM_JSON, {'mensagem_id': principal.id, 'data': agora_br()})
+        await enviar_log(f'✅ Hierarquia única garantida na mensagem `{principal.id}`.')
+
+
+@bot.listen('on_ready')
+async def limpar_hierarquia_duplicada_ao_iniciar():
+    try:
+        await enviar_hierarquia_substituindo_anterior()
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha ao garantir hierarquia única no início: {erro}')
 
 if __name__ == '__main__':
     asyncio.run(main())
