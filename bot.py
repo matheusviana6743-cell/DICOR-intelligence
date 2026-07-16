@@ -3806,130 +3806,289 @@ async def fechar_mesa_core(
     except Exception: traceback.print_exc()
 
 
+async def _reabrir_responder(interaction: discord.Interaction, mensagem: str) -> None:
+    """Finaliza corretamente uma interação que foi adiada com defer()."""
+    try:
+        await interaction.edit_original_response(content=mensagem, view=None)
+        return
+    except Exception:
+        pass
+    try:
+        await interaction.followup.send(mensagem, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _operacao_reabertura(coro, timeout: float, descricao: str, avisos: List[str]):
+    """Executa uma operação da reabertura sem deixar o botão carregando para sempre."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        avisos.append(f"Tempo excedido ao {descricao}.")
+    except Exception as erro:
+        avisos.append(f"Falha ao {descricao}: {erro}")
+    return None
+
+
+async def _threads_reabertura_rapida(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    avisos: List[str],
+) -> List[discord.Thread]:
+    """Localiza os tópicos sem travar a interação em buscas longas do Discord."""
+    encontrados: Dict[int, discord.Thread] = {}
+
+    for thread in list(getattr(canal, "threads", []) or []):
+        if isinstance(thread, discord.Thread):
+            encontrados[thread.id] = thread
+
+    for tid in ((mesa or {}).get("topicos_ids", []) or []):
+        try:
+            tid_int = int(tid)
+        except Exception:
+            continue
+        thread = canal.guild.get_thread(tid_int) or bot.get_channel(tid_int)
+        if thread is None:
+            thread = await _operacao_reabertura(
+                bot.fetch_channel(tid_int),
+                5.0,
+                f"localizar o tópico {tid_int}",
+                avisos,
+            )
+        if isinstance(thread, discord.Thread):
+            encontrados[thread.id] = thread
+
+    # Busca complementar limitada. Um erro aqui não bloqueia a reabertura do canal.
+    async def coletar_arquivados(private: bool):
+        async for thread in canal.archived_threads(limit=50, private=private):
+            if isinstance(thread, discord.Thread):
+                encontrados[thread.id] = thread
+
+    await _operacao_reabertura(
+        coletar_arquivados(False),
+        8.0,
+        "consultar tópicos públicos arquivados",
+        avisos,
+    )
+    await _operacao_reabertura(
+        coletar_arquivados(True),
+        8.0,
+        "consultar tópicos privados arquivados",
+        avisos,
+    )
+    return list(encontrados.values())
+
+
 async def reabrir_mesa_core(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
-    """Reabre uma mesa fechada pelo botão ou pelo comando /reabrirmesa."""
+    """Reabre uma mesa fechada sem deixar o botão carregando indefinidamente."""
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception: traceback.print_exc()
+    except Exception:
+        pass
 
     guild = interaction.guild
     if guild is None:
-        await responder_interacao(interaction, "❌ Use dentro de um servidor.", ephemeral=True)
+        await _reabrir_responder(interaction, "❌ Use este botão dentro do servidor.")
         return
 
-    if canal is None:
-        canal = interaction.channel
+    # O botão também funciona caso seja clicado dentro de um tópico da mesa.
+    alvo = canal or interaction.channel
+    if isinstance(alvo, discord.Thread):
+        alvo = alvo.parent
+    if not isinstance(alvo, discord.TextChannel):
+        await _reabrir_responder(interaction, "❌ Não consegui identificar o canal principal desta mesa.")
+        return
+    canal = alvo
 
-    if not isinstance(canal, discord.TextChannel):
-        await responder_interacao(interaction, "❌ Canal inválido para reabrir mesa.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not usuario_pode_fechar_mesa(interaction.user):
+        await _reabrir_responder(interaction, mensagem_sem_permissao_fechar_mesa())
         return
 
     mesa = buscar_mesa_por_canal(canal.id)
+    avisos: List[str] = []
 
-    try:
-        categoria_aberta = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
-        novo_nome = canal.name
-        while novo_nome.startswith("🔒") or novo_nome.startswith("-"):
-            novo_nome = novo_nome.replace("🔒", "", 1).lstrip("-").strip()
-        novo_nome = novo_nome or canal.name.replace("🔒-", "")
+    # Procura a categoria configurada e usa o nome como fallback quando o ID mudou.
+    categoria_aberta = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
+    if not isinstance(categoria_aberta, discord.CategoryChannel):
+        categoria_aberta = discord.utils.find(
+            lambda c: isinstance(c, discord.CategoryChannel)
+            and "mesa" in normalizar_busca(c.name)
+            and "abert" in normalizar_busca(c.name),
+            guild.categories,
+        )
 
-        if categoria_aberta:
-            await canal.edit(
-                category=categoria_aberta,
-                name=novo_nome,
-                reason="Mesa reaberta pela DICOR",
-            )
-        else:
-            await canal.edit(name=novo_nome, reason="Mesa reaberta pela DICOR")
-    except Exception as erro:
-        await enviar_log(f"⚠️ Não consegui mover/renomear a mesa reaberta {canal.id}: {erro}")
+    novo_nome = canal.name
+    novo_nome = re.sub(r"^[🔒🔐\-・┃\s]+", "", novo_nome).strip()
+    if not novo_nome:
+        novo_nome = f"mesa-reaberta-{str(canal.id)[-6:]}"
 
-    try:
-        # Restaura permissão de envio para equipe/admin, autor da mesa, usuário que reabriu e o bot.
-        for cargo_id in set(CARGOS_EQUIPE_IDS + CARGOS_ADMIN_IDS):
-            cargo = guild.get_role(cargo_id)
-            if cargo:
-                overwrite = canal.overwrites_for(cargo)
-                overwrite.view_channel = True
-                overwrite.send_messages = True
-                overwrite.attach_files = True
-                overwrite.read_message_history = True
-                overwrite.create_public_threads = True
-                overwrite.send_messages_in_threads = True
-                await canal.set_permissions(cargo, overwrite=overwrite)
-                await asyncio.sleep(0.05)
+    kwargs_edit = {
+        "name": novo_nome[:100],
+        "reason": f"Mesa reaberta por {interaction.user}",
+    }
+    if categoria_aberta:
+        kwargs_edit["category"] = categoria_aberta
 
-        if mesa and mesa.get("autor_id"):
+    await _operacao_reabertura(
+        canal.edit(**kwargs_edit),
+        15.0,
+        "mover e renomear a mesa",
+        avisos,
+    )
+
+    # A rotina de fechamento preserva view_channel e altera apenas o envio.
+    # Portanto, todo cargo/usuário que já enxergava a mesa volta a poder escrever.
+    alvos_permissao: List[Any] = []
+    for alvo_overwrite, overwrite_atual in list(canal.overwrites.items()):
+        if alvo_overwrite == guild.default_role:
+            continue
+        if guild.me and alvo_overwrite == guild.me:
+            continue
+        if overwrite_atual.view_channel is True:
+            alvos_permissao.append(alvo_overwrite)
+
+    for cargo_id in sorted(set(CARGOS_EQUIPE_IDS + CARGOS_ADMIN_IDS)):
+        cargo = guild.get_role(int(cargo_id))
+        if cargo and cargo not in alvos_permissao:
+            alvos_permissao.append(cargo)
+
+    if mesa and mesa.get("autor_id"):
+        try:
             autor = guild.get_member(int(mesa.get("autor_id")))
-            if autor:
-                overwrite = canal.overwrites_for(autor)
-                overwrite.view_channel = True
-                overwrite.send_messages = True
-                overwrite.attach_files = True
-                overwrite.read_message_history = True
-                overwrite.create_public_threads = True
-                overwrite.send_messages_in_threads = True
-                await canal.set_permissions(autor, overwrite=overwrite)
+            if autor and autor not in alvos_permissao:
+                alvos_permissao.append(autor)
+        except Exception:
+            pass
+    if interaction.user not in alvos_permissao:
+        alvos_permissao.append(interaction.user)
 
-        if isinstance(interaction.user, discord.Member):
-            overwrite = canal.overwrites_for(interaction.user)
+    for alvo_permissao in alvos_permissao:
+        try:
+            overwrite = canal.overwrites_for(alvo_permissao)
             overwrite.view_channel = True
             overwrite.send_messages = True
             overwrite.attach_files = True
+            overwrite.embed_links = True
             overwrite.read_message_history = True
             overwrite.create_public_threads = True
+            overwrite.create_private_threads = True
             overwrite.send_messages_in_threads = True
-            await canal.set_permissions(interaction.user, overwrite=overwrite)
+            await _operacao_reabertura(
+                canal.set_permissions(
+                    alvo_permissao,
+                    overwrite=overwrite,
+                    reason=f"Mesa reaberta por {interaction.user}",
+                ),
+                8.0,
+                f"restaurar a permissão de {getattr(alvo_permissao, 'name', alvo_permissao)}",
+                avisos,
+            )
+        except Exception as erro:
+            avisos.append(f"Permissão não restaurada para {getattr(alvo_permissao, 'name', alvo_permissao)}: {erro}")
 
-        if guild.me:
-            overwrite = canal.overwrites_for(guild.me)
-            overwrite.view_channel = True
-            overwrite.send_messages = True
-            overwrite.manage_channels = True
-            overwrite.manage_threads = True
-            overwrite.attach_files = True
-            overwrite.read_message_history = True
-            overwrite.create_public_threads = True
-            overwrite.send_messages_in_threads = True
-            await canal.set_permissions(guild.me, overwrite=overwrite)
-    except Exception as erro:
-        await enviar_log(f"⚠️ Falha parcial ao restaurar permissões da mesa {canal.id}: {erro}")
+    if guild.me:
+        overwrite_bot = canal.overwrites_for(guild.me)
+        overwrite_bot.view_channel = True
+        overwrite_bot.send_messages = True
+        overwrite_bot.manage_channels = True
+        overwrite_bot.manage_threads = True
+        overwrite_bot.attach_files = True
+        overwrite_bot.embed_links = True
+        overwrite_bot.read_message_history = True
+        overwrite_bot.create_public_threads = True
+        overwrite_bot.create_private_threads = True
+        overwrite_bot.send_messages_in_threads = True
+        await _operacao_reabertura(
+            canal.set_permissions(guild.me, overwrite=overwrite_bot, reason="Permissões operacionais do bot"),
+            8.0,
+            "restaurar as permissões do bot",
+            avisos,
+        )
 
-    try:
-        threads = await listar_threads_da_mesa(canal, mesa)
-        for thread in threads:
-            try:
-                if thread.archived:
-                    await thread.edit(archived=False)
-                if thread.locked:
-                    await thread.edit(locked=False, reason="Mesa reaberta pela DICOR")
-            except Exception: traceback.print_exc()
-    except Exception: traceback.print_exc()
+    threads = await _threads_reabertura_rapida(canal, mesa, avisos)
+    reabertos = 0
+    for thread in threads:
+        try:
+            # Uma única chamada reduz erros de rate limit e desbloqueia o tópico.
+            resultado = await _operacao_reabertura(
+                thread.edit(
+                    archived=False,
+                    locked=False,
+                    reason=f"Mesa reaberta por {interaction.user}",
+                ),
+                10.0,
+                f"reabrir o tópico {thread.name}",
+                avisos,
+            )
+            if resultado is not None:
+                reabertos += 1
+        except Exception as erro:
+            avisos.append(f"Tópico `{thread.name}` não reaberto: {erro}")
 
     try:
         mesas = carregar_mesas()
+        localizado = False
         for item in mesas:
-            if int(item.get("canal_id", 0)) == canal.id:
+            if int(item.get("canal_id", 0) or 0) == canal.id:
                 item["status"] = "ABERTA"
                 item["reaberta_em"] = agora_br()
                 item["reaberta_por"] = str(interaction.user)
-                item["nome_canal"] = canal.name
+                item["reaberta_por_id"] = interaction.user.id
+                item["nome_canal"] = novo_nome
+                item["categoria_id"] = getattr(categoria_aberta, "id", None)
+                localizado = True
                 break
+        if not localizado:
+            mesas.append({
+                "canal_id": canal.id,
+                "nome_canal": novo_nome,
+                "autor_id": interaction.user.id,
+                "autor_nome": str(interaction.user),
+                "status": "ABERTA",
+                "criada_em": agora_br(),
+                "reaberta_em": agora_br(),
+                "reaberta_por": str(interaction.user),
+                "topicos_ids": [t.id for t in threads],
+            })
         salvar_mesas(mesas)
     except Exception as erro:
-        await enviar_log(f"⚠️ Não consegui atualizar banco da mesa reaberta {canal.id}: {erro}")
+        avisos.append(f"Banco da mesa não atualizado: {erro}")
+
+    # Remove o painel antigo de reabertura para evitar clique repetido.
+    try:
+        if interaction.message:
+            await interaction.message.edit(view=None)
+    except Exception:
+        pass
 
     try:
         await canal.send(
             f"🔓 **Mesa reaberta com sucesso.**\n"
             f"👮 **Reaberta por:** {interaction.user.mention}\n"
-            f"🕒 **Data:** {agora_br()}"
+            f"🧵 **Tópicos restaurados:** `{reabertos}/{len(threads)}`\n"
+            f"🕒 **Data:** {agora_br()}\n\n"
+            "A investigação pode continuar normalmente. Para encerrá-la novamente, use o botão abaixo.",
+            view=FecharMesaView(),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
         )
-    except Exception: traceback.print_exc()
+    except Exception as erro:
+        avisos.append(f"Mensagem de reabertura não enviada: {erro}")
 
-    await enviar_log(f"🔓 Mesa reaberta: {canal.mention} | Por: {interaction.user.mention}")
-    await responder_interacao(interaction, f"✅ Mesa reaberta com sucesso: {canal.mention}", ephemeral=True)
+    resumo_avisos = ""
+    if avisos:
+        resumo_avisos = "\n\n⚠️ **Avisos:**\n" + "\n".join(f"• {a}" for a in avisos[:5])
+
+    await enviar_log(
+        f"🔓 Mesa reaberta: {canal.mention} | Por: {interaction.user.mention} | "
+        f"Tópicos: {reabertos}/{len(threads)} | Avisos: {len(avisos)}"
+    )
+    await _reabrir_responder(
+        interaction,
+        f"✅ Mesa reaberta com sucesso: {canal.mention}\n"
+        f"🧵 Tópicos restaurados: `{reabertos}/{len(threads)}`"
+        f"{resumo_avisos}",
+    )
 
 
 async def backup_core(interaction: discord.Interaction):
