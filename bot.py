@@ -18465,5 +18465,253 @@ async def _mandado_avulso_on_error_corrigido(
 MandadoAvulsoModal.on_submit = _mandado_avulso_submit_corrigido
 MandadoAvulsoModal.on_error = _mandado_avulso_on_error_corrigido
 
+
+# =====================================================
+# PATCH FINAL — BOLETINS ABERTOS EM TÓPICOS/THREADS
+# =====================================================
+async def _resolver_canal_boletins_abertos(guild: discord.Guild):
+    """Localiza o canal configurado de boletins abertos e aplica fallback por nome."""
+    canal = guild.get_channel(int(BOLETIM_ATENDIMENTO_CHANNEL_ID or 0))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(BOLETIM_ATENDIMENTO_CHANNEL_ID or 0))
+        except Exception:
+            canal = None
+
+    if isinstance(canal, (discord.TextChannel, discord.ForumChannel)):
+        return canal
+
+    # Fallback para evitar criar canais soltos se o ID estiver apontando para uma categoria antiga.
+    nomes_alvo = {
+        'boletins em aberto',
+        'boletim em aberto',
+        'boletins abertos',
+    }
+    for candidato in list(getattr(guild, 'text_channels', []) or []):
+        try:
+            nome = normalizar_busca(getattr(candidato, 'name', '')).replace('-', ' ')
+            nome = re.sub(r'\s+', ' ', nome).strip()
+            if any(alvo in nome for alvo in nomes_alvo):
+                return candidato
+        except Exception:
+            continue
+    for candidato in list(getattr(guild, 'forums', []) or []):
+        try:
+            nome = normalizar_busca(getattr(candidato, 'name', '')).replace('-', ' ')
+            nome = re.sub(r'\s+', ' ', nome).strip()
+            if any(alvo in nome for alvo in nomes_alvo):
+                return candidato
+        except Exception:
+            continue
+    return None
+
+
+async def criar_area_atendimento_boletim(
+    message: discord.Message,
+) -> Optional[Dict[str, Any]]:
+    """Cria um tópico dentro de BOLETINS-EM-ABERTO e atribui o agente pelo rodízio.
+
+    Não cria mais canais separados como ``boletim-008``. Em canal de texto, o bot
+    publica uma mensagem inicial e cria o tópico vinculado nela, exatamente como
+    o modelo aprovado pelo usuário.
+    """
+    if buscar_atendimento_por_mensagem(message.id):
+        return None
+    if not message.guild:
+        return None
+
+    numero = numero_boletim_de_texto(
+        coletar_texto_embed(message) or message.content or ''
+    )
+    existente = buscar_atendimento_por_numero(numero)
+    if existente:
+        await enviar_log(
+            f'⚠️ Tópico duplicado ignorado | boletim `{numero}` | '
+            f'mensagem `{message.id}` | área existente '
+            f'`{existente.get("thread_id") or existente.get("area_id")}`'
+        )
+        return None
+
+    canal_atendimento = await _resolver_canal_boletins_abertos(message.guild)
+    if not isinstance(canal_atendimento, (discord.TextChannel, discord.ForumChannel)):
+        await enviar_log(
+            f'❌ Canal de boletins em aberto `{BOLETIM_ATENDIMENTO_CHANNEL_ID}` '
+            'não encontrado ou incompatível. Configure BOLETIM_ATENDIMENTO_CHANNEL_ID '
+            'com o ID do canal #boletins-em-aberto.'
+        )
+        return None
+
+    agente = await escolher_agente_rodizio(message.guild, numero)
+    texto_original = coletar_texto_embed(message) or message.content or 'Sem texto.'
+    pasta = BOLETIM_ARQUIVOS_DIR / numero.replace('/', '-')
+    anexos = await arquivos_para_reenvio_de_mensagens([message], pasta, numero)
+    titulo = f'📋 BOLETIM DE OCORRÊNCIA — Nº {numero_curto_boletim(numero)}'
+
+    mensagem_abertura = None
+    area = None
+    try:
+        if isinstance(canal_atendimento, discord.TextChannel):
+            mensagem_abertura = await canal_atendimento.send(
+                f'📋 Atendimento criado para **Boletim Nº '
+                f'{numero_curto_boletim(numero)}**. Use o tópico vinculado abaixo.',
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            try:
+                area = await mensagem_abertura.create_thread(
+                    name=titulo[:100],
+                    auto_archive_duration=10080,
+                )
+            except discord.HTTPException:
+                # Alguns servidores não possuem arquivamento de sete dias habilitado.
+                area = await mensagem_abertura.create_thread(
+                    name=titulo[:100],
+                    auto_archive_duration=1440,
+                )
+        else:
+            try:
+                criado = await canal_atendimento.create_thread(
+                    name=titulo[:100],
+                    content=(
+                        f'📋 Atendimento criado para **Boletim Nº '
+                        f'{numero_curto_boletim(numero)}**.'
+                    ),
+                    auto_archive_duration=10080,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    reason=f'Atendimento automático do boletim {numero}',
+                )
+            except (TypeError, discord.HTTPException):
+                criado = await canal_atendimento.create_thread(
+                    name=titulo[:100],
+                    content=(
+                        f'📋 Atendimento criado para **Boletim Nº '
+                        f'{numero_curto_boletim(numero)}**.'
+                    ),
+                    auto_archive_duration=1440,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            area = getattr(criado, 'thread', criado)
+            mensagem_abertura = getattr(criado, 'message', None)
+
+        if not isinstance(area, discord.Thread):
+            raise RuntimeError('O Discord não retornou um tópico válido para o boletim.')
+
+        # Adiciona o agente ao tópico e garante que ele receba a atribuição.
+        if agente:
+            try:
+                await area.add_user(agente)
+            except Exception as erro_add:
+                await enviar_log(
+                    f'⚠️ Tópico criado, mas não consegui adicionar diretamente o agente '
+                    f'`{agente.id}`: {erro_add}'
+                )
+
+        mencoes_admin = mencoes_inspetor_mais(message.guild)
+        mencao_agente = agente.mention if agente else 'Nenhum agente elegível encontrado'
+        conteudo_abertura = (
+            f'{mencoes_admin} {agente.mention if agente else ""}\n'
+            '📋 **NOVO BOLETIM — RODÍZIO AUTOMÁTICO**\n'
+            '━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+            f'**Boletim:** Nº `{numero_curto_boletim(numero)}`\n'
+            f'**Agente responsável:** {mencao_agente}\n'
+            f'**Autor do boletim:** '
+            f'{message.author.mention if message.author else "Não identificado"}\n'
+            f'**Data de recebimento:** {agora_br()}\n'
+            f'**Mensagem original:** {message.jump_url}\n'
+            f'**Anexos localizados:** `{len(anexos)}`\n\n'
+            'Toda a análise, provas, permissões e decisões devem permanecer neste tópico. '
+            'O agente foi escolhido automaticamente sem repetição dentro do ciclo.'
+        )
+        await area.send(
+            conteudo_abertura,
+            allowed_mentions=discord.AllowedMentions(
+                roles=True, users=True, everyone=False,
+            ),
+        )
+
+        texto_completo = (
+            '📄 **BOLETIM ORIGINAL COMPLETO**\n'
+            '━━━━━━━━━━━━━━━━━━━━━━━\n'
+            f'{cortar_discord(texto_original, 1650)}\n\n'
+            f'📎 **Anexos preservados:** `{len(anexos)}`'
+        )
+        if anexos:
+            await enviar_texto_com_anexos_path(
+                area,
+                texto_completo,
+                anexos,
+                f'📎 Anexos restantes do boletim {numero}',
+            )
+        else:
+            await area.send(texto_completo)
+
+        atendimento = {
+            'id': f'ATD-{message.id}',
+            'numero': numero,
+            'mensagem_original_id': message.id,
+            'mensagem_original_url': message.jump_url,
+            'canal_origem_id': message.channel.id,
+            'area_id': area.id,
+            'thread_id': area.id,
+            'forum_thread_id': area.id if isinstance(canal_atendimento, discord.ForumChannel) else None,
+            'canal_atendimento_id': canal_atendimento.id,
+            'mensagem_abertura_id': getattr(mensagem_abertura, 'id', None),
+            'painel_msg_id': None,
+            'agente_id': agente.id if agente else None,
+            'agente_nome': str(agente) if agente else 'Nenhum agente elegível',
+            'agente_atribuido_por': 'RODIZIO_AUTOMATICO',
+            'agente_atribuido_em': agora_br(),
+            'autor_id': message.author.id if message.author else None,
+            'autor_nome': str(message.author) if message.author else 'Não identificado',
+            'status': 'EM ATENDIMENTO' if agente else 'SEM AGENTE ELEGÍVEL',
+            'data_criacao': agora_br(),
+            'anexos_salvos': [str(p) for p in anexos],
+            'historico': [{
+                'acao': 'Tópico criado em boletins-em-aberto e agente atribuído pelo rodízio',
+                'usuario': 'Sistema',
+                'agente_id': agente.id if agente else None,
+                'agente_nome': str(agente) if agente else None,
+                'canal_pai_id': canal_atendimento.id,
+                'topico_id': area.id,
+                'data': agora_br(),
+            }],
+            'comparecimento_status': 'não solicitado',
+            'procurado_status': 'não solicitado',
+        }
+        lista = carregar_atendimentos_boletins()
+        lista.append(atendimento)
+        salvar_atendimentos_boletins(lista)
+
+        painel_msg = await area.send(
+            texto_painel_boletim(atendimento),
+            view=BoletimAtendimentoView(),
+        )
+        atendimento['painel_msg_id'] = painel_msg.id
+        atualizar_atendimento_boletim('id', atendimento['id'], atendimento)
+
+        await enviar_log(
+            '📋 **Boletim aberto em tópico**\n'
+            f'Boletim: `{numero}`\n'
+            f'Canal pai: <#{canal_atendimento.id}> (`{canal_atendimento.id}`)\n'
+            f'Tópico: <#{area.id}> (`{area.id}`)\n'
+            f'Agente: `{atendimento.get("agente_id")}`\n'
+            f'Original: {message.jump_url}\n'
+            f'Data: {agora_br()}'
+        )
+        return atendimento
+
+    except Exception as erro:
+        # Não deixa uma mensagem órfã no canal de boletins abertos.
+        if area is None and mensagem_abertura is not None:
+            try:
+                await mensagem_abertura.delete()
+            except Exception:
+                pass
+        await enviar_log(
+            f'❌ Erro ao criar tópico do boletim `{numero}`: '
+            f'{type(erro).__name__}: {erro}\n'
+            f'```{traceback.format_exc()[-1600:]}```'
+        )
+        return None
+
 if __name__ == '__main__':
     asyncio.run(main())
