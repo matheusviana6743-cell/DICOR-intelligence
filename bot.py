@@ -18144,5 +18144,326 @@ async def registrar_regras_globais_autorizacao_dicor():
         await enviar_log(f'⚠️ Falha ao registrar regra global de autorização: {erro}')
 
 
+
+# =====================================================
+# PATCH FINAL — CORREÇÃO DO MODAL DE MANDADO AVULSO
+# =====================================================
+async def _enviar_comparecimento_fallback_canal_atual(
+    interaction: discord.Interaction,
+    registro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fallback seguro quando o canal oficial de mandados está ausente ou inacessível.
+
+    Mantém o mesmo PDF e envia no canal/tópico em que o formulário foi usado, em vez
+    de deixar a interação falhar com a mensagem genérica do Discord.
+    """
+    caminho_pdf = Path(str(registro.get('arquivo_pdf') or ''))
+    if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 0:
+        pasta = COMPARECIMENTOS_DIR / slugify(
+            str(registro.get('numero') or registro.get('id') or data_caso())
+        )
+        pasta.mkdir(parents=True, exist_ok=True)
+        numero_limpo = re.sub(
+            r'[^0-9A-Za-z_-]+', '_',
+            str(registro.get('numero') or 'comparecimento')
+        )
+        caminho_pdf = pasta / f'SOLICITACAO_COMPARECIMENTO_{numero_limpo}.pdf'
+        await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
+        registro['arquivo_pdf'] = str(caminho_pdf)
+
+    canal = getattr(interaction, 'channel', None)
+    if canal is None or not hasattr(canal, 'send'):
+        raise RuntimeError('O canal atual não permite o envio do mandado.')
+
+    tamanho = caminho_pdf.stat().st_size
+    limite = int(
+        getattr(getattr(canal, 'guild', None), 'filesize_limit', 25 * 1024 * 1024)
+        or 25 * 1024 * 1024
+    )
+    if tamanho > limite:
+        raise RuntimeError(
+            f'O PDF possui {tamanho / 1024 / 1024:.1f} MB e ultrapassa o limite '
+            f'do Discord de {limite / 1024 / 1024:.1f} MB.'
+        )
+
+    embed = discord.Embed(
+        title='📩 Solicitação de Comparecimento emitida',
+        description=(
+            'O canal oficial de mandados não estava acessível; por segurança, '
+            'o documento foi anexado no canal em que foi solicitado.'
+        ),
+        color=discord.Color.from_rgb(0, 43, 91),
+    )
+    embed.add_field(
+        name='Solicitação', value=f"`{registro.get('numero', 'N/I')}`", inline=True
+    )
+    embed.add_field(
+        name='Processo/Boletim',
+        value=f"`{registro.get('processo') or registro.get('boletim') or 'N/I'}`",
+        inline=True,
+    )
+    embed.add_field(
+        name='Convocado',
+        value=f"**{registro.get('nome', 'Não informado')}**\nRG: `{registro.get('rg', 'N/I')}`",
+        inline=False,
+    )
+    embed.add_field(name='Data/Horário', value=str(registro.get('data_hora') or 'N/I'), inline=True)
+    embed.add_field(name='Local', value=str(registro.get('local') or 'N/I'), inline=True)
+    embed.add_field(name='Motivo', value=str(registro.get('motivo') or 'N/I')[:1024], inline=False)
+
+    buffer_pdf = io.BytesIO(caminho_pdf.read_bytes())
+    buffer_pdf.seek(0)
+    try:
+        mensagem = await canal.send(
+            content='📄 **Mandado/Solicitação de Comparecimento DICOR**',
+            embed=embed,
+            file=discord.File(buffer_pdf, filename=caminho_pdf.name),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    finally:
+        buffer_pdf.close()
+
+    registro.update({
+        'publicacao_id': mensagem.id,
+        'publicacao_url': mensagem.jump_url,
+        'publicacao_canal_id': getattr(canal, 'id', None),
+        'status': 'AUTORIZADO/EMITIDO',
+        'publicado_em_fallback': True,
+    })
+    lista = carregar_comparecimentos()
+    existente = next(
+        (item for item in lista if str(item.get('id')) == str(registro.get('id'))),
+        None,
+    )
+    if existente:
+        existente.update(registro)
+    else:
+        lista.append(registro)
+    salvar_comparecimentos(lista)
+    return registro
+
+
+async def _criar_autorizacao_mandado_avulso_segura(
+    interaction: discord.Interaction,
+    registro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Cria autorização de mandado avulso no mesmo canal sem depender do fluxo de boletim."""
+    canal = getattr(interaction, 'channel', None)
+    if canal is None or not hasattr(canal, 'send'):
+        raise RuntimeError('Não encontrei o canal onde o mandado foi solicitado.')
+
+    await _adicionar_administradores_ao_topico(canal, interaction.guild)
+    codigo = (
+        f"AUT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-"
+        f"{secrets.token_hex(3).upper()}"
+    )
+    contexto = {
+        'standalone': True,
+        'area_id': getattr(canal, 'id', None),
+        'canal_origem_id': getattr(canal, 'id', None),
+    }
+    solicitacao = {
+        'id': codigo,
+        'tipo': 'comparecimento',
+        'status': 'PENDENTE',
+        'dados': dict(registro),
+        'contexto': contexto,
+        'solicitante_id': interaction.user.id,
+        'solicitante_nome': str(interaction.user),
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': getattr(canal, 'id', None),
+        'canal_autorizacao_id': getattr(canal, 'id', None),
+        'mensagem_id': None,
+        'autorizacao_na_origem': True,
+        'versao_fluxo': 'MANDADO_AVULSO_CORRIGIDO',
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    embed = discord.Embed(
+        title='📩 Autorizar mandado/comparecimento',
+        description=resumo_dados_autorizacao('comparecimento', registro),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name='Solicitação', value=f'`{codigo}`', inline=True)
+    embed.add_field(
+        name='Solicitado por',
+        value=f'{interaction.user.mention}\n`{interaction.user.id}`',
+        inline=True,
+    )
+    embed.add_field(name='Data e horário', value=agora_br(), inline=False)
+    embed.set_footer(text='Somente Inspetor, Vice-Diretor ou Diretor pode decidir')
+
+    mensagem = await canal.send(
+        content=(
+            f'{mencoes_inspetor_mais(interaction.guild)}\n'
+            '🔐 **Nova solicitação aguardando decisão neste canal/tópico.**'
+        ),
+        embed=embed,
+        view=AutorizacaoCentralView(),
+        allowed_mentions=discord.AllowedMentions(
+            roles=True, users=True, everyone=False
+        ),
+    )
+    solicitacao['mensagem_id'] = mensagem.id
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+    return solicitacao
+
+
+async def _mandado_avulso_submit_corrigido(
+    self,
+    interaction: discord.Interaction,
+) -> None:
+    """Corrige a falha genérica do modal e sempre devolve uma resposta útil."""
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        return await interaction.response.send_message(
+            '❌ Apenas Estagiário, Investigador ou Inspetor+ pode criar mandados.',
+            ephemeral=True,
+        )
+
+    # O defer precisa acontecer antes de qualquer geração de PDF ou acesso à API.
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+    try:
+        nome = str(self.nome.value or '').strip()
+        rg = str(self.rg.value or '').strip()
+        processo = str(self.processo.value or '').strip()
+        data_hora = str(self.data_hora.value or '').strip()
+        local_motivo = str(self.local.value or '').strip()
+
+        faltando = [
+            rotulo for rotulo, valor in (
+                ('Nome do convocado', nome),
+                ('RG', rg),
+                ('Nº do processo/boletim', processo),
+                ('Data e horário', data_hora),
+                ('Local e motivo', local_motivo),
+            ) if not valor
+        ]
+        if faltando:
+            return await interaction.followup.send(
+                '❌ Preencha todos os campos obrigatórios: ' + ', '.join(faltando),
+                ephemeral=True,
+            )
+
+        # Aceita "LOCAL | MOTIVO". Sem separador, usa o texto como local e mantém
+        # um motivo institucional padrão para não invalidar a solicitação.
+        partes = local_motivo.split('|', 1)
+        local = partes[0].strip()
+        motivo = (
+            partes[1].strip()
+            if len(partes) > 1 and partes[1].strip()
+            else 'Comparecimento para prestar esclarecimentos.'
+        )
+
+        registro = {
+            'id': (
+                f"CMP-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-"
+                f"{secrets.token_hex(2).upper()}"
+            ),
+            'numero': proximo_numero_comparecimento(),
+            'boletim': processo,
+            'processo': processo,
+            'nome': nome,
+            'rg': rg,
+            'motivo': motivo,
+            'data_hora': data_hora,
+            'local': local or 'Sede da Polícia Federal - DICOR',
+            'solicitado_por_id': membro.id,
+            'solicitado_por_nome': str(membro),
+            'data_expedicao': agora_br(),
+            'data': agora_br(),
+        }
+
+        if usuario_e_administrador(membro):
+            registro.update({
+                'autorizado_por_id': membro.id,
+                'autorizado_por_nome': str(membro),
+                'autorizado_por_cargo': cargo_autorizador(membro),
+                'autorizado_em': agora_br(),
+                'assinatura_slot': resolver_slot_assinatura_autorizador(membro),
+            })
+            atendimento_avulso = {'numero': processo, 'id': None}
+            try:
+                registro = await gerar_e_enviar_comparecimento(
+                    interaction, atendimento_avulso, registro
+                )
+            except Exception as erro_oficial:
+                await enviar_log(
+                    f'⚠️ Falha no canal oficial do mandado; tentando fallback no canal atual | '
+                    f'{type(erro_oficial).__name__}: {erro_oficial}'
+                )
+                registro = await _enviar_comparecimento_fallback_canal_atual(
+                    interaction, registro
+                )
+
+            return await interaction.followup.send(
+                f"✅ Mandado `{registro.get('numero')}` emitido diretamente por Inspetor+.\n"
+                f"📄 {registro.get('publicacao_url') or 'Documento enviado.'}",
+                ephemeral=True,
+            )
+
+        solicitacao = await _criar_autorizacao_mandado_avulso_segura(
+            interaction, registro
+        )
+        await interaction.followup.send(
+            f"📩 Mandado `{registro['numero']}` enviado para autorização neste "
+            f"canal/tópico (`{solicitacao['id']}`).",
+            ephemeral=True,
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'❌ Erro no modal de mandado avulso | usuário '
+            f'`{getattr(interaction.user, "id", 0)}` | '
+            f'{type(erro).__name__}: {erro}\n'
+            f'```{traceback.format_exc()[-1700:]}```'
+        )
+        try:
+            await interaction.followup.send(
+                f'❌ Não foi possível criar o mandado: '
+                f'`{type(erro).__name__}: {erro}`'[:1900],
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+
+async def _mandado_avulso_on_error_corrigido(
+    self,
+    interaction: discord.Interaction,
+    error: Exception,
+) -> None:
+    await enviar_log(
+        f'❌ Erro não tratado no formulário de mandado | '
+        f'usuário `{getattr(interaction.user, "id", 0)}` | '
+        f'{type(error).__name__}: {error}\n'
+        f'```{traceback.format_exc()[-1500:]}```'
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f'❌ Erro ao processar o formulário: `{type(error).__name__}: {error}`'[:1900],
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f'❌ Erro ao processar o formulário: `{type(error).__name__}: {error}`'[:1900],
+                ephemeral=True,
+            )
+    except Exception:
+        pass
+
+
+MandadoAvulsoModal.on_submit = _mandado_avulso_submit_corrigido
+MandadoAvulsoModal.on_error = _mandado_avulso_on_error_corrigido
+
 if __name__ == '__main__':
     asyncio.run(main())
