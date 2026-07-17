@@ -1817,7 +1817,7 @@ async def arquivar_procurado_discord(
 
     if mensagem_original is not None:
         try:
-            await mensagem_original.delete(reason="Procurado retirado e arquivado no histórico")
+            await mensagem_original.delete()
         except Exception as erro:
             await enviar_log(
                 "⚠️ Procurado arquivado, mas não foi possível apagar a mensagem ativa "
@@ -1978,6 +1978,30 @@ class FinalizarProcuradoView(View):
                 "mensagem_id": None,
                 "mensagem_url": None,
             }
+            if usuario_e_administrador(interaction.user):
+                solicitacao_direta = {
+                    "id": f"DIRETO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    "tipo": "procurado_painel",
+                    "status": "APROVADO_DIRETO",
+                    "dados": registro,
+                    "contexto": {"canal_provisorio_id": canal.id},
+                    "solicitante_id": interaction.user.id,
+                    "solicitante_nome": str(interaction.user),
+                }
+                resultado = await executar_criacao_procurado_painel(solicitacao_direta, interaction.user)
+                await interaction.followup.send(
+                    f"✅ Procurado publicado diretamente por Inspetor+: {resultado}",
+                    ephemeral=True,
+                )
+                return
+
+            if not usuario_precisa_autorizacao_dicor(interaction.user):
+                await interaction.followup.send(
+                    "❌ Apenas Estagiário ou Investigador pode solicitar autorização. Inspetor+ executa diretamente.",
+                    ephemeral=True,
+                )
+                return
+
             solicitacao = await criar_solicitacao_autorizacao(
                 interaction=interaction,
                 tipo="procurado_painel",
@@ -2015,7 +2039,7 @@ class FinalizarProcuradoView(View):
         await interaction.response.send_message("Cadastro cancelado. O canal será apagado.", ephemeral=True)
         await asyncio.sleep(2)
         try:
-            await canal.delete(reason="Cadastro de procurado cancelado")
+            await canal.delete()
         except Exception as erro:
             await enviar_log(f"⚠️ Não consegui apagar o canal provisório `{canal.id}`: {erro}")
 
@@ -4622,7 +4646,7 @@ async def cancelar_boletim_core(interaction: discord.Interaction) -> None:
     )
     await asyncio.sleep(3)
     try:
-        await canal.delete(reason="Boletim cancelado")
+        await canal.delete()
     except Exception: traceback.print_exc()
 
 
@@ -4848,7 +4872,7 @@ async def publicar_boletim_core(interaction: discord.Interaction) -> None:
         )
         await canal_temp.send("✅ Boletim publicado com sucesso. Este canal será apagado em 5 segundos.")
         await asyncio.sleep(5)
-        await canal_temp.delete(reason="Boletim publicado com sucesso")
+        await canal_temp.delete()
     except Exception as erro:
         dados["publicando"] = False
         boletins_pendentes[canal_temp.id] = dados
@@ -8338,7 +8362,7 @@ async def finalizar_e_postar_relatorio_legacy(interaction: discord.Interaction, 
         await canal_atual.send("✅ Relatório enviado com sucesso para o canal oficial! Este canal provisório será apagado em 5 segundos...")
         await asyncio.sleep(5)
         try:
-            await canal_atual.delete(reason="Relatório operacional concluído e armazenado.")
+            await canal_atual.delete()
         except Exception: traceback.print_exc()
 
 class TocaiaModal(Modal, title="Relatório de Tocaia"):
@@ -10937,7 +10961,7 @@ async def finalizar_boletim_atendimento(interaction: discord.Interaction, result
     await enviar_log(f"✅ **Boletim finalizado e arquivado**\nBoletim: `{atendimento.get('numero')}`\nFinalizado por: {interaction.user.mention} (`{interaction.user.id}`)\nMensagens coletadas: `{len(mensagens)}`\nAnexos arquivados: `{enviados}`")
     try: await interaction.followup.send("✅ Boletim finalizado, arquivado e área temporária removida.", ephemeral=True)
     except Exception: traceback.print_exc()
-    try: await interaction.channel.delete(reason="Boletim finalizado e arquivado com sucesso")
+    try: await interaction.channel.delete()
     except Exception as erro: await enviar_log(f"⚠️ Boletim arquivado, mas não consegui apagar a área `{getattr(interaction.channel, 'id', 0)}`: {erro}")
 
 @bot.listen("on_message")
@@ -11986,7 +12010,7 @@ async def executar_criacao_procurado_painel(solicitacao: Dict[str, Any], autoriz
         await canal.send(f"✅ Procurado autorizado por {autorizador.mention} e publicado: {msg.jump_url}")
         try:
             await asyncio.sleep(2)
-            await canal.delete(reason="Cadastro de procurado autorizado e concluído")
+            await canal.delete()
         except Exception as erro:
             await enviar_log(f"⚠️ Cadastro concluído, mas o canal provisório `{canal_id}` não foi apagado: {erro}")
     return msg.jump_url
@@ -12159,7 +12183,7 @@ class AutorizacaoCentralView(View):
                 f"resultado `{solicitacao['status']}` | dados `{json.dumps(solicitacao.get('dados', {}), ensure_ascii=False)[:700]}` | {agora_br()}"
             )
             try:
-                await interaction.message.delete(reason=f"Solicitação {solicitacao['status'].lower()} e registrada")
+                await interaction.message.delete()
             except Exception as erro_delete:
                 await enviar_log(f"⚠️ Solicitação decidida, mas a mensagem `{mensagem_id}` não foi apagada: {erro_delete}")
             await interaction.followup.send(
@@ -12448,7 +12472,7 @@ async def apagar_mensagem_original_procurado(registro: Dict[str, Any], guild: Op
             continue
         try:
             msg = await canal.fetch_message(int(mid))
-            await msg.delete(reason="Procurado retirado e arquivado por Inspetor+")
+            await msg.delete()
             return True
         except Exception: traceback.print_exc()
     # Segurança para registros antigos sem ID: procura RG e nome no histórico.
@@ -12459,7 +12483,7 @@ async def apagar_mensagem_original_procurado(registro: Dict[str, Any], guild: Op
             texto_msg = coletar_texto_embed(msg)
             norm = normalizar_busca(texto_msg)
             if (rg and rg in limpar_rg(texto_msg)) or (nome and nome in norm):
-                await msg.delete(reason="Procurado antigo localizado por RG/nome e arquivado")
+                await msg.delete()
                 return True
     except Exception: traceback.print_exc()
     return False
@@ -12602,7 +12626,7 @@ async def _apagar_mensagens_relatorio(canal, ids: List[int]) -> None:
     for mensagem_id in ids:
         try:
             msg = await canal.fetch_message(int(mensagem_id))
-            await msg.delete(reason="Relatório substituído pelo sistema de edição DICOR")
+            await msg.delete()
         except Exception: traceback.print_exc()
 
 
@@ -12757,7 +12781,7 @@ class FinalizarRelatorioFotosView(View):
             else "✅ Formulário e fotos enviados juntos com sucesso. Este canal será apagado em 8 segundos."
         )
         await asyncio.sleep(8)
-        try: await canal.delete(reason="Relatório concluído e anexos salvos")
+        try: await canal.delete()
         except Exception: traceback.print_exc()
 
     @discord.ui.button(label="Cancelar", emoji="❌", style=discord.ButtonStyle.danger, custom_id="dicor_relatorio_fotos_cancelar")
@@ -12776,7 +12800,7 @@ class FinalizarRelatorioFotosView(View):
         _remover_draft(canal.id)
         await interaction.response.send_message("🗑️ Relatório cancelado. O canal será apagado.",ephemeral=True)
         await asyncio.sleep(3)
-        try: await canal.delete(reason="Relatório cancelado")
+        try: await canal.delete()
         except Exception: traceback.print_exc()
 
 
@@ -14392,9 +14416,7 @@ class AutorizacaoCentralView(View):
             )
 
             try:
-                await interaction.message.delete(
-                    reason=f"Solicitação {solicitacao['status'].lower()} e registrada"
-                )
+                await interaction.message.delete()
             except Exception as erro_delete:
                 await enviar_log(
                     f'⚠️ Solicitação decidida, mas a mensagem `{getattr(interaction.message, "id", 0)}` '
@@ -15602,9 +15624,7 @@ async def _decidir_autorizacao_persistente(
             f"autoridade `{interaction.user.id}` | status `{solicitacao['status']}`"
         )
         try:
-            await interaction.message.delete(
-                reason=f"Solicitação {solicitacao['status'].lower()}"
-            )
+            await interaction.message.delete()
         except Exception as erro_delete:
             await enviar_log(
                 f'⚠️ Decisão registrada, mas não consegui apagar o painel '
@@ -16430,7 +16450,7 @@ async def _apagar_paineis_permissao_apos_veredito(
         mensagem_ids.add(int(mensagem_atual.id))
         canal_ids.add(int(mensagem_atual.channel.id))
         try:
-            await mensagem_atual.delete(reason='Permissão decidida; painel removido após o veredito')
+            await mensagem_atual.delete()
         except discord.NotFound:
             pass
         except Exception as erro:
@@ -16443,7 +16463,7 @@ async def _apagar_paineis_permissao_apos_veredito(
         for mensagem_id in list(mensagem_ids):
             try:
                 msg = await canal.fetch_message(mensagem_id)
-                await msg.delete(reason='Permissão decidida; painel removido após o veredito')
+                await msg.delete()
             except discord.NotFound:
                 pass
             except Exception:
@@ -16462,7 +16482,7 @@ async def _apagar_paineis_permissao_apos_veredito(
                             texto += ' ' + str(campo_embed.name) + ' ' + str(campo_embed.value)
                     if codigo in texto:
                         try:
-                            await msg.delete(reason='Cópia de permissão removida após o veredito')
+                            await msg.delete()
                         except discord.NotFound:
                             pass
                         except Exception:
@@ -16635,7 +16655,7 @@ async def _espelhar_assinatura_no_discord(
             canal_antigo = await obter_canal_bot(antigo_canal_id)
             if canal_antigo:
                 antigo = await canal_antigo.fetch_message(int(antigo_id))
-                await antigo.delete(reason='Assinatura DICOR substituída por uma versão mais recente')
+                await antigo.delete()
         except Exception:
             pass
 
@@ -16961,7 +16981,7 @@ async def _apagar_paineis_permissao_apos_veredito(
     msg = getattr(interaction, 'message', None) if interaction else None
     if msg is not None:
         try:
-            await msg.delete(reason='Painel de permissão removido após autorizar/negar')
+            await msg.delete()
         except discord.NotFound:
             pass
         except Exception:
@@ -17064,18 +17084,18 @@ async def arquivar_procurado_discord(
     # Apaga obrigatoriamente da aba de ativos somente após arquivamento confirmado.
     if mensagem_original is not None:
         try:
-            await mensagem_original.delete(reason='Procurado retirado: movido para Procurados Arquivados')
+            await mensagem_original.delete()
         except Exception as erro:
             # Evita marcar como retirado se ainda continua visível nos ativos.
             try:
-                await mensagem_arquivada.delete(reason='Rollback: não foi possível apagar o procurado ativo')
+                await mensagem_arquivada.delete()
             except Exception:
                 pass
             raise RuntimeError(f'O registro foi copiado, mas não consegui apagar da aba de procurados ativos: {erro}')
     else:
         # Sem postagem localizada, o processo não deve fingir sucesso.
         try:
-            await mensagem_arquivada.delete(reason='Rollback: postagem ativa não localizada')
+            await mensagem_arquivada.delete()
         except Exception:
             pass
         raise RuntimeError('A postagem do procurado não foi localizada no canal de ativos; nada foi alterado.')
@@ -17100,7 +17120,7 @@ async def apagar_mensagem_original_procurado(registro: Dict[str, Any], guild: Op
                 corresponde = bool((rg and rg in limpar_rg(texto_msg)) or (nome and nome in normalizar_busca(texto_msg)))
             if corresponde:
                 try:
-                    await msg.delete(reason='Limpeza final após retirada do procurado')
+                    await msg.delete()
                     apagou = True
                 except discord.NotFound:
                     apagou = True
@@ -17169,7 +17189,7 @@ async def enviar_hierarquia_substituindo_anterior() -> None:
                 continue
             vistos.add(msg.id)
             try:
-                await msg.delete(reason='Remoção de hierarquia DICOR duplicada')
+                await msg.delete()
             except discord.NotFound:
                 pass
             except Exception as erro:
@@ -17401,14 +17421,14 @@ class AutorizacaoOrganizacaoView(View):
             registro = aprovacoes.get(codigo)
             if not registro:
                 try:
-                    await interaction.message.delete(reason='Painel de permissão inválido removido')
+                    await interaction.message.delete()
                 except Exception:
                     pass
                 await interaction.followup.send('❌ Solicitação não encontrada.', ephemeral=True)
                 return
             if str(registro.get('status')) != 'PENDENTE':
                 try:
-                    await interaction.message.delete(reason='Painel já decidido removido')
+                    await interaction.message.delete()
                 except Exception:
                     pass
                 await interaction.followup.send('⚠️ Esta solicitação já foi decidida.', ephemeral=True)
@@ -17445,7 +17465,7 @@ class AutorizacaoOrganizacaoView(View):
             )
             # A mensagem de permissão é sempre apagada após o veredito.
             try:
-                await interaction.message.delete(reason='Permissão de organização decidida; painel removido')
+                await interaction.message.delete()
             except discord.NotFound:
                 pass
             except Exception as erro:
@@ -17551,6 +17571,578 @@ async def registrar_view_aprovacao_organizacoes():
         garantir_56_organizacoes()
     except Exception as erro:
         await enviar_log(f'⚠️ Falha ao registrar aprovação de organizações: {erro}')
+
+
+
+# =====================================================
+# PATCH FINAL — AUTORIZAÇÕES GLOBAIS + RETIRADA CORRIGIDA
+# =====================================================
+CARGO_ESTAGIARIO_AUTORIZACAO_ID = 1490200391239864352
+CARGO_INVESTIGADOR_AUTORIZACAO_ID = 1490200390426165290
+CARGOS_QUE_PRECISAM_AUTORIZACAO = {
+    CARGO_ESTAGIARIO_AUTORIZACAO_ID,
+    CARGO_INVESTIGADOR_AUTORIZACAO_ID,
+}
+_AUTORIZACAO_GLOBAL_LOCK = asyncio.Lock()
+
+
+def usuario_precisa_autorizacao_dicor(member: Optional[discord.Member]) -> bool:
+    """Regra global solicitada.
+
+    Inspetor, Vice-Diretor e Diretor executam diretamente.
+    Estagiário e Investigador enviam para aprovação de Inspetor+.
+    """
+    if not isinstance(member, discord.Member):
+        return False
+    if usuario_e_administrador(member):
+        return False
+    return any(role.id in CARGOS_QUE_PRECISAM_AUTORIZACAO for role in member.roles)
+
+
+def usuario_pode_operar_fluxo_com_aprovacao(member: Optional[discord.Member]) -> bool:
+    return bool(usuario_e_administrador(member) or usuario_precisa_autorizacao_dicor(member))
+
+
+async def _apagar_mensagem_discord_segura(mensagem: Any) -> bool:
+    """Apaga Message ou PartialMessage sem `reason`, compatível com discord.py 2.7+."""
+    if mensagem is None or not hasattr(mensagem, 'delete'):
+        return False
+    try:
+        await mensagem.delete()
+        return True
+    except discord.NotFound:
+        return True
+    except Exception as erro:
+        await enviar_log(
+            f"⚠️ Falha ao apagar mensagem `{getattr(mensagem, 'id', 0)}`: "
+            f"{type(erro).__name__}: {erro}"
+        )
+        return False
+
+
+async def _apagar_paineis_permissao_apos_veredito(
+    solicitacao: Optional[Dict[str, Any]],
+    interaction: Optional[discord.Interaction] = None,
+) -> None:
+    """Remove o painel atual e qualquer cópia da autorização após APROVAR ou NEGAR."""
+    solicitacao = dict(solicitacao or {})
+    codigo = str(solicitacao.get('id') or '').strip()
+    mensagem_ids = set()
+    canal_ids = set()
+
+    for chave in ('mensagem_id', 'mensagem_autorizacao_id'):
+        valor = solicitacao.get(chave)
+        if valor:
+            try:
+                mensagem_ids.add(int(valor))
+            except Exception:
+                pass
+
+    for chave in ('canal_autorizacao_id', 'canal_solicitante_id'):
+        valor = solicitacao.get(chave)
+        if valor:
+            try:
+                canal_ids.add(int(valor))
+            except Exception:
+                pass
+
+    contexto = solicitacao.get('contexto') or {}
+    for chave in (
+        'area_id', 'topico_id', 'thread_id', 'canal_atendimento_id',
+        'canal_solicitante_id', 'canal_provisorio_id', 'canal_origem_id',
+    ):
+        valor = contexto.get(chave)
+        if valor:
+            try:
+                canal_ids.add(int(valor))
+            except Exception:
+                pass
+
+    mensagem_atual = getattr(interaction, 'message', None) if interaction else None
+    if mensagem_atual is not None:
+        mensagem_ids.add(int(mensagem_atual.id))
+        canal_ids.add(int(mensagem_atual.channel.id))
+        await _apagar_mensagem_discord_segura(mensagem_atual)
+
+    # Pequena espera evita disputa com callbacks que ainda estão editando a mensagem.
+    await asyncio.sleep(0.25)
+
+    for canal_id in list(canal_ids):
+        canal = await obter_canal_bot(canal_id)
+        if canal is None:
+            continue
+
+        if hasattr(canal, 'fetch_message'):
+            for mensagem_id in list(mensagem_ids):
+                try:
+                    msg = await canal.fetch_message(mensagem_id)
+                except discord.NotFound:
+                    continue
+                except Exception:
+                    continue
+                await _apagar_mensagem_discord_segura(msg)
+
+        # Limpa duplicatas antigas que possuam o mesmo código AUT-.
+        if codigo and hasattr(canal, 'history'):
+            try:
+                async for msg in canal.history(limit=100, oldest_first=False):
+                    if bot.user and msg.author.id != bot.user.id:
+                        continue
+                    texto_msg = str(msg.content or '')
+                    for emb in msg.embeds:
+                        texto_msg += ' ' + str(emb.title or '') + ' ' + str(emb.description or '')
+                        for campo in emb.fields:
+                            texto_msg += ' ' + str(campo.name or '') + ' ' + str(campo.value or '')
+                    if codigo in texto_msg:
+                        await _apagar_mensagem_discord_segura(msg)
+            except Exception as erro:
+                await enviar_log(
+                    f"⚠️ Limpeza de cópias da autorização `{codigo}` falhou no canal `{canal_id}`: {erro}"
+                )
+
+
+async def arquivar_procurado_discord(
+    registro: Dict[str, Any],
+    motivo: str,
+    retirado_por: str,
+) -> discord.Message:
+    """Move do canal ativo para arquivados e apaga o original sem usar reason=."""
+    canal_arquivados = await _obter_canal_seguro(PROCURADOS_ARQUIVADOS_FIXO_ID)
+    canal_ativos = await _obter_canal_seguro(PROCURADOS_ATIVOS_FIXO_ID)
+    if canal_arquivados is None or not hasattr(canal_arquivados, 'send'):
+        raise RuntimeError(f'Canal de procurados arquivados `{PROCURADOS_ARQUIVADOS_FIXO_ID}` não encontrado.')
+    if canal_ativos is None or not hasattr(canal_ativos, 'history'):
+        raise RuntimeError(f'Canal de procurados ativos `{PROCURADOS_ATIVOS_FIXO_ID}` não encontrado.')
+
+    mensagem_original = None
+    ids = {
+        str(v) for v in (
+            registro.get('mensagem_id'), registro.get('mensagem_original_id')
+        ) if v
+    }
+    for mid in list(ids):
+        if hasattr(canal_ativos, 'fetch_message'):
+            try:
+                mensagem_original = await canal_ativos.fetch_message(int(mid))
+                break
+            except Exception:
+                mensagem_original = None
+
+    if mensagem_original is None:
+        rg_alvo = limpar_rg(registro.get('rg', ''))
+        nome_alvo = normalizar_busca(registro.get('nome', ''))
+        try:
+            async for msg in canal_ativos.history(limit=None, oldest_first=False):
+                texto_msg = coletar_texto_embed(msg)
+                if (
+                    (rg_alvo and rg_alvo in limpar_rg(texto_msg))
+                    or (nome_alvo and nome_alvo in normalizar_busca(texto_msg))
+                ):
+                    mensagem_original = msg
+                    break
+        except Exception as erro:
+            raise RuntimeError(f'Falha ao localizar o procurado ativo: {erro}')
+
+    if mensagem_original is None:
+        raise RuntimeError('A postagem do procurado não foi localizada no canal de ativos; nada foi alterado.')
+
+    arquivos: List[discord.File] = []
+    links_extras: List[str] = []
+    embeds_copia: List[discord.Embed] = []
+    try:
+        embeds_copia = [discord.Embed.from_dict(e.to_dict()) for e in mensagem_original.embeds[:10]]
+    except Exception:
+        embeds_copia = []
+
+    for anexo in mensagem_original.attachments[:10]:
+        try:
+            arquivos.append(await anexo.to_file(use_cached=True))
+        except Exception:
+            links_extras.append(anexo.url)
+    if not arquivos:
+        arquivos = arquivos_locais_procurado(registro)
+
+    texto_arquivado = cortar_discord(
+        '📁 **PROCURADO ARQUIVADO**\n\n'
+        f'**Nome:** {registro.get("nome", "Não informado")}\n'
+        f'**RG:** {registro.get("rg", "Não informado")}\n'
+        f'**Último avistamento:** {registro.get("ultimo_avistamento") or registro.get("informacoes") or "Não informado"}\n'
+        f'**Características:** {registro.get("caracteristicas", "Não informado")}\n'
+        f'**Crimes:**\n{valor_crimes_registro(registro)}\n\n'
+        f'**Motivo da retirada:** {motivo}\n'
+        f'**Retirado por:** {retirado_por}\n'
+        f'**Data da retirada:** {agora_br()}\n'
+        f'**Autor original:** {registro.get("autor_nome", "Não informado")}\n'
+        f'**Data original:** {registro.get("data", "Não informado")}\n'
+        + ('\n**Links adicionais:**\n' + '\n'.join(links_extras) if links_extras else ''),
+        1900,
+    )
+
+    kwargs: Dict[str, Any] = {'content': texto_arquivado, 'files': arquivos}
+    if embeds_copia:
+        kwargs['embeds'] = embeds_copia
+    mensagem_arquivada = await canal_arquivados.send(**kwargs)
+
+    if not await _apagar_mensagem_discord_segura(mensagem_original):
+        await _apagar_mensagem_discord_segura(mensagem_arquivada)
+        raise RuntimeError('O registro foi copiado, mas não consegui apagar da aba de procurados ativos.')
+
+    return mensagem_arquivada
+
+
+async def apagar_mensagem_original_procurado(
+    registro: Dict[str, Any],
+    guild: Optional[discord.Guild],
+) -> bool:
+    """Remove eventuais duplicatas restantes no canal de procurados ativos."""
+    canal = await _obter_canal_seguro(PROCURADOS_ATIVOS_FIXO_ID)
+    if canal is None or not hasattr(canal, 'history'):
+        return False
+    rg = limpar_rg(registro.get('rg', ''))
+    nome = normalizar_busca(registro.get('nome', ''))
+    ids = {str(v) for v in (registro.get('mensagem_id'), registro.get('mensagem_original_id')) if v}
+    apagou = False
+    try:
+        async for msg in canal.history(limit=None, oldest_first=False):
+            texto_msg = coletar_texto_embed(msg)
+            corresponde = str(msg.id) in ids
+            if not corresponde:
+                corresponde = bool(
+                    (rg and rg in limpar_rg(texto_msg))
+                    or (nome and nome in normalizar_busca(texto_msg))
+                )
+            if corresponde and await _apagar_mensagem_discord_segura(msg):
+                apagou = True
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha na limpeza final do procurado ativo: {erro}')
+    return apagou
+
+
+_retirar_procurado_antes_regra_global = retirar_procurado
+
+
+async def retirar_procurado(
+    interaction: discord.Interaction,
+    rg: str,
+    motivo: str,
+):
+    """Inspetor+ retira direto; Estagiário/Investigador solicitam autorização."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        return await interaction.followup.send(
+            '❌ Apenas Estagiário, Investigador, Inspetor, Vice-Diretor ou Diretor pode usar esta função.',
+            ephemeral=True,
+        )
+
+    lista = carregar_procurados()
+    alvo = limpar_rg(rg)
+    encontrado = next((p for p in lista if limpar_rg(p.get('rg', '')) == alvo), None)
+    if not encontrado:
+        return await interaction.followup.send('❌ Não encontrei procurado com esse RG.', ephemeral=True)
+    if str(encontrado.get('status', '')).upper() != 'A PROCURAR':
+        return await interaction.followup.send('⚠️ Esse procurado já está arquivado/retirado.', ephemeral=True)
+
+    if usuario_e_administrador(membro):
+        solicitacao_direta = {
+            'id': f"DIRETO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+            'tipo': 'procurado_retirada',
+            'status': 'APROVADO_DIRETO',
+            'dados': {
+                'rg': encontrado.get('rg'),
+                'nome': encontrado.get('nome'),
+                'motivo': motivo or 'Não informado',
+                'registro_id': encontrado.get('id'),
+            },
+            'contexto': {'canal_origem_id': getattr(interaction.channel, 'id', None)},
+            'solicitante_id': membro.id,
+            'solicitante_nome': str(membro),
+        }
+        try:
+            url = await executar_retirada_procurado(solicitacao_direta, membro)
+            await enviar_log(
+                f'✅ Retirada direta por Inspetor+ | RG `{rg}` | autoridade `{membro.id}` | {agora_br()}'
+            )
+            return await interaction.followup.send(
+                f'✅ Procurado retirado diretamente e arquivado: {url}', ephemeral=True
+            )
+        except Exception as erro:
+            await registrar_erro_interacao('retirada_direta_procurado', interaction, erro)
+            return
+
+    solicitacao = await criar_solicitacao_autorizacao(
+        interaction=interaction,
+        tipo='procurado_retirada',
+        dados={
+            'rg': encontrado.get('rg'),
+            'nome': encontrado.get('nome'),
+            'motivo': motivo or 'Não informado',
+            'registro_id': encontrado.get('id'),
+        },
+        contexto={'canal_origem_id': getattr(interaction.channel, 'id', None)},
+    )
+    await interaction.followup.send(
+        f"📩 Solicitação `{solicitacao['id']}` enviada neste canal/tópico. Nada foi removido antes da aprovação.",
+        ephemeral=True,
+    )
+
+
+_solicitar_comparecimento_base_regra_global = solicitar_autorizacao_comparecimento_boletim
+
+
+async def solicitar_autorizacao_comparecimento_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        if not interaction.response.is_done():
+            await interaction.response.send_message('❌ Você não possui cargo autorizado para esta ação.', ephemeral=True)
+        else:
+            await interaction.followup.send('❌ Você não possui cargo autorizado para esta ação.', ephemeral=True)
+        return
+
+    if not usuario_e_administrador(membro):
+        return await _solicitar_comparecimento_base_regra_global(interaction, dados)
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    atendimento = await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        return await interaction.followup.send('❌ Atendimento não encontrado.', ephemeral=True)
+
+    registro = preparar_registro_comparecimento(atendimento, dados, membro)
+    solicitacao_direta = {
+        'id': f"DIRETO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+        'tipo': 'comparecimento',
+        'status': 'APROVADO_DIRETO',
+        'dados': registro,
+        'contexto': {'atendimento_id': atendimento.get('id'), 'area_id': atendimento.get('area_id')},
+        'solicitante_id': membro.id,
+        'solicitante_nome': str(membro),
+    }
+    resultado = await executar_aprovacao_autorizacao(interaction, solicitacao_direta)
+    await interaction.followup.send(
+        f'✅ Mandado/comparecimento emitido diretamente por Inspetor+: {resultado}',
+        ephemeral=True,
+    )
+
+
+_solicitar_procurado_boletim_base_regra_global = solicitar_autorizacao_procurado_boletim
+
+
+async def solicitar_autorizacao_procurado_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        if not interaction.response.is_done():
+            await interaction.response.send_message('❌ Você não possui cargo autorizado para esta ação.', ephemeral=True)
+        else:
+            await interaction.followup.send('❌ Você não possui cargo autorizado para esta ação.', ephemeral=True)
+        return
+
+    if not usuario_e_administrador(membro):
+        return await _solicitar_procurado_boletim_base_regra_global(interaction, dados)
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    atendimento = await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        return await interaction.followup.send('❌ Atendimento não encontrado.', ephemeral=True)
+    if procurar_por_rg(dados.get('rg')):
+        return await interaction.followup.send('❌ Já existe procurado cadastrado com esse RG.', ephemeral=True)
+
+    atendimento.update({
+        'procurado_solicitado': dados,
+        'procurado_status': 'aguardando_autorizacao',
+        'procurado_solicitado_por_id': membro.id,
+        'procurado_solicitado_por_nome': str(membro),
+        'procurado_solicitado_em': agora_br(),
+    })
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    solicitacao_direta = {
+        'id': f"DIRETO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+        'tipo': 'procurado_boletim',
+        'status': 'APROVADO_DIRETO',
+        'dados': dict(dados),
+        'contexto': {'atendimento_id': atendimento.get('id'), 'area_id': atendimento.get('area_id')},
+        'solicitante_id': membro.id,
+        'solicitante_nome': str(membro),
+    }
+    resultado = await executar_aprovacao_autorizacao(interaction, solicitacao_direta)
+    await interaction.followup.send(
+        f'✅ Cadastro autorizado diretamente por Inspetor+. As duas fotos continuam obrigatórias. {resultado}',
+        ephemeral=True,
+    )
+
+
+async def _mandado_avulso_submit_regra_global(
+    self,
+    interaction: discord.Interaction,
+) -> None:
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        return await interaction.response.send_message(
+            '❌ Apenas Estagiário, Investigador ou Inspetor+ pode criar mandados.', ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    partes = str(self.local.value).split('|', 1)
+    local = partes[0].strip()
+    motivo = partes[1].strip() if len(partes) > 1 else 'Comparecimento para prestar esclarecimentos.'
+    registro = {
+        'id': f'CMP-{data_caso()}',
+        'numero': proximo_numero_comparecimento(),
+        'boletim': str(self.processo.value),
+        'processo': str(self.processo.value),
+        'nome': str(self.nome.value),
+        'rg': str(self.rg.value),
+        'motivo': motivo,
+        'data_hora': str(self.data_hora.value),
+        'local': local or 'Sede da Polícia Federal - DICOR',
+        'solicitado_por_id': membro.id,
+        'solicitado_por_nome': str(membro),
+        'data_expedicao': agora_br(),
+        'data': agora_br(),
+    }
+
+    if usuario_e_administrador(membro):
+        solicitacao_direta = {
+            'id': f"DIRETO-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+            'tipo': 'comparecimento',
+            'status': 'APROVADO_DIRETO',
+            'dados': registro,
+            'contexto': {'standalone': True, 'area_id': getattr(interaction.channel, 'id', None)},
+            'solicitante_id': membro.id,
+            'solicitante_nome': str(membro),
+        }
+        resultado = await executar_aprovacao_autorizacao(interaction, solicitacao_direta)
+        return await interaction.followup.send(
+            f"✅ Mandado `{registro['numero']}` emitido diretamente por Inspetor+: {resultado}",
+            ephemeral=True,
+        )
+
+    solicitacao = await criar_solicitacao_autorizacao(
+        interaction,
+        'comparecimento',
+        registro,
+        {'standalone': True, 'area_id': getattr(interaction.channel, 'id', None)},
+    )
+    await interaction.followup.send(
+        f"📩 Mandado `{registro['numero']}` enviado para autorização neste canal/tópico (`{solicitacao['id']}`).",
+        ephemeral=True,
+    )
+
+
+MandadoAvulsoModal.on_submit = _mandado_avulso_submit_regra_global
+
+
+async def _processar_edicao_org_modal(
+    interaction: discord.Interaction,
+    numero: int,
+    versao: int,
+    valores: Dict[str, str],
+) -> None:
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if usuario_e_administrador(membro):
+        sucesso, mensagem, organizacao = await aplicar_edicao_organizacao(numero, versao, valores, membro)
+        conteudo = mensagem
+        view = None
+        if organizacao:
+            conteudo += '\n\n' + formatar_ficha_organizacao(organizacao)
+            view = OrganizacaoAcoesView(numero, int(organizacao.get('versao', 1) or 1))
+        await interaction.response.send_message(cortar_discord(conteudo, 1900), view=view, ephemeral=True)
+        return
+
+    if usuario_precisa_autorizacao_dicor(membro):
+        await _criar_pedido_edicao_organizacao(interaction, numero, versao, valores)
+        return
+
+    await interaction.response.send_message(
+        '❌ Apenas Estagiário ou Investigador pode solicitar alteração; Inspetor+ altera diretamente.',
+        ephemeral=True,
+    )
+
+
+async def _decidir_organizacao_regra_global(
+    self,
+    interaction: discord.Interaction,
+    aprovado: bool,
+) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Somente Inspetor, Vice-Diretor ou Diretor pode decidir.', ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    codigo = _codigo_org_da_mensagem(interaction)
+    if not codigo:
+        await _apagar_mensagem_discord_segura(getattr(interaction, 'message', None))
+        return await interaction.followup.send('❌ Solicitação não identificada.', ephemeral=True)
+
+    async with _ORG_APROVACAO_LOCK:
+        aprovacoes = _carregar_aprovacoes_org()
+        registro = aprovacoes.get(codigo)
+        if not registro:
+            await _apagar_mensagem_discord_segura(getattr(interaction, 'message', None))
+            return await interaction.followup.send('❌ Solicitação não encontrada.', ephemeral=True)
+        if str(registro.get('status')) != 'PENDENTE':
+            await _apagar_mensagem_discord_segura(getattr(interaction, 'message', None))
+            return await interaction.followup.send('⚠️ Esta solicitação já foi decidida.', ephemeral=True)
+
+        resultado = '❌ Alteração negada.'
+        if aprovado:
+            guild = interaction.guild
+            solicitante = guild.get_member(int(registro.get('solicitante_id') or 0)) if guild else None
+            usuario_registro = solicitante or interaction.user
+            sucesso, mensagem, _organizacao = await aplicar_edicao_organizacao(
+                int(registro['organizacao_id']),
+                int(registro['versao']),
+                dict(registro.get('novos_valores') or {}),
+                usuario_registro,
+            )
+            if not sucesso:
+                return await interaction.followup.send(mensagem, ephemeral=True)
+            resultado = mensagem
+            registro['status'] = 'APROVADO'
+        else:
+            registro['status'] = 'NEGADO'
+
+        registro.update({
+            'decidido_por_id': interaction.user.id,
+            'decidido_por_nome': str(interaction.user),
+            'decidido_em': agora_br(),
+        })
+        aprovacoes[codigo] = registro
+        _salvar_aprovacoes_org(aprovacoes)
+        await _apagar_mensagem_discord_segura(getattr(interaction, 'message', None))
+        await enviar_log(
+            f"{'✅' if aprovado else '❌'} Alteração de organização decidida e painel apagado | "
+            f"Solicitação `{codigo}` | autoridade `{interaction.user.id}`"
+        )
+        await interaction.followup.send(resultado, ephemeral=True)
+
+
+AutorizacaoOrganizacaoView._decidir = _decidir_organizacao_regra_global
+
+
+@bot.listen('on_ready')
+async def registrar_regras_globais_autorizacao_dicor():
+    try:
+        bot.add_view(AutorizacaoCentralView())
+        bot.add_view(AutorizacaoOrganizacaoView())
+        await enviar_log(
+            '✅ Regra global de autorização ativa: Inspetor+ executa direto; '
+            'Estagiário/Investigador solicitam aprovação; painéis são apagados após o veredito.'
+        )
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha ao registrar regra global de autorização: {erro}')
+
 
 if __name__ == '__main__':
     asyncio.run(main())
