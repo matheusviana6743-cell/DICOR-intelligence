@@ -17186,5 +17186,371 @@ async def limpar_hierarquia_duplicada_ao_iniciar():
     except Exception as erro:
         await enviar_log(f'⚠️ Falha ao garantir hierarquia única no início: {erro}')
 
+
+# =====================================================
+# PATCH — TABELA DE ORGANIZAÇÕES COM INVESTIGADOR E APROVAÇÃO
+# =====================================================
+ORGANIZACOES_APROVACOES_JSON = DATA_DIR / 'organizacoes_aprovacoes.json'
+CARGO_ESTAGIARIO_ORG_ID = 1490200391239864352
+CARGO_INVESTIGADOR_ORG_ID = 1490200390426165290
+_ORG_APROVACAO_LOCK = asyncio.Lock()
+
+_modelo_organizacao_anterior = modelo_organizacao
+
+def modelo_organizacao(numero: int) -> Dict[str, Any]:
+    base = _modelo_organizacao_anterior(numero)
+    base.setdefault('investigador', 'Não informado')
+    return base
+
+
+def _membro_tem_algum_cargo(member: Any, ids: set[int]) -> bool:
+    try:
+        return any(int(role.id) in ids for role in getattr(member, 'roles', []))
+    except Exception:
+        return False
+
+
+def _membro_inspetor_mais(member: Any) -> bool:
+    try:
+        return bool(usuario_e_administrador(member))
+    except Exception:
+        return _membro_tem_algum_cargo(member, set(CARGOS_ADMIN_IDS) | set(CARGOS_AUTORIZADORES))
+
+
+def _carregar_aprovacoes_org() -> Dict[str, Dict[str, Any]]:
+    dados = carregar_json(ORGANIZACOES_APROVACOES_JSON, {})
+    return dados if isinstance(dados, dict) else {}
+
+
+def _salvar_aprovacoes_org(dados: Dict[str, Dict[str, Any]]) -> None:
+    salvar_json(ORGANIZACOES_APROVACOES_JSON, dados)
+
+
+def formatar_ficha_organizacao(organizacao: Dict[str, Any]) -> str:
+    numero = int(organizacao.get('id', 0) or 0)
+    ultima = valor_org(organizacao, 'ultima_edicao', 'Nunca editada')
+    editor = valor_org(organizacao, 'editado_por', 'Nenhum')
+    texto = (
+        f"🏴 **ORGANIZAÇÃO {numero:02d} — {valor_org(organizacao, 'nome')}**\n\n"
+        f"⚠️ **Zona de risco:** {valor_org(organizacao, 'zona_risco')}\n"
+        f"📊 **Status:** {valor_org(organizacao, 'status')}\n"
+        f"🕵️‍♂️ **Investigador:** {valor_org(organizacao, 'investigador')}\n"
+        f"📦 **Produto:** {valor_org(organizacao, 'produto')}\n"
+        f"🕵️ **Possui informante:** {valor_org(organizacao, 'informante')}\n"
+        f"👑 **Líder:** {valor_org(organizacao, 'lider')}\n\n"
+        f"🔎 **Características:**\n{cortar_campo_org(valor_org(organizacao, 'caracteristicas'), 620)}\n\n"
+        f"📂 **Histórico operacional:**\n{cortar_campo_org(valor_org(organizacao, 'historico', 'Sem registros.'), 620)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✏️ **Última edição:** {ultima}\n"
+        f"👤 **Editado por:** {editor}\n"
+        f"🔢 **Versão:** {int(organizacao.get('versao', 1) or 1)}"
+    )
+    return cortar_discord(texto, 1900)
+
+
+def formatar_lista_organizacoes(pagina: int = 0) -> str:
+    organizacoes = carregar_organizacoes()
+    total_paginas = max(1, (len(organizacoes) + ORGANIZACOES_POR_PAGINA - 1) // ORGANIZACOES_POR_PAGINA)
+    pagina = max(0, min(pagina, total_paginas - 1))
+    inicio = pagina * ORGANIZACOES_POR_PAGINA
+    fim = inicio + ORGANIZACOES_POR_PAGINA
+    linhas = [
+        '📋 **TABELA DE ORGANIZAÇÕES — DICOR**',
+        f'Página `{pagina + 1}/{total_paginas}` • Total: `{TOTAL_ORGANIZACOES}`',
+        '',
+    ]
+    for org in organizacoes[inicio:fim]:
+        linhas.append(
+            f"**{int(org.get('id', 0)):02d}. {cortar_campo_org(valor_org(org, 'nome'), 35)}**\n"
+            f"> ⚠️ {cortar_campo_org(valor_org(org, 'zona_risco'), 18)} | "
+            f"📊 {cortar_campo_org(valor_org(org, 'status'), 24)} | "
+            f"📦 {cortar_campo_org(valor_org(org, 'produto'), 22)}\n"
+            f"> 🕵️‍♂️ Investigador: {cortar_campo_org(valor_org(org, 'investigador'), 30)}\n"
+            f"> 🕵️ Informante: {cortar_campo_org(valor_org(org, 'informante'), 12)} | "
+            f"👑 {cortar_campo_org(valor_org(org, 'lider'), 32)}"
+        )
+    return cortar_discord('\n'.join(linhas), 1900)
+
+
+async def aplicar_edicao_organizacao(
+    numero: int,
+    versao_esperada: int,
+    novos_valores: Dict[str, str],
+    usuario: Any,
+) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+    organizacoes = carregar_organizacoes()
+    indice = next((i for i, org in enumerate(organizacoes) if int(org.get('id', 0) or 0) == numero), None)
+    if indice is None:
+        return False, '❌ Organização não encontrada.', None
+    atual = organizacoes[indice]
+    versao_atual = int(atual.get('versao', 1) or 1)
+    if versao_atual != versao_esperada:
+        return False, '⚠️ Essa organização foi editada enquanto você preenchia. Abra novamente.', atual
+    antes = dict(atual)
+    alteracoes: Dict[str, Dict[str, str]] = {}
+    campos_permitidos = {
+        'nome', 'zona_risco', 'status', 'investigador', 'produto',
+        'informante', 'lider', 'caracteristicas', 'historico'
+    }
+    for chave, valor in novos_valores.items():
+        if chave not in campos_permitidos:
+            continue
+        novo = str(valor or '').strip() or 'Não informado'
+        antigo = str(atual.get(chave, '') or '').strip() or 'Não informado'
+        if novo != antigo:
+            alteracoes[chave] = {'antes': antigo, 'depois': novo}
+            atual[chave] = novo
+    if not alteracoes:
+        return False, 'ℹ️ Nenhuma informação foi alterada.', atual
+    atual['versao'] = versao_atual + 1
+    atual['ultima_edicao'] = agora_br()
+    atual['editado_por'] = str(usuario)
+    atual['editado_por_id'] = getattr(usuario, 'id', None)
+    organizacoes[indice] = atual
+    salvar_organizacoes(organizacoes)
+    await registrar_edicao_organizacao(antes, atual, usuario, alteracoes)
+    return True, '✅ Organização atualizada e alteração salva.', atual
+
+
+async def _criar_pedido_edicao_organizacao(
+    interaction: discord.Interaction,
+    numero: int,
+    versao: int,
+    novos_valores: Dict[str, str],
+) -> None:
+    org = obter_organizacao_por_id(numero)
+    if not org:
+        await interaction.response.send_message('❌ Organização não encontrada.', ephemeral=True)
+        return
+    codigo = f"ORG-{int(time.time())}-{interaction.user.id}-{numero}"
+    alteracoes = []
+    for chave, valor in novos_valores.items():
+        antigo = valor_org(org, chave)
+        novo = str(valor or '').strip() or 'Não informado'
+        if antigo != novo:
+            alteracoes.append(f"• **{chave.replace('_', ' ').title()}:** `{cortar_campo_org(antigo, 120)}` → `{cortar_campo_org(novo, 120)}`")
+    if not alteracoes:
+        await interaction.response.send_message('ℹ️ Nenhuma informação foi alterada.', ephemeral=True)
+        return
+    registro = {
+        'id': codigo,
+        'status': 'PENDENTE',
+        'organizacao_id': numero,
+        'versao': versao,
+        'novos_valores': novos_valores,
+        'solicitante_id': interaction.user.id,
+        'solicitante_nome': str(interaction.user),
+        'canal_id': getattr(interaction.channel, 'id', None),
+        'criado_em': agora_br(),
+    }
+    aprovacoes = _carregar_aprovacoes_org()
+    aprovacoes[codigo] = registro
+    _salvar_aprovacoes_org(aprovacoes)
+    embed = discord.Embed(
+        title='🔐 Aprovação de alteração — Organização',
+        description=(
+            f"**Organização:** `{numero:02d}` — {valor_org(org, 'nome')}\n"
+            f"**Solicitado por:** {interaction.user.mention}\n"
+            f"**Solicitação:** `{codigo}`\n\n" + '\n'.join(alteracoes)
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text=f'Solicitação {codigo} • Somente Inspetor+ pode decidir')
+    await interaction.response.send_message(
+        content=f"{mencoes_inspetor_mais(interaction.guild)}\n🔐 **Alteração aguardando aprovação.**",
+        embed=embed,
+        view=AutorizacaoOrganizacaoView(),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+    )
+    try:
+        msg = await interaction.original_response()
+        aprovacoes = _carregar_aprovacoes_org()
+        if codigo in aprovacoes:
+            aprovacoes[codigo]['mensagem_id'] = msg.id
+            _salvar_aprovacoes_org(aprovacoes)
+    except Exception:
+        pass
+
+
+def _codigo_org_da_mensagem(interaction: discord.Interaction) -> Optional[str]:
+    msg = interaction.message
+    if not msg:
+        return None
+    texto = str(msg.content or '')
+    for emb in msg.embeds:
+        texto += ' ' + str(emb.title or '') + ' ' + str(emb.description or '') + ' ' + str(getattr(emb.footer, 'text', '') or '')
+    match = re.search(r'ORG-\d+-\d+-\d+', texto)
+    return match.group(0) if match else None
+
+
+class AutorizacaoOrganizacaoView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _decidir(self, interaction: discord.Interaction, aprovado: bool) -> None:
+        if not _membro_inspetor_mais(interaction.user):
+            await interaction.response.send_message('❌ Somente Inspetor+ pode decidir.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        codigo = _codigo_org_da_mensagem(interaction)
+        if not codigo:
+            await interaction.followup.send('❌ Solicitação não identificada.', ephemeral=True)
+            return
+        async with _ORG_APROVACAO_LOCK:
+            aprovacoes = _carregar_aprovacoes_org()
+            registro = aprovacoes.get(codigo)
+            if not registro:
+                try:
+                    await interaction.message.delete(reason='Painel de permissão inválido removido')
+                except Exception:
+                    pass
+                await interaction.followup.send('❌ Solicitação não encontrada.', ephemeral=True)
+                return
+            if str(registro.get('status')) != 'PENDENTE':
+                try:
+                    await interaction.message.delete(reason='Painel já decidido removido')
+                except Exception:
+                    pass
+                await interaction.followup.send('⚠️ Esta solicitação já foi decidida.', ephemeral=True)
+                return
+            resultado = '❌ Alteração negada.'
+            if aprovado:
+                guild = interaction.guild
+                solicitante = guild.get_member(int(registro.get('solicitante_id') or 0)) if guild else None
+                usuario_registro = solicitante or interaction.user
+                sucesso, mensagem, org = await aplicar_edicao_organizacao(
+                    int(registro['organizacao_id']),
+                    int(registro['versao']),
+                    dict(registro.get('novos_valores') or {}),
+                    usuario_registro,
+                )
+                if not sucesso:
+                    await interaction.followup.send(mensagem, ephemeral=True)
+                    return
+                resultado = mensagem
+                registro['status'] = 'APROVADO'
+            else:
+                registro['status'] = 'NEGADO'
+            registro.update({
+                'decidido_por_id': interaction.user.id,
+                'decidido_por_nome': str(interaction.user),
+                'decidido_em': agora_br(),
+            })
+            aprovacoes[codigo] = registro
+            _salvar_aprovacoes_org(aprovacoes)
+            await enviar_log(
+                f"{'✅' if aprovado else '❌'} Alteração de organização decidida | "
+                f"Solicitação `{codigo}` | organização `{registro.get('organizacao_id')}` | "
+                f"autoridade <@{interaction.user.id}>"
+            )
+            # A mensagem de permissão é sempre apagada após o veredito.
+            try:
+                await interaction.message.delete(reason='Permissão de organização decidida; painel removido')
+            except discord.NotFound:
+                pass
+            except Exception as erro:
+                await enviar_log(f'⚠️ Não consegui apagar painel de permissão `{codigo}`: {erro}')
+            await interaction.followup.send(resultado, ephemeral=True)
+
+    @discord.ui.button(label='Autorizar', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_org_autorizar')
+    async def autorizar(self, interaction: discord.Interaction, button: Button):
+        await self._decidir(interaction, True)
+
+    @discord.ui.button(label='Negar', emoji='❌', style=discord.ButtonStyle.red, custom_id='dic_org_negar')
+    async def negar(self, interaction: discord.Interaction, button: Button):
+        await self._decidir(interaction, False)
+
+
+async def _processar_edicao_org_modal(
+    interaction: discord.Interaction,
+    numero: int,
+    versao: int,
+    valores: Dict[str, str],
+) -> None:
+    # Inspetor, Vice-Diretor e Diretor alteram diretamente, sem pedir autorização.
+    if _membro_inspetor_mais(interaction.user):
+        sucesso, mensagem, organizacao = await aplicar_edicao_organizacao(numero, versao, valores, interaction.user)
+        conteudo = mensagem
+        view = None
+        if organizacao:
+            conteudo += '\n\n' + formatar_ficha_organizacao(organizacao)
+            view = OrganizacaoAcoesView(numero, int(organizacao.get('versao', 1) or 1))
+        await interaction.response.send_message(cortar_discord(conteudo, 1900), view=view, ephemeral=True)
+        return
+    # Estagiário, Investigador e qualquer outro usuário enviam para aprovação de Inspetor+.
+    await _criar_pedido_edicao_organizacao(interaction, numero, versao, valores)
+
+
+def _editar_org_basico_init(self, organizacao: Dict[str, Any]):
+    numero = int(organizacao.get('id', 0) or 0)
+    Modal.__init__(self, title=f'Editar organização {numero:02d}')
+    self.numero = numero
+    self.versao = int(organizacao.get('versao', 1) or 1)
+    self.nome = TextInput(label='Nome', default=valor_org(organizacao, 'nome'), max_length=100)
+    self.zona_risco = TextInput(label='Zona de risco', default=valor_org(organizacao, 'zona_risco'), max_length=80)
+    self.status = TextInput(label='Status', default=valor_org(organizacao, 'status'), max_length=100)
+    self.produto = TextInput(label='Produto', default=valor_org(organizacao, 'produto'), max_length=150)
+    self.informante = TextInput(label='Possui informante?', default=valor_org(organizacao, 'informante'), max_length=60)
+    for item in (self.nome, self.zona_risco, self.status, self.produto, self.informante):
+        self.add_item(item)
+
+
+async def _editar_org_basico_submit(self, interaction: discord.Interaction):
+    await _processar_edicao_org_modal(interaction, self.numero, self.versao, {
+        'nome': str(self.nome.value), 'zona_risco': str(self.zona_risco.value),
+        'status': str(self.status.value), 'produto': str(self.produto.value),
+        'informante': str(self.informante.value),
+    })
+
+
+def _editar_org_detalhes_init(self, organizacao: Dict[str, Any]):
+    numero = int(organizacao.get('id', 0) or 0)
+    Modal.__init__(self, title=f'Detalhes da organização {numero:02d}')
+    self.numero = numero
+    self.versao = int(organizacao.get('versao', 1) or 1)
+    self.investigador = TextInput(label='Nome do Investigador', default=valor_org(organizacao, 'investigador'), max_length=150)
+    self.lider = TextInput(label='Líder', default=valor_org(organizacao, 'lider'), max_length=150)
+    self.caracteristicas = TextInput(label='Características', default=valor_org(organizacao, 'caracteristicas'), style=discord.TextStyle.paragraph, max_length=1800)
+    self.historico = TextInput(label='Histórico operacional', default=valor_org(organizacao, 'historico', 'Sem registros.'), style=discord.TextStyle.paragraph, max_length=3000)
+    for item in (self.investigador, self.lider, self.caracteristicas, self.historico):
+        self.add_item(item)
+
+
+async def _editar_org_detalhes_submit(self, interaction: discord.Interaction):
+    await _processar_edicao_org_modal(interaction, self.numero, self.versao, {
+        'investigador': str(self.investigador.value), 'lider': str(self.lider.value),
+        'caracteristicas': str(self.caracteristicas.value), 'historico': str(self.historico.value),
+    })
+
+EditarOrganizacaoBasicoModal.__init__ = _editar_org_basico_init
+EditarOrganizacaoBasicoModal.on_submit = _editar_org_basico_submit
+EditarOrganizacaoDetalhesModal.__init__ = _editar_org_detalhes_init
+EditarOrganizacaoDetalhesModal.on_submit = _editar_org_detalhes_submit
+
+
+def embed_painel_organizacoes_padrao() -> discord.Embed:
+    return discord.Embed(
+        title='🏴 Tabela de Organizações - DICOR',
+        description=(
+            'As **56 organizações** são fixas e compartilhadas. Todos podem consultar e solicitar alterações.\n\n'
+            '📋 **Ver Organizações** — Abre a tabela completa por páginas.\n'
+            '🔎 **Pesquisar Organização** — Busca pelo nome ou número.\n'
+            '✏️ **Editar Organização** — Atualiza dados, incluindo o **Nome do Investigador**.\n\n'
+            '🔐 **Estagiário e Investigador:** a alteração só é aplicada após aprovação de Inspetor+.\n'
+            '⚡ **Inspetor, Vice-Diretor e Diretor:** alteração direta, sem pedir permissão.\n'
+            '🧹 Após Autorizar ou Negar, a mensagem de permissão é apagada automaticamente.'
+        ),
+        color=discord.Color.dark_blue(),
+    )
+
+
+@bot.listen('on_ready')
+async def registrar_view_aprovacao_organizacoes():
+    try:
+        bot.add_view(AutorizacaoOrganizacaoView())
+        garantir_56_organizacoes()
+    except Exception as erro:
+        await enviar_log(f'⚠️ Falha ao registrar aprovação de organizações: {erro}')
+
 if __name__ == '__main__':
     asyncio.run(main())
