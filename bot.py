@@ -19026,5 +19026,660 @@ async def liberar_fotos_em_topicos_antigos_boletins() -> None:
         )
 
 
+# =====================================================
+# PATCH FINAL — RG ÚNICO, NUMERAÇÃO DOS TÓPICOS, TROCA DE AGENTE
+# E PAINEL DE RELATÓRIOS SOMENTE OLB/TOCAIA
+# =====================================================
+
+_BOLETIM_NUMERO_TOPICO_LOCK = asyncio.Lock()
+_NOVO_PROCURADO_ON_SUBMIT_ANTERIOR = NovoProcuradoModal.on_submit
+_SOLICITAR_PROCURADO_BOLETIM_ANTERIOR = solicitar_autorizacao_procurado_boletim
+_BOLETIM_ATENDIMENTO_VIEW_ANTERIOR = BoletimAtendimentoView
+
+
+def _extrair_inteiro_numero_boletim(valor: Any) -> int:
+    texto = str(valor or '')
+    padroes = [
+        r'BO[-\s]?DICOR[-\s]?(\d{1,8})',
+        r'BOLETIM(?:\s+DE\s+OCORR[ÊE]NCIA)?[^\d]{0,20}(\d{1,8})',
+        r'N[º°O]?\.?\s*(\d{1,8})',
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, texto, flags=re.I)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    numeros = re.findall(r'\d+', texto)
+    if numeros:
+        try:
+            return int(numeros[-1])
+        except Exception:
+            pass
+    return 0
+
+
+async def _proximo_numero_topico_boletim(canal_pai) -> str:
+    """Usa o maior número já existente em tópicos/atendimentos e soma 1.
+
+    Assim a numeração do novo tópico nunca depende da ordem em que mensagens
+    antigas foram importadas nem reinicia após um deploy.
+    """
+    async with _BOLETIM_NUMERO_TOPICO_LOCK:
+        maior = 0
+
+        # Banco persistente dos atendimentos.
+        try:
+            for atendimento in carregar_atendimentos_boletins():
+                maior = max(maior, _extrair_inteiro_numero_boletim(atendimento.get('numero')))
+        except Exception as erro:
+            await enviar_log(f'⚠️ Falha ao consultar numeração salva dos boletins: {erro}')
+
+        # Tópicos ativos do canal.
+        for topico in list(getattr(canal_pai, 'threads', []) or []):
+            maior = max(maior, _extrair_inteiro_numero_boletim(getattr(topico, 'name', '')))
+
+        # Tópicos arquivados. Limite evita atrasar o bot em servidores enormes.
+        try:
+            try:
+                iterator = canal_pai.archived_threads(limit=200, private=False, joined=False)
+            except TypeError:
+                try:
+                    iterator = canal_pai.archived_threads(limit=200, private=False)
+                except TypeError:
+                    iterator = canal_pai.archived_threads(limit=200)
+            async for topico in iterator:
+                maior = max(maior, _extrair_inteiro_numero_boletim(getattr(topico, 'name', '')))
+        except (AttributeError, discord.Forbidden):
+            pass
+        except Exception as erro:
+            await enviar_log(f'⚠️ Falha ao consultar tópicos arquivados para numeração: {erro}')
+
+        proximo = maior + 1
+        numero = f'BO-DICOR-{proximo:03d}'
+
+        # Mantém o contador geral no mínimo no mesmo valor para evitar regressão.
+        try:
+            contador = carregar_json(BOLETINS_CONTADOR_JSON, {})
+            if not isinstance(contador, dict):
+                contador = {}
+            ultimo = int(contador.get('ultimo', 0) or 0)
+            if proximo > ultimo:
+                contador.update({
+                    'ultimo': proximo,
+                    'modelo': 'topico_sequencial',
+                    'atualizado_em': agora_br(),
+                })
+                salvar_json(BOLETINS_CONTADOR_JSON, contador)
+        except Exception as erro:
+            await enviar_log(f'⚠️ Não consegui atualizar o contador do boletim: {erro}')
+
+        return numero
+
+
+def _embed_boletim_limpo(
+    numero: str,
+    agente: Optional[discord.Member],
+    autor: Optional[discord.abc.User],
+    texto_original: str,
+    mensagem_url: str,
+    quantidade_anexos: int,
+) -> discord.Embed:
+    agente_texto = agente.mention if agente else 'Nenhum agente elegível encontrado'
+    autor_texto = autor.mention if autor else 'Não identificado'
+    descricao = cortar_discord(str(texto_original or 'Sem informações.'), 3500)
+    embed = discord.Embed(
+        title=f'📋 BOLETIM DE OCORRÊNCIA — Nº {numero_curto_boletim(numero)}',
+        description=descricao,
+        color=discord.Color.dark_teal(),
+    )
+    embed.add_field(name='👤 Agente responsável', value=agente_texto, inline=True)
+    embed.add_field(name='📌 Status', value='EM ATENDIMENTO' if agente else 'SEM AGENTE', inline=True)
+    embed.add_field(name='📝 Autor', value=autor_texto, inline=True)
+    embed.add_field(name='📎 Anexos preservados', value=str(int(quantidade_anexos or 0)), inline=True)
+    embed.add_field(name='🕒 Recebido em', value=agora_br(), inline=True)
+    embed.add_field(name='🔗 Boletim original', value=f'[Abrir mensagem]({mensagem_url})', inline=True)
+    embed.set_footer(text='DICOR • Provas, decisões e anexos devem permanecer neste tópico')
+    return embed
+
+
+def texto_painel_boletim(atendimento: Dict[str, Any]) -> str:
+    agente = (
+        f"<@{atendimento.get('agente_id')}>"
+        if atendimento.get('agente_id')
+        else 'Nenhum agente definido'
+    )
+    return (
+        f"🧭 **CONTROLE DO BOLETIM Nº {numero_curto_boletim(atendimento.get('numero'))}**\n"
+        f"👤 **Responsável:** {agente}\n"
+        f"📌 **Status:** {atendimento.get('status', 'EM ATENDIMENTO')}\n\n"
+        'Use os botões abaixo para finalizar, solicitar comparecimento, cadastrar procurado '
+        'ou trocar o responsável. Fotos e arquivos podem ser enviados diretamente neste tópico.'
+    )
+
+
+async def _novo_procurado_com_rg_unico(
+    self: NovoProcuradoModal,
+    interaction: discord.Interaction,
+) -> None:
+    existente = procurar_por_rg(str(self.rg.value))
+    if existente:
+        return await interaction.response.send_message(
+            '⚠️ **Este RG já está cadastrado como procurado.**\n'
+            f"👤 **Nome:** {existente.get('nome', 'Não informado')}\n"
+            f"🪪 **RG:** `{existente.get('rg', '')}`\n\n"
+            'Não foi criado um cadastro duplicado. Use o botão temporário abaixo para editar o registro existente.',
+            view=AbrirEdicaoProcuradoView(existente),
+            ephemeral=True,
+        )
+    await _NOVO_PROCURADO_ON_SUBMIT_ANTERIOR(self, interaction)
+
+
+NovoProcuradoModal.on_submit = _novo_procurado_com_rg_unico
+
+
+async def solicitar_autorizacao_procurado_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    existente = procurar_por_rg(dados.get('rg'))
+    if existente:
+        mensagem = (
+            '⚠️ **Este RG já está cadastrado como procurado.**\n'
+            f"👤 **Nome:** {existente.get('nome', 'Não informado')}\n"
+            f"🪪 **RG:** `{existente.get('rg', '')}`\n\n"
+            'Nenhum novo procurado foi criado. Use o botão abaixo para editar o existente.'
+        )
+        if interaction.response.is_done():
+            return await interaction.followup.send(
+                mensagem,
+                view=AbrirEdicaoProcuradoView(existente),
+                ephemeral=True,
+            )
+        return await interaction.response.send_message(
+            mensagem,
+            view=AbrirEdicaoProcuradoView(existente),
+            ephemeral=True,
+        )
+    await _SOLICITAR_PROCURADO_BOLETIM_ANTERIOR(interaction, dados)
+
+
+def _atendimento_por_id(atendimento_id: str) -> Optional[Dict[str, Any]]:
+    return next(
+        (a for a in carregar_atendimentos_boletins() if str(a.get('id')) == str(atendimento_id)),
+        None,
+    )
+
+
+def _registrar_troca_no_rodizio(
+    numero: str,
+    agente_antigo_id: int,
+    agente_novo: discord.Member,
+) -> None:
+    """Marca o novo responsável como usado para manter a regra sem repetição."""
+    try:
+        estado = carregar_rodizio_boletim()
+        usados = []
+        for valor in estado.get('ciclo_usados', []) or []:
+            try:
+                inteiro = int(valor)
+                if inteiro not in usados:
+                    usados.append(inteiro)
+            except Exception:
+                pass
+        if agente_novo.id not in usados:
+            usados.append(agente_novo.id)
+        historico = estado.get('historico', [])
+        if not isinstance(historico, list):
+            historico = []
+        historico.append({
+            'numero': numero,
+            'agente_id': agente_novo.id,
+            'agente_nome': str(agente_novo),
+            'agente_anterior_id': int(agente_antigo_id or 0),
+            'tipo': 'TROCA_MANUAL_POR_INSPETOR_MAIS',
+            'data': agora_br(),
+        })
+        estado.update({
+            'ultimo_id': agente_novo.id,
+            'ciclo_usados': usados,
+            'historico': historico[-2000:],
+            'ultima_atribuicao': agora_br(),
+        })
+        salvar_rodizio_boletim(estado)
+    except Exception:
+        traceback.print_exc()
+
+
+async def _trocar_agente_responsavel_boletim(
+    interaction: discord.Interaction,
+    atendimento_id: str,
+    novo_agente: discord.Member,
+) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Somente Inspetor, Vice-Diretor ou Diretor pode trocar o agente responsável.',
+            ephemeral=True,
+        )
+
+    elegiveis = {m.id for m in membros_elegiveis_rodizio(interaction.guild)}
+    if novo_agente.bot or novo_agente.id not in elegiveis:
+        return await interaction.response.send_message(
+            '❌ Selecione um Estagiário ou Investigador elegível para o rodízio.',
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    atendimento = _atendimento_por_id(atendimento_id)
+    if not atendimento:
+        return await interaction.followup.send('❌ Atendimento não encontrado.', ephemeral=True)
+
+    agente_antigo_id = int(atendimento.get('agente_id') or 0)
+    if agente_antigo_id == novo_agente.id:
+        return await interaction.followup.send(
+            '⚠️ Esse agente já é o responsável pelo boletim.', ephemeral=True
+        )
+
+    topico = await obter_canal_bot(
+        atendimento.get('thread_id') or atendimento.get('area_id')
+    )
+    if not isinstance(topico, discord.Thread):
+        return await interaction.followup.send(
+            '❌ O tópico deste boletim não foi localizado.', ephemeral=True
+        )
+
+    agente_antigo = interaction.guild.get_member(agente_antigo_id) if agente_antigo_id else None
+
+    # Remove o membro antigo da lista de participantes do tópico, quando possível.
+    if isinstance(agente_antigo, discord.Member):
+        try:
+            await topico.remove_user(agente_antigo)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui remover o antigo responsável `{agente_antigo.id}` '
+                f'da associação do tópico `{topico.id}`: {erro}'
+            )
+
+    try:
+        await topico.add_user(novo_agente)
+    except Exception as erro:
+        return await interaction.followup.send(
+            f'❌ Não consegui adicionar o novo agente ao tópico: `{type(erro).__name__}: {erro}`',
+            ephemeral=True,
+        )
+
+    canal_pai = getattr(topico, 'parent', None)
+    if canal_pai is not None:
+        await liberar_envio_de_fotos_para_todos_no_boletim(canal_pai, topico)
+
+    atendimento.update({
+        'agente_id': novo_agente.id,
+        'agente_nome': str(novo_agente),
+        'agente_atribuido_por': f'MANUAL:{interaction.user.id}',
+        'agente_atribuido_em': agora_br(),
+        'status': 'EM ATENDIMENTO',
+    })
+    historico = atendimento.get('historico', [])
+    if not isinstance(historico, list):
+        historico = []
+    historico.append({
+        'acao': 'Agente responsável alterado',
+        'usuario': str(interaction.user),
+        'usuario_id': interaction.user.id,
+        'agente_anterior_id': agente_antigo_id or None,
+        'agente_novo_id': novo_agente.id,
+        'agente_novo_nome': str(novo_agente),
+        'data': agora_br(),
+    })
+    atendimento['historico'] = historico
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    _registrar_troca_no_rodizio(
+        str(atendimento.get('numero') or ''), agente_antigo_id, novo_agente
+    )
+
+    painel_id = int(atendimento.get('painel_msg_id') or 0)
+    if painel_id:
+        try:
+            painel = await topico.fetch_message(painel_id)
+            await painel.edit(
+                content=texto_painel_boletim(atendimento),
+                view=BoletimAtendimentoView(),
+            )
+        except Exception as erro:
+            await enviar_log(f'⚠️ Responsável alterado, mas painel não foi editado: {erro}')
+
+    antigo_texto = agente_antigo.mention if agente_antigo else 'Não definido'
+    await topico.send(
+        '🔄 **RESPONSÁVEL ALTERADO**\n'
+        f'**Anterior:** {antigo_texto}\n'
+        f'**Novo:** {novo_agente.mention}\n'
+        f'**Alterado por:** {interaction.user.mention}\n'
+        '📎 O tópico permanece liberado para envio de imagens e anexos.',
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+    await enviar_log(
+        f'🔄 Responsável do boletim `{atendimento.get("numero")}` alterado | '
+        f'antigo `{agente_antigo_id}` | novo `{novo_agente.id}` | '
+        f'autoridade `{interaction.user.id}`'
+    )
+    await interaction.followup.send(
+        f'✅ Responsável alterado para {novo_agente.mention}.', ephemeral=True
+    )
+
+
+class _SelecionarNovoAgenteBoletim(discord.ui.UserSelect):
+    def __init__(self, atendimento_id: str):
+        super().__init__(
+            placeholder='Selecione o novo agente responsável',
+            min_values=1,
+            max_values=1,
+        )
+        self.atendimento_id = str(atendimento_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        selecionado = self.values[0] if self.values else None
+        if not isinstance(selecionado, discord.Member):
+            try:
+                selecionado = interaction.guild.get_member(int(selecionado.id))
+            except Exception:
+                selecionado = None
+        if not isinstance(selecionado, discord.Member):
+            return await interaction.response.send_message(
+                '❌ Não consegui localizar o membro selecionado.', ephemeral=True
+            )
+        await _trocar_agente_responsavel_boletim(
+            interaction, self.atendimento_id, selecionado
+        )
+
+
+class _TrocarAgenteBoletimView(View):
+    def __init__(self, atendimento_id: str):
+        super().__init__(timeout=180)
+        self.add_item(_SelecionarNovoAgenteBoletim(atendimento_id))
+
+
+class BoletimAtendimentoView(_BOLETIM_ATENDIMENTO_VIEW_ANTERIOR):
+    """Painel original acrescido da troca de responsável para Inspetor+."""
+    def __init__(self):
+        super().__init__()
+        botao = Button(
+            label='Trocar Agente',
+            emoji='🔄',
+            style=discord.ButtonStyle.primary,
+            custom_id='dic_bo_trocar_agente',
+            row=1,
+        )
+        botao.callback = self._abrir_troca_agente
+        self.add_item(botao)
+
+    async def _abrir_troca_agente(self, interaction: discord.Interaction):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message(
+                '❌ Somente Inspetor, Vice-Diretor ou Diretor pode trocar o responsável.',
+                ephemeral=True,
+            )
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        await interaction.response.send_message(
+            'Selecione abaixo o novo Estagiário ou Investigador responsável:',
+            view=_TrocarAgenteBoletimView(str(atendimento.get('id'))),
+            ephemeral=True,
+        )
+
+
+async def criar_area_atendimento_boletim(
+    message: discord.Message,
+) -> Optional[Dict[str, Any]]:
+    """Cria um tópico limpo, numerado pelo último tópico existente e com rodízio."""
+    if buscar_atendimento_por_mensagem(message.id):
+        return None
+    if not message.guild:
+        return None
+
+    canal_atendimento = await _resolver_canal_boletins_abertos(message.guild)
+    if not isinstance(canal_atendimento, (discord.TextChannel, discord.ForumChannel)):
+        await enviar_log(
+            f'❌ Canal de boletins em aberto `{BOLETIM_ATENDIMENTO_CHANNEL_ID}` não encontrado.'
+        )
+        return None
+
+    numero = await _proximo_numero_topico_boletim(canal_atendimento)
+    agente = await escolher_agente_rodizio(message.guild, numero)
+    texto_original = coletar_texto_embed(message) or message.content or 'Sem texto.'
+    pasta = BOLETIM_ARQUIVOS_DIR / numero.replace('/', '-')
+    anexos = await arquivos_para_reenvio_de_mensagens([message], pasta, numero)
+    titulo = f'📋 BOLETIM DE OCORRÊNCIA — Nº {numero_curto_boletim(numero)}'
+
+    mensagem_abertura = None
+    area = None
+    try:
+        if isinstance(canal_atendimento, discord.TextChannel):
+            mensagem_abertura = await canal_atendimento.send(
+                f'📋 Atendimento criado para **Boletim Nº {numero_curto_boletim(numero)}**.',
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            try:
+                area = await mensagem_abertura.create_thread(
+                    name=titulo[:100], auto_archive_duration=10080
+                )
+            except discord.HTTPException:
+                area = await mensagem_abertura.create_thread(
+                    name=titulo[:100], auto_archive_duration=1440
+                )
+        else:
+            try:
+                criado = await canal_atendimento.create_thread(
+                    name=titulo[:100],
+                    content=f'📋 Atendimento do **Boletim Nº {numero_curto_boletim(numero)}**.',
+                    auto_archive_duration=10080,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    reason=f'Atendimento automático do boletim {numero}',
+                )
+            except (TypeError, discord.HTTPException):
+                criado = await canal_atendimento.create_thread(
+                    name=titulo[:100],
+                    content=f'📋 Atendimento do **Boletim Nº {numero_curto_boletim(numero)}**.',
+                    auto_archive_duration=1440,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            area = getattr(criado, 'thread', criado)
+            mensagem_abertura = getattr(criado, 'message', None)
+
+        if not isinstance(area, discord.Thread):
+            raise RuntimeError('O Discord não retornou um tópico válido para o boletim.')
+
+        await liberar_envio_de_fotos_para_todos_no_boletim(canal_atendimento, area)
+        if agente:
+            try:
+                await area.add_user(agente)
+            except Exception as erro:
+                await enviar_log(f'⚠️ Não consegui adicionar o agente `{agente.id}` ao tópico: {erro}')
+
+        mencoes = f'{mencoes_inspetor_mais(message.guild)} {agente.mention if agente else ""}'.strip()
+        embed = _embed_boletim_limpo(
+            numero,
+            agente,
+            message.author,
+            texto_original,
+            message.jump_url,
+            len(anexos),
+        )
+        await area.send(
+            content=mencoes or None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                roles=True, users=True, everyone=False
+            ),
+        )
+        if anexos:
+            await enviar_arquivos_em_lotes(
+                area, anexos, legenda='📎 Provas e anexos do boletim'
+            )
+
+        atendimento = {
+            'id': f'ATD-{message.id}',
+            'numero': numero,
+            'numero_original_texto': extrair_numero_boletim_seguro(
+                coletar_texto_embed(message) or message.content or ''
+            ),
+            'mensagem_original_id': message.id,
+            'mensagem_original_url': message.jump_url,
+            'canal_origem_id': message.channel.id,
+            'area_id': area.id,
+            'thread_id': area.id,
+            'forum_thread_id': area.id if isinstance(canal_atendimento, discord.ForumChannel) else None,
+            'canal_atendimento_id': canal_atendimento.id,
+            'mensagem_abertura_id': getattr(mensagem_abertura, 'id', None),
+            'painel_msg_id': None,
+            'agente_id': agente.id if agente else None,
+            'agente_nome': str(agente) if agente else 'Nenhum agente elegível',
+            'agente_atribuido_por': 'RODIZIO_AUTOMATICO',
+            'agente_atribuido_em': agora_br(),
+            'autor_id': message.author.id if message.author else None,
+            'autor_nome': str(message.author) if message.author else 'Não identificado',
+            'status': 'EM ATENDIMENTO' if agente else 'SEM AGENTE ELEGÍVEL',
+            'data_criacao': agora_br(),
+            'anexos_salvos': [str(p) for p in anexos],
+            'historico': [{
+                'acao': 'Tópico limpo criado e agente atribuído pelo rodízio',
+                'usuario': 'Sistema',
+                'agente_id': agente.id if agente else None,
+                'agente_nome': str(agente) if agente else None,
+                'canal_pai_id': canal_atendimento.id,
+                'topico_id': area.id,
+                'data': agora_br(),
+            }],
+            'comparecimento_status': 'não solicitado',
+            'procurado_status': 'não solicitado',
+        }
+        lista = carregar_atendimentos_boletins()
+        lista.append(atendimento)
+        salvar_atendimentos_boletins(lista)
+
+        painel_msg = await area.send(
+            texto_painel_boletim(atendimento),
+            view=BoletimAtendimentoView(),
+        )
+        atendimento['painel_msg_id'] = painel_msg.id
+        atualizar_atendimento_boletim('id', atendimento['id'], atendimento)
+
+        await enviar_log(
+            f'📋 Boletim `{numero}` aberto em tópico `{area.id}` | '
+            f'agente `{atendimento.get("agente_id")}` | original `{message.id}`'
+        )
+        return atendimento
+    except Exception as erro:
+        if area is None and mensagem_abertura is not None:
+            try:
+                await mensagem_abertura.delete()
+            except Exception:
+                pass
+        await enviar_log(
+            f'❌ Erro ao criar tópico do boletim `{numero}`: '
+            f'{type(erro).__name__}: {erro}\n'
+            f'```{traceback.format_exc()[-1600:]}```'
+        )
+        return None
+
+
+# Painel de relatórios: somente Tocaia e OLB.
+class RelatoriosPainelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='👀 TOCAIA',
+        style=discord.ButtonStyle.secondary,
+        custom_id='rel_btn_tocaia',
+    )
+    async def btn_tocaia(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(TocaiaModal())
+
+    @discord.ui.button(
+        label='🚔 OLB',
+        style=discord.ButtonStyle.secondary,
+        custom_id='rel_btn_olb',
+    )
+    async def btn_olb(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(OlbModal())
+
+
+try:
+    bot.tree.remove_command('painel-relatorios')
+except Exception:
+    pass
+
+
+@bot.tree.command(
+    name='painel-relatorios',
+    description='Envia o painel de Tocaia e OLB.',
+)
+async def painel_relatorios(interaction: discord.Interaction):
+    if not usuario_tem_admin(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Apenas membros autorizados podem usar este comando.', ephemeral=True
+        )
+    embed = discord.Embed(
+        title='📑 PAINEL DE RELATÓRIOS OPERACIONAIS',
+        description=(
+            'Selecione o relatório operacional que deseja iniciar.\n\n'
+            '👀 **TOCAIA:** vigilância em local de interesse.\n'
+            '🚔 **OLB:** emboscada ou operação planejada.'
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text='DICOR • Sistema Operacional Seguro')
+    await interaction.response.send_message(embed=embed, view=RelatoriosPainelView())
+
+
+# Atualiza também painéis antigos para incluir o botão Trocar Agente.
+_LIBERAR_FOTOS_ANTIGOS_ANTERIOR = liberar_fotos_em_topicos_antigos_boletins
+
+
+async def _atualizar_paineis_antigos_boletins() -> None:
+    await bot.wait_until_ready()
+    atualizados = 0
+    falhas = 0
+    for atendimento in carregar_atendimentos_boletins():
+        if str(atendimento.get('status') or '').upper() == 'FINALIZADO':
+            continue
+        topico_id = int(atendimento.get('thread_id') or atendimento.get('area_id') or 0)
+        painel_id = int(atendimento.get('painel_msg_id') or 0)
+        if not topico_id or not painel_id:
+            continue
+        try:
+            topico = await obter_canal_bot(topico_id)
+            if not isinstance(topico, discord.Thread):
+                continue
+            if bool(getattr(topico, 'archived', False)) or bool(getattr(topico, 'locked', False)):
+                await topico.edit(archived=False, locked=False)
+            painel = await topico.fetch_message(painel_id)
+            await painel.edit(
+                content=texto_painel_boletim(atendimento),
+                view=BoletimAtendimentoView(),
+            )
+            atualizados += 1
+        except discord.NotFound:
+            continue
+        except Exception as erro:
+            falhas += 1
+            await enviar_log(
+                f'⚠️ Não consegui atualizar o painel antigo do boletim '
+                f'`{atendimento.get("numero")}`: {type(erro).__name__}: {erro}'
+            )
+    await enviar_log(
+        f'🔄 Painéis antigos de boletins atualizados: `{atualizados}` | falhas: `{falhas}`'
+    )
+
+
+async def liberar_fotos_em_topicos_antigos_boletins() -> None:
+    await _LIBERAR_FOTOS_ANTIGOS_ANTERIOR()
+    await _atualizar_paineis_antigos_boletins()
+
+
 if __name__ == '__main__':
     asyncio.run(main())
