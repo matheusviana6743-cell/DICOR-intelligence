@@ -8094,6 +8094,16 @@ async def on_ready():
     print('VERSAO COMPLETA: mesas | procurados | catalogo | boletins | organizacoes | relatorios')
     print(f"Bot online como {bot.user}")
 
+    # Atualiza também todos os tópicos ANTIGOS de boletins. A tarefa roda em
+    # segundo plano para não atrasar a sincronização nem travar o on_ready.
+    try:
+        asyncio.create_task(
+            liberar_fotos_em_topicos_antigos_boletins(),
+            name='dicor-liberar-fotos-boletins-antigos',
+        )
+    except Exception as erro:
+        print(f"Aviso ao iniciar migração dos tópicos antigos: {erro}")
+
 # =====================================================
 # REGISTRO LOCAL DE RELATÓRIOS OPERACIONAIS
 # =====================================================
@@ -18469,6 +18479,50 @@ MandadoAvulsoModal.on_error = _mandado_avulso_on_error_corrigido
 # =====================================================
 # PATCH FINAL — BOLETINS ABERTOS EM TÓPICOS/THREADS
 # =====================================================
+async def liberar_envio_de_fotos_para_todos_no_boletim(
+    canal_pai,
+    topico: discord.Thread,
+) -> None:
+    """Permite que qualquer membro do servidor que veja o canal possa falar e
+    anexar fotos/arquivos dentro dos tópicos de boletim.
+
+    A permissão é aplicada no canal pai porque tópicos públicos herdam as
+    permissões dele. O canal pai não precisa permitir mensagens comuns; apenas
+    mensagens dentro de tópicos e anexos são liberados.
+    """
+    guild = getattr(canal_pai, 'guild', None)
+    if guild is None:
+        return
+
+    try:
+        overwrite = canal_pai.overwrites_for(guild.default_role)
+        overwrite.view_channel = True
+        overwrite.read_message_history = True
+        overwrite.send_messages_in_threads = True
+        overwrite.attach_files = True
+        overwrite.embed_links = True
+        overwrite.use_external_emojis = True
+        await canal_pai.set_permissions(
+            guild.default_role,
+            overwrite=overwrite,
+            reason='Permitir que todos anexem fotos nos tópicos de boletim',
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Não consegui liberar anexos para @everyone no canal de boletins '
+            f'`{getattr(canal_pai, "id", 0)}`: {type(erro).__name__}: {erro}'
+        )
+
+    # Garante que o tópico recém-criado esteja aberto e utilizável.
+    try:
+        if bool(getattr(topico, 'archived', False)) or bool(getattr(topico, 'locked', False)):
+            await topico.edit(archived=False, locked=False)
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Não consegui destravar o tópico de boletim '
+            f'`{getattr(topico, "id", 0)}`: {type(erro).__name__}: {erro}'
+        )
+
 async def _resolver_canal_boletins_abertos(guild: discord.Guild):
     """Localiza o canal configurado de boletins abertos e aplica fallback por nome."""
     canal = guild.get_channel(int(BOLETIM_ATENDIMENTO_CHANNEL_ID or 0))
@@ -18595,6 +18649,12 @@ async def criar_area_atendimento_boletim(
         if not isinstance(area, discord.Thread):
             raise RuntimeError('O Discord não retornou um tópico válido para o boletim.')
 
+        # Qualquer membro do servidor pode enviar mensagens, fotos e arquivos
+        # dentro do tópico de boletim.
+        await liberar_envio_de_fotos_para_todos_no_boletim(
+            canal_atendimento, area
+        )
+
         # Adiciona o agente ao tópico e garante que ele receba a atribuição.
         if agente:
             try:
@@ -18618,7 +18678,8 @@ async def criar_area_atendimento_boletim(
             f'**Data de recebimento:** {agora_br()}\n'
             f'**Mensagem original:** {message.jump_url}\n'
             f'**Anexos localizados:** `{len(anexos)}`\n\n'
-            'Toda a análise, provas, permissões e decisões devem permanecer neste tópico. '
+            'Toda a análise, provas, permissões e decisões devem permanecer neste tópico.\n'
+            '📎 **Qualquer membro pode enviar fotos e arquivos neste tópico.**\n'
             'O agente foi escolhido automaticamente sem repetição dentro do ciclo.'
         )
         await area.send(
@@ -18712,6 +18773,206 @@ async def criar_area_atendimento_boletim(
             f'```{traceback.format_exc()[-1600:]}```'
         )
         return None
+
+
+
+# =====================================================
+# PATCH FINAL — LIBERAR FOTOS NOS TÓPICOS ANTIGOS DE BOLETINS
+# =====================================================
+_BOLETINS_ANTIGOS_FOTOS_LOCK = asyncio.Lock()
+_BOLETINS_ANTIGOS_FOTOS_CONCLUIDO = False
+
+
+def _eh_topico_de_boletim_antigo(topico: discord.Thread, ids_registrados: set[int]) -> bool:
+    """Evita alterar tópicos que não pertencem ao sistema de boletins."""
+    try:
+        if int(getattr(topico, 'id', 0) or 0) in ids_registrados:
+            return True
+    except Exception:
+        pass
+
+    nome = str(getattr(topico, 'name', '') or '').lower()
+    nome = unicodedata.normalize('NFKD', nome).encode('ascii', 'ignore').decode('ascii')
+    return 'boletim' in nome or 'ocorrencia' in nome
+
+
+async def _aplicar_permissoes_fotos_no_canal_boletins_antigos(canal_pai) -> None:
+    """Tópicos públicos herdam as permissões do canal pai.
+
+    Mantemos o envio de mensagens comuns do canal principal como estiver e
+    liberamos apenas mensagens em tópicos, imagens e arquivos.
+    """
+    guild = getattr(canal_pai, 'guild', None)
+    if guild is None:
+        raise RuntimeError('Canal de boletins sem servidor associado.')
+
+    overwrite = canal_pai.overwrites_for(guild.default_role)
+    overwrite.view_channel = True
+    overwrite.read_message_history = True
+    overwrite.send_messages_in_threads = True
+    overwrite.attach_files = True
+    overwrite.embed_links = True
+    overwrite.use_external_emojis = True
+    # Não alteramos overwrite.send_messages: o canal principal pode continuar
+    # bloqueado para mensagens comuns, enquanto os tópicos ficam liberados.
+    await canal_pai.set_permissions(
+        guild.default_role,
+        overwrite=overwrite,
+        reason='Liberar fotos e arquivos nos tópicos antigos de boletins',
+    )
+
+
+async def _listar_topicos_publicos_antigos(canal_pai) -> list[discord.Thread]:
+    """Coleta tópicos ativos e arquivados, com compatibilidade entre versões."""
+    encontrados: dict[int, discord.Thread] = {}
+
+    for topico in list(getattr(canal_pai, 'threads', []) or []):
+        if isinstance(topico, discord.Thread):
+            encontrados[int(topico.id)] = topico
+
+    # Tópicos públicos arquivados de canais de texto.
+    try:
+        iterator = canal_pai.archived_threads(
+            limit=None,
+            private=False,
+            joined=False,
+        )
+    except TypeError:
+        # ForumChannel e versões diferentes do discord.py usam assinatura menor.
+        try:
+            iterator = canal_pai.archived_threads(limit=None, private=False)
+        except TypeError:
+            iterator = canal_pai.archived_threads(limit=None)
+    except AttributeError:
+        iterator = None
+
+    if iterator is not None:
+        try:
+            async for topico in iterator:
+                if isinstance(topico, discord.Thread):
+                    encontrados[int(topico.id)] = topico
+        except discord.Forbidden:
+            await enviar_log(
+                '⚠️ O bot não possui permissão para consultar tópicos arquivados '
+                f'no canal `{getattr(canal_pai, "id", 0)}`.'
+            )
+        except Exception as erro:
+            await enviar_log(
+                '⚠️ Falha ao listar tópicos arquivados de boletins: '
+                f'{type(erro).__name__}: {erro}'
+            )
+
+    return list(encontrados.values())
+
+
+async def liberar_fotos_em_topicos_antigos_boletins() -> None:
+    """Libera envio de fotos/arquivos em todos os tópicos antigos de boletins.
+
+    A rotina é executada uma vez a cada inicialização. Ela atualiza a permissão
+    herdada do canal pai e reabre/desbloqueia tópicos antigos que tenham sido
+    arquivados automaticamente pelo Discord.
+    """
+    global _BOLETINS_ANTIGOS_FOTOS_CONCLUIDO
+
+    await bot.wait_until_ready()
+    await asyncio.sleep(3)
+
+    async with _BOLETINS_ANTIGOS_FOTOS_LOCK:
+        if _BOLETINS_ANTIGOS_FOTOS_CONCLUIDO:
+            return
+
+        guild = bot.get_guild(int(GUILD_ID or 0)) if int(GUILD_ID or 0) else None
+        if guild is None:
+            guild = next(iter(getattr(bot, 'guilds', []) or []), None)
+        if guild is None:
+            await enviar_log('⚠️ Não encontrei o servidor para atualizar os tópicos antigos de boletins.')
+            return
+
+        canal_pai = await _resolver_canal_boletins_abertos(guild)
+        if not isinstance(canal_pai, (discord.TextChannel, discord.ForumChannel)):
+            await enviar_log(
+                '⚠️ Não encontrei o canal de boletins em aberto para liberar os tópicos antigos. '
+                f'ID configurado: `{BOLETIM_ATENDIMENTO_CHANNEL_ID}`.'
+            )
+            return
+
+        try:
+            await _aplicar_permissoes_fotos_no_canal_boletins_antigos(canal_pai)
+        except Exception as erro:
+            await enviar_log(
+                '❌ Não consegui aplicar as permissões dos tópicos antigos de boletins: '
+                f'{type(erro).__name__}: {erro}'
+            )
+            return
+
+        ids_registrados: set[int] = set()
+        try:
+            for atendimento in carregar_atendimentos_boletins():
+                for chave in ('thread_id', 'area_id', 'forum_thread_id'):
+                    valor = atendimento.get(chave)
+                    if valor:
+                        ids_registrados.add(int(valor))
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui carregar os IDs históricos dos boletins: {erro}'
+            )
+
+        topicos = await _listar_topicos_publicos_antigos(canal_pai)
+        analisados = 0
+        liberados = 0
+        falhas = 0
+        privados = 0
+
+        for topico in topicos:
+            if not _eh_topico_de_boletim_antigo(topico, ids_registrados):
+                continue
+            analisados += 1
+
+            try:
+                # Tópicos privados não podem ser transformados em públicos pela API.
+                # Os tópicos criados pelo sistema atual são públicos; este teste só
+                # evita prometer acesso universal em um tópico privado legado.
+                try:
+                    if topico.is_private():
+                        privados += 1
+                        continue
+                except Exception:
+                    pass
+
+                precisa_editar = bool(getattr(topico, 'archived', False)) or bool(
+                    getattr(topico, 'locked', False)
+                )
+                if precisa_editar:
+                    await topico.edit(archived=False, locked=False)
+
+                liberados += 1
+            except discord.NotFound:
+                # O tópico pode ter sido apagado enquanto a rotina percorria a lista.
+                continue
+            except Exception as erro:
+                falhas += 1
+                await enviar_log(
+                    f'⚠️ Não consegui liberar o tópico antigo `{getattr(topico, "id", 0)}` '
+                    f'(`{getattr(topico, "name", "sem nome")}`): '
+                    f'{type(erro).__name__}: {erro}'
+                )
+
+        _BOLETINS_ANTIGOS_FOTOS_CONCLUIDO = True
+        await enviar_log(
+            '📎 **Permissões dos tópicos antigos de boletins atualizadas**\n'
+            f'Canal: <#{canal_pai.id}> (`{canal_pai.id}`)\n'
+            f'Tópicos encontrados/analisados: `{analisados}`\n'
+            f'Tópicos públicos liberados: `{liberados}`\n'
+            f'Tópicos privados ignorados: `{privados}`\n'
+            f'Falhas: `{falhas}`\n'
+            f'Data: {agora_br()}'
+        )
+        print(
+            f'✅ Tópicos antigos de boletins liberados: {liberados} '
+            f'| privados: {privados} | falhas: {falhas}',
+            flush=True,
+        )
+
 
 if __name__ == '__main__':
     asyncio.run(main())
