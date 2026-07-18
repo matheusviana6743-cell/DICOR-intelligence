@@ -2087,7 +2087,7 @@ class BuscarModificarProcuradoModal(Modal, title="Modificar Procurado"):
         # de outro modal. Por isso, mostramos um botão intermediário privado.
         await interaction.response.send_message(
             f"✅ Procurado localizado: **{encontrado.get('nome', 'Sem nome')}** — RG: `{encontrado.get('rg', '')}`\n"
-            "Clique abaixo para abrir a edição dos crimes.",
+            "Clique abaixo para editar os crimes e o último avistamento.",
             view=AbrirEdicaoProcuradoView(encontrado),
             ephemeral=True,
         )
@@ -2097,7 +2097,7 @@ class EditarCrimesProcuradoModal(Modal):
     def __init__(self, registro: Dict[str, Any]):
         nome = str(registro.get("nome", "Procurado") or "Procurado")
         rg = str(registro.get("rg", "") or "")
-        super().__init__(title="Editar Crimes do Procurado")
+        super().__init__(title="Editar Procurado")
 
         self.rg_registro = rg
         self.nome_registro = nome
@@ -2105,6 +2105,14 @@ class EditarCrimesProcuradoModal(Modal):
         crimes_atuais = valor_crimes_registro(registro)
         if len(crimes_atuais) > 3300:
             crimes_atuais = crimes_atuais[:3300].rstrip() + "\n..."
+
+        ultimo_atual = str(
+            registro.get("ultimo_avistamento")
+            or registro.get("informacoes")
+            or "Não informado"
+        ).strip()
+        if len(ultimo_atual) > 900:
+            ultimo_atual = ultimo_atual[:900].rstrip() + "..."
 
         self.crimes_cadastrados = TextInput(
             label=f"Crimes já cadastrados - {nome[:35]}",
@@ -2121,9 +2129,18 @@ class EditarCrimesProcuradoModal(Modal):
             required=False,
             max_length=1000,
         )
+        self.ultimo_avistamento = TextInput(
+            label="Último avistamento",
+            placeholder="Ex.: Vanila, próximo ao banco central",
+            style=discord.TextStyle.paragraph,
+            default=ultimo_atual,
+            required=False,
+            max_length=1000,
+        )
 
         self.add_item(self.crimes_cadastrados)
         self.add_item(self.novos_crimes)
+        self.add_item(self.ultimo_avistamento)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
@@ -2152,37 +2169,70 @@ class EditarCrimesProcuradoModal(Modal):
             return
 
         crimes_antigos = valor_crimes_registro(encontrado)
+        ultimo_antigo = str(
+            encontrado.get("ultimo_avistamento")
+            or encontrado.get("informacoes")
+            or "Não informado"
+        ).strip()
+
         crimes_editados = str(self.crimes_cadastrados.value or "").strip()
         crimes_adicionados = str(self.novos_crimes.value or "").strip()
         crimes_finais = juntar_crimes_procurado(crimes_editados, crimes_adicionados)
+        ultimo_novo = str(self.ultimo_avistamento.value or "").strip() or "Não informado"
 
-        if crimes_finais.strip() == crimes_antigos.strip():
+        crimes_alterados = crimes_finais.strip() != crimes_antigos.strip()
+        ultimo_alterado = ultimo_novo.strip() != ultimo_antigo.strip()
+
+        if not crimes_alterados and not ultimo_alterado:
             await interaction.followup.send(
-                "⚠️ Nenhum crime novo foi adicionado ou alterado.",
+                "⚠️ Nenhuma informação foi alterada.",
                 ephemeral=True,
             )
             return
 
-        encontrado["crimes"] = crimes_finais
-        encontrado.setdefault("historico_edicoes", []).append({
-            "data": agora_br(),
-            "tipo": "ALTERAÇÃO DE CRIMES",
-            "campo": "crimes",
-            "usuario": str(interaction.user),
-            "usuario_id": interaction.user.id,
-            "valor_anterior": crimes_antigos,
-            "valor_novo": crimes_finais,
-            "acrescimo": crimes_adicionados,
-        })
+        historico = encontrado.setdefault("historico_edicoes", [])
+
+        if crimes_alterados:
+            encontrado["crimes"] = crimes_finais
+            historico.append({
+                "data": agora_br(),
+                "tipo": "ALTERAÇÃO DE CRIMES",
+                "campo": "crimes",
+                "usuario": str(interaction.user),
+                "usuario_id": interaction.user.id,
+                "valor_anterior": crimes_antigos,
+                "valor_novo": crimes_finais,
+                "acrescimo": crimes_adicionados,
+            })
+
+        if ultimo_alterado:
+            encontrado["ultimo_avistamento"] = ultimo_novo
+            historico.append({
+                "data": agora_br(),
+                "tipo": "ALTERAÇÃO DE ÚLTIMO AVISTAMENTO",
+                "campo": "ultimo_avistamento",
+                "usuario": str(interaction.user),
+                "usuario_id": interaction.user.id,
+                "valor_anterior": ultimo_antigo,
+                "valor_novo": ultimo_novo,
+            })
 
         salvar_procurados(lista)
         gerar_catalogo_html()
         post_atualizado = await atualizar_post_procurado_discord(encontrado)
 
+        campos_alterados = []
+        if crimes_alterados:
+            campos_alterados.append("crimes")
+        if ultimo_alterado:
+            campos_alterados.append("último avistamento")
+
         await enviar_log(
             "✏️ **Procurado modificado**\n"
             f"Nome: {encontrado.get('nome')}\n"
             f"RG: {encontrado.get('rg')}\n"
+            f"Campos alterados: {', '.join(campos_alterados)}\n"
+            f"Último avistamento: {encontrado.get('ultimo_avistamento') or 'Não informado'}\n"
             f"Alterado por: {interaction.user.mention}\n"
             f"Post Discord atualizado: {'sim' if post_atualizado else 'não'}"
         )
@@ -2197,6 +2247,8 @@ class EditarCrimesProcuradoModal(Modal):
             f"✅ **Procurado atualizado com sucesso.**\n"
             f"👤 **Nome:** {encontrado.get('nome')}\n"
             f"🪪 **RG:** `{encontrado.get('rg')}`\n"
+            f"📍 **Último avistamento:** {encontrado.get('ultimo_avistamento') or 'Não informado'}\n"
+            f"📝 **Campos alterados:** {', '.join(campos_alterados)}\n"
             f"{aviso_post}\n"
             f"🔗 {CATALOG_PUBLIC_URL}",
             ephemeral=True,
@@ -2209,7 +2261,7 @@ class AbrirEdicaoProcuradoView(View):
         self.registro = dict(registro)
 
     @discord.ui.button(
-        label="Abrir edição de crimes",
+        label="Abrir edição do procurado",
         emoji="✏️",
         style=discord.ButtonStyle.primary,
     )
