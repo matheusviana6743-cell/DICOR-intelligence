@@ -23103,10 +23103,55 @@ def _salvar_tarefas(dados: Dict[str, Any]) -> None:
     _salvar_dict_json(TAREFAS_MESAS_JSON, dados)
 
 
-def _numero_tarefa_mesa(canal_id: int) -> int:
+def _numero_tarefa_mesa(mesa_canal_id: int) -> int:
     tarefas = _carregar_tarefas()
-    nums = [int(t.get('numero') or 0) for t in tarefas.values() if int(t.get('canal_id') or 0) == canal_id]
+    nums = [
+        int(t.get('numero') or 0)
+        for t in tarefas.values()
+        if int(t.get('mesa_canal_id') or t.get('canal_id') or 0) == mesa_canal_id
+    ]
     return max(nums, default=0) + 1
+
+
+async def _obter_topico_chat_mesa(canal: discord.abc.GuildChannel) -> Optional[discord.Thread]:
+    """Localiza o tópico 💬 Chat pertencente à mesa, sem criar outro tópico."""
+    guild = getattr(canal, 'guild', None)
+    if guild is None:
+        return None
+
+    # Caso a ação já tenha sido iniciada dentro do próprio Chat.
+    if isinstance(canal, discord.Thread) and 'chat' in str(canal.name).lower():
+        return canal
+
+    mesa_canal_id = int(getattr(canal, 'parent_id', 0) or getattr(canal, 'id', 0) or 0)
+    mesa = buscar_mesa_por_canal(mesa_canal_id) or {}
+
+    # Primeiro usa somente os tópicos registrados para esta mesa.
+    for topico_id in list(mesa.get('topicos_ids') or []):
+        topico = guild.get_thread(int(topico_id)) or guild.get_channel(int(topico_id))
+        if topico is None:
+            try:
+                topico = await guild.fetch_channel(int(topico_id))
+            except Exception:
+                topico = None
+        if isinstance(topico, discord.Thread) and 'chat' in str(topico.name).lower():
+            return topico
+
+    # Fallback para mesas antigas: procura um Chat cujo canal-pai seja esta mesa.
+    for topico in list(getattr(guild, 'threads', []) or []):
+        if int(getattr(topico, 'parent_id', 0) or 0) == mesa_canal_id and 'chat' in str(topico.name).lower():
+            return topico
+
+    try:
+        ativos = await guild.active_threads()
+        threads = getattr(ativos, 'threads', ativos)
+        for topico in list(threads or []):
+            if int(getattr(topico, 'parent_id', 0) or 0) == mesa_canal_id and 'chat' in str(topico.name).lower():
+                return topico
+    except Exception:
+        pass
+
+    return None
 
 
 def _texto_tarefa(t: Dict[str, Any]) -> str:
@@ -23127,34 +23172,68 @@ def _texto_tarefa(t: Dict[str, Any]) -> str:
 
 class ObjetivoTarefaModal(Modal, title='Criar Tarefa Investigativa'):
     objetivo = TextInput(label='Objetivo da tarefa', placeholder='Ex.: Fotografar a entrada e os veículos utilizados.', style=discord.TextStyle.paragraph, max_length=1000)
-    def __init__(self, responsavel_id: int):
-        super().__init__(); self.responsavel_id = responsavel_id
+
+    def __init__(self, responsavel_id: int, mesa_canal_id: int):
+        super().__init__()
+        self.responsavel_id = responsavel_id
+        self.mesa_canal_id = mesa_canal_id
+
     async def on_submit(self, interaction: discord.Interaction):
         if not usuario_e_administrador(interaction.user):
             return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
-        canal = interaction.channel
-        numero = _numero_tarefa_mesa(canal.id)
-        tarefa = {'numero':numero,'canal_id':canal.id,'objetivo':str(self.objetivo.value),'responsavel_id':self.responsavel_id,'criador_id':interaction.user.id,'status':'PENDENTE','criada_em':agora_br()}
+
         await interaction.response.defer(ephemeral=True, thinking=True)
-        msg = await canal.send(_texto_tarefa(tarefa), view=TarefaInvestigativaView())
+        canal_mesa = interaction.guild.get_channel(self.mesa_canal_id) if interaction.guild else None
+        if canal_mesa is None and interaction.guild:
+            try:
+                canal_mesa = await interaction.guild.fetch_channel(self.mesa_canal_id)
+            except Exception:
+                canal_mesa = None
+        if canal_mesa is None:
+            return await interaction.followup.send('❌ Não encontrei o canal principal desta mesa.', ephemeral=True)
+
+        topico_chat = await _obter_topico_chat_mesa(canal_mesa)
+        if topico_chat is None:
+            return await interaction.followup.send('❌ Não encontrei o tópico 💬 Chat desta mesa. Nenhum tópico novo foi criado.', ephemeral=True)
+
+        numero = _numero_tarefa_mesa(self.mesa_canal_id)
+        tarefa = {
+            'numero': numero,
+            'mesa_canal_id': self.mesa_canal_id,
+            'canal_id': topico_chat.id,
+            'objetivo': str(self.objetivo.value),
+            'responsavel_id': self.responsavel_id,
+            'criador_id': interaction.user.id,
+            'status': 'PENDENTE',
+            'criada_em': agora_br(),
+        }
+        msg = await topico_chat.send(_texto_tarefa(tarefa), view=TarefaInvestigativaView())
         tarefa['mensagem_id'] = msg.id
-        tarefas = _carregar_tarefas(); tarefas[str(msg.id)] = tarefa; _salvar_tarefas(tarefas)
-        await interaction.followup.send(f'✅ Tarefa Nº {numero:03d} criada para <@{self.responsavel_id}>.', ephemeral=True)
+        tarefas = _carregar_tarefas()
+        tarefas[str(msg.id)] = tarefa
+        _salvar_tarefas(tarefas)
+        await interaction.followup.send(
+            f'✅ Tarefa Nº {numero:03d} criada para <@{self.responsavel_id}> dentro de {topico_chat.mention}.',
+            ephemeral=True,
+        )
 
 
 class SelecionarResponsavelTarefa(discord.ui.UserSelect):
-    def __init__(self):
+    def __init__(self, mesa_canal_id: int):
         super().__init__(placeholder='Selecione o agente responsável', min_values=1, max_values=1)
+        self.mesa_canal_id = mesa_canal_id
+
     async def callback(self, interaction: discord.Interaction):
         membro = self.values[0]
         if getattr(membro, 'bot', False):
             return await interaction.response.send_message('❌ Selecione uma pessoa, não um bot.', ephemeral=True)
-        await interaction.response.send_modal(ObjetivoTarefaModal(membro.id))
+        await interaction.response.send_modal(ObjetivoTarefaModal(membro.id, self.mesa_canal_id))
 
 
 class SelecionarResponsavelTarefaView(View):
-    def __init__(self):
-        super().__init__(timeout=120); self.add_item(SelecionarResponsavelTarefa())
+    def __init__(self, mesa_canal_id: int):
+        super().__init__(timeout=120)
+        self.add_item(SelecionarResponsavelTarefa(mesa_canal_id))
 
 
 class TarefaInvestigativaView(View):
@@ -23194,10 +23273,18 @@ class GerenciamentoTarefasView(View):
             return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
         if not buscar_mesa_por_canal(interaction.channel.id):
             return await interaction.response.send_message('❌ Este painel só funciona dentro de uma mesa.', ephemeral=True)
-        await interaction.response.send_message('👤 Selecione o agente responsável:', view=SelecionarResponsavelTarefaView(), ephemeral=True)
+        await interaction.response.send_message(
+            '👤 Selecione o agente responsável:',
+            view=SelecionarResponsavelTarefaView(interaction.channel.id),
+            ephemeral=True,
+        )
     @discord.ui.button(label='Ver Tarefas Pendentes', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_mesa_ver_tarefas_v1')
     async def ver(self, interaction: discord.Interaction, button: Button):
-        tarefas = [t for t in _carregar_tarefas().values() if int(t.get('canal_id') or 0)==interaction.channel.id and t.get('status')!='CONCLUIDA']
+        tarefas = [
+            t for t in _carregar_tarefas().values()
+            if int(t.get('mesa_canal_id') or t.get('canal_id') or 0) == interaction.channel.id
+            and t.get('status') != 'CONCLUIDA'
+        ]
         tarefas.sort(key=lambda t:int(t.get('numero') or 0))
         if not tarefas:
             return await interaction.response.send_message('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
@@ -23606,6 +23693,143 @@ class PesquisaCrimeModal(Modal, title='Pesquisar Crime'):
             view=ResultadoPesquisaCrimeView(self.sessao_id, resultados),
             ephemeral=True,
         )
+
+
+# =====================================================
+# PATCH FINAL — PESQUISA DE CRIMES EM UMA ÚNICA MENSAGEM
+# =====================================================
+
+def _painel_crimes_da_sessao(sessao: Dict[str, Any]):
+    """Retorna o texto e a view corretos para criação ou edição."""
+    if sessao.get('tipo') == 'editar':
+        return _texto_painel_edicao_crimes(sessao), EditarCrimesPesquisaView()
+    return _texto_painel_pesquisa_crimes(sessao), PesquisaCrimesView()
+
+
+def _texto_resultados_crimes(sessao: Dict[str, Any], consulta: str, resultados: List[Dict[str, Any]]) -> str:
+    linhas = [
+        '⚖️ **RESULTADOS DA PESQUISA DE CRIMES**',
+        '',
+        f'🔎 Pesquisa: `{consulta}`',
+        'Clique no número do crime que deseja adicionar.',
+        '',
+    ]
+    for indice, crime in enumerate(resultados[:5], start=1):
+        linhas.extend([
+            f'**{indice}️⃣ Art. {crime["artigo"]} — {crime["nome"]}**',
+            f'Categoria: {crime.get("categoria", "Não informada")}',
+            f'Pena: **{int(crime.get("pena", 0))} meses** | Multa: **{_dinheiro_br(int(crime.get("multa", 0)))}**',
+            '',
+        ])
+    if len(resultados) > 5:
+        linhas.append(f'ℹ️ Foram encontrados {len(resultados)} resultados. Exibindo os 5 primeiros; refine a pesquisa para ver outros.')
+        linhas.append('')
+    linhas.append('**CRIMES JÁ SELECIONADOS:**')
+    linhas.append(_formatar_crimes_selecionados(list(sessao.get('artigos') or [])))
+    return '\n'.join(linhas)[:3900]
+
+
+class AdicionarCrimeResultadoButton(Button):
+    def __init__(self, sessao_id: str, crime: Dict[str, Any], numero: int):
+        super().__init__(
+            label=str(numero),
+            emoji=f'{numero}️⃣',
+            style=discord.ButtonStyle.blurple,
+            custom_id=f'dic_crime_resultado_{numero}_{str(crime.get("artigo", "")).replace(".", "_")}'[:100],
+            row=0,
+        )
+        self.sessao_id = str(sessao_id)
+        self.artigo = str(crime.get('artigo') or '')
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        if self.artigo and self.artigo not in artigos:
+            artigos.append(self.artigo)
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(self.sessao_id, sessao)
+        texto, view = _painel_crimes_da_sessao(sessao)
+        await interaction.response.edit_message(content='✅ **Crime adicionado com sucesso.**\n\n' + texto, view=view)
+
+
+class NovaPesquisaCrimeButton(Button):
+    def __init__(self, sessao_id: str):
+        super().__init__(label='Pesquisar Outro', emoji='🔎', style=discord.ButtonStyle.secondary, custom_id='dic_nova_pesquisa_crime_unica', row=1)
+        self.sessao_id = str(sessao_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        await interaction.response.send_modal(PesquisaCrimeModal(self.sessao_id))
+
+
+class VoltarPainelCrimesButton(Button):
+    def __init__(self, sessao_id: str):
+        super().__init__(label='Voltar', emoji='↩️', style=discord.ButtonStyle.secondary, custom_id='dic_voltar_painel_crimes_unico', row=1)
+        self.sessao_id = str(sessao_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        texto, view = _painel_crimes_da_sessao(sessao)
+        await interaction.response.edit_message(content=texto, view=view)
+
+
+class ResultadoPesquisaCrimeBotoesView(View):
+    def __init__(self, sessao_id: str, resultados: List[Dict[str, Any]]):
+        super().__init__(timeout=300)
+        for indice, crime in enumerate(resultados[:5], start=1):
+            self.add_item(AdicionarCrimeResultadoButton(sessao_id, crime, indice))
+        self.add_item(NovaPesquisaCrimeButton(sessao_id))
+        self.add_item(VoltarPainelCrimesButton(sessao_id))
+
+
+class PesquisaCrimeModal(Modal, title='Pesquisar Crime'):
+    consulta = TextInput(
+        label='Artigo ou nome do crime',
+        placeholder='Ex.: 6.4, tráfico, homicídio ou arma',
+        max_length=100,
+    )
+
+    def __init__(self, sessao_id: str):
+        super().__init__()
+        self.sessao_id = str(sessao_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        consulta = str(self.consulta.value).strip()
+        resultados = _buscar_crimes(consulta)
+        if not resultados:
+            return await interaction.response.send_message('🔎 Nenhum crime encontrado. Tente outro artigo ou nome.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            canal = interaction.guild.get_channel(int(sessao.get('canal_id') or 0)) if interaction.guild else None
+            if canal is None:
+                canal = bot.get_channel(int(sessao.get('canal_id') or 0))
+            if not canal or not sessao.get('painel_id'):
+                raise RuntimeError('painel da pesquisa não localizado')
+            mensagem = await canal.fetch_message(int(sessao['painel_id']))
+            await mensagem.edit(
+                content=_texto_resultados_crimes(sessao, consulta, resultados),
+                view=ResultadoPesquisaCrimeBotoesView(self.sessao_id, resultados),
+            )
+        except Exception as erro:
+            await interaction.followup.send(f'❌ Não foi possível atualizar o painel da pesquisa: {erro}', ephemeral=True)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
