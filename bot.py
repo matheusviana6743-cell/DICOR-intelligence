@@ -22532,5 +22532,211 @@ async def registrar_views_fotos_procurado_separadas() -> None:
         print(f'⚠️ Falha ao registrar views das fotos separadas: {erro}', flush=True)
 
 
+
+# =====================================================
+# PATCH FINAL — TROCA DE RESPONSÁVEL NO MESMO TÓPICO
+# =====================================================
+# Regra definitiva desta versão:
+# - o botão Trocar Responsável nunca cria, migra ou duplica o tópico;
+# - o boletim, mensagens, anexos e painel permanecem no tópico atual;
+# - em tópico privado, o responsável anterior é removido e o novo é adicionado;
+# - em tópico público legado, a associação é atualizada sem criar outro tópico.
+
+async def _trocar_agente_responsavel_boletim(
+    interaction: discord.Interaction,
+    atendimento_id: str,
+    novo_agente: discord.Member,
+) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Somente Inspetor, Vice-Diretor ou Diretor pode trocar o agente responsável.',
+            ephemeral=True,
+        )
+    if not isinstance(novo_agente, discord.Member) or novo_agente.bot:
+        return await interaction.response.send_message(
+            '❌ Selecione uma pessoa válida. Bots não podem ser responsáveis.',
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    atendimento = _atendimento_por_id(atendimento_id)
+    if not atendimento:
+        return await interaction.followup.send(
+            '❌ Atendimento não encontrado.', ephemeral=True
+        )
+
+    agente_antigo_id = int(atendimento.get('agente_id') or 0)
+    if agente_antigo_id == novo_agente.id:
+        return await interaction.followup.send(
+            '⚠️ Essa pessoa já é a responsável pelo boletim.', ephemeral=True
+        )
+
+    topico = await obter_canal_bot(
+        atendimento.get('thread_id') or atendimento.get('area_id')
+    )
+    if not isinstance(topico, discord.Thread):
+        return await interaction.followup.send(
+            '❌ O tópico deste boletim não foi localizado.', ephemeral=True
+        )
+
+    # Nunca cria outro tópico. O atendimento permanece exatamente no tópico atual.
+    try:
+        if bool(getattr(topico, 'archived', False)) or bool(getattr(topico, 'locked', False)):
+            await topico.edit(archived=False, locked=False)
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Não consegui destravar o tópico `{topico.id}` antes da troca: {erro}'
+        )
+
+    canal_pai = getattr(topico, 'parent', None)
+    topico_e_privado = _topico_privado(topico)
+    agente_antigo = (
+        interaction.guild.get_member(agente_antigo_id)
+        if interaction.guild and agente_antigo_id
+        else None
+    )
+
+    # Garante que o novo responsável consiga ver o canal pai e usar anexos.
+    if isinstance(canal_pai, discord.TextChannel):
+        try:
+            await _configurar_canal_pai_para_topicos_privados(canal_pai, novo_agente)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui preparar o canal pai para o novo responsável '
+                f'`{novo_agente.id}`: {erro}'
+            )
+
+    # Remove o antigo responsável da associação do tópico atual.
+    if isinstance(agente_antigo, discord.Member):
+        try:
+            await topico.remove_user(agente_antigo)
+        except discord.NotFound:
+            pass
+        except discord.Forbidden as erro:
+            await enviar_log(
+                f'⚠️ Sem permissão para remover o antigo responsável '
+                f'`{agente_antigo.id}` do tópico `{topico.id}`: {erro}'
+            )
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui remover o antigo responsável '
+                f'`{agente_antigo.id}` do tópico `{topico.id}`: {erro}'
+            )
+
+    # Adiciona o novo responsável no MESMO tópico.
+    try:
+        await topico.add_user(novo_agente)
+    except Exception as erro:
+        return await interaction.followup.send(
+            f'❌ Não consegui adicionar o novo responsável ao tópico atual: '
+            f'`{type(erro).__name__}: {erro}`',
+            ephemeral=True,
+        )
+
+    # Inspetor+ permanece com acesso ao mesmo tópico.
+    try:
+        await _adicionar_acessos_topico_privado(topico, novo_agente)
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Responsável adicionado, mas não consegui revisar os acessos '
+            f'de Inspetor+ no tópico `{topico.id}`: {erro}'
+        )
+
+    # Remove o overwrite individual do antigo responsável quando ele não precisa
+    # mais acessar nenhum outro boletim. Isso não mexe nos cargos ou no rodízio.
+    if (
+        isinstance(canal_pai, discord.TextChannel)
+        and isinstance(agente_antigo, discord.Member)
+        and not _agente_possui_cargo_padrao_boletim(agente_antigo)
+        and not _agente_tem_outro_boletim_ativo(
+            agente_antigo.id, str(atendimento.get('id'))
+        )
+    ):
+        try:
+            await canal_pai.set_permissions(
+                agente_antigo,
+                overwrite=None,
+                reason='Responsável removido deste boletim e sem outros atendimentos ativos',
+            )
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Não consegui retirar o acesso individual antigo '
+                f'`{agente_antigo.id}` do canal pai: {erro}'
+            )
+
+    atendimento.update({
+        'agente_id': novo_agente.id,
+        'agente_nome': str(novo_agente),
+        'agente_atribuido_por': f'MANUAL:{interaction.user.id}',
+        'agente_atribuido_em': agora_br(),
+        'status': 'EM ATENDIMENTO',
+        'area_id': topico.id,
+        'thread_id': topico.id,
+        'topico_privado': topico_e_privado,
+    })
+
+    historico = atendimento.get('historico', [])
+    if not isinstance(historico, list):
+        historico = []
+    historico.append({
+        'acao': 'Responsável alterado manualmente no mesmo tópico',
+        'usuario': str(interaction.user),
+        'usuario_id': interaction.user.id,
+        'agente_anterior_id': agente_antigo_id or None,
+        'agente_novo_id': novo_agente.id,
+        'agente_novo_nome': str(novo_agente),
+        'topico_id': topico.id,
+        'topico_mantido': True,
+        'rodizio_alterado': False,
+        'data': agora_br(),
+    })
+    atendimento['historico'] = historico[-2000:]
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    # Atualiza o painel existente; não envia outro boletim nem cria outro painel.
+    painel_id = int(atendimento.get('painel_msg_id') or 0)
+    if painel_id:
+        try:
+            painel = await topico.fetch_message(painel_id)
+            await painel.edit(
+                content=texto_painel_boletim(atendimento),
+                view=BoletimAtendimentoView(),
+            )
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Responsável alterado, mas o painel existente não foi editado: {erro}'
+            )
+
+    antigo_texto = agente_antigo.mention if agente_antigo else 'Não definido'
+    observacao_visibilidade = (
+        '🔐 O responsável anterior foi removido deste tópico privado.'
+        if topico_e_privado
+        else 'ℹ️ Este é um tópico público antigo; a visibilidade continua seguindo '
+             'as permissões do canal pai.'
+    )
+    await topico.send(
+        '🔄 **RESPONSÁVEL ALTERADO**\n'
+        f'**Anterior:** {antigo_texto}\n'
+        f'**Novo:** {novo_agente.mention}\n'
+        f'**Alterado por:** {interaction.user.mention}\n'
+        '📌 O boletim permaneceu neste mesmo tópico. Nenhum novo tópico foi criado.\n'
+        f'{observacao_visibilidade}\n'
+        '📎 Imagens e arquivos continuam liberados.',
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
+
+    await enviar_log(
+        f'🔄 Responsável do boletim `{atendimento.get("numero")}` alterado no mesmo tópico '
+        f'`{topico.id}` | antigo `{agente_antigo_id}` | novo `{novo_agente.id}` | '
+        f'autoridade `{interaction.user.id}` | rodízio preservado'
+    )
+    await interaction.followup.send(
+        f'✅ Responsável alterado para {novo_agente.mention} no mesmo tópico. '
+        'Nenhum tópico novo foi criado e o rodízio não foi modificado.',
+        ephemeral=True,
+    )
+
 if __name__ == '__main__':
     asyncio.run(main())
