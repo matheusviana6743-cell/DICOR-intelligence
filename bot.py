@@ -22738,5 +22738,874 @@ async def _trocar_agente_responsavel_boletim(
         ephemeral=True,
     )
 
+
+# =====================================================
+# PATCH FINAL — PESQUISA DE CRIMES + GERENCIAMENTO DE TAREFAS
+# =====================================================
+
+CRIMES_RP = [
+    # Crimes Contra a Vida
+    {"categoria":"Crimes Contra a Vida","artigo":"1.1","nome":"Homicídio","descricao":"Quando uma pessoa pratica ação premeditada com a intenção de causar a morte de outra pessoa, consumando o resultado morte.","pena":35,"multa":5250},
+    {"categoria":"Crimes Contra a Vida","artigo":"1.2","nome":"Tentativa de Homicídio","descricao":"Quando uma pessoa pratica ação deliberada e maliciosa, com intenção clara de causar a morte de outra pessoa, mas não obtém sucesso, não ocorrendo o óbito.","pena":20,"multa":2660},
+    # Direitos Fundamentais
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.1","nome":"Lesão Corporal","descricao":"Causar danos significativos a outra pessoa através do toque intencional ofensivo ou prejudicial sem consentimento.","pena":5,"multa":2100},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.2","nome":"Sequestro","descricao":"Apreender, levar ou deter ilegalmente uma pessoa contra a sua vontade, mediante uso de força ou fraude.","pena":15,"multa":3500},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.2.1","nome":"Sequestro de Oficial","descricao":"Apreender, deter ou manter sob restrição de liberdade oficial da lei ou agente público no exercício da função.","pena":200,"multa":50000},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.3","nome":"Cárcere Privado","descricao":"Deter, prender ou manter alguém indevidamente e contra sua vontade, restringindo sua liberdade de locomoção.","pena":10,"multa":1750},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.5","nome":"Prisão Militar","descricao":"Quando oficial da lei deixa de cumprir ordem direta ou age em desacordo com as normas de conduta.","pena":40,"multa":0},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.6","nome":"Prevaricação","descricao":"Funcionário público que retarda, deixa de praticar ou pratica ato de ofício em desacordo com a lei.","pena":40,"multa":6300},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.7","nome":"Obstrução de Justiça","descricao":"Obstruir, dificultar ou impedir o cumprimento de mandado judicial ou a execução da lei.","pena":10,"multa":3000},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.8","nome":"Tentativa de Suborno","descricao":"Tentar obter vantagem ilícita junto à defensoria ou autoridade.","pena":20,"multa":5600},
+    {"categoria":"Crimes Contra Direitos Fundamentais","artigo":"2.9","nome":"Bagunça em Área Militar","descricao":"Provocar desordem, tumulto ou perturbação em área militar, quartel ou instalação de segurança.","pena":300,"multa":50000},
+    # Patrimônio
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.1","nome":"Furto","descricao":"Subtrair, para si ou para outrem, coisa alheia móvel.","pena":10,"multa":2100},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.2","nome":"Receptação de Veículos","descricao":"Possuir, deter ou manter sob sua posse veículo proveniente de roubo ou furto.","pena":5,"multa":2100},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.3","nome":"Tentativa de Furto","descricao":"Tentar subtrair coisa alheia móvel, sem consumar o resultado.","pena":5,"multa":1050},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.4","nome":"Furto de Veículos","descricao":"Subtrair veículo pertencente a terceiro.","pena":5,"multa":2100},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.5","nome":"Invasão de Imóvel","descricao":"Entrar ou permanecer em imóvel alheio sem permissão.","pena":20,"multa":5600},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.6","nome":"Roubo","descricao":"Subtrair materiais, bens ou equipamentos pertencentes a outrem.","pena":15,"multa":2100},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.7","nome":"Roubo/Furto de Viatura","descricao":"Subtrair ou tentar subtrair viatura de serviço público para uso pessoal.","pena":100,"multa":14000},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.8","nome":"Estabelecimento não Licenciado","descricao":"Manter comércio ou estabelecimento sem alvará válido.","pena":0,"multa":15000},
+    {"categoria":"Crimes Contra o Patrimônio","artigo":"3.9","nome":"Falsificação de Documento de Alvará","descricao":"Utilizar documento de alvará falsificado ou não expedido pelo tribunal competente.","pena":25,"multa":10000},
+    # Roubos e Extorsão
+    {"categoria":"Dos Roubos e da Extorsão","artigo":"4.1","nome":"Assalto","descricao":"Subtrair coisa móvel alheia mediante grave ameaça ou violência.","pena":10,"multa":3500},
+    {"categoria":"Dos Roubos e da Extorsão","artigo":"4.2","nome":"Furto a Caixa Eletrônico","descricao":"Furtar, violar ou subtrair caixa eletrônico, registradora ou equivalente.","pena":10,"multa":3500},
+    {"categoria":"Dos Roubos e da Extorsão","artigo":"4.3","nome":"Extorsão","descricao":"Constranger alguém mediante violência ou grave ameaça para obter vantagem econômica indevida.","pena":10,"multa":3500},
+    # Armas e Equipamentos
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.3","nome":"Tráfico de Armas","descricao":"Possuir, transportar ou comercializar três ou mais armamentos.","pena":30,"multa":10500},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.4","nome":"Porte de Arma Pesada","descricao":"Portar armamento de uso pesado.","pena":15,"multa":5250},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.5","nome":"Porte de Arma Leve","descricao":"Portar armamento de uso leve.","pena":10,"multa":2450},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.6","nome":"Posse de Munição (-250)","descricao":"Manter sob posse munição em quantidade inferior a 250 unidades.","pena":5,"multa":1750},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.7","nome":"Posse de Arma Branca","descricao":"Manter sob posse objeto utilizado como arma corpo a corpo.","pena":5,"multa":0},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.8","nome":"Tráfico de Munição (+250)","descricao":"Porte ou posse de 250 ou mais munições.","pena":30,"multa":7000},
+    {"categoria":"Crimes de Porte, Posse e Equipamentos Ilegais","artigo":"5.10","nome":"Posse de Materiais Ilegais","descricao":"Posse de mais de um material da mesma espécie com indícios de finalidade criminosa.","pena":5,"multa":2450},
+    # Narcotráfico
+    {"categoria":"Narcotráfico","artigo":"6.3","nome":"Posse de Drogas (1 a 6)","descricao":"Manter sob posse quantidade de drogas entre uma e seis unidades.","pena":0,"multa":0},
+    {"categoria":"Narcotráfico","artigo":"6.4","nome":"Tráfico de Drogas","descricao":"Posse cumulativa de sete ou mais unidades de drogas.","pena":25,"multa":8750},
+    # Honra
+    {"categoria":"Crimes Contra a Honra","artigo":"8.1","nome":"Falsidade Ideológica","descricao":"Passar-se ou identificar-se falsamente como advogado, policial ou funcionário do governo.","pena":250,"multa":50000},
+    {"categoria":"Crimes Contra a Honra","artigo":"8.3","nome":"Formação de Quadrilha","descricao":"Associação de quatro ou mais pessoas com objetivo de cometer delitos.","pena":10,"multa":2800},
+    {"categoria":"Crimes Contra a Honra","artigo":"8.4","nome":"Associação Criminosa","descricao":"Associação de duas ou mais pessoas com finalidade de cometer delitos.","pena":10,"multa":1400},
+    {"categoria":"Crimes Contra a Honra","artigo":"8.5","nome":"Desordem em Tribunal","descricao":"Perturbar a ordem durante audiência no tribunal.","pena":5,"multa":0},
+    # Menores
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.1","nome":"Ameaça","descricao":"Colocar pessoa em estado de medo quanto à possibilidade de sofrer lesões.","pena":10,"multa":1400},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.3","nome":"Desobediência","descricao":"Descumprimento de ordem legal emanada por policial.","pena":10,"multa":1400},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.8","nome":"Vandalismo","descricao":"Destruir, inutilizar ou deteriorar bem alheio.","pena":10,"multa":3500},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.8.1","nome":"Dano ao Patrimônio Público","descricao":"Causar danos a bens do Governo ou administração pública.","pena":15,"multa":0},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.9","nome":"Abuso de Autoridade","descricao":"Agente público utiliza o cargo para constranger, ameaçar ou agredir cidadão.","pena":10,"multa":10500},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.10","nome":"Uso de Máscara","descricao":"Utilizar meio que impeça identificação por agente da lei.","pena":10,"multa":5600},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.11","nome":"Uso de Equipamentos Restritos","descricao":"Utilizar equipamentos balísticos ou restritos sem autorização.","pena":10,"multa":5600},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.19","nome":"Omissão de Socorro","descricao":"Deixar de prestar assistência à pessoa em grave perigo.","pena":10,"multa":3500},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.20","nome":"Bloqueio de Via Pública","descricao":"Interromper circulação em via pública com veículo ou material.","pena":10,"multa":5600},
+    {"categoria":"Infrações Penais / Crimes Menores","artigo":"10.21","nome":"Desordem em Local Público","descricao":"Provocar tumulto, desordem ou pânico em local público.","pena":30,"multa":5600},
+    # Trânsito
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.1","nome":"Tentativa de Fuga","descricao":"Desobediência à ordem de parada emitida por oficial da lei.","pena":10,"multa":1400},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.4","nome":"Corridas Ilegais","descricao":"Participar, promover ou organizar corridas ilegais.","pena":20,"multa":2100},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.6","nome":"Estacionar em Local Proibido","descricao":"Estacionar em local não permitido.","pena":0,"multa":1400},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.7","nome":"Pousar em Local Proibido","descricao":"Pousar aeronave em local inadequado ou não autorizado.","pena":0,"multa":7000},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.8","nome":"Manobra Imprudente com Aeronave","descricao":"Manobrar aeronave de forma imprudente.","pena":0,"multa":35000},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.9","nome":"Veículo Abandonado","descricao":"Abandonar veículo em local indevido causando obstrução.","pena":0,"multa":1050},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.11","nome":"Dano ao Patrimônio","descricao":"Utilizar veículo para causar dano ao patrimônio alheio.","pena":0,"multa":1400},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.12","nome":"Veículo Danificado","descricao":"Trafegar com veículo em condições inadequadas.","pena":0,"multa":1400},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.13","nome":"Bloquear ou Danificar Viatura","descricao":"Impedir, bloquear ou dificultar passagem de viatura oficial.","pena":0,"multa":2100},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.15","nome":"Conduzir sem Habilitação","descricao":"Conduzir veículo sem habilitação válida.","pena":0,"multa":1400},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.16","nome":"Homicídio Culposo no Trânsito","descricao":"Causar morte sem intenção em acidente de trânsito.","pena":5,"multa":3500},
+    {"categoria":"Das Violações no Trânsito (CTB)","artigo":"11.17","nome":"Tentativa de Homicídio no Trânsito","descricao":"Conduta no trânsito com intenção de causar morte, não consumada.","pena":5,"multa":3500},
+    # Ações Fechadas
+    *[{"categoria":"Ações Fechadas","artigo":a,"nome":n,"descricao":d,"pena":p,"multa":m} for a,n,d,p,m in [
+        ("12.1","Barbearia","Roubo ou assalto à barbearia.",25,5000),("12.2","Loja de Armas","Roubo ou assalto à loja de armas.",30,6000),("12.3","Loja de Conveniência","Roubo ou assalto à loja de conveniência.",35,7500),("12.4","Banco Central com Refém + Sem fuga","Assalto ao Banco Central com reféns e sem fuga.",65,16000),("12.5","Banco Central com Refém + fuga","Assalto ao Banco Central com reféns e fuga.",60,14000),("12.6","Banco Central sem Refém","Assalto ao Banco Central sem reféns.",55,12500),("12.7","Banco de Paleto","Assalto ao Banco de Paleto.",50,15000),("12.8","Banco Flecca","Assalto ao Banco Flecca.",45,12000),("12.9","Galinheiro","Roubo ou assalto ao galinheiro.",45,12000),("12.10","Açougue","Roubo ou assalto ao açougue.",45,12000),("12.11","Nióbio","Roubo ou extração ilegal de nióbio.",40,12000),("12.12","Joalheria","Assalto à joalheria.",45,12000),("12.13","Concessionária","Assalto à concessionária.",48,15000)
+    ]],
+    # Agravantes
+    {"categoria":"Agravantes","artigo":"14.1","nome":"Desacato à Autoridade","descricao":"Desacatar ou desrespeitar funcionário público no exercício da função.","pena":5,"multa":1400},
+    {"categoria":"Agravantes","artigo":"14.2","nome":"Resistência à Prisão","descricao":"Uso de força para impedir prisão ou dificultar algemamento.","pena":5,"multa":50000},
+    {"categoria":"Agravantes","artigo":"14.3","nome":"Discriminação / Assédio (Feminino)","descricao":"Atos discriminatórios, ofensivos ou intimidatórios contra mulher em razão do gênero.","pena":30,"multa":5000},
+]
+
+CRIMES_SESSOES_JSON = DATA_DIR / 'crimes_sessoes.json'
+TAREFAS_MESAS_JSON = DATA_DIR / 'tarefas_mesas.json'
+
+
+def _carregar_dict_json(caminho: Path) -> Dict[str, Any]:
+    dados = carregar_json(caminho, {})
+    return dados if isinstance(dados, dict) else {}
+
+
+def _salvar_dict_json(caminho: Path, dados: Dict[str, Any]) -> None:
+    salvar_json(caminho, dados)
+
+
+def _normalizar_pesquisa_crime(valor: Any) -> str:
+    texto = unicodedata.normalize('NFKD', str(valor or '').lower())
+    return ''.join(c for c in texto if not unicodedata.combining(c)).strip()
+
+
+def _buscar_crimes(consulta: str) -> List[Dict[str, Any]]:
+    q = _normalizar_pesquisa_crime(consulta).replace('art.', '').strip()
+    resultados = []
+    for crime in CRIMES_RP:
+        alvo = _normalizar_pesquisa_crime(
+            f"{crime['artigo']} {crime['nome']} {crime['categoria']} {crime.get('descricao','')}"
+        )
+        if q and q in alvo:
+            resultados.append(crime)
+    resultados.sort(key=lambda c: (0 if _normalizar_pesquisa_crime(c['artigo']) == q else 1, c['artigo']))
+    return resultados[:25]
+
+
+def _dinheiro_br(valor: int) -> str:
+    return f"R$ {int(valor):,}".replace(',', '.')
+
+
+def _formatar_crimes_selecionados(artigos: List[str]) -> str:
+    escolhidos = [c for a in artigos for c in CRIMES_RP if c['artigo'] == a]
+    linhas = []
+    for c in escolhidos:
+        linhas.append(
+            f"• Art. {c['artigo']} — {c['nome']}\n"
+            f"  Pena: {c['pena']} meses | Multa: {_dinheiro_br(c['multa'])}"
+        )
+    pena = sum(c['pena'] for c in escolhidos)
+    multa = sum(c['multa'] for c in escolhidos)
+    if linhas:
+        linhas.append(f"\nTOTAL — Pena: {pena} meses | Multa: {_dinheiro_br(multa)}")
+    return '\n'.join(linhas) or 'Nenhum crime selecionado.'
+
+
+def _obter_sessao_crime(sessao_id: str) -> Optional[Dict[str, Any]]:
+    return _carregar_dict_json(CRIMES_SESSOES_JSON).get(str(sessao_id))
+
+
+def _salvar_sessao_crime(sessao_id: str, sessao: Dict[str, Any]) -> None:
+    sessoes = _carregar_dict_json(CRIMES_SESSOES_JSON)
+    sessoes[str(sessao_id)] = sessao
+    _salvar_dict_json(CRIMES_SESSOES_JSON, sessoes)
+
+
+def _apagar_sessao_crime(sessao_id: str) -> None:
+    sessoes = _carregar_dict_json(CRIMES_SESSOES_JSON)
+    sessoes.pop(str(sessao_id), None)
+    _salvar_dict_json(CRIMES_SESSOES_JSON, sessoes)
+
+
+class ResultadoPesquisaCrimeSelect(discord.ui.Select):
+    def __init__(self, sessao_id: str, resultados: List[Dict[str, Any]]):
+        self.sessao_id = sessao_id
+        options = [
+            discord.SelectOption(
+                label=f"Art. {c['artigo']} — {c['nome']}"[:100],
+                description=f"{c['pena']} meses | {_dinheiro_br(c['multa'])}"[:100],
+                value=c['artigo'],
+            ) for c in resultados[:25]
+        ]
+        super().__init__(
+            placeholder='Selecione um ou mais crimes encontrados',
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        for artigo in self.values:
+            if artigo not in artigos:
+                artigos.append(artigo)
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(self.sessao_id, sessao)
+        await interaction.response.send_message(
+            '✅ Crime(s) adicionado(s).\n\n' + _formatar_crimes_selecionados(artigos),
+            ephemeral=True,
+        )
+        try:
+            canal = bot.get_channel(int(sessao.get('canal_id') or 0))
+            if canal and sessao.get('painel_id'):
+                msg = await canal.fetch_message(int(sessao['painel_id']))
+                await msg.edit(content=_texto_painel_pesquisa_crimes(sessao), view=PesquisaCrimesView())
+        except Exception:
+            pass
+
+
+class ResultadoPesquisaCrimeView(View):
+    def __init__(self, sessao_id: str, resultados: List[Dict[str, Any]]):
+        super().__init__(timeout=180)
+        self.add_item(ResultadoPesquisaCrimeSelect(sessao_id, resultados))
+
+
+class PesquisaCrimeModal(Modal, title='Pesquisar Crime'):
+    consulta = TextInput(label='Artigo ou nome do crime', placeholder='Ex.: 6.4, tráfico, homicídio ou arma', max_length=100)
+
+    def __init__(self, sessao_id: str):
+        super().__init__()
+        self.sessao_id = sessao_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        resultados = _buscar_crimes(str(self.consulta.value))
+        if not resultados:
+            return await interaction.response.send_message('🔎 Nenhum crime encontrado. Tente outro artigo ou nome.', ephemeral=True)
+        await interaction.response.send_message(
+            f'🔎 **Resultados para:** `{self.consulta.value}`\nSelecione o(s) crime(s) desejado(s):',
+            view=ResultadoPesquisaCrimeView(self.sessao_id, resultados),
+            ephemeral=True,
+        )
+
+
+def _texto_painel_pesquisa_crimes(sessao: Dict[str, Any]) -> str:
+    return (
+        '⚖️ **PESQUISA E SELEÇÃO DE CRIMES**\n\n'
+        f"👤 **Procurado:** {sessao.get('nome','Não informado')}\n"
+        f"🪪 **RG:** `{sessao.get('rg','Não informado')}`\n\n"
+        'Use **Pesquisar Crime** e digite o artigo ou o nome. Você pode repetir a pesquisa para adicionar vários crimes.\n\n'
+        '**CRIMES SELECIONADOS:**\n' + _formatar_crimes_selecionados(list(sessao.get('artigos') or []))
+    )
+
+
+class PesquisaCrimesView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _sessao_id(self, interaction: discord.Interaction) -> str:
+        return str(getattr(interaction.message, 'id', ''))
+
+    @discord.ui.button(label='Pesquisar Crime', emoji='🔎', style=discord.ButtonStyle.blurple, custom_id='dic_pesquisar_crime_v1')
+    async def pesquisar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de crimes não encontrada.', ephemeral=True)
+        await interaction.response.send_modal(PesquisaCrimeModal(sid))
+
+    @discord.ui.button(label='Remover Último', emoji='↩️', style=discord.ButtonStyle.secondary, custom_id='dic_remover_ultimo_crime_v1')
+    async def remover(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão não encontrada.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta sessão pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        if artigos:
+            artigos.pop()
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(sid, sessao)
+        await interaction.response.edit_message(content=_texto_painel_pesquisa_crimes(sessao), view=self)
+
+    @discord.ui.button(label='Finalizar Crimes', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_finalizar_crimes_v1')
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão não encontrada.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta sessão pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        if not artigos:
+            return await interaction.response.send_message('❌ Pesquise e selecione pelo menos um crime.', ephemeral=True)
+        crimes_texto = _formatar_crimes_selecionados(artigos)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if sessao.get('tipo') == 'painel':
+            canal = interaction.channel
+            dados = cadastros_pendentes.get(canal.id, {})
+            dados['crimes'] = crimes_texto
+            dados['crimes_artigos'] = artigos
+            dados['etapa_fotos'] = 'aguardando_foto_individuo'
+            cadastros_pendentes[canal.id] = dados
+            salvar_cadastros_pendentes()
+            await interaction.message.edit(content=_texto_painel_pesquisa_crimes(sessao) + '\n\n✅ **Seleção finalizada.**', view=None)
+            prompt = await canal.send(
+                '👤 **ETAPA 1 DE 2 — FOTO DO INDIVÍDUO**\n\nEnvie **uma nova mensagem contendo somente a foto do indivíduo**.\nNão envie a foto do RG nesta etapa.\n\nDepois clique em **Confirmar Foto do Indivíduo**.',
+                view=FotoIndividuoProcuradoPainelView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            dados['foto_individuo_prompt_id'] = prompt.id
+            cadastros_pendentes[canal.id] = dados
+            salvar_cadastros_pendentes()
+        else:
+            dados = dict(sessao.get('dados') or {})
+            dados['crimes'] = crimes_texto
+            dados['crimes_artigos'] = artigos
+            await interaction.message.edit(content=_texto_painel_pesquisa_crimes(sessao) + '\n\n✅ **Seleção finalizada.**', view=None)
+            await solicitar_autorizacao_procurado_boletim(interaction, dados)
+        _apagar_sessao_crime(sid)
+        await interaction.followup.send('✅ Crimes finalizados. Continue a próxima etapa.', ephemeral=True)
+
+
+class NovoProcuradoModal(Modal, title='Cadastrar Novo Procurado'):
+    nome = TextInput(label='Nome', placeholder='Nome do procurado', max_length=100)
+    rg = TextInput(label='RG', placeholder='RG do procurado', max_length=50)
+    ultimo = TextInput(label='Último Avistamento', placeholder="Ex: Caixa d'água", style=discord.TextStyle.paragraph, max_length=600)
+    numero_boletim = TextInput(label='Número do boletim', placeholder='Ex: 1, 01 ou 001', max_length=20, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if not guild:
+            return await interaction.response.send_message('❌ Use dentro de um servidor.', ephemeral=True)
+        existente = procurar_por_rg(str(self.rg.value))
+        if existente:
+            return await interaction.response.send_message('⚠️ Este RG já está cadastrado.', view=AbrirEdicaoProcuradoView(existente), ephemeral=True)
+        numero = normalizar_boletim_procurado(str(self.numero_boletim.value))
+        if not numero:
+            return await interaction.response.send_message('❌ Número do boletim inválido.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        categoria = guild.get_channel(PROCURADOS_TEMP_CATEGORY_ID) if PROCURADOS_TEMP_CATEGORY_ID else None
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True)}
+        if guild.me:
+            overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, attach_files=True)
+        for cargo_id in set(CARGOS_ADMIN_IDS + CARGOS_EQUIPE_IDS):
+            cargo = guild.get_role(cargo_id)
+            if cargo:
+                overwrites[cargo] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+        canal = await guild.create_text_channel(name=f"📸・procurado-{slugify(str(self.nome.value))}", category=categoria, overwrites=overwrites)
+        dados = {'nome':str(self.nome.value),'rg':str(self.rg.value),'ultimo_avistamento':str(self.ultimo.value),'numero_boletim':numero,'autor_id':interaction.user.id,'autor_nome':str(interaction.user),'etapa_fotos':'aguardando_crimes'}
+        cadastros_pendentes[canal.id] = dados
+        salvar_cadastros_pendentes()
+        painel = await canal.send('Preparando pesquisa de crimes...')
+        sessao = {'tipo':'painel','canal_id':canal.id,'painel_id':painel.id,'autor_id':interaction.user.id,'nome':dados['nome'],'rg':dados['rg'],'artigos':[]}
+        _salvar_sessao_crime(str(painel.id), sessao)
+        await painel.edit(content=_texto_painel_pesquisa_crimes(sessao), view=PesquisaCrimesView())
+        await interaction.followup.send(f'✅ Canal provisório criado: {canal.mention}\nComece pesquisando os crimes.', ephemeral=True)
+
+
+class ProcuradoBoletimModal(Modal, title='Cadastrar como Procurado'):
+    nome = TextInput(label='Nome', max_length=120, required=True)
+    rg = TextInput(label='RG', max_length=50, required=True)
+    ultimo_avistamento = TextInput(label='Último avistamento', placeholder='Ex.: Vanilla, praça central ou comunidade', style=discord.TextStyle.paragraph, max_length=700, required=True)
+    detalhes = TextInput(label='Características / outras informações', style=discord.TextStyle.paragraph, max_length=900, required=False)
+
+    def __init__(self, dados: Optional[Dict[str, str]] = None):
+        super().__init__()
+        dados = dados or {}
+        for campo, valor in [(self.nome,dados.get('nome','')),(self.rg,dados.get('rg','')),(self.ultimo_avistamento,dados.get('ultimo_avistamento') or dados.get('outras') or ''),(self.detalhes,dados.get('caracteristicas') or dados.get('outras_informacoes') or '')]:
+            try: campo.default = str(valor or '')[:campo.max_length]
+            except Exception: pass
+
+    async def on_submit(self, interaction: discord.Interaction):
+        detalhes = str(self.detalhes.value or 'Não informado').strip() or 'Não informado'
+        dados = {'nome':str(self.nome.value).strip(),'rg':str(self.rg.value).strip(),'ultimo_avistamento':str(self.ultimo_avistamento.value).strip(),'caracteristicas':detalhes,'outras':detalhes,'outras_informacoes':detalhes}
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        painel = await interaction.channel.send('Preparando pesquisa de crimes...')
+        sessao = {'tipo':'boletim','canal_id':interaction.channel.id,'painel_id':painel.id,'autor_id':interaction.user.id,'nome':dados['nome'],'rg':dados['rg'],'artigos':[],'dados':dados}
+        _salvar_sessao_crime(str(painel.id), sessao)
+        await painel.edit(content=_texto_painel_pesquisa_crimes(sessao), view=PesquisaCrimesView())
+        await interaction.followup.send('✅ Pesquisa de crimes aberta neste mesmo tópico.', ephemeral=True)
+
+
+# ----------------------- TAREFAS NAS MESAS -----------------------
+
+def _carregar_tarefas() -> Dict[str, Any]:
+    return _carregar_dict_json(TAREFAS_MESAS_JSON)
+
+
+def _salvar_tarefas(dados: Dict[str, Any]) -> None:
+    _salvar_dict_json(TAREFAS_MESAS_JSON, dados)
+
+
+def _numero_tarefa_mesa(canal_id: int) -> int:
+    tarefas = _carregar_tarefas()
+    nums = [int(t.get('numero') or 0) for t in tarefas.values() if int(t.get('canal_id') or 0) == canal_id]
+    return max(nums, default=0) + 1
+
+
+def _texto_tarefa(t: Dict[str, Any]) -> str:
+    status = t.get('status','PENDENTE')
+    status_txt = {'PENDENTE':'⏳ Pendente','AGUARDANDO_ENCERRAMENTO':'🟡 Aguardando encerramento','CONCLUIDA':'✅ Concluída'}.get(status,status)
+    texto = (
+        f"✅ **TAREFA INVESTIGATIVA Nº {int(t.get('numero',0)):03d}**\n\n"
+        f"**Objetivo:**\n{t.get('objetivo','Não informado')}\n\n"
+        f"**Responsável:**\n<@{t.get('responsavel_id')}>\n\n"
+        f"**Status:**\n{status_txt}"
+    )
+    if t.get('conclusao_solicitada_por_id'):
+        texto += f"\n\n**Conclusão solicitada por:** <@{t['conclusao_solicitada_por_id']}>"
+    if t.get('encerrada_por_id'):
+        texto += f"\n**Encerrada por:** <@{t['encerrada_por_id']}>\n**Data:** {t.get('encerrada_em')}"
+    return texto
+
+
+class ObjetivoTarefaModal(Modal, title='Criar Tarefa Investigativa'):
+    objetivo = TextInput(label='Objetivo da tarefa', placeholder='Ex.: Fotografar a entrada e os veículos utilizados.', style=discord.TextStyle.paragraph, max_length=1000)
+    def __init__(self, responsavel_id: int):
+        super().__init__(); self.responsavel_id = responsavel_id
+    async def on_submit(self, interaction: discord.Interaction):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+        canal = interaction.channel
+        numero = _numero_tarefa_mesa(canal.id)
+        tarefa = {'numero':numero,'canal_id':canal.id,'objetivo':str(self.objetivo.value),'responsavel_id':self.responsavel_id,'criador_id':interaction.user.id,'status':'PENDENTE','criada_em':agora_br()}
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        msg = await canal.send(_texto_tarefa(tarefa), view=TarefaInvestigativaView())
+        tarefa['mensagem_id'] = msg.id
+        tarefas = _carregar_tarefas(); tarefas[str(msg.id)] = tarefa; _salvar_tarefas(tarefas)
+        await interaction.followup.send(f'✅ Tarefa Nº {numero:03d} criada para <@{self.responsavel_id}>.', ephemeral=True)
+
+
+class SelecionarResponsavelTarefa(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder='Selecione o agente responsável', min_values=1, max_values=1)
+    async def callback(self, interaction: discord.Interaction):
+        membro = self.values[0]
+        if getattr(membro, 'bot', False):
+            return await interaction.response.send_message('❌ Selecione uma pessoa, não um bot.', ephemeral=True)
+        await interaction.response.send_modal(ObjetivoTarefaModal(membro.id))
+
+
+class SelecionarResponsavelTarefaView(View):
+    def __init__(self):
+        super().__init__(timeout=120); self.add_item(SelecionarResponsavelTarefa())
+
+
+class TarefaInvestigativaView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label='Marcar como Concluída', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_tarefa_marcar_concluida_v1')
+    async def marcar(self, interaction: discord.Interaction, button: Button):
+        tarefas = _carregar_tarefas(); tarefa = tarefas.get(str(interaction.message.id))
+        if not tarefa:
+            return await interaction.response.send_message('❌ Tarefa não encontrada.', ephemeral=True)
+        if interaction.user.id != int(tarefa.get('responsavel_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Apenas o responsável ou Inspetor+ pode concluir.', ephemeral=True)
+        if tarefa.get('status') == 'CONCLUIDA':
+            return await interaction.response.send_message('⚠️ Esta tarefa já foi encerrada.', ephemeral=True)
+        tarefa['status']='AGUARDANDO_ENCERRAMENTO'; tarefa['conclusao_solicitada_por_id']=interaction.user.id; tarefa['conclusao_solicitada_em']=agora_br(); tarefas[str(interaction.message.id)]=tarefa; _salvar_tarefas(tarefas)
+        await interaction.response.edit_message(content=_texto_tarefa(tarefa), view=self)
+    @discord.ui.button(label='Encerrar Tarefa', emoji='🔒', style=discord.ButtonStyle.red, custom_id='dic_tarefa_encerrar_v1')
+    async def encerrar(self, interaction: discord.Interaction, button: Button):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode encerrar tarefas.', ephemeral=True)
+        tarefas = _carregar_tarefas(); tarefa = tarefas.get(str(interaction.message.id))
+        if not tarefa:
+            return await interaction.response.send_message('❌ Tarefa não encontrada.', ephemeral=True)
+        if tarefa.get('status') != 'AGUARDANDO_ENCERRAMENTO':
+            return await interaction.response.send_message('⚠️ O responsável precisa marcar como concluída primeiro.', ephemeral=True)
+        tarefa['status']='CONCLUIDA'; tarefa['encerrada_por_id']=interaction.user.id; tarefa['encerrada_em']=agora_br(); tarefas[str(interaction.message.id)]=tarefa; _salvar_tarefas(tarefas)
+        for item in self.children: item.disabled=True
+        await interaction.response.edit_message(content=_texto_tarefa(tarefa), view=self)
+
+
+class GerenciamentoTarefasView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label='Criar Tarefa', emoji='➕', style=discord.ButtonStyle.green, custom_id='dic_mesa_criar_tarefa_v1')
+    async def criar(self, interaction: discord.Interaction, button: Button):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+        if not buscar_mesa_por_canal(interaction.channel.id):
+            return await interaction.response.send_message('❌ Este painel só funciona dentro de uma mesa.', ephemeral=True)
+        await interaction.response.send_message('👤 Selecione o agente responsável:', view=SelecionarResponsavelTarefaView(), ephemeral=True)
+    @discord.ui.button(label='Ver Tarefas Pendentes', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_mesa_ver_tarefas_v1')
+    async def ver(self, interaction: discord.Interaction, button: Button):
+        tarefas = [t for t in _carregar_tarefas().values() if int(t.get('canal_id') or 0)==interaction.channel.id and t.get('status')!='CONCLUIDA']
+        tarefas.sort(key=lambda t:int(t.get('numero') or 0))
+        if not tarefas:
+            return await interaction.response.send_message('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
+        linhas=[]
+        for t in tarefas[:25]:
+            st='⏳ Pendente' if t.get('status')=='PENDENTE' else '🟡 Aguardando encerramento'
+            linhas.append(f"**Nº {int(t.get('numero',0)):03d}** — {st}\nResponsável: <@{t.get('responsavel_id')}>\nObjetivo: {str(t.get('objetivo',''))[:180]}")
+        await interaction.response.send_message('📋 **TAREFAS PENDENTES DA MESA**\n\n'+'\n\n'.join(linhas), ephemeral=True)
+
+
+async def criar_mesa_core(interaction: discord.Interaction, apelido: str, familia: str, observacao: str = ''):
+    guild = interaction.guild
+    if guild is None:
+        return await responder_interacao(interaction, '❌ Use dentro de um servidor.', ephemeral=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    categoria = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
+    overwrites = cargos_equipe_permissoes(guild)
+    overwrites[interaction.user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True, send_messages_in_threads=True)
+    canal = await guild.create_text_channel(name=f"🕵️┃{slugify(apelido)}-{slugify(familia)}", category=categoria, overwrites=overwrites)
+    await canal.send(
+        f"🕵️ **Mesa de Investigação — {familia}**\n👮 **Agente:** {interaction.user.mention}\n📛 **Apelido:** {apelido}\n🏷️ **Organização/Família:** {familia}\n🕒 **Criada em:** {agora_br()}\n📝 **Observação:** {observacao or 'Nenhuma'}"
+    )
+    # Painel separado e no topo, antes dos tópicos e longe do botão Fechar Mesa.
+    await canal.send(
+        '✅ **GERENCIAMENTO DE TAREFAS**\n\nCrie tarefas investigativas e consulte as pendências desta mesa.',
+        view=GerenciamentoTarefasView(),
+    )
+    topicos_ids = await criar_topicos_reais_mesa(canal)
+    await canal.send('🔒 Para encerrar esta mesa, clique no botão abaixo.', view=FecharMesaView())
+    registrar_mesa({'canal_id':canal.id,'nome_canal':canal.name,'apelido':apelido,'familia':familia,'autor_id':interaction.user.id,'autor_nome':str(interaction.user),'status':'ABERTA','criada_em':agora_br(),'fechada_em':None,'topicos_ids':topicos_ids})
+    await enviar_log(f"➕ Mesa criada: {canal.mention} | Família: {familia} | Por: {interaction.user.mention}")
+    await responder_interacao(interaction, f'✅ Mesa criada: {canal.mention}', ephemeral=True)
+
+
+@bot.listen('on_ready')
+async def registrar_views_pesquisa_crimes_tarefas() -> None:
+    try:
+        bot.add_view(PesquisaCrimesView())
+        bot.add_view(GerenciamentoTarefasView())
+        bot.add_view(TarefaInvestigativaView())
+        print('✅ Views de pesquisa de crimes e tarefas registradas.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ Falha ao registrar views de crimes/tarefas: {erro}', flush=True)
+
+
+# =====================================================
+# PATCH FINAL — PESQUISA DE CRIMES NO EDITAR PROCURADO
+# =====================================================
+
+def _artigos_do_registro_procurado(registro: Dict[str, Any]) -> List[str]:
+    artigos = []
+    for artigo in list(registro.get('crimes_artigos') or []):
+        artigo = str(artigo).strip()
+        if artigo and any(c['artigo'] == artigo for c in CRIMES_RP) and artigo not in artigos:
+            artigos.append(artigo)
+    texto = valor_crimes_registro(registro)
+    for crime in CRIMES_RP:
+        padrao = rf"(?<![0-9.])(?:art\.?\s*)?{re.escape(crime['artigo'])}(?![0-9.])"
+        if re.search(padrao, texto, flags=re.IGNORECASE) and crime['artigo'] not in artigos:
+            artigos.append(crime['artigo'])
+    return artigos
+
+
+def _texto_legado_sem_artigos_conhecidos(registro: Dict[str, Any], artigos: List[str]) -> str:
+    texto = valor_crimes_registro(registro).strip()
+    if not texto:
+        return ''
+    # Registros criados pelo sistema de pesquisa já podem ser reconstruídos integralmente.
+    if artigos and ('TOTAL — Pena:' in texto or 'Pena:' in texto and 'Multa:' in texto):
+        return ''
+    return texto
+
+
+def _texto_painel_edicao_crimes(sessao: Dict[str, Any]) -> str:
+    legado = str(sessao.get('crimes_legado') or '').strip()
+    texto = (
+        '✏️ **EDITAR CRIMES DO PROCURADO**\n\n'
+        f"👤 **Procurado:** {sessao.get('nome','Não informado')}\n"
+        f"🪪 **RG:** `{sessao.get('rg','Não informado')}`\n\n"
+        'Use **Pesquisar Crime** para adicionar artigos pelo nome ou número.\n'
+        'Use **Remover Crime** para retirar um artigo selecionado.\n\n'
+        '**CRIMES SELECIONADOS:**\n' + _formatar_crimes_selecionados(list(sessao.get('artigos') or []))
+    )
+    if legado:
+        texto += '\n\n**TEXTO ANTIGO PRESERVADO:**\n' + legado[:1200]
+    return texto
+
+
+class RemoverCrimeEdicaoSelect(discord.ui.Select):
+    def __init__(self, sessao_id: str, artigos: List[str]):
+        self.sessao_id = sessao_id
+        options = []
+        for artigo in artigos[:25]:
+            crime = next((c for c in CRIMES_RP if c['artigo'] == artigo), None)
+            if crime:
+                options.append(discord.SelectOption(
+                    label=f"Art. {crime['artigo']} — {crime['nome']}"[:100],
+                    description=f"{crime['pena']} meses | {_dinheiro_br(crime['multa'])}"[:100],
+                    value=crime['artigo'],
+                ))
+        super().__init__(
+            placeholder='Selecione um ou mais crimes para remover',
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta edição expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.', ephemeral=True)
+        artigos = [a for a in list(sessao.get('artigos') or []) if a not in self.values]
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(self.sessao_id, sessao)
+        await interaction.response.send_message(
+            '✅ Crime(s) removido(s).\n\n' + _formatar_crimes_selecionados(artigos),
+            ephemeral=True,
+        )
+        try:
+            canal = bot.get_channel(int(sessao.get('canal_id') or 0))
+            if canal and sessao.get('painel_id'):
+                msg = await canal.fetch_message(int(sessao['painel_id']))
+                await msg.edit(content=_texto_painel_edicao_crimes(sessao), view=EditarCrimesPesquisaView())
+        except Exception:
+            pass
+
+
+class RemoverCrimeEdicaoView(View):
+    def __init__(self, sessao_id: str, artigos: List[str]):
+        super().__init__(timeout=180)
+        self.add_item(RemoverCrimeEdicaoSelect(sessao_id, artigos))
+
+
+class EditarUltimoAvistamentoModal(Modal, title='Editar Último Avistamento'):
+    ultimo = TextInput(
+        label='Último avistamento',
+        placeholder='Ex.: Vanilla, praça central ou comunidade',
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    def __init__(self, sessao_id: str, atual: str):
+        super().__init__()
+        self.sessao_id = sessao_id
+        self.ultimo.default = str(atual or 'Não informado')[:1000]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta edição expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.', ephemeral=True)
+        sessao['ultimo_avistamento'] = str(self.ultimo.value).strip() or 'Não informado'
+        _salvar_sessao_crime(self.sessao_id, sessao)
+        await interaction.response.send_message('✅ Último avistamento atualizado na sessão. Clique em **Salvar Alterações**.', ephemeral=True)
+
+
+class EditarCrimesPesquisaView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _sessao_id(self, interaction: discord.Interaction) -> str:
+        return str(getattr(interaction.message, 'id', ''))
+
+    @discord.ui.button(label='Pesquisar Crime', emoji='🔎', style=discord.ButtonStyle.blurple, custom_id='dic_editar_pesquisar_crime_v2')
+    async def pesquisar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de edição não encontrada.', ephemeral=True)
+        await interaction.response.send_modal(PesquisaCrimeModal(sid))
+
+    @discord.ui.button(label='Remover Crime', emoji='➖', style=discord.ButtonStyle.secondary, custom_id='dic_editar_remover_crime_v2')
+    async def remover(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de edição não encontrada.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        if not artigos:
+            return await interaction.response.send_message('⚠️ Não existem crimes selecionados para remover.', ephemeral=True)
+        await interaction.response.send_message(
+            '➖ Selecione os crimes que deseja remover:',
+            view=RemoverCrimeEdicaoView(sid, artigos),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label='Editar Último Avistamento', emoji='📍', style=discord.ButtonStyle.secondary, custom_id='dic_editar_ultimo_avistamento_v2')
+    async def editar_ultimo(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de edição não encontrada.', ephemeral=True)
+        await interaction.response.send_modal(
+            EditarUltimoAvistamentoModal(sid, str(sessao.get('ultimo_avistamento') or 'Não informado'))
+        )
+
+    @discord.ui.button(label='Salvar Alterações', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_editar_salvar_crimes_v2')
+    async def salvar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de edição não encontrada.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.', ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lista = carregar_procurados()
+        alvo = limpar_rg(sessao.get('rg', ''))
+        registro = next((p for p in lista if limpar_rg(p.get('rg','')) == alvo), None)
+        if not registro:
+            return await interaction.followup.send('❌ Esse procurado não existe mais no catálogo.', ephemeral=True)
+
+        artigos = list(sessao.get('artigos') or [])
+        legado = str(sessao.get('crimes_legado') or '').strip()
+        crimes_formatados = _formatar_crimes_selecionados(artigos) if artigos else ''
+        if crimes_formatados == 'Nenhum crime selecionado.':
+            crimes_formatados = ''
+        crimes_finais = '\n\n'.join(parte for parte in [crimes_formatados, legado] if parte).strip()
+        if not crimes_finais:
+            return await interaction.followup.send('❌ O procurado precisa permanecer com pelo menos um crime.', ephemeral=True)
+
+        crimes_antigos = valor_crimes_registro(registro)
+        ultimo_antigo = str(registro.get('ultimo_avistamento') or registro.get('informacoes') or 'Não informado').strip()
+        ultimo_novo = str(sessao.get('ultimo_avistamento') or ultimo_antigo or 'Não informado').strip()
+
+        registro['crimes'] = crimes_finais
+        registro['crimes_artigos'] = artigos
+        registro['ultimo_avistamento'] = ultimo_novo
+        historico = registro.setdefault('historico_edicoes', [])
+        historico.append({
+            'data': agora_br(),
+            'tipo': 'EDIÇÃO COM PESQUISA DE CRIMES',
+            'campo': 'crimes/ultimo_avistamento',
+            'usuario': str(interaction.user),
+            'usuario_id': interaction.user.id,
+            'valor_anterior': crimes_antigos,
+            'valor_novo': crimes_finais,
+            'ultimo_anterior': ultimo_antigo,
+            'ultimo_novo': ultimo_novo,
+            'artigos': artigos,
+        })
+        salvar_procurados(lista)
+        gerar_catalogo_html()
+        post_atualizado = await atualizar_post_procurado_discord(registro)
+
+        try:
+            await interaction.message.edit(
+                content=_texto_painel_edicao_crimes(sessao) + '\n\n✅ **ALTERAÇÕES SALVAS COM SUCESSO.**',
+                view=None,
+            )
+        except Exception:
+            pass
+        _apagar_sessao_crime(sid)
+        await enviar_log(
+            '✏️ **Procurado editado por pesquisa de crimes**\n'
+            f"Nome: {registro.get('nome')}\nRG: {registro.get('rg')}\n"
+            f"Artigos: {', '.join(artigos) or 'texto legado'}\n"
+            f"Último avistamento: {ultimo_novo}\nAlterado por: {interaction.user.mention}\n"
+            f"Post atualizado: {'sim' if post_atualizado else 'não'}"
+        )
+        await interaction.followup.send(
+            '✅ **Procurado atualizado com sucesso.**\n'
+            f"👤 **Nome:** {registro.get('nome')}\n"
+            f"🪪 **RG:** `{registro.get('rg')}`\n"
+            f"📍 **Último avistamento:** {ultimo_novo}\n"
+            f"⚖️ **Crimes:** {len(artigos)} artigo(s) selecionado(s)\n"
+            f"{'✅ Post oficial atualizado.' if post_atualizado else '⚠️ Catálogo atualizado, mas o post antigo não foi localizado.'}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label='Cancelar', emoji='✖️', style=discord.ButtonStyle.red, custom_id='dic_editar_cancelar_crimes_v2')
+    async def cancelar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message('❌ Sessão de edição não encontrada.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.', ephemeral=True)
+        _apagar_sessao_crime(sid)
+        await interaction.response.edit_message(content='✖️ Edição de procurado cancelada.', view=None)
+
+
+class AbrirEdicaoProcuradoView(View):
+    def __init__(self, registro: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.registro = dict(registro)
+
+    @discord.ui.button(label='Abrir pesquisa e edição', emoji='✏️', style=discord.ButtonStyle.primary)
+    async def abrir_edicao(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            return await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.', ephemeral=True)
+        alvo = limpar_rg(self.registro.get('rg',''))
+        registro = next((p for p in carregar_procurados() if limpar_rg(p.get('rg','')) == alvo), None)
+        if not registro:
+            return await interaction.response.send_message('❌ Esse procurado não existe mais no catálogo.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        artigos = _artigos_do_registro_procurado(registro)
+        sessao = {
+            'tipo': 'editar',
+            'canal_id': interaction.channel.id,
+            'autor_id': interaction.user.id,
+            'nome': registro.get('nome','Não informado'),
+            'rg': registro.get('rg',''),
+            'artigos': artigos,
+            'crimes_legado': _texto_legado_sem_artigos_conhecidos(registro, artigos),
+            'ultimo_avistamento': registro.get('ultimo_avistamento') or registro.get('informacoes') or 'Não informado',
+        }
+        painel = await interaction.channel.send('Preparando edição por pesquisa de crimes...')
+        sessao['painel_id'] = painel.id
+        _salvar_sessao_crime(str(painel.id), sessao)
+        await painel.edit(content=_texto_painel_edicao_crimes(sessao), view=EditarCrimesPesquisaView())
+        await interaction.followup.send(f'✅ Painel de edição aberto: {painel.jump_url}', ephemeral=True)
+
+
+class BuscarModificarProcuradoModal(Modal, title='Modificar Procurado'):
+    rg = TextInput(label='RG do procurado', placeholder='Digite o RG para localizar o cadastro', max_length=50)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            return await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.', ephemeral=True)
+        alvo = limpar_rg(str(self.rg.value))
+        encontrado = next((p for p in carregar_procurados() if limpar_rg(p.get('rg','')) == alvo), None)
+        if not encontrado:
+            return await interaction.response.send_message('❌ Não encontrei procurado com esse RG no catálogo.', ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Procurado localizado: **{encontrado.get('nome','Sem nome')}** — RG: `{encontrado.get('rg','')}`\n"
+            'Clique abaixo para pesquisar, adicionar ou remover crimes e editar o último avistamento.',
+            view=AbrirEdicaoProcuradoView(encontrado),
+            ephemeral=True,
+        )
+
+
+@bot.listen('on_ready')
+async def registrar_view_edicao_pesquisa_crimes() -> None:
+    try:
+        bot.add_view(EditarCrimesPesquisaView())
+        print('✅ View de edição por pesquisa de crimes registrada.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ Falha ao registrar view de edição de procurados: {erro}', flush=True)
+
+
+# Ajuste do seletor compartilhado: mantém o painel correto durante a edição.
+class ResultadoPesquisaCrimeSelect(discord.ui.Select):
+    def __init__(self, sessao_id: str, resultados: List[Dict[str, Any]]):
+        self.sessao_id = sessao_id
+        options = [
+            discord.SelectOption(
+                label=f"Art. {c['artigo']} — {c['nome']}"[:100],
+                description=f"{c['pena']} meses | {_dinheiro_br(c['multa'])}"[:100],
+                value=c['artigo'],
+            ) for c in resultados[:25]
+        ]
+        super().__init__(placeholder='Selecione um ou mais crimes encontrados', min_values=1, max_values=max(1, len(options)), options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        sessao = _obter_sessao_crime(self.sessao_id)
+        if not sessao:
+            return await interaction.response.send_message('❌ Esta pesquisa expirou.', ephemeral=True)
+        if interaction.user.id != int(sessao.get('autor_id') or 0) and not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Esta pesquisa pertence a outro usuário.', ephemeral=True)
+        artigos = list(sessao.get('artigos') or [])
+        for artigo in self.values:
+            if artigo not in artigos:
+                artigos.append(artigo)
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(self.sessao_id, sessao)
+        await interaction.response.send_message('✅ Crime(s) adicionado(s).\n\n' + _formatar_crimes_selecionados(artigos), ephemeral=True)
+        try:
+            canal = bot.get_channel(int(sessao.get('canal_id') or 0))
+            if canal and sessao.get('painel_id'):
+                msg = await canal.fetch_message(int(sessao['painel_id']))
+                if sessao.get('tipo') == 'editar':
+                    await msg.edit(content=_texto_painel_edicao_crimes(sessao), view=EditarCrimesPesquisaView())
+                else:
+                    await msg.edit(content=_texto_painel_pesquisa_crimes(sessao), view=PesquisaCrimesView())
+        except Exception as erro:
+            await enviar_log(f'⚠️ Não consegui atualizar o painel após pesquisar crime: {erro}')
+
+
+class ResultadoPesquisaCrimeView(View):
+    def __init__(self, sessao_id: str, resultados: List[Dict[str, Any]]):
+        super().__init__(timeout=180)
+        self.add_item(ResultadoPesquisaCrimeSelect(sessao_id, resultados))
+
+
+class PesquisaCrimeModal(Modal, title='Pesquisar Crime'):
+    consulta = TextInput(label='Artigo ou nome do crime', placeholder='Ex.: 6.4, tráfico, homicídio ou arma', max_length=100)
+
+    def __init__(self, sessao_id: str):
+        super().__init__()
+        self.sessao_id = sessao_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        resultados = _buscar_crimes(str(self.consulta.value))
+        if not resultados:
+            return await interaction.response.send_message('🔎 Nenhum crime encontrado. Tente outro artigo ou nome.', ephemeral=True)
+        await interaction.response.send_message(
+            f'🔎 **Resultados para:** `{self.consulta.value}`\nSelecione o(s) crime(s) desejado(s):',
+            view=ResultadoPesquisaCrimeView(self.sessao_id, resultados),
+            ephemeral=True,
+        )
+
 if __name__ == '__main__':
     asyncio.run(main())
