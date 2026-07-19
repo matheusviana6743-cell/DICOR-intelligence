@@ -19681,5 +19681,604 @@ async def liberar_fotos_em_topicos_antigos_boletins() -> None:
     await _atualizar_paineis_antigos_boletins()
 
 
+
+# =====================================================
+# PATCH FINAL — ALERTAS INTELIGENTES NO CANAL DA AÇÃO
+# =====================================================
+# Os alertas abaixo NÃO são enviados para o canal de logs. Eles aparecem
+# somente no canal/tópico onde a ação aconteceu, com links dos registros que
+# coincidiram. Logs continuam reservados apenas para erros técnicos do bot.
+
+ALERTAS_INTELIGENTES_JSON = DATA_DIR / 'alertas_inteligentes.json'
+ALERTA_BOLETIM_PARADO_HORAS = env_int('ALERTA_BOLETIM_PARADO_HORAS', 48)
+ALERTA_MAX_LINKS = max(1, min(10, env_int('ALERTA_MAX_LINKS', 10)))
+_ALERTAS_INTELIGENTES_LOCK = asyncio.Lock()
+
+
+def _carregar_alertas_inteligentes() -> Dict[str, Any]:
+    dados = carregar_json(ALERTAS_INTELIGENTES_JSON, {})
+    return dados if isinstance(dados, dict) else {}
+
+
+def _salvar_alertas_inteligentes(dados: Dict[str, Any]) -> None:
+    # Mantém somente os registros mais recentes para não deixar o JSON crescer
+    # indefinidamente em servidores com muitos boletins.
+    itens = list(dados.items())[-8000:]
+    salvar_json(ALERTAS_INTELIGENTES_JSON, dict(itens))
+
+
+def _normalizar_alerta(valor: Any) -> str:
+    texto = unicodedata.normalize('NFKD', str(valor or ''))
+    texto = texto.encode('ascii', 'ignore').decode('ascii').lower()
+    texto = re.sub(r'[^a-z0-9]+', ' ', texto)
+    return re.sub(r'\s+', ' ', texto).strip()
+
+
+def _valor_util_alerta(valor: Any) -> bool:
+    texto = _normalizar_alerta(valor)
+    return bool(texto) and texto not in {
+        'nao informado', 'nao identificado', 'desconhecido', 'nenhum',
+        'sem informacao', 'a definir', 'n i', 'ni', '-', '0'
+    }
+
+
+def _normalizar_placa_alerta(valor: Any) -> str:
+    texto = re.sub(r'[^A-Za-z0-9]', '', str(valor or '')).upper()
+    if texto in {'', 'NAOIDENTIFICADO', 'NAOINFORMADO', 'DESCONHECIDO'}:
+        return ''
+    return texto
+
+
+def _rg_alerta(valor: Any) -> str:
+    try:
+        return limpar_rg(str(valor or ''))
+    except Exception:
+        return re.sub(r'\D', '', str(valor or ''))
+
+
+def _url_registro_alerta(registro: Dict[str, Any], guild_id: Optional[int] = None) -> str:
+    for chave in (
+        'mensagem_url', 'mensagem_original_url', 'mensagem_arquivada_url',
+        'url', 'jump_url', 'reabrir_url'
+    ):
+        url = str(registro.get(chave) or '').strip()
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+
+    gid = int(guild_id or GUILD_ID or 0)
+    canal_id = int(
+        registro.get('thread_id') or registro.get('area_id') or
+        registro.get('canal_id') or registro.get('canal_atendimento_id') or 0
+    )
+    mensagem_id = int(
+        registro.get('painel_msg_id') or registro.get('mensagem_id') or
+        registro.get('mensagem_abertura_id') or 0
+    )
+    if gid and canal_id and mensagem_id:
+        return f'https://discord.com/channels/{gid}/{canal_id}/{mensagem_id}'
+    if gid and canal_id:
+        return f'https://discord.com/channels/{gid}/{canal_id}'
+    return ''
+
+
+def _rotulo_registro_alerta(prefixo: str, registro: Dict[str, Any]) -> str:
+    numero = str(
+        registro.get('numero') or registro.get('caso') or
+        registro.get('familia') or registro.get('nome') or ''
+    ).strip()
+    if numero:
+        return f'{prefixo} {numero}'[:80]
+    return prefixo[:80]
+
+
+class LinksAlertaInteligenteView(discord.ui.View):
+    def __init__(self, links: List[Tuple[str, str]]):
+        super().__init__(timeout=None)
+        vistos: set[str] = set()
+        adicionados = 0
+        for rotulo, url in links:
+            url = str(url or '').strip()
+            if not url.startswith(('http://', 'https://')) or url in vistos:
+                continue
+            vistos.add(url)
+            self.add_item(discord.ui.Button(
+                label=str(rotulo or 'Abrir registro')[:80],
+                style=discord.ButtonStyle.link,
+                url=url,
+                row=min(4, adicionados // 5),
+            ))
+            adicionados += 1
+            if adicionados >= ALERTA_MAX_LINKS:
+                break
+
+
+async def _alerta_ja_enviado(chave: str) -> bool:
+    async with _ALERTAS_INTELIGENTES_LOCK:
+        return chave in _carregar_alertas_inteligentes()
+
+
+async def _registrar_alerta_enviado(chave: str, mensagem: Optional[discord.Message] = None) -> None:
+    async with _ALERTAS_INTELIGENTES_LOCK:
+        dados = _carregar_alertas_inteligentes()
+        dados[chave] = {
+            'enviado_em': agora_br(),
+            'mensagem_id': getattr(mensagem, 'id', None),
+            'canal_id': getattr(getattr(mensagem, 'channel', None), 'id', None),
+        }
+        _salvar_alertas_inteligentes(dados)
+
+
+async def enviar_alerta_inteligente_no_canal(
+    canal: Any,
+    *,
+    chave: str,
+    titulo: str,
+    descricao: str,
+    itens: List[str],
+    links: Optional[List[Tuple[str, str]]] = None,
+    cor: Optional[discord.Color] = None,
+    mencao: Optional[str] = None,
+) -> Optional[discord.Message]:
+    """Envia uma única mensagem no canal da ação, nunca no canal de logs."""
+    if canal is None or not hasattr(canal, 'send'):
+        return None
+    if await _alerta_ja_enviado(chave):
+        return None
+
+    embed = discord.Embed(
+        title=titulo[:256],
+        description=descricao[:4096],
+        color=cor or discord.Color.orange(),
+    )
+    if itens:
+        texto_itens = '\n'.join(f'• {str(item)}' for item in itens)
+        embed.add_field(
+            name='Coincidências encontradas',
+            value=texto_itens[:1024],
+            inline=False,
+        )
+    embed.set_footer(text='DICOR • Alerta automático no local da ação')
+
+    view = LinksAlertaInteligenteView(links or []) if links else None
+    try:
+        mensagem = await canal.send(
+            content=mencao or None,
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions(
+                users=True, roles=False, everyone=False
+            ),
+        )
+        await _registrar_alerta_enviado(chave, mensagem)
+        return mensagem
+    except Exception as erro:
+        # Não envia o alerta para logs como fallback: isso quebraria a regra
+        # definida pelo usuário. Apenas registra o erro no console do Railway.
+        print(
+            f'⚠️ Falha ao enviar alerta inteligente no canal da ação: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+        return None
+
+
+def _boletim_por_mensagem_alerta(message_id: int) -> Optional[Dict[str, Any]]:
+    for boletim in carregar_boletins():
+        if str(boletim.get('mensagem_id')) == str(message_id):
+            return boletim
+        for item in boletim.get('mensagens_oficiais', []) or []:
+            if isinstance(item, dict) and str(item.get('id')) == str(message_id):
+                return boletim
+    return None
+
+
+def _dados_identificacao_boletim_alerta(boletim: Dict[str, Any]) -> Dict[str, List[str]]:
+    individuo = boletim.get('dados_individuo') or {}
+    veiculo = boletim.get('dados_veiculo') or {}
+    rgs = []
+    nomes = []
+    placas = []
+
+    for valor in (individuo.get('rg'), veiculo.get('rg_proprietario')):
+        rg = _rg_alerta(valor)
+        if rg and rg not in rgs:
+            rgs.append(rg)
+    for valor in (individuo.get('nome'), veiculo.get('proprietario')):
+        nome = _normalizar_alerta(valor)
+        if len(nome) >= 4 and _valor_util_alerta(valor) and nome not in nomes:
+            nomes.append(nome)
+    placa = _normalizar_placa_alerta(veiculo.get('placa'))
+    if placa:
+        placas.append(placa)
+
+    return {'rgs': rgs, 'nomes': nomes, 'placas': placas}
+
+
+def _mesas_relacionadas_ao_texto_alerta(texto: str, excluir_canal_id: int = 0) -> List[Dict[str, Any]]:
+    normalizado = f' {_normalizar_alerta(texto)} '
+    relacionados = []
+    for mesa in carregar_mesas():
+        if int(mesa.get('canal_id') or 0) == int(excluir_canal_id or 0):
+            continue
+        if str(mesa.get('status') or '').upper() not in {'ABERTA', 'EM ANDAMENTO', 'ATIVA'}:
+            continue
+        familia = _normalizar_alerta(mesa.get('familia'))
+        if len(familia) >= 4 and f' {familia} ' in normalizado:
+            relacionados.append(mesa)
+    return relacionados
+
+
+async def alertar_coincidencias_novo_boletim(
+    message: discord.Message,
+    atendimento: Dict[str, Any],
+) -> None:
+    canal = await obter_canal_bot(
+        atendimento.get('thread_id') or atendimento.get('area_id')
+    )
+    if not canal or not hasattr(canal, 'send'):
+        return
+
+    boletim = _boletim_por_mensagem_alerta(message.id) or {}
+    # A mensagem oficial e o salvamento do JSON acontecem quase ao mesmo tempo.
+    # Aguarda alguns segundos para não perder os dados estruturados do indivíduo
+    # ou do veículo por uma condição de corrida.
+    if not boletim:
+        for _ in range(6):
+            await asyncio.sleep(1)
+            boletim = _boletim_por_mensagem_alerta(message.id) or {}
+            if boletim:
+                break
+    if not boletim:
+        # Ainda assim tenta usar o texto da mensagem oficial.
+        boletim = {
+            'numero': atendimento.get('numero'),
+            'mensagem_id': message.id,
+            'mensagem_url': message.jump_url,
+            'dados_individuo': {},
+            'dados_veiculo': {},
+        }
+
+    atual = _dados_identificacao_boletim_alerta(boletim)
+    itens: List[str] = []
+    links: List[Tuple[str, str]] = []
+    usados: set[str] = set()
+    guild_id = getattr(getattr(message, 'guild', None), 'id', None)
+
+    # 1) RG já consta como procurado ativo.
+    procurados = carregar_procurados()
+    for rg in atual['rgs']:
+        for procurado in procurados:
+            if str(procurado.get('status') or 'A PROCURAR').upper() != 'A PROCURAR':
+                continue
+            if _rg_alerta(procurado.get('rg')) != rg:
+                continue
+            chave_item = f'procurado:{procurado.get("id") or rg}'
+            if chave_item in usados:
+                continue
+            usados.add(chave_item)
+            itens.append(
+                f'🪪 O RG `{procurado.get("rg")}` já consta como procurado ativo '
+                f'({procurado.get("nome") or "nome não informado"}).'
+            )
+            url = _url_registro_alerta(procurado, guild_id)
+            if url:
+                links.append(('Ver procurado ativo', url))
+
+    # 2) Pessoa/identificação já apareceu em boletins anteriores.
+    for anterior in carregar_boletins():
+        if str(anterior.get('mensagem_id')) == str(message.id):
+            continue
+        dados_ant = _dados_identificacao_boletim_alerta(anterior)
+        rgs_comuns = sorted(set(atual['rgs']) & set(dados_ant['rgs']))
+        nomes_comuns = sorted(set(atual['nomes']) & set(dados_ant['nomes']))
+        if not rgs_comuns and not nomes_comuns:
+            continue
+        identidade = (
+            f'RG `{rgs_comuns[0]}`' if rgs_comuns
+            else f'nome **{nomes_comuns[0].title()}**'
+        )
+        chave_item = f'boletim:{anterior.get("numero") or anterior.get("mensagem_id")}:{identidade}'
+        if chave_item in usados:
+            continue
+        usados.add(chave_item)
+        itens.append(
+            f'👤 A identificação por {identidade} já apareceu no '
+            f'boletim `{anterior.get("numero") or "anterior"}`.'
+        )
+        url = _url_registro_alerta(anterior, guild_id)
+        if url:
+            links.append((_rotulo_registro_alerta('Ver boletim', anterior), url))
+
+    # 3) Veículo/placa recorrente em outras ocorrências.
+    for placa in atual['placas']:
+        for anterior in carregar_boletins():
+            if str(anterior.get('mensagem_id')) == str(message.id):
+                continue
+            placas_ant = _dados_identificacao_boletim_alerta(anterior)['placas']
+            if placa not in placas_ant:
+                continue
+            chave_item = f'placa:{placa}:{anterior.get("numero") or anterior.get("mensagem_id")}'
+            if chave_item in usados:
+                continue
+            usados.add(chave_item)
+            itens.append(
+                f'🚘 A placa `{placa}` já apareceu no boletim '
+                f'`{anterior.get("numero") or "anterior"}`.'
+            )
+            url = _url_registro_alerta(anterior, guild_id)
+            if url:
+                links.append((_rotulo_registro_alerta('Ver ocorrência', anterior), url))
+
+    # 4) Organização citada já possui mesa ativa.
+    texto_total = json.dumps(boletim, ensure_ascii=False) + '\n' + (
+        coletar_texto_embed(message) or message.content or ''
+    )
+    for mesa in _mesas_relacionadas_ao_texto_alerta(texto_total):
+        chave_item = f'mesa:{mesa.get("canal_id")}'
+        if chave_item in usados:
+            continue
+        usados.add(chave_item)
+        itens.append(
+            f'🕵️ A organização **{mesa.get("familia") or mesa.get("nome_canal") or "não informada"}** '
+            'já possui uma mesa de investigação ativa.'
+        )
+        url = _url_registro_alerta(mesa, guild_id)
+        if url:
+            links.append(('Abrir mesa relacionada', url))
+
+    if not itens:
+        return
+
+    numero = atendimento.get('numero') or boletim.get('numero') or message.id
+    await enviar_alerta_inteligente_no_canal(
+        canal,
+        chave=f'alerta-boletim:{message.id}',
+        titulo='🚨 ALERTA INTELIGENTE — INFORMAÇÕES RELACIONADAS',
+        descricao=(
+            f'O Boletim Nº **{numero_curto_boletim(str(numero))}** possui informações '
+            'que coincidem com registros já existentes. Use os botões para abrir '
+            'diretamente os locais onde a informação foi encontrada.'
+        ),
+        itens=itens[:12],
+        links=links,
+        cor=discord.Color.red(),
+    )
+
+
+_CRIAR_AREA_ATENDIMENTO_BOLETIM_ALERTA_ANTERIOR = criar_area_atendimento_boletim
+
+
+async def criar_area_atendimento_boletim(message: discord.Message) -> Optional[Dict[str, Any]]:
+    atendimento = await _CRIAR_AREA_ATENDIMENTO_BOLETIM_ALERTA_ANTERIOR(message)
+    if atendimento:
+        try:
+            await alertar_coincidencias_novo_boletim(message, atendimento)
+        except Exception as erro:
+            print(
+                f'⚠️ Falha ao analisar coincidências do boletim {getattr(message, "id", 0)}: '
+                f'{type(erro).__name__}: {erro}',
+                flush=True,
+            )
+    return atendimento
+
+
+async def alertar_mesas_da_mesma_organizacao(dados_mesa: Dict[str, Any]) -> None:
+    canal_id = int(dados_mesa.get('canal_id') or 0)
+    familia = _normalizar_alerta(dados_mesa.get('familia'))
+    if not canal_id or len(familia) < 4:
+        return
+    canal = await obter_canal_bot(canal_id)
+    if not canal or not hasattr(canal, 'send'):
+        return
+
+    relacionadas: List[Dict[str, Any]] = []
+    for mesa in carregar_mesas():
+        if int(mesa.get('canal_id') or 0) == canal_id:
+            continue
+        if str(mesa.get('status') or '').upper() not in {'ABERTA', 'EM ANDAMENTO', 'ATIVA'}:
+            continue
+        outra = _normalizar_alerta(mesa.get('familia'))
+        if not outra:
+            continue
+        if familia == outra or (len(familia) >= 5 and (familia in outra or outra in familia)):
+            relacionadas.append(mesa)
+
+    if not relacionadas:
+        return
+
+    guild_id = getattr(getattr(canal, 'guild', None), 'id', None)
+    itens = [
+        f'🕵️ Mesa ativa encontrada: **{m.get("familia") or m.get("nome_canal") or "sem nome"}**.'
+        for m in relacionadas[:10]
+    ]
+    links = []
+    for mesa in relacionadas:
+        url = _url_registro_alerta(mesa, guild_id)
+        if url:
+            links.append(('Abrir mesa relacionada', url))
+
+    await enviar_alerta_inteligente_no_canal(
+        canal,
+        chave=f'alerta-mesa-duplicada:{canal_id}',
+        titulo='⚠️ POSSÍVEL INVESTIGAÇÃO DUPLICADA',
+        descricao=(
+            f'A organização **{dados_mesa.get("familia") or "não informada"}** '
+            'já aparece em outra mesa ativa. Verifique se as investigações devem '
+            'ser vinculadas ou unificadas.'
+        ),
+        itens=itens,
+        links=links,
+        cor=discord.Color.gold(),
+    )
+
+
+_REGISTRAR_MESA_ALERTA_ANTERIOR = registrar_mesa
+
+
+def registrar_mesa(dados: Dict[str, Any]) -> None:
+    _REGISTRAR_MESA_ALERTA_ANTERIOR(dados)
+    try:
+        asyncio.get_running_loop().create_task(
+            alertar_mesas_da_mesma_organizacao(dict(dados)),
+            name=f'dicor-alerta-mesa-{dados.get("canal_id")}',
+        )
+    except RuntimeError:
+        pass
+
+
+async def alertar_procurado_incompleto(registro: Dict[str, Any]) -> None:
+    if str(registro.get('status') or '').upper() != 'A PROCURAR':
+        return
+    faltando = []
+    if not _valor_util_alerta(registro.get('rg')):
+        faltando.append('RG')
+    if not _valor_util_alerta(registro.get('ultimo_avistamento')):
+        faltando.append('último avistamento')
+    if not _valor_util_alerta(registro.get('foto_individuo')):
+        faltando.append('foto do indivíduo')
+    if not _valor_util_alerta(registro.get('foto_rg')):
+        faltando.append('foto do RG')
+    if not faltando:
+        return
+
+    canal = await obter_canal_bot(PROCURADOS_CHANNEL_ID)
+    if not canal or not hasattr(canal, 'send'):
+        return
+    guild_id = getattr(getattr(canal, 'guild', None), 'id', None)
+    url = _url_registro_alerta(registro, guild_id)
+    links = [('Abrir procurado', url)] if url else []
+    identificador = registro.get('id') or _rg_alerta(registro.get('rg')) or registro.get('nome')
+    await enviar_alerta_inteligente_no_canal(
+        canal,
+        chave=f'alerta-procurado-incompleto:{identificador}:{"-".join(faltando)}',
+        titulo='⚠️ ALERTA DE PROCURADO INCOMPLETO',
+        descricao=(
+            f'O cadastro de **{registro.get("nome") or "procurado sem nome"}** '
+            'está ativo, porém ainda possui informações obrigatórias ausentes.'
+        ),
+        itens=[f'Faltando: **{item}**' for item in faltando],
+        links=links,
+        cor=discord.Color.orange(),
+    )
+
+
+_SALVAR_PROCURADO_CATALOGO_ALERTA_ANTERIOR = salvar_procurado_catalogo
+
+
+async def salvar_procurado_catalogo(registro: Dict[str, Any]) -> None:
+    await _SALVAR_PROCURADO_CATALOGO_ALERTA_ANTERIOR(registro)
+    try:
+        await alertar_procurado_incompleto(registro)
+    except Exception as erro:
+        print(
+            f'⚠️ Falha ao verificar procurado incompleto: {type(erro).__name__}: {erro}',
+            flush=True,
+        )
+
+
+async def verificar_procurados_incompletos_existentes() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(7)
+    for registro in carregar_procurados():
+        try:
+            await alertar_procurado_incompleto(registro)
+        except Exception as erro:
+            print(f'⚠️ Falha ao verificar procurado existente: {erro}', flush=True)
+        await asyncio.sleep(0.20)
+
+
+def _ultima_atividade_humana_topico(mensagens: List[discord.Message], topico: discord.Thread):
+    for mensagem in mensagens:
+        if not getattr(mensagem.author, 'bot', False):
+            return mensagem.created_at, mensagem.id
+    criado = getattr(topico, 'created_at', None)
+    return criado, int(getattr(topico, 'id', 0) or 0)
+
+
+@tasks.loop(hours=1)
+async def verificar_boletins_parados_alerta_inteligente():
+    if ALERTA_BOLETIM_PARADO_HORAS <= 0:
+        return
+    agora_utc = datetime.datetime.now(datetime.timezone.utc)
+    for atendimento in carregar_atendimentos_boletins():
+        if str(atendimento.get('status') or '').upper() in {
+            'FINALIZADO', 'ARQUIVADO', 'CONCLUÍDO', 'CONCLUIDO'
+        }:
+            continue
+        topico_id = int(atendimento.get('thread_id') or atendimento.get('area_id') or 0)
+        if not topico_id:
+            continue
+        topico = await obter_canal_bot(topico_id)
+        if not isinstance(topico, discord.Thread):
+            continue
+        try:
+            mensagens = [m async for m in topico.history(limit=50, oldest_first=False)]
+            ultima_data, marcador = _ultima_atividade_humana_topico(mensagens, topico)
+            if ultima_data is None:
+                continue
+            if ultima_data.tzinfo is None:
+                ultima_data = ultima_data.replace(tzinfo=datetime.timezone.utc)
+            horas = (agora_utc - ultima_data.astimezone(datetime.timezone.utc)).total_seconds() / 3600
+            if horas < ALERTA_BOLETIM_PARADO_HORAS:
+                continue
+
+            numero = atendimento.get('numero') or topico.name
+            agente_id = int(atendimento.get('agente_id') or 0)
+            links = []
+            original = str(atendimento.get('mensagem_original_url') or '').strip()
+            if original.startswith('http'):
+                links.append(('Ver boletim original', original))
+            links.append(('Abrir tópico', _url_registro_alerta(
+                {'canal_id': topico.id}, getattr(topico.guild, 'id', None)
+            )))
+            await enviar_alerta_inteligente_no_canal(
+                topico,
+                chave=f'alerta-boletim-parado:{topico.id}:{marcador}',
+                titulo='⏰ ALERTA DE BOLETIM PARADO',
+                descricao=(
+                    f'O boletim Nº **{numero_curto_boletim(str(numero))}** está sem '
+                    f'atualização humana há aproximadamente **{int(horas)} horas**.'
+                ),
+                itens=[
+                    f'Responsável atual: <@{agente_id}>' if agente_id else 'Sem agente responsável definido',
+                    'Atualize, conclua ou transfira o boletim para outro agente.',
+                ],
+                links=links,
+                cor=discord.Color.orange(),
+                mencao=f'<@{agente_id}>' if agente_id else None,
+            )
+        except discord.NotFound:
+            continue
+        except Exception as erro:
+            print(
+                f'⚠️ Falha ao verificar boletim parado {topico_id}: '
+                f'{type(erro).__name__}: {erro}',
+                flush=True,
+            )
+
+
+@verificar_boletins_parados_alerta_inteligente.before_loop
+async def antes_verificar_boletins_parados_alerta_inteligente():
+    await bot.wait_until_ready()
+    await asyncio.sleep(15)
+
+
+@bot.listen('on_ready')
+async def iniciar_alertas_inteligentes_dicor():
+    try:
+        if not verificar_boletins_parados_alerta_inteligente.is_running():
+            verificar_boletins_parados_alerta_inteligente.start()
+        asyncio.create_task(
+            verificar_procurados_incompletos_existentes(),
+            name='dicor-verificar-procurados-incompletos',
+        )
+        print(
+            '✅ Alertas inteligentes ativos no canal da ação '
+            f'| boletim parado: {ALERTA_BOLETIM_PARADO_HORAS}h',
+            flush=True,
+        )
+    except Exception as erro:
+        print(f'⚠️ Falha ao iniciar alertas inteligentes: {erro}', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
