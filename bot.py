@@ -24278,5 +24278,322 @@ async def gerar_e_enviar_comparecimento(
     )
     return registro
 
+
+# =====================================================
+# CORREÇÃO FINAL — PROCURADOS ARQUIVADOS NÃO BLOQUEIAM NOVO CADASTRO
+# =====================================================
+# Um RG existente apenas no histórico/arquivados não é mais tratado como
+# procurado ativo. Isso permite cadastrar novamente o mesmo RG quando houver
+# um novo mandado, preservando o registro antigo no histórico.
+
+_STATUS_PROCURADO_ARQUIVADO = {
+    'RETIRADO',
+    'ARQUIVADO',
+    'ARQUIVADA',
+    'PEGO',
+    'CAPTURADO',
+    'PRESO',
+    'INATIVO',
+    'FINALIZADO',
+    'CONCLUIDO',
+    'CONCLUÍDO',
+    'CUMPRIDO',
+    'MANDADO CUMPRIDO',
+    'ENCERRADO',
+    'APAGADO',
+}
+
+_STATUS_PROCURADO_ATIVO = {
+    'A PROCURAR',
+    'ATIVO',
+    'PROCURADO',
+    'EM ABERTO',
+    'ABERTO',
+}
+
+
+def _normalizar_status_procurado(registro: Dict[str, Any]) -> str:
+    """Retorna somente A PROCURAR ou RETIRADO para compatibilidade geral."""
+    status = str(registro.get('status') or '').strip().upper()
+
+    # Campos de retirada têm prioridade, inclusive em registros antigos que
+    # perderam ou nunca receberam o campo status corretamente.
+    possui_marca_arquivo = any(
+        registro.get(chave)
+        for chave in (
+            'data_retirada',
+            'motivo_retirada',
+            'mensagem_arquivada_id',
+            'mensagem_arquivada_url',
+            'retirado_por',
+            'retirado_por_id',
+            'autorizado_retirada_por_id',
+        )
+    )
+    # Algumas versões antigas deixavam status A PROCURAR, mas trocavam a URL
+    # para a publicação do canal de arquivados. A URL também é prova de arquivo.
+    url_atual = str(registro.get('mensagem_url') or '').strip()
+    aponta_canal_arquivado = bool(
+        HISTORICO_PROCURADOS_ID
+        and f'/{int(HISTORICO_PROCURADOS_ID)}/' in url_atual
+    )
+    if status in _STATUS_PROCURADO_ARQUIVADO or possui_marca_arquivo or aponta_canal_arquivado:
+        return 'RETIRADO'
+    if status in _STATUS_PROCURADO_ATIVO:
+        return 'A PROCURAR'
+
+    # Registros antigos sem status eram publicações ativas, exceto quando
+    # possuem marcas explícitas de arquivamento verificadas acima.
+    return 'A PROCURAR'
+
+
+def procurado_esta_ativo(registro: Optional[Dict[str, Any]]) -> bool:
+    return bool(isinstance(registro, dict) and _normalizar_status_procurado(registro) == 'A PROCURAR')
+
+
+def carregar_procurados() -> List[Dict[str, Any]]:
+    """Carrega e normaliza registros antigos sem misturar ativos e arquivados."""
+    dados = carregar_json(CATALOGO_JSON, [])
+    if not isinstance(dados, list):
+        return []
+    saida: List[Dict[str, Any]] = []
+    for item in dados:
+        if not isinstance(item, dict):
+            continue
+        registro = dict(item)
+        registro['status'] = _normalizar_status_procurado(registro)
+        saida.append(registro)
+    return saida
+
+
+def procurar_por_rg(rg: str) -> Optional[Dict[str, Any]]:
+    """Procura SOMENTE no canal/lote ativo. Arquivados não bloqueiam cadastro."""
+    alvo = limpar_rg(rg)
+    if not alvo:
+        return None
+    # O mais recente vence caso uma versão antiga tenha deixado duplicados.
+    for registro in reversed(carregar_procurados()):
+        if limpar_rg(registro.get('rg', '')) == alvo and procurado_esta_ativo(registro):
+            return registro
+    return None
+
+
+def procurar_por_rg_qualquer_status(rg: str) -> Optional[Dict[str, Any]]:
+    """Consulta histórica, sem ser usada para impedir novos cadastros."""
+    alvo = limpar_rg(rg)
+    if not alvo:
+        return None
+    for registro in reversed(carregar_procurados()):
+        if limpar_rg(registro.get('rg', '')) == alvo:
+            return registro
+    return None
+
+
+def remover_duplicados(lista: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Mantém no máximo um registro ATIVO por RG, mas preserva o histórico
+    arquivado. Assim, o mesmo RG pode ter um mandado antigo arquivado e um
+    novo mandado ativo sem um apagar o outro.
+    """
+    saida: List[Dict[str, Any]] = []
+    indice_ativo_por_rg: Dict[str, int] = {}
+    historicos_vistos = set()
+    sem_rg_vistos = set()
+
+    for bruto in lista or []:
+        if not isinstance(bruto, dict):
+            continue
+        item = dict(bruto)
+        item['status'] = _normalizar_status_procurado(item)
+        rg = limpar_rg(item.get('rg', ''))
+
+        if procurado_esta_ativo(item):
+            if rg:
+                # Em duplicidade ativa, mantém o registro mais novo/último.
+                if rg in indice_ativo_por_rg:
+                    saida[indice_ativo_por_rg[rg]] = item
+                else:
+                    indice_ativo_por_rg[rg] = len(saida)
+                    saida.append(item)
+                continue
+
+            chave_sem_rg = (
+                str(item.get('mensagem_id') or ''),
+                str(item.get('id') or item.get('caso') or ''),
+                str(item.get('nome') or '').casefold(),
+            )
+            if chave_sem_rg in sem_rg_vistos:
+                continue
+            sem_rg_vistos.add(chave_sem_rg)
+            saida.append(item)
+            continue
+
+        # Arquivados são histórico. Deduplica apenas a mesma publicação de
+        # arquivo, sem eliminar ciclos diferentes do mesmo RG.
+        identidade_historico = str(
+            item.get('mensagem_arquivada_id')
+            or item.get('mensagem_arquivada_url')
+            or item.get('id')
+            or item.get('caso')
+            or item.get('data_retirada')
+            or item.get('mensagem_url')
+            or ''
+        ).strip()
+        chave_historico = (rg, identidade_historico)
+        if identidade_historico and chave_historico in historicos_vistos:
+            continue
+        if identidade_historico:
+            historicos_vistos.add(chave_historico)
+        saida.append(item)
+
+    return saida
+
+
+def salvar_procurados(lista: List[Dict[str, Any]]) -> None:
+    """Salva mantendo ativos e históricos separados pelo status."""
+    normalizados = remover_duplicados(lista if isinstance(lista, list) else [])
+    salvar_json(CATALOGO_JSON, normalizados)
+
+
+async def sincronizar_catalogo_core(interaction: discord.Interaction):
+    """
+    Sincroniza os dois canais sem deixar uma publicação arquivada antiga
+    transformar em RETIRADO um novo procurado ativo com o mesmo RG.
+    """
+    if not PROCURADOS_CHANNEL_ID:
+        return await interaction.response.send_message(
+            '❌ Configure PROCURADOS_CHANNEL_ID.', ephemeral=True
+        )
+
+    canal_ativos = bot.get_channel(PROCURADOS_CHANNEL_ID)
+    if canal_ativos is None:
+        try:
+            canal_ativos = await bot.fetch_channel(PROCURADOS_CHANNEL_ID)
+        except Exception:
+            canal_ativos = None
+
+    canal_arquivados = bot.get_channel(HISTORICO_PROCURADOS_ID) if HISTORICO_PROCURADOS_ID else None
+    if canal_arquivados is None and HISTORICO_PROCURADOS_ID:
+        try:
+            canal_arquivados = await bot.fetch_channel(HISTORICO_PROCURADOS_ID)
+        except Exception:
+            canal_arquivados = None
+
+    if not isinstance(canal_ativos, discord.TextChannel):
+        return await interaction.response.send_message(
+            '❌ Não encontrei o canal de procurados ativos.', ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    importados = 0
+    atualizados = 0
+    analisados = 0
+    lista = carregar_procurados()
+
+    # Canal ativo: procura apenas outro registro ativo do mesmo RG.
+    async for msg in canal_ativos.history(limit=1000, oldest_first=True):
+        analisados += 1
+        registro = await importar_mensagem_antiga(msg)
+        if not registro:
+            continue
+        registro['status'] = 'A PROCURAR'
+        registro['mensagem_id'] = msg.id
+        registro['mensagem_url'] = msg.jump_url
+        registro.pop('mensagem_arquivada_id', None)
+        registro.pop('mensagem_arquivada_url', None)
+        registro.pop('data_retirada', None)
+        registro.pop('motivo_retirada', None)
+
+        alvo = limpar_rg(registro.get('rg', ''))
+        existente = next(
+            (
+                p for p in lista
+                if limpar_rg(p.get('rg', '')) == alvo and procurado_esta_ativo(p)
+            ),
+            None,
+        )
+        if existente is None:
+            registro['crimes'] = valor_crimes_registro(registro)
+            lista.append(registro)
+            importados += 1
+            continue
+
+        mudou = False
+        for campo in (
+            'nome', 'crimes', 'ultimo_avistamento', 'informacoes',
+            'foto_individuo', 'foto_rg', 'mensagem_id', 'mensagem_url',
+        ):
+            novo = registro.get(campo)
+            atual = existente.get(campo)
+            if registro_tem_valor_util(novo) and not registro_tem_valor_util(atual):
+                existente[campo] = novo
+                mudou = True
+            elif novo and not atual:
+                existente[campo] = novo
+                mudou = True
+        existente['status'] = 'A PROCURAR'
+        if mudou:
+            atualizados += 1
+
+    # Canal arquivado: cria/atualiza um registro histórico SEPARADO. Nunca
+    # altera o registro ativo do mesmo RG.
+    if isinstance(canal_arquivados, discord.TextChannel):
+        async for msg in canal_arquivados.history(limit=1000, oldest_first=True):
+            analisados += 1
+            registro = await importar_mensagem_antiga(msg)
+            if not registro:
+                continue
+            registro['status'] = 'RETIRADO'
+            registro['mensagem_arquivada_id'] = msg.id
+            registro['mensagem_arquivada_url'] = msg.jump_url
+            registro['mensagem_url'] = msg.jump_url
+            registro['mensagem_id'] = None
+
+            existente_hist = next(
+                (
+                    p for p in lista
+                    if not procurado_esta_ativo(p)
+                    and int(p.get('mensagem_arquivada_id') or 0) == int(msg.id)
+                ),
+                None,
+            )
+            if existente_hist is None:
+                registro['crimes'] = valor_crimes_registro(registro)
+                lista.append(registro)
+                importados += 1
+                continue
+
+            mudou = False
+            for campo in (
+                'nome', 'rg', 'crimes', 'ultimo_avistamento', 'informacoes',
+                'foto_individuo', 'foto_rg', 'mensagem_arquivada_id',
+                'mensagem_arquivada_url', 'mensagem_url',
+            ):
+                novo = registro.get(campo)
+                atual = existente_hist.get(campo)
+                if registro_tem_valor_util(novo) and not registro_tem_valor_util(atual):
+                    existente_hist[campo] = novo
+                    mudou = True
+                elif novo and not atual:
+                    existente_hist[campo] = novo
+                    mudou = True
+            existente_hist['status'] = 'RETIRADO'
+            if mudou:
+                atualizados += 1
+
+    lista = remover_duplicados(lista)
+    salvar_procurados(lista)
+    gerar_catalogo_html()
+
+    await interaction.followup.send(
+        '✅ Sincronização concluída sem misturar ativos e arquivados.\n'
+        f'Mensagens analisadas: `{analisados}`\n'
+        f'Registros importados: `{importados}`\n'
+        f'Registros atualizados: `{atualizados}`\n'
+        '**RG arquivado não bloqueia mais um novo cadastro ativo.**\n'
+        f'Catálogo: {CATALOG_PUBLIC_URL}',
+        ephemeral=True,
+    )
+
 if __name__ == '__main__':
     asyncio.run(main())
