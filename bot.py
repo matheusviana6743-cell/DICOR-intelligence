@@ -10113,7 +10113,7 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
         c.setStrokeColor(azul_claro)
         c.setLineWidth(0.85)
         c.roundRect(margem_x, limite_baixo, largura_util, painel_altura, 7, fill=0, stroke=1)
-        faixa_h = 0.72 * cm
+        faixa_h = 1.02 * cm
         faixa_y = painel_topo - faixa_h
         c.setFillColor(colors.HexColor("#111111"))
         c.rect(margem_x + 0.08 * cm, faixa_y, largura_util - 0.16 * cm, faixa_h, stroke=0, fill=1)
@@ -10121,8 +10121,8 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
         c.setLineWidth(0.75)
         c.line(margem_x + 0.18 * cm, faixa_y + 0.12 * cm, largura - margem_x - 0.18 * cm, faixa_y + 0.12 * cm)
         c.setFillColor(dourado)
-        c.setFont("Courier-Bold", 11.7)
-        c.drawString(margem_x + 0.28 * cm, faixa_y + 0.28 * cm, titulo.upper()[:78])
+        c.setFont("Courier-Bold", 15.2)
+        c.drawString(margem_x + 0.28 * cm, faixa_y + 0.36 * cm, titulo.upper()[:78])
         return faixa_y - 0.36 * cm
 
     def _nova_pagina(titulo: str) -> float:
@@ -10203,22 +10203,27 @@ Sem mais para o momento, renovamos nossos votos de elevada consideração e colo
 
     # Assinatura exata da autoridade que clicou em Autorizar.
     assinatura = obter_assinatura_comparecimento(registro.get("autorizado_por_id"))
-    y = _precisa(y, 3.15 * cm, titulo_base)
+    y = _precisa(y, 4.65 * cm, titulo_base)
     imagem_ass = assinatura.get("arquivo") if assinatura else None
+    if imagem_ass:
+        try:
+            imagem_ass = str(limpar_imagem_assinatura_dossie(Path(str(imagem_ass))) or imagem_ass)
+        except Exception:
+            pass
     if imagem_ass and Path(str(imagem_ass)).exists():
         try:
-            c.drawImage(str(imagem_ass), largura/2-2.6*cm, y-1.45*cm, width=5.2*cm, height=1.35*cm, preserveAspectRatio=True, mask="auto")
+            c.drawImage(str(imagem_ass), largura/2-4.0*cm, y-2.15*cm, width=8.0*cm, height=2.25*cm, preserveAspectRatio=True, mask="auto")
         except Exception: traceback.print_exc()
     c.setStrokeColor(colors.HexColor("#777777"))
-    c.line(4.4 * cm, y - 1.55 * cm, largura - 4.4 * cm, y - 1.55 * cm)
+    c.line(3.6 * cm, y - 2.28 * cm, largura - 3.6 * cm, y - 2.28 * cm)
     nome_ass = (assinatura or {}).get("nome") or registro.get("autorizado_por_nome") or "Autoridade responsável"
     cargo_ass = (assinatura or {}).get("cargo") or registro.get("autorizado_por_cargo") or "Inspetor DICOR ou superior"
     c.setFillColor(colors.HexColor("#111111"))
-    c.setFont("Courier-Bold", 9.1)
-    c.drawCentredString(largura / 2, y - 1.90 * cm, str(nome_ass)[:65])
-    c.setFont("Courier", 8.1)
-    c.drawCentredString(largura / 2, y - 2.22 * cm, str(cargo_ass)[:65])
-    c.drawCentredString(largura / 2, y - 2.52 * cm, f"Autorizado em: {registro.get('autorizado_em', agora_br())}")
+    c.setFont("Courier-Bold", 11.8)
+    c.drawCentredString(largura / 2, y - 2.72 * cm, str(nome_ass)[:65])
+    c.setFont("Courier", 9.4)
+    c.drawCentredString(largura / 2, y - 3.10 * cm, str(cargo_ass)[:65])
+    c.drawCentredString(largura / 2, y - 3.46 * cm, f"Autorizado em: {registro.get('autorizado_em', agora_br())}")
     c.save()
 
 def gerar_docx_comparecimento(registro: Dict[str, Any], caminho_docx: Path) -> None:
@@ -11904,7 +11909,7 @@ async def assinaturas(
     await imagem.save(str(destino))
     vinculada = pessoa or interaction.user
     dados[chave] = {
-        "nome": vinculada.display_name,
+        "nome": _nome_rp_usuario(vinculada),
         "usuario_id": vinculada.id,
         "cargo": cargo_autorizador(vinculada) if isinstance(vinculada, discord.Member) else rotulo,
         "arquivo": caminho_relativo_base(destino),
@@ -16026,10 +16031,10 @@ def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float) -> None:
         traceback.print_exc()
 
     c.setFillColor(cores['dourado_claro'])
-    c.setFont('Courier-Bold', 13.4)
+    c.setFont('Courier-Bold', 17.0)
     c.drawCentredString(largura / 2, altura - 1.50 * cm, 'POLÍCIA FEDERAL  •  DICOR')
     c.setFillColor(cores['branco'])
-    c.setFont('Courier-Bold', 9.5)
+    c.setFont('Courier-Bold', 11.2)
     c.drawCentredString(largura / 2, altura - 2.02 * cm, 'CAPITAL MORADA DO VALLEY')
 
 
@@ -16077,16 +16082,16 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
             fill=0,
             stroke=1,
         )
-        faixa_y = topo - 0.63 * cm
+        faixa_y = topo - 0.83 * cm
         c.setFillColor(cores['azul'])
-        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=1, stroke=0)
+        c.rect(margem_x, faixa_y, largura_util, 0.82 * cm, fill=1, stroke=0)
         c.setStrokeColor(cores['dourado_claro'])
-        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
+        c.rect(margem_x, faixa_y, largura_util, 0.82 * cm, fill=0, stroke=1)
         c.setFillColor(cores['branco'])
-        c.setFont('Courier-Bold', 14.0)
+        c.setFont('Courier-Bold', 17.2)
         texto_titulo = titulo + (' - CONTINUAÇÃO' if continuacao else '')
-        c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, texto_titulo[:86])
-        return faixa_y - 0.35 * cm
+        c.drawString(margem_x + 0.18 * cm, faixa_y + 0.27 * cm, texto_titulo[:86])
+        return faixa_y - 0.42 * cm
 
     pagina_titulo = 'SOLICITAÇÃO DE COMPARECIMENTO'
 
@@ -16189,27 +16194,32 @@ def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> Non
     y = paragrafo(texto_oficial, y)
 
     assinatura = obter_assinatura_comparecimento(registro.get('autorizado_por_id'))
-    y = quebra(y, 3.65 * cm)
+    y = quebra(y, 4.85 * cm)
     nome = str(assinatura.get('nome') or registro.get('autorizado_por_nome') or 'Autoridade Competente')
     cargo = str(assinatura.get('cargo') or registro.get('autorizado_por_cargo') or 'Autoridade Competente')
     arq = assinatura.get('arquivo')
+    if arq:
+        try:
+            arq = str(limpar_imagem_assinatura_dossie(Path(str(arq))) or arq)
+        except Exception:
+            pass
     if arq and Path(str(arq)).exists():
         try:
-            c.drawImage(str(arq), largura / 2 - 3.45 * cm, y - 1.35 * cm, width=6.9 * cm, height=1.35 * cm, preserveAspectRatio=True, mask='auto')
+            c.drawImage(str(arq), largura / 2 - 4.45 * cm, y - 2.20 * cm, width=8.9 * cm, height=2.25 * cm, preserveAspectRatio=True, mask='auto')
         except Exception:
             traceback.print_exc()
     else:
         c.setFillColor(cores['texto_suave'])
         c.setFont('Courier-Oblique', 11.0)
-        c.drawCentredString(largura / 2, y - 0.92 * cm, nome[:54])
+        c.drawCentredString(largura / 2, y - 1.48 * cm, nome[:54])
     c.setStrokeColor(cores['texto_suave'])
-    c.line(largura / 2 - 4.25 * cm, y - 1.52 * cm, largura / 2 + 4.25 * cm, y - 1.52 * cm)
+    c.line(largura / 2 - 4.70 * cm, y - 2.35 * cm, largura / 2 + 4.70 * cm, y - 2.35 * cm)
     c.setFillColor(cores['texto'])
-    c.setFont('Courier-Bold', 10.4)
-    c.drawCentredString(largura / 2, y - 1.92 * cm, nome[:64])
-    c.setFont('Courier', 9.3)
-    c.drawCentredString(largura / 2, y - 2.31 * cm, cargo[:64])
-    c.drawCentredString(largura / 2, y - 2.68 * cm, f'Autorizado em: {registro.get("autorizado_em") or agora_br()}')
+    c.setFont('Courier-Bold', 12.4)
+    c.drawCentredString(largura / 2, y - 2.82 * cm, nome[:64])
+    c.setFont('Courier', 10.2)
+    c.drawCentredString(largura / 2, y - 3.24 * cm, cargo[:64])
+    c.drawCentredString(largura / 2, y - 3.64 * cm, f'Autorizado em: {registro.get("autorizado_em") or agora_br()}')
     c.save()
 
 
@@ -23830,6 +23840,443 @@ class PesquisaCrimeModal(Modal, title='Pesquisar Crime'):
         except Exception as erro:
             await interaction.followup.send(f'❌ Não foi possível atualizar o painel da pesquisa: {erro}', ephemeral=True)
 
+
+
+# =====================================================
+# PATCH FINAL — ASSINATURAS PERSISTENTES + MANDADO NO TÓPICO
+# =====================================================
+
+def _apelido_rp_de_texto(valor: Any) -> str:
+    """Extrai o apelido RP entre o fechamento do cargo e a barra/separador.
+
+    Exemplos aceitos:
+    ``(Inspetor) Coronel | usuario123`` e ``[DICOR] Coronel / usuario123``.
+    """
+    texto = re.sub(r'\s+', ' ', str(valor or '')).strip()
+    if not texto:
+        return ''
+
+    padroes = (
+        r'[\)\]]\s*([^/|]+?)\s*[/|]',
+        r'^[^/|]*?[\)\]]\s*(.+)$',
+    )
+    for padrao in padroes:
+        achado = re.search(padrao, texto)
+        if achado:
+            candidato = achado.group(1).strip(' -–—|/')
+            if candidato:
+                return candidato[:80]
+
+    # Quando não há cargo entre parênteses, usa somente o trecho anterior à barra.
+    if '|' in texto or '/' in texto:
+        candidato = re.split(r'[/|]', texto, maxsplit=1)[0].strip(' -–—|/')
+        candidato = re.sub(r'^(?:\([^)]*\)|\[[^]]*\])\s*', '', candidato).strip()
+        if candidato:
+            return candidato[:80]
+    return texto[:80]
+
+
+def _nome_rp_usuario(usuario: Any) -> str:
+    if usuario is None:
+        return 'Autoridade responsável'
+    candidatos = [
+        getattr(usuario, 'nick', None),
+        getattr(usuario, 'display_name', None),
+        getattr(usuario, 'global_name', None),
+    ]
+    username = str(getattr(usuario, 'name', '') or '').strip()
+    for candidato in candidatos:
+        apelido = _apelido_rp_de_texto(candidato)
+        if not apelido:
+            continue
+        # Evita nomes de conta longos/cheios de números quando há um apelido RP.
+        if username and apelido.casefold() == username.casefold():
+            continue
+        if re.fullmatch(r'[A-Za-z_\-.]*\d{6,}[A-Za-z0-9_\-.]*', apelido):
+            continue
+        return apelido
+    apelido_username = _apelido_rp_de_texto(username)
+    if apelido_username and not re.fullmatch(r'[A-Za-z_\-.]*\d{6,}[A-Za-z0-9_\-.]*', apelido_username):
+        return apelido_username
+    return 'Autoridade responsável'
+
+
+# Normaliza também cadastros antigos que possuíam o username no campo de nome.
+_obter_assinatura_comparecimento_antes_nome_rp = obter_assinatura_comparecimento
+
+def obter_assinatura_comparecimento(usuario_id: Any) -> Dict[str, Any]:
+    item = dict(_obter_assinatura_comparecimento_antes_nome_rp(usuario_id) or {})
+    membro = None
+    try:
+        uid = int(usuario_id or 0)
+        guild = bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if bot.guilds else None)
+        membro = guild.get_member(uid) if guild and uid else None
+    except Exception:
+        membro = None
+    if membro is not None:
+        item['nome'] = _nome_rp_usuario(membro)
+        item['cargo'] = item.get('cargo') or cargo_autorizador(membro)
+    elif item.get('nome'):
+        item['nome'] = _apelido_rp_de_texto(item.get('nome')) or 'Autoridade responsável'
+    return item
+
+
+# ---------- Persistência real das assinaturas ----------
+# A imagem fica no DATA_DIR/Volume e também é espelhada no Discord. Assim, mesmo
+# que o deploy apague o sistema de arquivos, o bot reconstrói o cadastro sozinho.
+
+def _ids_canais_cofre_assinaturas() -> List[int]:
+    ids: List[int] = []
+    for valor in (
+        ASSINATURAS_BACKUP_CHANNEL_ID,
+        DOSSIE_CHANNEL_ID,
+        BACKUP_CHANNEL_ID,
+        LOGS_CHANNEL_ID,
+    ):
+        try:
+            cid = int(valor or 0)
+        except Exception:
+            cid = 0
+        if cid and cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+async def _canais_cofre_assinaturas(guild: Optional[discord.Guild]) -> List[Any]:
+    canais: List[Any] = []
+    if guild is None:
+        return canais
+    for cid in _ids_canais_cofre_assinaturas():
+        canal = guild.get_channel(cid)
+        if canal is None:
+            try:
+                canal = await guild.fetch_channel(cid)
+            except Exception:
+                canal = None
+        if canal is not None and hasattr(canal, 'send') and canal not in canais:
+            canais.append(canal)
+    return canais
+
+
+async def _canal_backup_assinaturas(guild: Optional[discord.Guild]):
+    canais = await _canais_cofre_assinaturas(guild)
+    return canais[0] if canais else None
+
+
+async def _espelhar_assinatura_no_discord(
+    guild: Optional[discord.Guild],
+    slot: str,
+    registro: Dict[str, Any],
+    caminho: Path,
+) -> Dict[str, Any]:
+    """Cria cópias duráveis sem apagar a anterior antes da nova existir."""
+    if guild is None or not caminho.exists():
+        return {}
+    canais = await _canais_cofre_assinaturas(guild)
+    if not canais:
+        return {}
+
+    conteudo = (
+        f'{_ASSINATURA_BACKUP_MARKER}\n'
+        f'slot={slot}\n'
+        f'usuario_id={registro.get("usuario_id", "")}\n'
+        f'nome={_apelido_rp_de_texto(registro.get("nome", ""))}\n'
+        f'cargo={registro.get("cargo", "")}\n'
+        f'data={registro.get("data", agora_br())}'
+    )
+    copias: List[Dict[str, Any]] = []
+    # Mantém duas cópias em canais diferentes, quando disponíveis.
+    for canal in canais[:2]:
+        try:
+            mensagem = await canal.send(
+                content=conteudo,
+                file=discord.File(str(caminho), filename=f'assinatura_{slot}{caminho.suffix.lower()}'),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            anexo = mensagem.attachments[0] if mensagem.attachments else None
+            copia = {
+                'channel_id': mensagem.channel.id,
+                'message_id': mensagem.id,
+                'url': anexo.url if anexo else '',
+                'filename': anexo.filename if anexo else caminho.name,
+                'data': agora_br(),
+            }
+            copias.append(copia)
+            try:
+                await mensagem.pin(reason='Cofre persistente de assinatura DICOR')
+            except Exception:
+                pass
+        except Exception as erro:
+            await enviar_log(f'⚠️ Falha ao criar cópia da assinatura `{slot}` no canal `{getattr(canal, "id", 0)}`: {erro}')
+
+    if not copias:
+        return {}
+    principal = copias[0]
+    return {
+        'backup_channel_id': principal['channel_id'],
+        'backup_message_id': principal['message_id'],
+        'backup_url': principal['url'],
+        'backup_filename': principal['filename'],
+        'backup_em': principal['data'],
+        'backup_copies': copias,
+    }
+
+
+async def _mensagens_cofre_assinaturas(canal: Any) -> List[discord.Message]:
+    mensagens: Dict[int, discord.Message] = {}
+    try:
+        if hasattr(canal, 'pins'):
+            for msg in await canal.pins():
+                mensagens[msg.id] = msg
+    except Exception:
+        pass
+    try:
+        if hasattr(canal, 'history'):
+            async for msg in canal.history(limit=5000, oldest_first=False):
+                if _ASSINATURA_BACKUP_MARKER in str(getattr(msg, 'content', '') or ''):
+                    mensagens[msg.id] = msg
+    except Exception as erro:
+        await enviar_log(f'⚠️ Não consegui consultar o cofre de assinaturas `{getattr(canal, "id", 0)}`: {erro}')
+    return list(mensagens.values())
+
+
+async def _restaurar_assinaturas_do_discord(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    canais = await _canais_cofre_assinaturas(guild)
+    if not canais:
+        return 0
+
+    encontrados: Dict[str, discord.Message] = {}
+    for canal in canais:
+        for msg in await _mensagens_cofre_assinaturas(canal):
+            if bot.user and getattr(getattr(msg, 'author', None), 'id', None) != bot.user.id:
+                continue
+            meta = _parse_assinatura_backup_marker(getattr(msg, 'content', ''))
+            slot = meta.get('slot', '')
+            if slot not in {'delegado_geral', 'delegado_dicor', 'inspetor_predador', 'inspetor_baiano'}:
+                continue
+            if not getattr(msg, 'attachments', None):
+                continue
+            anterior = encontrados.get(slot)
+            if anterior is None or getattr(msg, 'created_at', datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)) > getattr(anterior, 'created_at', datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)):
+                encontrados[slot] = msg
+
+    dados = carregar_assinaturas_dossie()
+    restauradas = 0
+    for slot, msg in encontrados.items():
+        meta = _parse_assinatura_backup_marker(msg.content)
+        registro = dict(dados.get(slot) or {})
+        caminho = caminho_assinatura_registrada(registro)
+        if caminho is None or not caminho.exists():
+            destino = await _baixar_anexo_assinatura(msg.attachments[0], slot)
+            if not destino:
+                continue
+            registro['arquivo'] = caminho_relativo_base(destino)
+            registro['restaurada_em'] = agora_br()
+            restauradas += 1
+        registro.update({
+            'nome': _apelido_rp_de_texto(registro.get('nome') or meta.get('nome') or slot),
+            'usuario_id': registro.get('usuario_id') or meta.get('usuario_id') or '',
+            'cargo': registro.get('cargo') or meta.get('cargo') or '',
+            'data': registro.get('data') or meta.get('data') or agora_br(),
+            'backup_channel_id': msg.channel.id,
+            'backup_message_id': msg.id,
+            'backup_url': msg.attachments[0].url,
+            'backup_filename': msg.attachments[0].filename,
+        })
+        dados[slot] = registro
+
+    salvar_assinaturas_dossie(dados)
+    return restauradas
+
+
+async def _garantir_backup_assinaturas_locais(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    dados = carregar_assinaturas_dossie()
+    alteradas = 0
+    for slot in ('delegado_geral', 'delegado_dicor', 'inspetor_predador', 'inspetor_baiano'):
+        registro = dict(dados.get(slot) or {})
+        caminho = caminho_assinatura_registrada(registro)
+        if not caminho or not caminho.exists():
+            continue
+        # Garante cópia em cada novo deploy. O cofre mantém a versão mais recente.
+        if registro.get('backup_message_id') and registro.get('backup_url'):
+            continue
+        info = await _espelhar_assinatura_no_discord(guild, slot, registro, caminho)
+        if info:
+            registro.update(info)
+            registro['nome'] = _apelido_rp_de_texto(registro.get('nome'))
+            dados[slot] = registro
+            alteradas += 1
+    if alteradas:
+        salvar_assinaturas_dossie(dados)
+    return alteradas
+
+
+# ---------- Publicação do mandado: canal oficial + tópico de origem ----------
+
+def _embed_comparecimento_corrigido(registro: Dict[str, Any], atendimento: Dict[str, Any]) -> discord.Embed:
+    uid = int(registro.get('autorizado_por_id') or 0)
+    nome_rp = _apelido_rp_de_texto(registro.get('autorizado_por_nome')) or 'Autoridade responsável'
+    autoridade = f'<@{uid}> — **{nome_rp}**' if uid else f'**{nome_rp}**'
+    embed = discord.Embed(
+        title='📩 Solicitação de Comparecimento emitida',
+        description='Documento autorizado em PDF e anexado diretamente para download.',
+        color=discord.Color.from_rgb(0, 43, 91),
+    )
+    embed.add_field(name='Solicitação', value=f'`{registro.get("numero")}`', inline=True)
+    embed.add_field(name='Processo/Boletim', value=f'`{registro.get("processo") or atendimento.get("numero") or "N/I"}`', inline=True)
+    embed.add_field(name='Convocado', value=f'**{registro.get("nome")}**\nRG: `{registro.get("rg")}`', inline=False)
+    embed.add_field(name='Data/Horário', value=str(registro.get('data_hora')), inline=True)
+    embed.add_field(name='Local', value=str(registro.get('local')), inline=True)
+    embed.add_field(
+        name='Autoridade responsável',
+        value=f'{autoridade}\n{registro.get("autorizado_por_cargo", "Cargo não identificado")}',
+        inline=False,
+    )
+    embed.set_footer(text='Polícia Federal - DICOR • Documento oficial em PDF')
+    return embed
+
+
+async def _enviar_pdf_comparecimento_destino(
+    destino: Any,
+    registro: Dict[str, Any],
+    atendimento: Dict[str, Any],
+    caminho_pdf: Path,
+    nome_pdf: str,
+    *,
+    origem: bool = False,
+) -> discord.Message:
+    conteudo = (
+        f'<@{int(registro.get("autorizado_por_id") or 0)}>\n'
+        if int(registro.get('autorizado_por_id') or 0) else ''
+    )
+    conteudo += (
+        '✅ **Mandado autorizado — PDF anexado neste tópico.**'
+        if origem else
+        '📄 **Mandado/Solicitação de Comparecimento DICOR — PDF para download**'
+    )
+    buffer = io.BytesIO(caminho_pdf.read_bytes())
+    buffer.seek(0)
+    try:
+        return await destino.send(
+            content=conteudo,
+            embed=_embed_comparecimento_corrigido(registro, atendimento),
+            file=discord.File(buffer, filename=nome_pdf),
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    finally:
+        buffer.close()
+
+
+async def gerar_e_enviar_comparecimento(
+    interaction: discord.Interaction,
+    atendimento: Dict[str, Any],
+    registro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Gera apenas PDF e publica no canal de mandados e no tópico solicitante."""
+    pasta = COMPARECIMENTOS_DIR / slugify(str(registro.get('numero') or registro.get('id') or data_caso()))
+    pasta.mkdir(parents=True, exist_ok=True)
+    numero_limpo = re.sub(r'[^0-9A-Za-z_-]+', '_', str(registro.get('numero', 'comparecimento')))
+    nome_pdf = f'SOLICITACAO_COMPARECIMENTO_{numero_limpo}.pdf'
+    caminho_pdf = pasta / nome_pdf
+
+    autorizador = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if autorizador is not None:
+        registro['autorizado_por_id'] = autorizador.id
+        registro['autorizado_por_nome'] = _nome_rp_usuario(autorizador)
+        registro['autorizado_por_cargo'] = cargo_autorizador(autorizador)
+        registro['autorizado_em'] = registro.get('autorizado_em') or agora_br()
+        registro['assinatura_slot'] = resolver_slot_assinatura_autorizador(autorizador)
+    else:
+        registro['autorizado_por_nome'] = _apelido_rp_de_texto(registro.get('autorizado_por_nome')) or 'Autoridade responsável'
+
+    await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
+    if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 0:
+        raise RuntimeError('O PDF do mandado foi gerado vazio ou não foi encontrado.')
+
+    registro['arquivo_pdf'] = str(caminho_pdf)
+    # Remove qualquer referência antiga ao DOCX: o sistema agora emite somente PDF.
+    registro.pop('arquivo_docx', None)
+    registro['gerado_em'] = agora_br()
+
+    destino_oficial = interaction.guild.get_channel(MANDADOS_CHANNEL_ID) if interaction.guild else None
+    if destino_oficial is None:
+        try:
+            destino_oficial = await bot.fetch_channel(MANDADOS_CHANNEL_ID)
+        except Exception:
+            destino_oficial = None
+    if destino_oficial is None or not hasattr(destino_oficial, 'send'):
+        raise RuntimeError(f'Canal de mandados `{MANDADOS_CHANNEL_ID}` não encontrado ou sem permissão de envio.')
+
+    limite = int(getattr(getattr(destino_oficial, 'guild', None), 'filesize_limit', 25 * 1024 * 1024) or 25 * 1024 * 1024)
+    if caminho_pdf.stat().st_size > limite:
+        raise RuntimeError(
+            f'O PDF possui {caminho_pdf.stat().st_size / 1024 / 1024:.1f} MB e ultrapassa o limite do Discord.'
+        )
+
+    mensagem_oficial = await _enviar_pdf_comparecimento_destino(
+        destino_oficial, registro, atendimento, caminho_pdf, nome_pdf, origem=False
+    )
+    registro.update({
+        'publicacao_id': mensagem_oficial.id,
+        'publicacao_url': mensagem_oficial.jump_url,
+        'publicacao_canal_id': getattr(destino_oficial, 'id', None),
+        'status': 'AUTORIZADO/EMITIDO',
+    })
+
+    # Prioriza o tópico/canal do atendimento. Para mandado avulso, usa o canal
+    # da própria interação, que é exatamente onde a solicitação foi criada.
+    ids_origem: List[int] = []
+    for valor in (
+        atendimento.get('thread_id'),
+        atendimento.get('area_id'),
+        atendimento.get('canal_atendimento_id'),
+        registro.get('canal_origem_id'),
+        getattr(getattr(interaction, 'channel', None), 'id', None),
+    ):
+        try:
+            cid = int(valor or 0)
+        except Exception:
+            cid = 0
+        if cid and cid != int(getattr(destino_oficial, 'id', 0) or 0) and cid not in ids_origem:
+            ids_origem.append(cid)
+
+    mensagem_origem = None
+    for cid in ids_origem:
+        canal_origem = await obter_canal_bot(cid)
+        if canal_origem is None or not hasattr(canal_origem, 'send'):
+            continue
+        try:
+            mensagem_origem = await _enviar_pdf_comparecimento_destino(
+                canal_origem, registro, atendimento, caminho_pdf, nome_pdf, origem=True
+            )
+            registro.update({
+                'publicacao_origem_id': mensagem_origem.id,
+                'publicacao_origem_url': mensagem_origem.jump_url,
+                'publicacao_origem_canal_id': getattr(canal_origem, 'id', None),
+            })
+            break
+        except Exception as erro_origem:
+            await enviar_log(f'⚠️ Mandado publicado no canal oficial, mas falhou no tópico `{cid}`: {erro_origem}')
+
+    lista = carregar_comparecimentos()
+    existente = next((item for item in lista if str(item.get('id')) == str(registro.get('id'))), None)
+    if existente:
+        existente.update(registro)
+    else:
+        lista.append(registro)
+    salvar_comparecimentos(lista)
+
+    await enviar_log(
+        f'📤 Mandado PDF publicado | solicitação `{registro.get("numero")}` | '
+        f'canal oficial `{getattr(destino_oficial, "id", 0)}` | '
+        f'tópico `{registro.get("publicacao_origem_canal_id", "não localizado")}` | '
+        f'autorizador `{registro.get("autorizado_por_id")}` | {agora_br()}'
+    )
+    return registro
 
 if __name__ == '__main__':
     asyncio.run(main())
