@@ -25387,5 +25387,1442 @@ async def antes_verificar_boletins_parados_alerta_inteligente():
     await asyncio.sleep(15)
 
 
+# =====================================================
+# PATCH — BANCO DE DADOS COMPLETO DICOR
+# Indivíduos, placas, facções/painéis e importação automática da Perícia Externa.
+# Não altera painéis/modelos de mesas, dossiês, mandados ou procurados.
+# =====================================================
+
+import sqlite3
+from contextlib import contextmanager
+
+BANCO_DADOS_SQLITE = DATA_DIR / "dicor_banco_dados.sqlite3"
+BANCO_ARQUIVOS_DIR = DATA_DIR / "banco_dados_arquivos"
+BANCO_PERICIA_CHANNEL_ID = env_int(
+    "BANCO_PERICIA_CHANNEL_ID",
+    int(CANAIS_RELATORIOS.get("pericia_externa", 1490200524367200297)),
+)
+BANCO_PERICIA_SCAN_LIMIT = env_int("BANCO_PERICIA_SCAN_LIMIT", 0)  # 0 = histórico inteiro
+BANCO_AUTO_SYNC_MINUTOS = max(10, env_int("BANCO_AUTO_SYNC_MINUTOS", 30))
+
+BANCO_ARQUIVOS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _banco_agora_iso() -> str:
+    tz = datetime.timezone(datetime.timedelta(hours=-3))
+    return datetime.datetime.now(tz).isoformat(timespec="seconds")
+
+
+def _banco_normalizar_rg(valor: Any) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", str(valor or "").strip()).upper()
+
+
+def _banco_normalizar_placa(valor: Any) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", str(valor or "").strip()).upper()[:16]
+
+
+def _banco_limpar_texto(valor: Any, limite: int = 500) -> str:
+    texto = str(valor or "").strip()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto[:limite]
+
+
+@contextmanager
+def _banco_conexao():
+    BANCO_DADOS_SQLITE.parent.mkdir(parents=True, exist_ok=True)
+    conexao = sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=30)
+    conexao.row_factory = sqlite3.Row
+    conexao.execute("PRAGMA foreign_keys = ON")
+    conexao.execute("PRAGMA journal_mode = WAL")
+    try:
+        yield conexao
+        conexao.commit()
+    except Exception:
+        conexao.rollback()
+        raise
+    finally:
+        conexao.close()
+
+
+def inicializar_banco_dicor() -> None:
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS individuos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rg TEXT NOT NULL UNIQUE,
+                nome TEXT NOT NULL,
+                apelido TEXT DEFAULT '',
+                telefone TEXT DEFAULT '',
+                faccao_atual TEXT DEFAULT '',
+                cargo_faccao TEXT DEFAULT '',
+                observacoes TEXT DEFAULT '',
+                status TEXT DEFAULT 'CADASTRADO',
+                foto_individuo_path TEXT DEFAULT '',
+                foto_rg_path TEXT DEFAULT '',
+                foto_individuo_url TEXT DEFAULT '',
+                foto_rg_url TEXT DEFAULT '',
+                origem TEXT DEFAULT 'manual',
+                mesa_canal_id INTEGER DEFAULT 0,
+                mesa_nome TEXT DEFAULT '',
+                criado_por_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS veiculos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                placa TEXT NOT NULL UNIQUE,
+                modelo TEXT DEFAULT '',
+                cor TEXT DEFAULT '',
+                proprietario_rg TEXT DEFAULT '',
+                proprietario_nome TEXT DEFAULT '',
+                faccao TEXT DEFAULT '',
+                local_ultimo_avistamento TEXT DEFAULT '',
+                observacoes TEXT DEFAULT '',
+                foto_path TEXT DEFAULT '',
+                foto_url TEXT DEFAULT '',
+                origem_tipo TEXT DEFAULT 'manual',
+                origem_id TEXT DEFAULT '',
+                mensagem_url TEXT DEFAULT '',
+                criado_por_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS faccoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                status TEXT DEFAULT 'ATIVA',
+                mesa_canal_id INTEGER DEFAULT 0,
+                mesa_nome TEXT DEFAULT '',
+                painel_atual TEXT DEFAULT '',
+                painel_mensagem_url TEXT DEFAULT '',
+                atualizado_por_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS painel_versoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faccao_id INTEGER NOT NULL,
+                versao INTEGER NOT NULL,
+                texto_original TEXT NOT NULL,
+                mensagem_url TEXT DEFAULT '',
+                autor_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                FOREIGN KEY(faccao_id) REFERENCES faccoes(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS faccao_membros (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                faccao_id INTEGER NOT NULL,
+                individuo_id INTEGER,
+                nome TEXT NOT NULL,
+                rg TEXT DEFAULT '',
+                cargo TEXT DEFAULT 'MEMBRO',
+                ativo INTEGER DEFAULT 1,
+                painel_versao INTEGER DEFAULT 1,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                UNIQUE(faccao_id, rg),
+                FOREIGN KEY(faccao_id) REFERENCES faccoes(id) ON DELETE CASCADE,
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pericia_sincronizada (
+                mensagem_id INTEGER PRIMARY KEY,
+                canal_id INTEGER NOT NULL,
+                placas_encontradas INTEGER DEFAULT 0,
+                sincronizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS historico_banco (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entidade_tipo TEXT NOT NULL,
+                entidade_chave TEXT NOT NULL,
+                acao TEXT NOT NULL,
+                detalhes TEXT DEFAULT '',
+                autor_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_individuos_nome ON individuos(nome);
+            CREATE INDEX IF NOT EXISTS idx_individuos_faccao ON individuos(faccao_atual);
+            CREATE INDEX IF NOT EXISTS idx_veiculos_modelo ON veiculos(modelo);
+            CREATE INDEX IF NOT EXISTS idx_veiculos_faccao ON veiculos(faccao);
+            CREATE INDEX IF NOT EXISTS idx_membros_faccao ON faccao_membros(faccao_id, ativo);
+            CREATE INDEX IF NOT EXISTS idx_historico_chave ON historico_banco(entidade_tipo, entidade_chave);
+            """
+        )
+
+
+def _banco_historico(
+    entidade_tipo: str,
+    entidade_chave: str,
+    acao: str,
+    detalhes: str = "",
+    autor_id: int = 0,
+    db: Optional[sqlite3.Connection] = None,
+) -> None:
+    proprio = db is None
+    conexao = db or sqlite3.connect(str(BANCO_DADOS_SQLITE))
+    try:
+        conexao.execute(
+            """
+            INSERT INTO historico_banco
+            (entidade_tipo, entidade_chave, acao, detalhes, autor_id, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _banco_limpar_texto(entidade_tipo, 40),
+                _banco_limpar_texto(entidade_chave, 100),
+                _banco_limpar_texto(acao, 80),
+                str(detalhes or "")[:1800],
+                int(autor_id or 0),
+                _banco_agora_iso(),
+            ),
+        )
+        if proprio:
+            conexao.commit()
+    finally:
+        if proprio:
+            conexao.close()
+
+
+def banco_encontrar_mesa(nome_faccao: str) -> Dict[str, Any]:
+    alvo = normalizar_busca(nome_faccao).strip()
+    candidatos: List[Dict[str, Any]] = []
+    for mesa in carregar_mesas():
+        familia = str(mesa.get("familia") or "")
+        nome_canal = str(mesa.get("nome_canal") or "")
+        if not alvo:
+            continue
+        fam_n = normalizar_busca(familia)
+        canal_n = normalizar_busca(nome_canal)
+        if alvo == fam_n or alvo in fam_n or fam_n in alvo or alvo in canal_n:
+            candidatos.append(mesa)
+    if not candidatos:
+        return {}
+    candidatos.sort(
+        key=lambda m: (
+            str(m.get("status", "")).upper() == "ABERTA",
+            str(m.get("criada_em", "")),
+        ),
+        reverse=True,
+    )
+    return candidatos[0]
+
+
+def banco_upsert_individuo(
+    *,
+    nome: str,
+    rg: str,
+    apelido: str = "",
+    telefone: str = "",
+    faccao: str = "",
+    cargo: str = "",
+    observacoes: str = "",
+    status: str = "CADASTRADO",
+    origem: str = "manual",
+    mesa_canal_id: int = 0,
+    mesa_nome: str = "",
+    criado_por_id: int = 0,
+    foto_individuo_path: str = "",
+    foto_rg_path: str = "",
+    foto_individuo_url: str = "",
+    foto_rg_url: str = "",
+    db: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    rg_n = _banco_normalizar_rg(rg)
+    nome_n = _banco_limpar_texto(nome, 120)
+    if not rg_n:
+        raise ValueError("RG não informado.")
+    if not nome_n:
+        raise ValueError("Nome não informado.")
+
+    agora = _banco_agora_iso()
+    proprio = db is None
+    conexao = db or sqlite3.connect(str(BANCO_DADOS_SQLITE))
+    conexao.row_factory = sqlite3.Row
+    try:
+        anterior = conexao.execute("SELECT * FROM individuos WHERE rg = ?", (rg_n,)).fetchone()
+        valores = {
+            "nome": nome_n,
+            "apelido": _banco_limpar_texto(apelido, 100),
+            "telefone": _banco_limpar_texto(telefone, 50),
+            "faccao": _banco_limpar_texto(faccao, 120),
+            "cargo": _banco_limpar_texto(cargo, 100),
+            "observacoes": str(observacoes or "")[:1800],
+            "status": _banco_limpar_texto(status or "CADASTRADO", 60).upper(),
+            "origem": _banco_limpar_texto(origem, 80),
+            "mesa_canal_id": int(mesa_canal_id or 0),
+            "mesa_nome": _banco_limpar_texto(mesa_nome, 150),
+            "foto_individuo_path": str(foto_individuo_path or "")[:500],
+            "foto_rg_path": str(foto_rg_path or "")[:500],
+            "foto_individuo_url": str(foto_individuo_url or "")[:1000],
+            "foto_rg_url": str(foto_rg_url or "")[:1000],
+        }
+
+        if anterior:
+            # Não apaga campos antigos quando uma sincronização trouxer valor vazio.
+            for campo, coluna in [
+                ("apelido", "apelido"),
+                ("telefone", "telefone"),
+                ("faccao", "faccao_atual"),
+                ("cargo", "cargo_faccao"),
+                ("observacoes", "observacoes"),
+                ("mesa_nome", "mesa_nome"),
+                ("foto_individuo_path", "foto_individuo_path"),
+                ("foto_rg_path", "foto_rg_path"),
+                ("foto_individuo_url", "foto_individuo_url"),
+                ("foto_rg_url", "foto_rg_url"),
+            ]:
+                if not valores[campo]:
+                    valores[campo] = str(anterior[coluna] or "")
+            if not valores["mesa_canal_id"]:
+                valores["mesa_canal_id"] = int(anterior["mesa_canal_id"] or 0)
+            if valores["status"] in {"", "CADASTRADO"} and str(anterior["status"] or ""):
+                valores["status"] = str(anterior["status"])
+
+            conexao.execute(
+                """
+                UPDATE individuos SET
+                    nome=?, apelido=?, telefone=?, faccao_atual=?, cargo_faccao=?,
+                    observacoes=?, status=?, foto_individuo_path=?, foto_rg_path=?,
+                    foto_individuo_url=?, foto_rg_url=?, origem=?, mesa_canal_id=?,
+                    mesa_nome=?, atualizado_em=?
+                WHERE rg=?
+                """,
+                (
+                    valores["nome"], valores["apelido"], valores["telefone"], valores["faccao"],
+                    valores["cargo"], valores["observacoes"], valores["status"],
+                    valores["foto_individuo_path"], valores["foto_rg_path"],
+                    valores["foto_individuo_url"], valores["foto_rg_url"], valores["origem"],
+                    valores["mesa_canal_id"], valores["mesa_nome"], agora, rg_n,
+                ),
+            )
+            acao = "ATUALIZADO"
+        else:
+            conexao.execute(
+                """
+                INSERT INTO individuos
+                (rg, nome, apelido, telefone, faccao_atual, cargo_faccao,
+                 observacoes, status, foto_individuo_path, foto_rg_path,
+                 foto_individuo_url, foto_rg_url, origem, mesa_canal_id,
+                 mesa_nome, criado_por_id, criado_em, atualizado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rg_n, valores["nome"], valores["apelido"], valores["telefone"],
+                    valores["faccao"], valores["cargo"], valores["observacoes"],
+                    valores["status"], valores["foto_individuo_path"], valores["foto_rg_path"],
+                    valores["foto_individuo_url"], valores["foto_rg_url"], valores["origem"],
+                    valores["mesa_canal_id"], valores["mesa_nome"], int(criado_por_id or 0),
+                    agora, agora,
+                ),
+            )
+            acao = "CADASTRADO"
+
+        _banco_historico(
+            "INDIVIDUO",
+            rg_n,
+            acao,
+            f"Nome: {nome_n} | Facção: {valores['faccao'] or 'N/A'} | Origem: {origem}",
+            criado_por_id,
+            conexao,
+        )
+        resultado = conexao.execute("SELECT * FROM individuos WHERE rg = ?", (rg_n,)).fetchone()
+        if proprio:
+            conexao.commit()
+        return dict(resultado) if resultado else {}
+    except Exception:
+        if proprio:
+            conexao.rollback()
+        raise
+    finally:
+        if proprio:
+            conexao.close()
+
+
+def banco_upsert_veiculo(
+    *,
+    placa: str,
+    modelo: str = "",
+    cor: str = "",
+    proprietario_rg: str = "",
+    proprietario_nome: str = "",
+    faccao: str = "",
+    local: str = "",
+    observacoes: str = "",
+    foto_path: str = "",
+    foto_url: str = "",
+    origem_tipo: str = "manual",
+    origem_id: str = "",
+    mensagem_url: str = "",
+    criado_por_id: int = 0,
+    db: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    placa_n = _banco_normalizar_placa(placa)
+    if len(placa_n) < 3:
+        raise ValueError("Placa inválida.")
+    agora = _banco_agora_iso()
+    proprio = db is None
+    conexao = db or sqlite3.connect(str(BANCO_DADOS_SQLITE))
+    conexao.row_factory = sqlite3.Row
+    try:
+        anterior = conexao.execute("SELECT * FROM veiculos WHERE placa = ?", (placa_n,)).fetchone()
+        campos = {
+            "modelo": _banco_limpar_texto(modelo, 120),
+            "cor": _banco_limpar_texto(cor, 80),
+            "proprietario_rg": _banco_normalizar_rg(proprietario_rg),
+            "proprietario_nome": _banco_limpar_texto(proprietario_nome, 120),
+            "faccao": _banco_limpar_texto(faccao, 120),
+            "local": _banco_limpar_texto(local, 180),
+            "observacoes": str(observacoes or "")[:1800],
+            "foto_path": str(foto_path or "")[:500],
+            "foto_url": str(foto_url or "")[:1000],
+            "origem_tipo": _banco_limpar_texto(origem_tipo, 80),
+            "origem_id": _banco_limpar_texto(origem_id, 120),
+            "mensagem_url": str(mensagem_url or "")[:1000],
+        }
+        if anterior:
+            for chave, coluna in [
+                ("modelo", "modelo"), ("cor", "cor"), ("proprietario_rg", "proprietario_rg"),
+                ("proprietario_nome", "proprietario_nome"), ("faccao", "faccao"),
+                ("local", "local_ultimo_avistamento"), ("observacoes", "observacoes"),
+                ("foto_path", "foto_path"), ("foto_url", "foto_url"),
+                ("mensagem_url", "mensagem_url"),
+            ]:
+                if not campos[chave]:
+                    campos[chave] = str(anterior[coluna] or "")
+            conexao.execute(
+                """
+                UPDATE veiculos SET modelo=?, cor=?, proprietario_rg=?, proprietario_nome=?,
+                    faccao=?, local_ultimo_avistamento=?, observacoes=?, foto_path=?, foto_url=?,
+                    origem_tipo=?, origem_id=?, mensagem_url=?, atualizado_em=?
+                WHERE placa=?
+                """,
+                (
+                    campos["modelo"], campos["cor"], campos["proprietario_rg"],
+                    campos["proprietario_nome"], campos["faccao"], campos["local"],
+                    campos["observacoes"], campos["foto_path"], campos["foto_url"],
+                    campos["origem_tipo"], campos["origem_id"], campos["mensagem_url"],
+                    agora, placa_n,
+                ),
+            )
+            acao = "ATUALIZADO"
+        else:
+            conexao.execute(
+                """
+                INSERT INTO veiculos
+                (placa, modelo, cor, proprietario_rg, proprietario_nome, faccao,
+                 local_ultimo_avistamento, observacoes, foto_path, foto_url,
+                 origem_tipo, origem_id, mensagem_url, criado_por_id, criado_em, atualizado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    placa_n, campos["modelo"], campos["cor"], campos["proprietario_rg"],
+                    campos["proprietario_nome"], campos["faccao"], campos["local"],
+                    campos["observacoes"], campos["foto_path"], campos["foto_url"],
+                    campos["origem_tipo"], campos["origem_id"], campos["mensagem_url"],
+                    int(criado_por_id or 0), agora, agora,
+                ),
+            )
+            acao = "CADASTRADO"
+        _banco_historico(
+            "VEICULO", placa_n, acao,
+            f"Modelo: {campos['modelo'] or 'N/A'} | Facção: {campos['faccao'] or 'N/A'} | Origem: {origem_tipo}",
+            criado_por_id, conexao,
+        )
+        resultado = conexao.execute("SELECT * FROM veiculos WHERE placa = ?", (placa_n,)).fetchone()
+        if proprio:
+            conexao.commit()
+        return dict(resultado) if resultado else {}
+    except Exception:
+        if proprio:
+            conexao.rollback()
+        raise
+    finally:
+        if proprio:
+            conexao.close()
+
+
+def _banco_cargo_cabecalho(linha: str, atual: str = "MEMBRO") -> str:
+    n = normalizar_busca(linha).strip(" :*-#[]()")
+    mapa = [
+        ("lider", "LÍDER"),
+        ("sub lider", "SUBLÍDER"),
+        ("sublider", "SUBLÍDER"),
+        ("vice lider", "VICE-LÍDER"),
+        ("gerente", "GERENTE"),
+        ("conselheiro", "CONSELHEIRO"),
+        ("membro", "MEMBRO"),
+        ("integrante", "MEMBRO"),
+        ("recruta", "RECRUTA"),
+    ]
+    # Só assume cabeçalho quando a linha é curta e não contém RG.
+    if len(n) <= 40 and not re.search(r"\brg\b|\d{3,}", n):
+        for chave, cargo in mapa:
+            if chave in n:
+                return cargo
+    return atual
+
+
+def banco_extrair_membros_painel(texto: str) -> List[Dict[str, str]]:
+    bruto = str(texto or "").replace("｜", "|").replace("—", "-").replace("–", "-")
+    linhas = [re.sub(r"[*_`>#]+", "", x).strip() for x in bruto.splitlines()]
+    membros: List[Dict[str, str]] = []
+    vistos: set = set()
+    cargo_atual = "MEMBRO"
+    nome_pendente = ""
+
+    def adicionar(nome: str, rg: str, cargo: str) -> None:
+        nome_l = _banco_limpar_texto(nome, 120).strip(" -|:•")
+        rg_l = _banco_normalizar_rg(rg)
+        if not nome_l or not rg_l or len(rg_l) < 2:
+            return
+        chave = rg_l
+        if chave in vistos:
+            return
+        vistos.add(chave)
+        membros.append({"nome": nome_l, "rg": rg_l, "cargo": cargo or "MEMBRO"})
+
+    for linha in linhas:
+        if not linha:
+            continue
+        novo_cargo = _banco_cargo_cabecalho(linha, cargo_atual)
+        if novo_cargo != cargo_atual and not re.search(r"\brg\b\s*[:\-]", linha, flags=re.I):
+            cargo_atual = novo_cargo
+            continue
+
+        # Nome: Fulano | RG: 123 / Fulano - RG: 123
+        m = re.search(
+            r"(?:nome\s*[:\-]\s*)?(.+?)\s*(?:\||-|;)\s*(?:rg\s*[:\-]?\s*)?([A-Za-z0-9.\-/]{2,20})\s*$",
+            linha,
+            flags=re.I,
+        )
+        if m and ("rg" in normalizar_busca(linha) or re.fullmatch(r"\d{2,20}", _banco_normalizar_rg(m.group(2)))):
+            adicionar(m.group(1), m.group(2), cargo_atual)
+            nome_pendente = ""
+            continue
+
+        # Nome e RG na mesma linha sem separador obrigatório.
+        m = re.search(r"(?:nome\s*[:\-]\s*)?(.+?)\s+rg\s*[:\-]\s*([A-Za-z0-9.\-/]{2,20})", linha, flags=re.I)
+        if m:
+            adicionar(m.group(1), m.group(2), cargo_atual)
+            nome_pendente = ""
+            continue
+
+        # Formato em duas linhas: Nome: X / RG: Y.
+        m_nome = re.match(r"(?:nome|integrante|membro)\s*[:\-]\s*(.+)$", linha, flags=re.I)
+        if m_nome:
+            nome_pendente = m_nome.group(1).strip()
+            continue
+        m_rg = re.match(r"rg\s*[:\-]\s*([A-Za-z0-9.\-/]{2,20})", linha, flags=re.I)
+        if m_rg and nome_pendente:
+            adicionar(nome_pendente, m_rg.group(1), cargo_atual)
+            nome_pendente = ""
+            continue
+
+        # Lista simples: Fulano | 12345
+        m = re.match(r"(.{2,120}?)\s*\|\s*([A-Za-z0-9.\-/]{2,20})$", linha)
+        if m:
+            adicionar(m.group(1), m.group(2), cargo_atual)
+
+    return membros
+
+
+def banco_importar_painel(
+    nome_faccao: str,
+    texto_painel: str,
+    *,
+    modo: str = "substituir",
+    autor_id: int = 0,
+    mensagem_url: str = "",
+) -> Dict[str, Any]:
+    faccao = _banco_limpar_texto(nome_faccao, 120)
+    if not faccao:
+        raise ValueError("Nome da facção/mesa não informado.")
+    texto = str(texto_painel or "").strip()
+    if not texto:
+        raise ValueError("Painel vazio.")
+    membros = banco_extrair_membros_painel(texto)
+    mesa = banco_encontrar_mesa(faccao)
+    mesa_id = int(mesa.get("canal_id", 0) or 0)
+    mesa_nome = str(mesa.get("nome_canal") or mesa.get("familia") or "")
+    agora = _banco_agora_iso()
+
+    with _banco_conexao() as db:
+        existente = db.execute("SELECT * FROM faccoes WHERE nome = ? COLLATE NOCASE", (faccao,)).fetchone()
+        if existente:
+            faccao_id = int(existente["id"])
+            db.execute(
+                """
+                UPDATE faccoes SET painel_atual=?, painel_mensagem_url=?, atualizado_por_id=?,
+                    mesa_canal_id=?, mesa_nome=?, atualizado_em=? WHERE id=?
+                """,
+                (texto, mensagem_url, int(autor_id or 0), mesa_id, mesa_nome, agora, faccao_id),
+            )
+        else:
+            cur = db.execute(
+                """
+                INSERT INTO faccoes
+                (nome, status, mesa_canal_id, mesa_nome, painel_atual, painel_mensagem_url,
+                 atualizado_por_id, criado_em, atualizado_em)
+                VALUES (?, 'ATIVA', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (faccao, mesa_id, mesa_nome, texto, mensagem_url, int(autor_id or 0), agora, agora),
+            )
+            faccao_id = int(cur.lastrowid)
+
+        versao = int(db.execute(
+            "SELECT COALESCE(MAX(versao), 0) + 1 FROM painel_versoes WHERE faccao_id=?",
+            (faccao_id,),
+        ).fetchone()[0])
+        db.execute(
+            """
+            INSERT INTO painel_versoes
+            (faccao_id, versao, texto_original, mensagem_url, autor_id, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (faccao_id, versao, texto, mensagem_url, int(autor_id or 0), agora),
+        )
+
+        if normalizar_busca(modo).startswith("sub"):
+            db.execute("UPDATE faccao_membros SET ativo=0, atualizado_em=? WHERE faccao_id=?", (agora, faccao_id))
+
+        novos = 0
+        atualizados = 0
+        for membro in membros:
+            anterior_ind = db.execute("SELECT id FROM individuos WHERE rg=?", (membro["rg"],)).fetchone()
+            individuo = banco_upsert_individuo(
+                nome=membro["nome"], rg=membro["rg"], faccao=faccao, cargo=membro["cargo"],
+                origem="painel_mesa", mesa_canal_id=mesa_id, mesa_nome=mesa_nome,
+                criado_por_id=autor_id, db=db,
+            )
+            individuo_id = int(individuo.get("id", 0) or 0)
+            membro_antigo = db.execute(
+                "SELECT id FROM faccao_membros WHERE faccao_id=? AND rg=?",
+                (faccao_id, membro["rg"]),
+            ).fetchone()
+            if membro_antigo:
+                db.execute(
+                    """
+                    UPDATE faccao_membros SET individuo_id=?, nome=?, cargo=?, ativo=1,
+                        painel_versao=?, atualizado_em=? WHERE id=?
+                    """,
+                    (individuo_id or None, membro["nome"], membro["cargo"], versao, agora, int(membro_antigo["id"])),
+                )
+                atualizados += 1
+            else:
+                db.execute(
+                    """
+                    INSERT INTO faccao_membros
+                    (faccao_id, individuo_id, nome, rg, cargo, ativo, painel_versao, criado_em, atualizado_em)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (faccao_id, individuo_id or None, membro["nome"], membro["rg"], membro["cargo"], versao, agora, agora),
+                )
+                novos += 1
+
+        _banco_historico(
+            "FACCAO", faccao, "PAINEL_IMPORTADO",
+            f"Versão {versao} | {len(membros)} integrantes | modo {modo} | mesa {mesa_nome or 'não vinculada'}",
+            autor_id, db,
+        )
+
+    return {
+        "faccao": faccao,
+        "versao": versao,
+        "membros": len(membros),
+        "novos": novos,
+        "atualizados": atualizados,
+        "mesa_canal_id": mesa_id,
+        "mesa_nome": mesa_nome,
+    }
+
+
+def _banco_extrair_label(texto: str, rotulos: List[str], limite: int = 180) -> str:
+    linhas = str(texto or "").replace("**", "").replace("`", "").splitlines()
+    for linha in linhas:
+        for rotulo in rotulos:
+            m = re.search(rf"(?:^|\s){rotulo}\s*[:\-]\s*(.+)$", linha, flags=re.I)
+            if m:
+                return _banco_limpar_texto(m.group(1), limite)
+    return ""
+
+
+def banco_extrair_veiculos_pericia(texto: str) -> List[Dict[str, str]]:
+    texto_limpo = str(texto or "").replace("**", "").replace("`", "")
+    placas: List[str] = []
+    for padrao in [
+        r"\bplaca(?:\s+do\s+ve[ií]culo)?\s*[:\-]\s*([A-Za-z0-9\-]{3,16})",
+        r"\bplate\s*[:\-]\s*([A-Za-z0-9\-]{3,16})",
+    ]:
+        for valor in re.findall(padrao, texto_limpo, flags=re.I):
+            placa = _banco_normalizar_placa(valor)
+            if placa and placa not in placas:
+                placas.append(placa)
+
+    modelo = _banco_extrair_label(texto_limpo, [r"modelo", r"ve[ií]culo", r"carro"], 120)
+    cor = _banco_extrair_label(texto_limpo, [r"cor"], 80)
+    proprietario_rg = _banco_extrair_label(texto_limpo, [r"rg\s+do\s+propriet[aá]rio", r"rg\s+propriet[aá]rio"], 40)
+    proprietario_nome = _banco_extrair_label(texto_limpo, [r"propriet[aá]rio", r"dono"], 120)
+    faccao = _banco_extrair_label(texto_limpo, [r"fac[cç][aã]o", r"organiza[cç][aã]o", r"fam[ií]lia"], 120)
+    local = _banco_extrair_label(texto_limpo, [r"local", r"localiza[cç][aã]o"], 180)
+    observacoes = _banco_extrair_label(texto_limpo, [r"observa[cç][aã]o", r"conclus[aã]o", r"an[aá]lise"], 600)
+
+    return [
+        {
+            "placa": placa,
+            "modelo": modelo,
+            "cor": cor,
+            "proprietario_rg": proprietario_rg,
+            "proprietario_nome": proprietario_nome,
+            "faccao": faccao,
+            "local": local,
+            "observacoes": observacoes,
+        }
+        for placa in placas
+    ]
+
+
+async def _banco_salvar_attachment(attachment: discord.Attachment, prefixo: str) -> str:
+    extensao = Path(attachment.filename or "").suffix.lower()
+    if extensao not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        extensao = ".png"
+    nome = f"{slugify(prefixo)}-{int(time.time() * 1000)}{extensao}"
+    destino = BANCO_ARQUIVOS_DIR / nome
+    await attachment.save(str(destino))
+    return str(destino)
+
+
+async def banco_sincronizar_pericias(guild: Optional[discord.Guild], *, limite: Optional[int] = None) -> Dict[str, int]:
+    if guild is None:
+        return {"mensagens": 0, "novas": 0, "placas": 0, "erros": 0}
+    canal = guild.get_channel(BANCO_PERICIA_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(BANCO_PERICIA_CHANNEL_ID)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, "history"):
+        raise RuntimeError("Canal de Perícia Externa não encontrado.")
+
+    historico_limite = limite
+    if historico_limite is None:
+        historico_limite = None if BANCO_PERICIA_SCAN_LIMIT <= 0 else BANCO_PERICIA_SCAN_LIMIT
+    resultado = {"mensagens": 0, "novas": 0, "placas": 0, "erros": 0}
+
+    async for msg in canal.history(limit=historico_limite, oldest_first=True):
+        resultado["mensagens"] += 1
+        with _banco_conexao() as db:
+            ja = db.execute("SELECT 1 FROM pericia_sincronizada WHERE mensagem_id=?", (int(msg.id),)).fetchone()
+        if ja:
+            continue
+        try:
+            texto = coletar_texto_embed(msg) if "coletar_texto_embed" in globals() else (msg.content or "")
+            encontrados = banco_extrair_veiculos_pericia(texto)
+            foto_path = ""
+            foto_url = ""
+            imagem = next(
+                (
+                    a for a in msg.attachments
+                    if (a.content_type or "").startswith("image/")
+                    or Path(a.filename or "").suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                ),
+                None,
+            )
+            if imagem and encontrados:
+                try:
+                    foto_path = await _banco_salvar_attachment(imagem, f"pericia-{msg.id}")
+                    foto_url = imagem.url
+                except Exception:
+                    traceback.print_exc()
+
+            for item in encontrados:
+                banco_upsert_veiculo(
+                    **item,
+                    foto_path=foto_path,
+                    foto_url=foto_url,
+                    origem_tipo="pericia_externa",
+                    origem_id=str(msg.id),
+                    mensagem_url=getattr(msg, "jump_url", ""),
+                    criado_por_id=int(getattr(msg.author, "id", 0) or 0),
+                )
+                resultado["placas"] += 1
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO pericia_sincronizada
+                    (mensagem_id, canal_id, placas_encontradas, sincronizado_em)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (int(msg.id), int(canal.id), len(encontrados), _banco_agora_iso()),
+                )
+            resultado["novas"] += 1
+        except Exception as erro:
+            resultado["erros"] += 1
+            await enviar_log(f"⚠️ Banco DICOR: falha ao importar perícia `{msg.id}`: {erro}")
+    return resultado
+
+
+def banco_sincronizar_procurados() -> Dict[str, int]:
+    total = 0
+    erros = 0
+    for p in carregar_procurados():
+        try:
+            rg = p.get("rg") or p.get("documento") or ""
+            nome = p.get("nome") or p.get("individuo") or "Não informado"
+            if not _banco_normalizar_rg(rg):
+                continue
+            status_bruto = str(p.get("status") or "PROCURADO").upper()
+            if p.get("arquivado") or "ARQUIV" in status_bruto or "CAPTUR" in status_bruto or "RETIR" in status_bruto:
+                status = "ARQUIVADO"
+            else:
+                status = "PROCURADO"
+            banco_upsert_individuo(
+                nome=str(nome), rg=str(rg), apelido=str(p.get("apelido") or ""),
+                faccao=str(p.get("faccao") or p.get("organizacao") or ""),
+                observacoes=str(p.get("ultimo_avistamento") or p.get("crimes") or ""),
+                status=status, origem="procurados",
+                criado_por_id=int(p.get("autor_id") or p.get("criado_por_id") or 0),
+                foto_individuo_url=str(p.get("foto_url") or p.get("foto_individuo_url") or ""),
+                foto_rg_url=str(p.get("foto_rg_url") or ""),
+            )
+            total += 1
+        except Exception:
+            erros += 1
+    return {"total": total, "erros": erros}
+
+
+def banco_sincronizar_mesas() -> Dict[str, int]:
+    total = 0
+    erros = 0
+    agora = _banco_agora_iso()
+    for mesa in carregar_mesas():
+        try:
+            nome = _banco_limpar_texto(mesa.get("familia") or mesa.get("nome_canal") or "", 120)
+            if not nome:
+                continue
+            with _banco_conexao() as db:
+                existe = db.execute("SELECT id FROM faccoes WHERE nome=? COLLATE NOCASE", (nome,)).fetchone()
+                if existe:
+                    db.execute(
+                        """
+                        UPDATE faccoes SET mesa_canal_id=?, mesa_nome=?, status=?, atualizado_em=? WHERE id=?
+                        """,
+                        (
+                            int(mesa.get("canal_id") or 0), str(mesa.get("nome_canal") or "")[:150],
+                            "ATIVA" if str(mesa.get("status") or "").upper() == "ABERTA" else "ARQUIVADA",
+                            agora, int(existe["id"]),
+                        ),
+                    )
+                else:
+                    db.execute(
+                        """
+                        INSERT INTO faccoes
+                        (nome, status, mesa_canal_id, mesa_nome, painel_atual, painel_mensagem_url,
+                         atualizado_por_id, criado_em, atualizado_em)
+                        VALUES (?, ?, ?, ?, '', '', 0, ?, ?)
+                        """,
+                        (
+                            nome,
+                            "ATIVA" if str(mesa.get("status") or "").upper() == "ABERTA" else "ARQUIVADA",
+                            int(mesa.get("canal_id") or 0), str(mesa.get("nome_canal") or "")[:150], agora, agora,
+                        ),
+                    )
+            total += 1
+        except Exception:
+            erros += 1
+    return {"total": total, "erros": erros}
+
+
+def banco_resumo() -> Dict[str, int]:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        return {
+            "individuos": int(db.execute("SELECT COUNT(*) FROM individuos").fetchone()[0]),
+            "placas": int(db.execute("SELECT COUNT(*) FROM veiculos").fetchone()[0]),
+            "faccoes": int(db.execute("SELECT COUNT(*) FROM faccoes").fetchone()[0]),
+            "membros_ativos": int(db.execute("SELECT COUNT(*) FROM faccao_membros WHERE ativo=1").fetchone()[0]),
+            "paineis": int(db.execute("SELECT COUNT(*) FROM painel_versoes").fetchone()[0]),
+            "pericias": int(db.execute("SELECT COUNT(*) FROM pericia_sincronizada").fetchone()[0]),
+        }
+
+
+def banco_buscar(consulta: str) -> Dict[str, List[Dict[str, Any]]]:
+    q = str(consulta or "").strip()
+    q_norm = f"%{q}%"
+    rg = _banco_normalizar_rg(q)
+    placa = _banco_normalizar_placa(q)
+    with _banco_conexao() as db:
+        individuos = db.execute(
+            """
+            SELECT * FROM individuos
+            WHERE rg LIKE ? OR nome LIKE ? COLLATE NOCASE OR apelido LIKE ? COLLATE NOCASE
+               OR faccao_atual LIKE ? COLLATE NOCASE OR telefone LIKE ?
+            ORDER BY nome LIMIT 15
+            """,
+            (f"%{rg}%", q_norm, q_norm, q_norm, q_norm),
+        ).fetchall()
+        veiculos = db.execute(
+            """
+            SELECT * FROM veiculos
+            WHERE placa LIKE ? OR modelo LIKE ? COLLATE NOCASE OR cor LIKE ? COLLATE NOCASE
+               OR proprietario_rg LIKE ? OR proprietario_nome LIKE ? COLLATE NOCASE
+               OR faccao LIKE ? COLLATE NOCASE
+            ORDER BY placa LIMIT 15
+            """,
+            (f"%{placa}%", q_norm, q_norm, f"%{rg}%", q_norm, q_norm),
+        ).fetchall()
+        faccoes = db.execute(
+            """
+            SELECT f.*, (SELECT COUNT(*) FROM faccao_membros m WHERE m.faccao_id=f.id AND m.ativo=1) AS membros
+            FROM faccoes f
+            WHERE f.nome LIKE ? COLLATE NOCASE OR f.mesa_nome LIKE ? COLLATE NOCASE
+            ORDER BY f.nome LIMIT 15
+            """,
+            (q_norm, q_norm),
+        ).fetchall()
+    return {
+        "individuos": [dict(x) for x in individuos],
+        "veiculos": [dict(x) for x in veiculos],
+        "faccoes": [dict(x) for x in faccoes],
+    }
+
+
+def banco_embed_painel() -> discord.Embed:
+    r = banco_resumo()
+    embed = discord.Embed(
+        title="🗃️ BANCO DE DADOS DICOR",
+        description=(
+            "Cadastre e consulte indivíduos, placas e painéis completos de organizações.\n"
+            "As placas publicadas em **Perícia Externa** são importadas automaticamente."
+        ),
+        color=discord.Color.dark_blue(),
+    )
+    embed.add_field(name="👤 Indivíduos", value=str(r["individuos"]), inline=True)
+    embed.add_field(name="🚗 Placas", value=str(r["placas"]), inline=True)
+    embed.add_field(name="🏴 Facções", value=str(r["faccoes"]), inline=True)
+    embed.add_field(name="👥 Membros ativos", value=str(r["membros_ativos"]), inline=True)
+    embed.add_field(name="📄 Painéis salvos", value=str(r["paineis"]), inline=True)
+    embed.add_field(name="🔬 Perícias lidas", value=str(r["pericias"]), inline=True)
+    embed.set_footer(text="DICOR • Capital Morada do Valley • dados persistentes no volume /data")
+    return embed
+
+
+async def _banco_esperar_mensagem_usuario(
+    interaction: discord.Interaction,
+    instrucao: str,
+    *,
+    timeout: float = 420,
+) -> Optional[discord.Message]:
+    await interaction.followup.send(instrucao, ephemeral=True)
+    canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+    usuario_id = int(interaction.user.id)
+
+    def check(msg: discord.Message) -> bool:
+        return int(msg.author.id) == usuario_id and int(msg.channel.id) == canal_id and not msg.author.bot
+
+    try:
+        return await bot.wait_for("message", check=check, timeout=timeout)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("⌛ Tempo esgotado. A operação foi cancelada.", ephemeral=True)
+        return None
+
+
+async def _banco_coletar_fotos_individuo(interaction: discord.Interaction, rg: str) -> Tuple[str, str, str, str]:
+    msg = await _banco_esperar_mensagem_usuario(
+        interaction,
+        "📸 Envie **uma única mensagem** com até 2 imagens:\n"
+        "1ª imagem: foto do indivíduo; 2ª imagem: foto do RG.\n"
+        "Digite `pular` para cadastrar sem fotos. A mensagem será apagada depois de salvar.",
+        timeout=240,
+    )
+    if msg is None:
+        return "", "", "", ""
+    try:
+        if normalizar_busca(msg.content).strip() == "pular":
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return "", "", "", ""
+        imagens = [
+            a for a in msg.attachments
+            if (a.content_type or "").startswith("image/")
+            or Path(a.filename or "").suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ][:2]
+        pessoa_path = rg_path = pessoa_url = rg_url = ""
+        if imagens:
+            pessoa_path = await _banco_salvar_attachment(imagens[0], f"individuo-{rg}")
+            pessoa_url = imagens[0].url
+        if len(imagens) > 1:
+            rg_path = await _banco_salvar_attachment(imagens[1], f"rg-{rg}")
+            rg_url = imagens[1].url
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return pessoa_path, rg_path, pessoa_url, rg_url
+    except Exception:
+        traceback.print_exc()
+        return "", "", "", ""
+
+
+async def _banco_coletar_foto_veiculo(interaction: discord.Interaction, placa: str) -> Tuple[str, str]:
+    msg = await _banco_esperar_mensagem_usuario(
+        interaction,
+        "📸 Envie a foto do veículo em uma mensagem ou digite `pular`. "
+        "A mensagem será apagada depois de salvar.",
+        timeout=180,
+    )
+    if msg is None:
+        return "", ""
+    try:
+        if normalizar_busca(msg.content).strip() == "pular":
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return "", ""
+        imagem = next(
+            (
+                a for a in msg.attachments
+                if (a.content_type or "").startswith("image/")
+                or Path(a.filename or "").suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            ),
+            None,
+        )
+        caminho = url = ""
+        if imagem:
+            caminho = await _banco_salvar_attachment(imagem, f"veiculo-{placa}")
+            url = imagem.url
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return caminho, url
+    except Exception:
+        traceback.print_exc()
+        return "", ""
+
+
+class BancoAdicionarIndividuoModal(Modal, title="Cadastrar indivíduo no banco"):
+    nome = TextInput(label="Nome", placeholder="Ex: Henrique Silva", max_length=120)
+    rg = TextInput(label="RG", placeholder="Ex: 31731", max_length=30)
+    apelido = TextInput(label="Apelido", required=False, max_length=100)
+    faccao_cargo = TextInput(label="Facção | Cargo", placeholder="Ex: Olimpo | Membro", required=False, max_length=180)
+    observacoes = TextInput(label="Observações", required=False, style=discord.TextStyle.paragraph, max_length=800)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            faccao = cargo = ""
+            partes = str(self.faccao_cargo.value or "").split("|", 1)
+            if partes:
+                faccao = partes[0].strip()
+            if len(partes) > 1:
+                cargo = partes[1].strip()
+            mesa = banco_encontrar_mesa(faccao) if faccao else {}
+            foto_pessoa, foto_rg, url_pessoa, url_rg = await _banco_coletar_fotos_individuo(
+                interaction, _banco_normalizar_rg(self.rg.value)
+            )
+            item = banco_upsert_individuo(
+                nome=str(self.nome.value), rg=str(self.rg.value), apelido=str(self.apelido.value or ""),
+                faccao=faccao, cargo=cargo, observacoes=str(self.observacoes.value or ""),
+                origem="manual", mesa_canal_id=int(mesa.get("canal_id", 0) or 0),
+                mesa_nome=str(mesa.get("nome_canal") or ""), criado_por_id=interaction.user.id,
+                foto_individuo_path=foto_pessoa, foto_rg_path=foto_rg,
+                foto_individuo_url=url_pessoa, foto_rg_url=url_rg,
+            )
+            await interaction.followup.send(
+                f"✅ **Indivíduo salvo no banco**\n"
+                f"👤 {item.get('nome')}\n🪪 RG: `{item.get('rg')}`\n"
+                f"🏴 Facção: {item.get('faccao_atual') or 'Não informada'}\n"
+                f"📸 Foto do indivíduo: {'✅' if item.get('foto_individuo_path') else '➖'} | "
+                f"Foto do RG: {'✅' if item.get('foto_rg_path') else '➖'}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Não foi possível cadastrar: {erro}", ephemeral=True)
+
+
+class BancoAdicionarVeiculoModal(Modal, title="Cadastrar placa/veículo"):
+    placa = TextInput(label="Placa", placeholder="Ex: ABC1234", max_length=16)
+    modelo = TextInput(label="Modelo", required=False, max_length=120)
+    cor = TextInput(label="Cor", required=False, max_length=80)
+    proprietario_rg = TextInput(label="RG do proprietário", required=False, max_length=30)
+    faccao = TextInput(label="Facção/organização", required=False, max_length=120)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            placa = _banco_normalizar_placa(self.placa.value)
+            foto_path, foto_url = await _banco_coletar_foto_veiculo(interaction, placa)
+            dono_nome = ""
+            rg_dono = _banco_normalizar_rg(self.proprietario_rg.value)
+            if rg_dono:
+                with _banco_conexao() as db:
+                    dono = db.execute("SELECT nome FROM individuos WHERE rg=?", (rg_dono,)).fetchone()
+                    dono_nome = str(dono["nome"]) if dono else ""
+            item = banco_upsert_veiculo(
+                placa=placa, modelo=str(self.modelo.value or ""), cor=str(self.cor.value or ""),
+                proprietario_rg=rg_dono, proprietario_nome=dono_nome,
+                faccao=str(self.faccao.value or ""), foto_path=foto_path, foto_url=foto_url,
+                origem_tipo="manual", criado_por_id=interaction.user.id,
+            )
+            await interaction.followup.send(
+                f"✅ **Veículo salvo no banco**\n🚗 Placa: `{item.get('placa')}`\n"
+                f"Modelo: {item.get('modelo') or 'Não informado'}\n"
+                f"Cor: {item.get('cor') or 'Não informada'}\n"
+                f"🏴 Facção: {item.get('faccao') or 'Não informada'}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Não foi possível cadastrar a placa: {erro}", ephemeral=True)
+
+
+class BancoImportarPainelModal(Modal, title="Importar painel completo da mesa"):
+    faccao = TextInput(label="Nome da facção/mesa", placeholder="Ex: Olimpo", max_length=120)
+    modo = TextInput(label="Modo", placeholder="substituir ou mesclar", default="substituir", max_length=20)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        msg = await _banco_esperar_mensagem_usuario(
+            interaction,
+            "📄 Envie agora o **painel completo em uma única mensagem**.\n"
+            "O bot salvará o texto original, separará todos os nomes/RGs e associará à mesa correspondente.\n"
+            "A mensagem enviada será apagada após a importação.",
+            timeout=600,
+        )
+        if msg is None:
+            return
+        try:
+            texto = str(msg.content or "").strip()
+            if not texto:
+                return await interaction.followup.send("❌ A mensagem não possui texto.", ephemeral=True)
+            resultado = banco_importar_painel(
+                str(self.faccao.value), texto, modo=str(self.modo.value or "substituir"),
+                autor_id=interaction.user.id, mensagem_url=getattr(msg, "jump_url", ""),
+            )
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await interaction.followup.send(
+                f"✅ **Painel salvo e processado**\n"
+                f"🏴 Facção: **{resultado['faccao']}**\n"
+                f"📄 Versão: `{resultado['versao']}`\n"
+                f"👥 Integrantes identificados: **{resultado['membros']}**\n"
+                f"➕ Novos vínculos: {resultado['novos']} | ♻️ Atualizados: {resultado['atualizados']}\n"
+                f"🕵️ Mesa associada: {resultado['mesa_nome'] or 'Nenhuma mesa correspondente encontrada'}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha ao importar painel: {erro}", ephemeral=True)
+
+
+class BancoConsultaModal(Modal, title="Consultar banco de dados"):
+    consulta = TextInput(label="Nome, RG, placa ou facção", placeholder="Ex: 31731, ABC1234 ou Olimpo", max_length=120)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            r = banco_buscar(str(self.consulta.value))
+            embed = discord.Embed(
+                title=f"🔍 RESULTADOS — {str(self.consulta.value)[:80]}",
+                color=discord.Color.blue(),
+            )
+            if r["individuos"]:
+                linhas = []
+                for x in r["individuos"]:
+                    linhas.append(
+                        f"• **{x['nome']}** — RG `{x['rg']}`\n"
+                        f"  🏴 {x['faccao_atual'] or 'Sem facção'} | 📌 {x['status']}"
+                    )
+                embed.add_field(name=f"👤 Indivíduos ({len(r['individuos'])})", value="\n".join(linhas)[:1024], inline=False)
+            if r["veiculos"]:
+                linhas = []
+                for x in r["veiculos"]:
+                    linhas.append(
+                        f"• `{x['placa']}` — **{x['modelo'] or 'Modelo não informado'}** / {x['cor'] or 'cor N/A'}\n"
+                        f"  👤 RG: {x['proprietario_rg'] or 'N/A'} | 🏴 {x['faccao'] or 'N/A'}"
+                    )
+                embed.add_field(name=f"🚗 Veículos ({len(r['veiculos'])})", value="\n".join(linhas)[:1024], inline=False)
+            if r["faccoes"]:
+                linhas = []
+                for x in r["faccoes"]:
+                    linhas.append(
+                        f"• **{x['nome']}** — {x['membros']} membros ativos\n"
+                        f"  🕵️ {x['mesa_nome'] or 'Sem mesa vinculada'} | 📌 {x['status']}"
+                    )
+                embed.add_field(name=f"🏴 Facções ({len(r['faccoes'])})", value="\n".join(linhas)[:1024], inline=False)
+            if not any(r.values()):
+                embed.description = "Nenhum registro encontrado."
+
+            files: List[discord.File] = []
+            # Em consulta exata de um indivíduo, anexa as fotos salvas.
+            if len(r["individuos"]) == 1:
+                ind = r["individuos"][0]
+                for caminho, nome in [
+                    (ind.get("foto_individuo_path"), "foto_individuo"),
+                    (ind.get("foto_rg_path"), "foto_rg"),
+                ]:
+                    try:
+                        if caminho and Path(caminho).exists():
+                            files.append(discord.File(str(caminho), filename=f"{nome}{Path(caminho).suffix}"))
+                    except Exception:
+                        pass
+            await interaction.followup.send(embed=embed, files=files[:2], ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha na consulta: {erro}", ephemeral=True)
+
+
+class BancoEditarRegistroModal(Modal, title="Editar registro do banco"):
+    tipo = TextInput(label="Tipo", placeholder="individuo, placa ou faccao", max_length=20)
+    chave = TextInput(label="RG, placa ou nome da facção", max_length=120)
+    campo1 = TextInput(label="Nome/Modelo/Novo nome", required=False, max_length=120)
+    campo2 = TextInput(label="Facção/Cor/Status", required=False, max_length=120)
+    observacoes = TextInput(label="Observações", required=False, style=discord.TextStyle.paragraph, max_length=800)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.followup.send("❌ Apenas Inspetor+ pode editar registros.", ephemeral=True)
+        tipo = normalizar_busca(self.tipo.value).strip()
+        chave = str(self.chave.value).strip()
+        agora = _banco_agora_iso()
+        try:
+            with _banco_conexao() as db:
+                if tipo.startswith("ind"):
+                    rg = _banco_normalizar_rg(chave)
+                    atual = db.execute("SELECT * FROM individuos WHERE rg=?", (rg,)).fetchone()
+                    if not atual:
+                        raise ValueError("Indivíduo não encontrado.")
+                    db.execute(
+                        "UPDATE individuos SET nome=?, faccao_atual=?, observacoes=?, atualizado_em=? WHERE rg=?",
+                        (
+                            str(self.campo1.value or atual["nome"])[:120],
+                            str(self.campo2.value or atual["faccao_atual"])[:120],
+                            str(self.observacoes.value or atual["observacoes"])[:1800],
+                            agora, rg,
+                        ),
+                    )
+                    entidade, key = "INDIVIDUO", rg
+                elif tipo.startswith("pla") or tipo.startswith("vei"):
+                    placa = _banco_normalizar_placa(chave)
+                    atual = db.execute("SELECT * FROM veiculos WHERE placa=?", (placa,)).fetchone()
+                    if not atual:
+                        raise ValueError("Placa não encontrada.")
+                    db.execute(
+                        "UPDATE veiculos SET modelo=?, cor=?, observacoes=?, atualizado_em=? WHERE placa=?",
+                        (
+                            str(self.campo1.value or atual["modelo"])[:120],
+                            str(self.campo2.value or atual["cor"])[:80],
+                            str(self.observacoes.value or atual["observacoes"])[:1800],
+                            agora, placa,
+                        ),
+                    )
+                    entidade, key = "VEICULO", placa
+                elif tipo.startswith("fac") or tipo.startswith("mes"):
+                    atual = db.execute("SELECT * FROM faccoes WHERE nome=? COLLATE NOCASE", (chave,)).fetchone()
+                    if not atual:
+                        raise ValueError("Facção não encontrada.")
+                    novo_nome = str(self.campo1.value or atual["nome"])[:120]
+                    novo_status = str(self.campo2.value or atual["status"])[:60].upper()
+                    db.execute("UPDATE faccoes SET nome=?, status=?, atualizado_em=? WHERE id=?", (novo_nome, novo_status, agora, int(atual["id"])))
+                    entidade, key = "FACCAO", novo_nome
+                else:
+                    raise ValueError("Tipo inválido. Use indivíduo, placa ou facção.")
+                _banco_historico(entidade, key, "EDITADO", str(self.observacoes.value or ""), interaction.user.id, db)
+            await interaction.followup.send("✅ Registro atualizado.", ephemeral=True)
+        except Exception as erro:
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+class BancoArquivarRegistroModal(Modal, title="Arquivar registro do banco"):
+    tipo = TextInput(label="Tipo", placeholder="individuo, placa ou faccao", max_length=20)
+    chave = TextInput(label="RG, placa ou nome da facção", max_length=120)
+    motivo = TextInput(label="Motivo", required=False, style=discord.TextStyle.paragraph, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.followup.send("❌ Apenas Inspetor+ pode arquivar registros.", ephemeral=True)
+        tipo = normalizar_busca(self.tipo.value).strip()
+        chave = str(self.chave.value).strip()
+        agora = _banco_agora_iso()
+        try:
+            with _banco_conexao() as db:
+                if tipo.startswith("ind"):
+                    key = _banco_normalizar_rg(chave)
+                    cur = db.execute("UPDATE individuos SET status='ARQUIVADO', atualizado_em=? WHERE rg=?", (agora, key))
+                    entidade = "INDIVIDUO"
+                elif tipo.startswith("pla") or tipo.startswith("vei"):
+                    key = _banco_normalizar_placa(chave)
+                    cur = db.execute("UPDATE veiculos SET observacoes=TRIM(observacoes || ' | ARQUIVADO'), atualizado_em=? WHERE placa=?", (agora, key))
+                    entidade = "VEICULO"
+                elif tipo.startswith("fac") or tipo.startswith("mes"):
+                    key = chave
+                    cur = db.execute("UPDATE faccoes SET status='ARQUIVADA', atualizado_em=? WHERE nome=? COLLATE NOCASE", (agora, key))
+                    entidade = "FACCAO"
+                else:
+                    raise ValueError("Tipo inválido.")
+                if cur.rowcount <= 0:
+                    raise ValueError("Registro não encontrado.")
+                _banco_historico(entidade, key, "ARQUIVADO", str(self.motivo.value or ""), interaction.user.id, db)
+            await interaction.followup.send("✅ Registro arquivado sem apagar o histórico.", ephemeral=True)
+        except Exception as erro:
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar o banco.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Adicionar indivíduo", emoji="👤", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_individuo", row=0)
+    async def adicionar_individuo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoAdicionarIndividuoModal())
+
+    @discord.ui.button(label="Adicionar placa", emoji="🚗", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_placa", row=0)
+    async def adicionar_placa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoAdicionarVeiculoModal())
+
+    @discord.ui.button(label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary, custom_id="dicor_banco_importar_painel", row=0)
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoImportarPainelModal())
+
+    @discord.ui.button(label="Consultar", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_consultar", row=0)
+    async def consultar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(label="Sincronizar tudo", emoji="🔄", style=discord.ButtonStyle.success, custom_id="dicor_banco_sync_tudo", row=1)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            mesas = banco_sincronizar_mesas()
+            procurados = banco_sincronizar_procurados()
+            pericias = await banco_sincronizar_pericias(interaction.guild)
+            await interaction.followup.send(
+                "✅ **Sincronização concluída**\n"
+                f"🕵️ Mesas/facções: {mesas['total']}\n"
+                f"🚨 Procurados importados/atualizados: {procurados['total']}\n"
+                f"🔬 Novas mensagens de perícia lidas: {pericias['novas']}\n"
+                f"🚗 Placas encontradas: {pericias['placas']}\n"
+                f"⚠️ Erros: {mesas['erros'] + procurados['erros'] + pericias['erros']}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha na sincronização: {erro}", ephemeral=True)
+
+    @discord.ui.button(label="Atualizar resumo", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_resumo", row=1)
+    async def resumo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=banco_embed_painel(), ephemeral=True)
+
+    @discord.ui.button(label="Editar registro", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_editar", row=1)
+    async def editar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode editar registros.", ephemeral=True)
+        await interaction.response.send_modal(BancoEditarRegistroModal())
+
+    @discord.ui.button(label="Arquivar", emoji="🗄️", style=discord.ButtonStyle.danger, custom_id="dicor_banco_arquivar", row=1)
+    async def arquivar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode arquivar registros.", ephemeral=True)
+        await interaction.response.send_modal(BancoArquivarRegistroModal())
+
+
+@bot.tree.command(name="painelbanco", description="Envia o painel completo do Banco de Dados DICOR.")
+async def painelbanco(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+        return await interaction.response.send_message("❌ Apenas a equipe DICOR pode enviar este painel.", ephemeral=True)
+    inicializar_banco_dicor()
+    await interaction.response.send_message(embed=banco_embed_painel(), view=BancoDadosView())
+
+
+@bot.tree.command(name="consultarbanco", description="Consulta nome, RG, placa ou facção no Banco DICOR.")
+@app_commands.describe(consulta="Nome, RG, placa ou facção")
+async def consultarbanco(interaction: discord.Interaction, consulta: str):
+    if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+        return await interaction.response.send_message("❌ Apenas a equipe DICOR pode consultar o banco.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    r = banco_buscar(consulta)
+    embed = discord.Embed(title=f"🔍 BANCO DICOR — {consulta[:70]}", color=discord.Color.blue())
+    if r["individuos"]:
+        embed.add_field(
+            name="👤 Indivíduos",
+            value="\n".join(f"• **{x['nome']}** — RG `{x['rg']}` — {x['faccao_atual'] or 'Sem facção'}" for x in r["individuos"])[:1024],
+            inline=False,
+        )
+    if r["veiculos"]:
+        embed.add_field(
+            name="🚗 Placas",
+            value="\n".join(f"• `{x['placa']}` — {x['modelo'] or 'Modelo N/A'} — {x['faccao'] or 'Sem facção'}" for x in r["veiculos"])[:1024],
+            inline=False,
+        )
+    if r["faccoes"]:
+        embed.add_field(
+            name="🏴 Facções",
+            value="\n".join(f"• **{x['nome']}** — {x['membros']} membros — {x['mesa_nome'] or 'Sem mesa'}" for x in r["faccoes"])[:1024],
+            inline=False,
+        )
+    if not any(r.values()):
+        embed.description = "Nenhum registro encontrado."
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tasks.loop(minutes=BANCO_AUTO_SYNC_MINUTOS)
+async def banco_dados_sincronizacao_automatica():
+    try:
+        inicializar_banco_dicor()
+        banco_sincronizar_mesas()
+        banco_sincronizar_procurados()
+        for guild in bot.guilds:
+            try:
+                await banco_sincronizar_pericias(guild)
+            except Exception as erro:
+                await enviar_log(f"⚠️ Banco DICOR: sincronização automática da Perícia falhou: {erro}")
+    except Exception as erro:
+        await enviar_log(f"⚠️ Banco DICOR: falha na sincronização automática: {erro}")
+
+
+@banco_dados_sincronizacao_automatica.before_loop
+async def _antes_banco_dados_sincronizacao_automatica():
+    await bot.wait_until_ready()
+    await asyncio.sleep(20)
+
+
+# Mantém o on_ready original e acrescenta apenas a persistência do Banco DICOR.
+_BANCO_ON_READY_ORIGINAL = bot.on_ready
+
+
+@bot.event
+async def on_ready():
+    await _BANCO_ON_READY_ORIGINAL()
+    try:
+        inicializar_banco_dicor()
+        bot.add_view(BancoDadosView())
+        if not banco_dados_sincronizacao_automatica.is_running():
+            banco_dados_sincronizacao_automatica.start()
+        print("✅ Banco de Dados DICOR carregado: indivíduos, placas, painéis e Perícia Externa.")
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao carregar Banco de Dados DICOR: {erro}")
+
+
 if __name__ == '__main__':
     asyncio.run(main())
