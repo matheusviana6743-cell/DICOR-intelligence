@@ -27231,6 +27231,10 @@ def _banco_ocr_extrair_candidatos(linhas: List[Tuple[str, float]]) -> List[Dict[
         return []
     return [max(isolados, key=lambda item: item["confianca"])]
 
+class BancoImagemIndisponivel(RuntimeError):
+    """Imagem antiga removida/expirada; não deve gerar spam nos logs."""
+
+
 def _banco_fontes_imagem_mensagem(msg: discord.Message) -> List[Dict[str, Any]]:
     fontes: List[Dict[str, Any]] = []
     urls_vistas = set()
@@ -27254,14 +27258,24 @@ def _banco_fontes_imagem_mensagem(msg: discord.Message) -> List[Dict[str, Any]]:
     for indice, embed in enumerate(list(getattr(msg, "embeds", []) or [])):
         for tipo, media in (("image", getattr(embed, "image", None)), ("thumb", getattr(embed, "thumbnail", None))):
             url = str(getattr(media, "url", "") or "")
-            if not url or url in urls_vistas:
+            proxy_url = str(getattr(media, "proxy_url", "") or "")
+            urls_candidatas = []
+            # O proxy do Discord costuma continuar disponível quando a URL original expira.
+            for candidata in (proxy_url, url):
+                if candidata and candidata not in urls_candidatas:
+                    urls_candidatas.append(candidata)
+            if not urls_candidatas:
                 continue
-            urls_vistas.add(url)
-            digest = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()[:24]
+            chave = "|".join(urls_candidatas)
+            if chave in urls_vistas:
+                continue
+            urls_vistas.add(chave)
+            digest = hashlib.sha1(chave.encode("utf-8", errors="ignore")).hexdigest()[:24]
             fontes.append(
                 {
                     "fonte_id": f"embed:{tipo}:{indice}:{digest}",
-                    "url": url,
+                    "url": url or proxy_url,
+                    "urls": urls_candidatas,
                     "attachment": None,
                     "size": 0,
                     "filename": f"embed-{digest}.png",
@@ -27277,21 +27291,40 @@ async def _banco_salvar_fonte_imagem(fonte: Dict[str, Any], prefixo: str) -> str
             raise ValueError("Imagem maior que o limite configurado para OCR.")
         return await _banco_salvar_attachment(attachment, prefixo)
 
-    url = str(fonte.get("url") or "")
-    if not url:
+    urls = [str(x) for x in (fonte.get("urls") or []) if str(x).strip()]
+    url_principal = str(fonte.get("url") or "")
+    if url_principal and url_principal not in urls:
+        urls.append(url_principal)
+    if not urls:
         raise ValueError("URL da imagem não encontrada.")
+
     timeout = ClientTimeout(total=45)
+    dados = b""
+    content_type = ""
+    status_finais = []
     async with ClientSession(timeout=timeout) as sessao:
-        async with sessao.get(url) as resposta:
-            if resposta.status != 200:
-                raise RuntimeError(f"Falha ao baixar imagem do embed: HTTP {resposta.status}")
-            tamanho = int(resposta.headers.get("Content-Length", "0") or 0)
-            if tamanho and tamanho > BANCO_OCR_MAX_BYTES:
-                raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
-            dados = await resposta.read()
-            if len(dados) > BANCO_OCR_MAX_BYTES:
-                raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
-            content_type = str(resposta.headers.get("Content-Type", "")).lower()
+        for url in urls:
+            try:
+                async with sessao.get(url) as resposta:
+                    status_finais.append(int(resposta.status))
+                    if resposta.status != 200:
+                        continue
+                    tamanho = int(resposta.headers.get("Content-Length", "0") or 0)
+                    if tamanho and tamanho > BANCO_OCR_MAX_BYTES:
+                        raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
+                    dados = await resposta.read()
+                    if len(dados) > BANCO_OCR_MAX_BYTES:
+                        raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
+                    content_type = str(resposta.headers.get("Content-Type", "")).lower()
+                    if dados:
+                        break
+            except ValueError:
+                raise
+            except Exception:
+                continue
+    if not dados:
+        status_txt = ",".join(map(str, status_finais)) or "sem resposta"
+        raise BancoImagemIndisponivel(f"Imagem antiga indisponível (HTTP {status_txt})")
     extensao = ".jpg" if "jpeg" in content_type else ".webp" if "webp" in content_type else ".png"
     destino = BANCO_ARQUIVOS_DIR / f"{slugify(prefixo)}-{int(time.time()*1000)}-{secrets.token_hex(3)}{extensao}"
     destino.write_bytes(dados)
@@ -27674,6 +27707,9 @@ async def banco_sincronizar_pericias(
                     try:
                         foto_path = await _banco_salvar_fonte_imagem(fontes[0], f"pericia-{msg.id}")
                         foto_url = str(fontes[0].get("url") or "")
+                    except BancoImagemIndisponivel:
+                        # Embed antigo removido/expirado: mantém a perícia e apenas segue sem foto.
+                        pass
                     except Exception:
                         traceback.print_exc()
                 for item in encontrados:
@@ -27710,7 +27746,7 @@ async def banco_sincronizar_pericias(
                     processada = db.execute(
                         "SELECT status FROM ocr_fontes_processadas WHERE fonte_id=?", (fonte_id,)
                     ).fetchone()
-                if (not forcar_historico) and processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE"}:
+                if (not forcar_historico) and processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE", "INDISPONIVEL"}:
                     continue
                 if forcar_historico:
                     await _banco_ocr_descartar_pendentes_antigos_da_fonte(guild, fonte_id)
@@ -27788,6 +27824,24 @@ async def banco_sincronizar_pericias(
                             ),
                         )
                     alguma_novidade = True
+                except BancoImagemIndisponivel as erro:
+                    # Links antigos do Discord/CDN podem expirar ou ser removidos.
+                    # Registra como indisponível para não tentar sem parar nem poluir os logs.
+                    resultado.setdefault("ocr_imagens_indisponiveis", 0)
+                    resultado["ocr_imagens_indisponiveis"] += 1
+                    with _banco_conexao() as db:
+                        db.execute(
+                            """
+                            INSERT OR REPLACE INTO ocr_fontes_processadas
+                            (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                            VALUES (?, ?, ?, ?, 'INDISPONIVEL', 0, ?, ?)
+                            """,
+                            (
+                                fonte_id, int(msg.id), int(canal.id), str(fonte.get("url") or "")[:1000],
+                                str(erro)[:1000], _banco_agora_iso(),
+                            ),
+                        )
+                    continue
                 except Exception as erro:
                     resultado["erros"] += 1
                     with _banco_conexao() as db:
@@ -27829,7 +27883,7 @@ def banco_embed_painel() -> discord.Embed:
         description=(
             "Cadastre e consulte indivíduos, placas e painéis completos de organizações.\n"
             "A Perícia Externa é lida por **texto, embeds e OCR de fotos/prints**. "
-            "O OCR da imagem procura **somente a placa** e exige confirmação. Use **Importar perícias antigas** para reler todo o histórico."
+            "O OCR lê imagens disponíveis e exige confirmação. Links antigos removidos/expirados são ignorados sem poluir os logs. Use **Importar perícias antigas** para reler o histórico."
         ),
         color=discord.Color.dark_blue(),
     )
