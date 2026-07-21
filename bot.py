@@ -24899,5 +24899,493 @@ class PainelProcuradosView(View):
     async def sync_old(self, interaction: discord.Interaction, button: Button):
         await sincronizar_catalogo_core(interaction)
 
+
+# =====================================================
+# PATCH FINAL — ALERTA DE BOLETIM PARADO A CADA 48 HORAS
+# + RESPONSÁVEL ATUAL SINCRONIZADO
+# =====================================================
+# Regras desta versão:
+# 1) todos os boletins ainda abertos são verificados;
+# 2) o primeiro aviso ocorre após 48 horas sem atividade e volta a ocorrer
+#    a cada novo período completo de 48 horas enquanto continuar parado;
+# 3) a troca de responsável reinicia o prazo de inatividade;
+# 4) o alerta consulta a troca mais recente no próprio tópico e sincroniza
+#    registros duplicados/antigos antes de mencionar alguém;
+# 5) nenhum modelo de mandado, dossiê ou procurado é alterado por este patch.
+
+ALERTA_BOLETIM_PARADO_INTERVALO_HORAS = 48
+_STATUS_BOLETIM_ENCERRADO_ALERTA = {
+    'FINALIZADO', 'ARQUIVADO', 'CONCLUÍDO', 'CONCLUIDO', 'ENCERRADO', 'FECHADO'
+}
+
+
+def _data_boletim_alerta_para_utc(valor: Any) -> Optional[datetime.datetime]:
+    texto = str(valor or '').strip()
+    if not texto:
+        return None
+    formatos = (
+        '%d/%m/%Y %H:%M:%S',
+        '%d/%m/%Y %H:%M',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S%z',
+        '%Y-%m-%dT%H:%M:%S.%f%z',
+    )
+    for formato in formatos:
+        try:
+            data = datetime.datetime.strptime(texto, formato)
+            if data.tzinfo is None:
+                # Datas salvas por agora_br() estão no horário de Brasília.
+                data = data.replace(
+                    tzinfo=datetime.timezone(datetime.timedelta(hours=-3))
+                )
+            return data.astimezone(datetime.timezone.utc)
+        except (TypeError, ValueError):
+            continue
+    try:
+        data = datetime.datetime.fromisoformat(texto.replace('Z', '+00:00'))
+        if data.tzinfo is None:
+            data = data.replace(
+                tzinfo=datetime.timezone(datetime.timedelta(hours=-3))
+            )
+        return data.astimezone(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _topico_id_atendimento_alerta(atendimento: Dict[str, Any]) -> int:
+    for chave in (
+        'thread_id', 'area_id', 'forum_thread_id',
+        'canal_atendimento_id', 'canal_id'
+    ):
+        try:
+            valor = int(atendimento.get(chave) or 0)
+        except (TypeError, ValueError):
+            valor = 0
+        if valor:
+            return valor
+    return 0
+
+
+def _boletim_aberto_para_alerta(atendimento: Dict[str, Any]) -> bool:
+    status = str(atendimento.get('status') or '').strip().upper()
+    return status not in _STATUS_BOLETIM_ENCERRADO_ALERTA
+
+
+def _numero_equivalente_alerta(a: Any, b: Any) -> bool:
+    texto_a = str(a or '').strip()
+    texto_b = str(b or '').strip()
+    if not texto_a or not texto_b:
+        return False
+    if texto_a.upper() == texto_b.upper():
+        return True
+    try:
+        return numero_curto_boletim(texto_a) == numero_curto_boletim(texto_b)
+    except Exception:
+        return False
+
+
+def _momento_responsavel_registro_alerta(
+    atendimento: Dict[str, Any],
+) -> datetime.datetime:
+    candidatos: List[datetime.datetime] = []
+    for chave in ('agente_atribuido_em', 'responsavel_alterado_em', 'data_atualizacao'):
+        data = _data_boletim_alerta_para_utc(atendimento.get(chave))
+        if data:
+            candidatos.append(data)
+    historico = atendimento.get('historico', [])
+    if isinstance(historico, list):
+        for item in historico:
+            if not isinstance(item, dict):
+                continue
+            if not (item.get('agente_novo_id') or item.get('novo_agente_id')):
+                continue
+            data = _data_boletim_alerta_para_utc(
+                item.get('data') or item.get('em') or item.get('criado_em')
+            )
+            if data:
+                candidatos.append(data)
+    return max(candidatos) if candidatos else datetime.datetime.min.replace(
+        tzinfo=datetime.timezone.utc
+    )
+
+
+def _responsavel_por_registros_alerta(
+    registros: List[Dict[str, Any]],
+) -> Tuple[int, str, Optional[datetime.datetime]]:
+    melhor_id = 0
+    melhor_nome = ''
+    melhor_data: Optional[datetime.datetime] = None
+
+    # Primeiro considera o histórico explícito de trocas de todos os registros
+    # duplicados do mesmo tópico.
+    for atendimento in registros:
+        historico = atendimento.get('historico', [])
+        if not isinstance(historico, list):
+            continue
+        for item in historico:
+            if not isinstance(item, dict):
+                continue
+            try:
+                agente_id = int(
+                    item.get('agente_novo_id') or item.get('novo_agente_id') or 0
+                )
+            except (TypeError, ValueError):
+                agente_id = 0
+            if not agente_id:
+                continue
+            data = _data_boletim_alerta_para_utc(
+                item.get('data') or item.get('em') or item.get('criado_em')
+            ) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+            if melhor_data is None or data >= melhor_data:
+                melhor_id = agente_id
+                melhor_nome = str(
+                    item.get('agente_novo_nome')
+                    or item.get('novo_agente_nome')
+                    or ''
+                )
+                melhor_data = data
+
+    # Depois considera o campo atual do registro que possui a atribuição mais
+    # recente. Isso cobre boletins sem histórico de troca.
+    for atendimento in registros:
+        try:
+            agente_id = int(atendimento.get('agente_id') or 0)
+        except (TypeError, ValueError):
+            agente_id = 0
+        if not agente_id:
+            continue
+        data = _momento_responsavel_registro_alerta(atendimento)
+        if melhor_data is None or data >= melhor_data:
+            melhor_id = agente_id
+            melhor_nome = str(atendimento.get('agente_nome') or '')
+            melhor_data = data
+
+    return melhor_id, melhor_nome, melhor_data
+
+
+async def _responsavel_mais_recente_no_topico_alerta(
+    topico: discord.Thread,
+    mensagens: Optional[List[discord.Message]] = None,
+) -> Tuple[int, str, Optional[datetime.datetime]]:
+    """Lê a troca mais recente publicada pelo bot no próprio tópico."""
+    historico = mensagens
+    if historico is None:
+        historico = [
+            mensagem async for mensagem in topico.history(
+                limit=250, oldest_first=False
+            )
+        ]
+
+    padroes = (
+        r'\*\*Novo:\*\*\s*<@!?(\d+)>',
+        r'\*\*Novo responsável:\*\*\s*<@!?(\d+)>',
+        r'Responsável alterado para\s*<@!?(\d+)>',
+    )
+    for mensagem in historico:  # histórico já vem do mais novo para o mais antigo
+        texto = str(getattr(mensagem, 'content', '') or '')
+        for embed in getattr(mensagem, 'embeds', []) or []:
+            texto += '\n' + str(getattr(embed, 'title', '') or '')
+            texto += '\n' + str(getattr(embed, 'description', '') or '')
+            for campo in getattr(embed, 'fields', []) or []:
+                texto += f'\n{getattr(campo, "name", "")}: {getattr(campo, "value", "")}'
+        if not texto:
+            continue
+        for padrao in padroes:
+            achado = re.search(padrao, texto, flags=re.I)
+            if not achado:
+                continue
+            agente_id = int(achado.group(1))
+            membro = topico.guild.get_member(agente_id) if topico.guild else None
+            nome = str(membro) if membro else ''
+            data = getattr(mensagem, 'created_at', None)
+            if data and data.tzinfo is None:
+                data = data.replace(tzinfo=datetime.timezone.utc)
+            return agente_id, nome, data
+    return 0, '', None
+
+
+def _sincronizar_responsavel_boletim_alerta(
+    *,
+    topico_id: int,
+    numero: Any,
+    agente_id: int,
+    agente_nome: str,
+    atribuido_em: Optional[datetime.datetime] = None,
+) -> None:
+    if not agente_id:
+        return
+    lista = carregar_atendimentos_boletins()
+    alterou = False
+    data_texto = None
+    if atribuido_em:
+        data_br = atribuido_em.astimezone(
+            datetime.timezone(datetime.timedelta(hours=-3))
+        )
+        data_texto = data_br.strftime('%d/%m/%Y %H:%M')
+
+    for item in lista:
+        mesmo_topico = _topico_id_atendimento_alerta(item) == int(topico_id or 0)
+        mesmo_numero = _numero_equivalente_alerta(item.get('numero'), numero)
+        if not (mesmo_topico or mesmo_numero):
+            continue
+        if int(item.get('agente_id') or 0) != int(agente_id):
+            item['agente_id'] = int(agente_id)
+            alterou = True
+        if agente_nome and str(item.get('agente_nome') or '') != agente_nome:
+            item['agente_nome'] = agente_nome
+            alterou = True
+        if data_texto:
+            atual = _data_boletim_alerta_para_utc(item.get('agente_atribuido_em'))
+            if atual is None or (atribuido_em and atribuido_em > atual):
+                item['agente_atribuido_em'] = data_texto
+                alterou = True
+        if int(item.get('thread_id') or 0) != int(topico_id):
+            item['thread_id'] = int(topico_id)
+            alterou = True
+        if int(item.get('area_id') or 0) != int(topico_id):
+            item['area_id'] = int(topico_id)
+            alterou = True
+
+    if alterou:
+        salvar_atendimentos_boletins(lista)
+
+
+def _ultima_troca_responsavel_como_atividade_alerta(
+    registros: List[Dict[str, Any]],
+) -> Optional[datetime.datetime]:
+    datas: List[datetime.datetime] = []
+    for atendimento in registros:
+        data = _data_boletim_alerta_para_utc(
+            atendimento.get('agente_atribuido_em')
+            or atendimento.get('responsavel_alterado_em')
+        )
+        if data:
+            datas.append(data)
+        historico = atendimento.get('historico', [])
+        if not isinstance(historico, list):
+            continue
+        for item in historico:
+            if not isinstance(item, dict):
+                continue
+            if not (item.get('agente_novo_id') or item.get('novo_agente_id')):
+                continue
+            data_hist = _data_boletim_alerta_para_utc(
+                item.get('data') or item.get('em') or item.get('criado_em')
+            )
+            if data_hist:
+                datas.append(data_hist)
+    return max(datas) if datas else None
+
+
+def _agrupar_boletins_abertos_alerta() -> Dict[int, List[Dict[str, Any]]]:
+    grupos: Dict[int, List[Dict[str, Any]]] = {}
+    for atendimento in carregar_atendimentos_boletins():
+        if not isinstance(atendimento, dict) or not _boletim_aberto_para_alerta(atendimento):
+            continue
+        topico_id = _topico_id_atendimento_alerta(atendimento)
+        if not topico_id:
+            continue
+        grupos.setdefault(topico_id, []).append(atendimento)
+    return grupos
+
+
+# Envolve a troca já aprovada para também corrigir registros duplicados antigos.
+_TROCAR_RESPONSAVEL_BOLETIM_ANTES_ALERTA_48H = _trocar_agente_responsavel_boletim
+
+
+async def _trocar_agente_responsavel_boletim(
+    interaction: discord.Interaction,
+    atendimento_id: str,
+    novo_agente: discord.Member,
+) -> None:
+    await _TROCAR_RESPONSAVEL_BOLETIM_ANTES_ALERTA_48H(
+        interaction, atendimento_id, novo_agente
+    )
+
+    # A função anterior pode ter encerrado antes da troca (sem permissão,
+    # atendimento inexistente, pessoa inválida etc.). Só sincroniza se a troca
+    # realmente ficou gravada no atendimento alvo.
+    atendimento = _atendimento_por_id(atendimento_id)
+    if not atendimento:
+        return
+    if int(atendimento.get('agente_id') or 0) != int(novo_agente.id):
+        return
+
+    topico_id = _topico_id_atendimento_alerta(atendimento)
+    if not topico_id:
+        return
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    _sincronizar_responsavel_boletim_alerta(
+        topico_id=topico_id,
+        numero=atendimento.get('numero'),
+        agente_id=novo_agente.id,
+        agente_nome=str(novo_agente),
+        atribuido_em=agora,
+    )
+
+
+@tasks.loop(hours=1)
+async def verificar_boletins_parados_alerta_inteligente():
+    intervalo = int(ALERTA_BOLETIM_PARADO_INTERVALO_HORAS)
+    if intervalo <= 0:
+        return
+
+    agora_utc = datetime.datetime.now(datetime.timezone.utc)
+    grupos = _agrupar_boletins_abertos_alerta()
+
+    for topico_id, registros in grupos.items():
+        topico = await obter_canal_bot(topico_id)
+        if not isinstance(topico, discord.Thread):
+            continue
+        try:
+            # Se o Discord arquivou automaticamente o tópico, abre apenas para
+            # publicar o aviso. Não altera a situação administrativa do boletim.
+            if bool(getattr(topico, 'archived', False)):
+                try:
+                    await topico.edit(archived=False)
+                except Exception:
+                    pass
+
+            mensagens = [
+                mensagem async for mensagem in topico.history(
+                    limit=250, oldest_first=False
+                )
+            ]
+            ultima_humana, marcador_humano = _ultima_atividade_humana_topico(
+                mensagens, topico
+            )
+            if ultima_humana and ultima_humana.tzinfo is None:
+                ultima_humana = ultima_humana.replace(tzinfo=datetime.timezone.utc)
+            if ultima_humana:
+                ultima_humana = ultima_humana.astimezone(datetime.timezone.utc)
+
+            # Resolve o responsável pela fonte mais confiável: a troca mais
+            # recente publicada no tópico. Se não houver, usa os dados mais
+            # atuais entre todos os registros duplicados.
+            agente_topico_id, agente_topico_nome, data_troca_topico = (
+                await _responsavel_mais_recente_no_topico_alerta(topico, mensagens)
+            )
+            agente_registro_id, agente_registro_nome, data_troca_registro = (
+                _responsavel_por_registros_alerta(registros)
+            )
+
+            if agente_topico_id:
+                agente_id = agente_topico_id
+                agente_nome = agente_topico_nome
+                data_responsavel = data_troca_topico
+            else:
+                agente_id = agente_registro_id
+                agente_nome = agente_registro_nome
+                data_responsavel = data_troca_registro
+
+            numero = next(
+                (r.get('numero') for r in registros if r.get('numero')),
+                topico.name,
+            )
+
+            if agente_id:
+                membro = topico.guild.get_member(agente_id) if topico.guild else None
+                if membro:
+                    agente_nome = str(membro)
+                _sincronizar_responsavel_boletim_alerta(
+                    topico_id=topico.id,
+                    numero=numero,
+                    agente_id=agente_id,
+                    agente_nome=agente_nome,
+                    atribuido_em=data_responsavel,
+                )
+
+            # Trocar o responsável conta como atualização do atendimento e
+            # concede ao novo responsável um novo prazo de 48 horas.
+            ultima_troca = _ultima_troca_responsavel_como_atividade_alerta(registros)
+            if data_responsavel and (ultima_troca is None or data_responsavel > ultima_troca):
+                ultima_troca = data_responsavel
+
+            atividades = [d for d in (ultima_humana, ultima_troca) if d is not None]
+            if not atividades:
+                criado = getattr(topico, 'created_at', None)
+                if criado and criado.tzinfo is None:
+                    criado = criado.replace(tzinfo=datetime.timezone.utc)
+                if criado:
+                    atividades.append(criado.astimezone(datetime.timezone.utc))
+            if not atividades:
+                continue
+
+            ultima_atividade = max(atividades)
+            horas = (agora_utc - ultima_atividade).total_seconds() / 3600
+            if horas < intervalo:
+                continue
+
+            # Período 1 = 48–95h, período 2 = 96–143h etc. Assim o mesmo
+            # boletim recebe um novo aviso a cada dois dias, sem repetir várias
+            # vezes dentro do mesmo período durante as verificações horárias.
+            periodo = max(1, int(horas // intervalo))
+            marcador = f't{int(ultima_atividade.timestamp())}'
+            if ultima_humana and ultima_humana == ultima_atividade and marcador_humano:
+                marcador = f'm{marcador_humano}'
+
+            links: List[Tuple[str, str]] = []
+            original = next(
+                (
+                    str(r.get('mensagem_original_url') or '').strip()
+                    for r in registros
+                    if str(r.get('mensagem_original_url') or '').strip().startswith('http')
+                ),
+                '',
+            )
+            if original:
+                links.append(('Ver boletim original', original))
+            links.append((
+                'Abrir tópico',
+                _url_registro_alerta(
+                    {'canal_id': topico.id},
+                    getattr(topico.guild, 'id', None),
+                ),
+            ))
+
+            if agente_id:
+                responsavel_texto = f'Responsável atual: <@{agente_id}>'
+                mencao = f'<@{agente_id}>'
+            else:
+                responsavel_texto = 'Sem agente responsável definido'
+                mencao = None
+
+            await enviar_alerta_inteligente_no_canal(
+                topico,
+                chave=(
+                    f'alerta-boletim-parado-48h-v2:'
+                    f'{topico.id}:{marcador}:periodo-{periodo}'
+                ),
+                titulo='⏰ ALERTA DE BOLETIM PARADO',
+                descricao=(
+                    f'O boletim Nº **{numero_curto_boletim(str(numero))}** está sem '
+                    f'atualização há aproximadamente **{int(horas)} horas**. '
+                    f'Este é o aviso do período **{periodo}** de 48 horas.'
+                ),
+                itens=[
+                    responsavel_texto,
+                    'Atualize, conclua ou transfira o boletim para outro agente.',
+                    'Enquanto permanecer parado, um novo aviso será enviado a cada 2 dias.',
+                ],
+                links=links,
+                cor=discord.Color.orange(),
+                mencao=mencao,
+            )
+        except discord.NotFound:
+            continue
+        except Exception as erro:
+            print(
+                f'⚠️ Falha ao verificar boletim parado {topico_id}: '
+                f'{type(erro).__name__}: {erro}',
+                flush=True,
+            )
+
+
+@verificar_boletins_parados_alerta_inteligente.before_loop
+async def antes_verificar_boletins_parados_alerta_inteligente():
+    await bot.wait_until_ready()
+    await asyncio.sleep(15)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
