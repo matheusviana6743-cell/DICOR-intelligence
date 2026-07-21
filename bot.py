@@ -26957,13 +26957,10 @@ def _banco_placa_valida(valor: Any) -> bool:
     numeros = sum(c.isdigit() for c in placa)
     if letras < 3 or numeros < 2:
         return False
-    # Padrões usados no RP, padrão antigo e Mercosul.
-    return bool(
-        re.fullmatch(r"[A-Z]{3}[0-9]{4}", placa)
-        or re.fullmatch(r"[A-Z]{3}[0-9][A-Z][0-9]{2}", placa)
-        or re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{1,3}", placa)
-        or re.fullmatch(r"[A-Z]{2,4}[0-9][A-Z0-9]{1,4}", placa)
-    )
+    # O servidor usa formatos RP variados, inclusive exemplos como
+    # TNH OJ09, MQT OY74 e YHV 3Z6. O contexto do OCR impede que
+    # campos como Modelo e Proprietário sejam aceitos como placa.
+    return bool(re.fullmatch(r"[A-Z0-9]{6,8}", placa))
 
 
 def _banco_extrair_placas_rotuladas(texto: str) -> List[str]:
@@ -27072,33 +27069,55 @@ def _banco_ocr_variantes(caminho: str) -> Tuple[List[str], List[str]]:
 
 
 def _banco_ocr_ler_imagem_sync(caminho: str) -> List[Tuple[str, float]]:
+    """Lê o OCR preservando a ordem visual aproximada das linhas.
+
+    A versão anterior ordenava tudo pela confiança. Isso podia colocar o nome do
+    modelo antes da linha ``Placa:`` e fazer o bot sugerir, por exemplo, OTTO19.
+    """
     engine = _banco_ocr_obter_engine()
     variantes, temporarios = _banco_ocr_variantes(caminho)
-    melhores: Dict[str, float] = {}
+    ordem: List[str] = []
+    melhores: Dict[str, Tuple[str, float]] = {}
     try:
         for variante in variantes:
             try:
                 resultado = engine(variante, use_det=True, use_cls=True, use_rec=True)
                 textos = list(getattr(resultado, "txts", None) or [])
                 scores = list(getattr(resultado, "scores", None) or [])
-                # Compatibilidade com retorno antigo: (resultado, tempo).
+
+                # Compatibilidade com o retorno antigo: (resultado, tempo).
                 if not textos and isinstance(resultado, tuple) and resultado:
                     bruto = resultado[0]
                     if isinstance(bruto, list):
                         for item in bruto:
-                            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                dados = item[1]
-                                if isinstance(dados, (list, tuple)) and dados:
-                                    txt = str(dados[0])
-                                    score = float(dados[1] if len(dados) > 1 else 0.5)
-                                    melhores[txt] = max(melhores.get(txt, 0.0), score)
+                            if not (isinstance(item, (list, tuple)) and len(item) >= 2):
+                                continue
+                            dados = item[1]
+                            if not (isinstance(dados, (list, tuple)) and dados):
+                                continue
+                            texto_lido = str(dados[0] or "").strip()
+                            score = float(dados[1] if len(dados) > 1 else 0.5)
+                            chave = re.sub(r"\s+", " ", texto_lido).strip().upper()
+                            if not chave:
+                                continue
+                            if chave not in melhores:
+                                ordem.append(chave)
+                                melhores[chave] = (texto_lido, score)
+                            elif score > melhores[chave][1]:
+                                melhores[chave] = (texto_lido, score)
                         continue
+
                 for indice, txt in enumerate(textos):
-                    texto = str(txt or "").strip()
-                    if not texto:
+                    texto_lido = str(txt or "").strip()
+                    if not texto_lido:
                         continue
                     score = float(scores[indice]) if indice < len(scores) else 0.5
-                    melhores[texto] = max(melhores.get(texto, 0.0), score)
+                    chave = re.sub(r"\s+", " ", texto_lido).strip().upper()
+                    if chave not in melhores:
+                        ordem.append(chave)
+                        melhores[chave] = (texto_lido, score)
+                    elif score > melhores[chave][1]:
+                        melhores[chave] = (texto_lido, score)
             except Exception:
                 traceback.print_exc()
     finally:
@@ -27107,41 +27126,104 @@ def _banco_ocr_ler_imagem_sync(caminho: str) -> List[Tuple[str, float]]:
                 Path(temporario).unlink(missing_ok=True)
             except Exception:
                 pass
-    return sorted(melhores.items(), key=lambda item: item[1], reverse=True)
-
+    return [melhores[chave] for chave in ordem]
 
 def _banco_ocr_extrair_candidatos(linhas: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
-    candidatos: Dict[str, Dict[str, Any]] = {}
+    """Extrai somente a placa da imagem.
+
+    Prioridade absoluta:
+    1. linha rotulada como ``Placa: ...``;
+    2. valor na linha imediatamente após um rótulo ``Placa``;
+    3. placa isolada em foto do veículo.
+
+    Campos como Modelo, Proprietário, Passaporte e Telefone nunca podem virar
+    sugestão de placa. Apenas um candidato é devolvido por imagem.
+    """
+    preparadas: List[Tuple[str, float]] = []
     for texto, score in linhas:
-        texto_upper = str(texto or "").upper()
-        # Prints do COPOM podem mostrar um exemplo de comando; isso não é a placa real.
-        if re.search(r"(?:^|\s)/PLACA\b", texto_upper):
+        limpo = re.sub(r"\s+", " ", str(texto or "")).strip()
+        if limpo:
+            preparadas.append((limpo, max(0.0, min(1.0, float(score or 0.0)))))
+
+    # 1) Procura a placa escrita na mesma linha do rótulo.
+    explicitos: List[Dict[str, Any]] = []
+    for texto, score in preparadas:
+        upper = texto.upper()
+        if re.search(r"(?:^|\s)/PLACA\b", upper):
             continue
-        # Caso explícito: "Placa: YXC 2XG6".
-        for placa in _banco_extrair_placas_rotuladas(texto_upper):
-            conf = min(0.99, max(float(score), 0.55) + 0.08)
-            atual = candidatos.get(placa)
-            if atual is None or conf > atual["confianca"]:
-                candidatos[placa] = {"placa": placa, "confianca": conf, "linha": texto}
+        placas = _banco_extrair_placas_rotuladas(texto)
+        for placa in placas:
+            explicitos.append({
+                "placa": placa,
+                "confianca": min(0.99, max(0.75, score + 0.14)),
+                "linha": texto,
+                "origem": "rotulo",
+            })
+    if explicitos:
+        return [max(explicitos, key=lambda item: item["confianca"])]
 
-        # Caso de foto aproximada da traseira do veículo: somente os caracteres da placa.
-        padroes = re.findall(
-            r"(?<![A-Z0-9])([A-Z]{2,4}[\s\-]?[0-9][A-Z0-9\s\-]{1,5})(?![A-Z0-9])",
-            texto_upper,
-        )
-        tokens = re.findall(r"[A-Z0-9][A-Z0-9\s\-]{4,10}[A-Z0-9]", texto_upper)
-        for bruto in padroes + tokens:
-            placa = _banco_normalizar_placa(bruto)
-            if not _banco_placa_valida(placa):
-                continue
-            conf = min(0.98, max(0.0, float(score)) * 0.92)
-            if conf < BANCO_OCR_CONFIANCA_MIN:
-                continue
-            atual = candidatos.get(placa)
-            if atual is None or conf > atual["confianca"]:
-                candidatos[placa] = {"placa": placa, "confianca": conf, "linha": texto}
-    return sorted(candidatos.values(), key=lambda item: item["confianca"], reverse=True)[:3]
+    # 2) Alguns OCRs separam "Placa:" e o valor em caixas diferentes.
+    for indice, (texto, score) in enumerate(preparadas[:-1]):
+        upper = texto.upper().strip(" :.-")
+        if upper not in {"PLACA", "PLATE", "PLACA DO VEICULO", "PLACA DO VEÍCULO"}:
+            continue
+        proximo, score_proximo = preparadas[indice + 1]
+        if re.search(r"(?:^|\s)/PLACA\b", proximo.upper()):
+            continue
+        placa = _banco_normalizar_placa(proximo)
+        if _banco_placa_valida(placa):
+            return [{
+                "placa": placa,
+                "confianca": min(0.98, max(0.72, score_proximo + 0.10)),
+                "linha": f"Placa: {proximo}",
+                "origem": "rotulo_separado",
+            }]
 
+    # Linhas de dados que jamais devem ser interpretadas como placa. Também
+    # bloqueia a linha seguinte quando o OCR separa o rótulo do valor.
+    rotulos_bloqueados = re.compile(
+        r"\b(MODELO|PROPRIET[ÁA]RIO|PASSAPORTE|TELEFONE|DETALHES|NOME|RG|COR|"
+        r"FAC[CÇ][ÃA]O|ORGANIZA[CÇ][ÃA]O|LOCAL|CHASSI|VE[IÍ]CULO|DONO)\b",
+        flags=re.I,
+    )
+    indices_bloqueados = set()
+    for indice, (texto, _) in enumerate(preparadas):
+        if rotulos_bloqueados.search(texto):
+            indices_bloqueados.add(indice)
+            # Se o rótulo estiver sozinho, o valor costuma ser a próxima caixa.
+            if re.fullmatch(r"[^:]{1,30}:?", texto.strip()) and indice + 1 < len(preparadas):
+                indices_bloqueados.add(indice + 1)
+
+    # 3) Foto contendo somente a placa ou a traseira do veículo.
+    isolados: List[Dict[str, Any]] = []
+    for indice, (texto, score) in enumerate(preparadas):
+        if indice in indices_bloqueados:
+            continue
+        upper = texto.upper()
+        if re.search(r"(?:^|\s)/PLACA\b", upper):
+            continue
+        # A linha inteira deve parecer uma placa; não vasculha frases completas.
+        sem_pontuacao = re.sub(r"[^A-Z0-9\s-]", " ", upper)
+        sem_pontuacao = re.sub(r"\s+", " ", sem_pontuacao).strip()
+        placa = _banco_normalizar_placa(sem_pontuacao)
+        if not _banco_placa_valida(placa):
+            continue
+        palavras = sem_pontuacao.split()
+        if len(palavras) > 3 or len(sem_pontuacao) > 12:
+            continue
+        conf = min(0.97, score * 0.95)
+        if conf < BANCO_OCR_CONFIANCA_MIN:
+            continue
+        isolados.append({
+            "placa": placa,
+            "confianca": conf,
+            "linha": texto,
+            "origem": "placa_isolada",
+        })
+
+    if not isolados:
+        return []
+    return [max(isolados, key=lambda item: item["confianca"])]
 
 def _banco_fontes_imagem_mensagem(msg: discord.Message) -> List[Dict[str, Any]]:
     fontes: List[Dict[str, Any]] = []
@@ -27275,33 +27357,22 @@ def _banco_ocr_pendentes(limite: int = 30, apenas_sem_mensagem: bool = False) ->
 
 def _banco_ocr_embed_revisao(pendente: Dict[str, Any]) -> discord.Embed:
     confianca = max(0.0, min(1.0, float(pendente.get("confianca") or 0)))
+    placa = str(pendente.get("placa_sugerida") or "N/A")
     embed = discord.Embed(
         title="🔎 PLACA ENCONTRADA EM IMAGEM",
         description=(
-            "O OCR encontrou uma possível placa em uma foto/print da **Perícia Externa**.\n"
+            "O OCR analisou a foto/print da **Perícia Externa** focando somente na placa.\n"
             "Confirme ou corrija antes de salvar no banco."
         ),
         color=discord.Color.orange(),
     )
-    embed.add_field(name="🚗 Placa sugerida", value=f"`{pendente.get('placa_sugerida') or 'N/A'}`", inline=True)
+    embed.add_field(name="🚗 Placa sugerida", value=f"`{placa}`", inline=True)
     embed.add_field(name="📊 Confiança", value=f"{confianca * 100:.0f}%", inline=True)
-    if pendente.get("modelo"):
-        embed.add_field(name="Modelo", value=str(pendente["modelo"])[:1024], inline=True)
-    if pendente.get("proprietario_nome") or pendente.get("proprietario_rg"):
-        embed.add_field(
-            name="Proprietário identificado",
-            value=(f"{pendente.get('proprietario_nome') or 'Nome N/A'}"
-                   f" — RG `{pendente.get('proprietario_rg') or 'N/A'}`")[:1024],
-            inline=False,
-        )
-    texto = str(pendente.get("texto_ocr") or "").strip()
-    if texto:
-        embed.add_field(name="Texto lido na imagem", value=f"```{texto[:900]}```", inline=False)
     if pendente.get("mensagem_url"):
         embed.add_field(name="Origem", value=f"[Abrir Perícia Externa]({pendente['mensagem_url']})", inline=False)
     if pendente.get("imagem_url"):
         embed.set_image(url=str(pendente["imagem_url"]))
-    embed.set_footer(text=f"OCR-ID:{int(pendente.get('id') or 0)} • nada será salvo sem confirmação")
+    embed.set_footer(text=f"OCR-ID:{int(pendente.get('id') or 0)} • somente a placa será salva após confirmação")
     return embed
 
 
@@ -27501,6 +27572,41 @@ class BancoOCRReviewView(View):
             await interaction.followup.send(f"❌ {erro}", ephemeral=True)
 
 
+async def _banco_ocr_descartar_pendentes_antigos_da_fonte(
+    guild: Optional[discord.Guild], fonte_id: str
+) -> None:
+    """Remove cartões antigos da mesma imagem antes de uma releitura forçada."""
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT id, revisao_canal_id, revisao_mensagem_id
+            FROM placas_ocr_pendentes
+            WHERE fonte_id=? AND status='PENDENTE'
+            """,
+            (str(fonte_id),),
+        ).fetchall()
+    for row in rows:
+        canal_id = int(row["revisao_canal_id"] or 0)
+        mensagem_id = int(row["revisao_mensagem_id"] or 0)
+        if guild is not None and canal_id and mensagem_id:
+            try:
+                canal = guild.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+                mensagem = await canal.fetch_message(mensagem_id)
+                await mensagem.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except Exception:
+                traceback.print_exc()
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            UPDATE placas_ocr_pendentes
+            SET status='REPROCESSADO', atualizado_em=?
+            WHERE fonte_id=? AND status='PENDENTE'
+            """,
+            (_banco_agora_iso(), str(fonte_id)),
+        )
+
 async def banco_sincronizar_pericias(
     guild: Optional[discord.Guild],
     *,
@@ -27600,6 +27706,8 @@ async def banco_sincronizar_pericias(
                     ).fetchone()
                 if (not forcar_historico) and processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE"}:
                     continue
+                if forcar_historico:
+                    await _banco_ocr_descartar_pendentes_antigos_da_fonte(guild, fonte_id)
                 if RapidOCR is None:
                     resultado["ocr_indisponivel"] += 1
                     if not _BANCO_OCR_AVISO_IMPORT_JA_ENVIADO:
@@ -27628,26 +27736,28 @@ async def banco_sincronizar_pericias(
                     linhas = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, imagem_path)
                     resultado["ocr_imagens"] += 1
                     ocr_processados_nesta_sync += 1
-                    texto_ocr = "\n".join(texto_linha for texto_linha, _ in linhas)
                     candidatos = _banco_ocr_extrair_candidatos(linhas)
                     candidatos = [x for x in candidatos if x["placa"] not in placas_diretas]
-                    combinado = f"{texto}\n{texto_ocr}".strip()
-                    dados_lista = banco_extrair_veiculos_pericia(combinado)
+
+                    # O OCR da imagem alimenta somente a placa. Modelo, proprietário,
+                    # telefone e demais textos da imagem não entram automaticamente.
+                    # Dados extras só podem vir do texto/embed real da mensagem.
+                    dados_lista = banco_extrair_veiculos_pericia(texto)
                     dados_base = dados_lista[0] if dados_lista else {
-                        "modelo": _banco_extrair_label(combinado, [r"modelo", r"ve[ií]culo", r"carro"], 120),
-                        "cor": _banco_extrair_label(combinado, [r"cor"], 80),
-                        "proprietario_rg": _banco_extrair_label(combinado, [r"rg\s+do\s+propriet[aá]rio", r"passaporte"], 40),
-                        "proprietario_nome": _banco_extrair_label(combinado, [r"propriet[aá]rio", r"dono"], 120),
-                        "faccao": _banco_extrair_label(combinado, [r"fac[cç][aã]o", r"organiza[cç][aã]o", r"fam[ií]lia"], 120),
-                        "local": _banco_extrair_label(combinado, [r"local", r"localiza[cç][aã]o"], 180),
-                        "observacoes": _banco_extrair_label(combinado, [r"observa[cç][aã]o", r"conclus[aã]o", r"an[aá]lise"], 600),
+                        "modelo": "",
+                        "cor": "",
+                        "proprietario_rg": "",
+                        "proprietario_nome": "",
+                        "faccao": "",
+                        "local": "",
+                        "observacoes": "",
                     }
                     novos_pendentes = 0
                     for candidato in candidatos:
                         pendente = _banco_ocr_criar_pendente(
                             msg=msg, canal_id=int(canal.id), fonte=fonte, imagem_path=imagem_path,
                             placa=candidato["placa"], confianca=float(candidato["confianca"]),
-                            texto_ocr=texto_ocr, dados=dados_base,
+                            texto_ocr=str(candidato.get("linha") or "")[:300], dados=dados_base,
                         )
                         if pendente and str(pendente.get("status")) == "PENDENTE":
                             novos_pendentes += 1
@@ -27713,7 +27823,7 @@ def banco_embed_painel() -> discord.Embed:
         description=(
             "Cadastre e consulte indivíduos, placas e painéis completos de organizações.\n"
             "A Perícia Externa é lida por **texto, embeds e OCR de fotos/prints**. "
-            "Leituras de imagem exigem confirmação antes de entrar no banco. Use **Importar perícias antigas** para reler todo o histórico."
+            "O OCR da imagem procura **somente a placa** e exige confirmação. Use **Importar perícias antigas** para reler todo o histórico."
         ),
         color=discord.Color.dark_blue(),
     )
