@@ -26824,5 +26824,1002 @@ async def on_ready():
         print(f"⚠️ Falha ao carregar Banco de Dados DICOR: {erro}")
 
 
+
+# =====================================================
+# PATCH — OCR DE PLACAS EM FOTOS/PRINTS DA PERÍCIA EXTERNA
+# - Lê texto normal e embeds sem OCR.
+# - Lê imagens anexadas e imagens de embeds usando RapidOCR local.
+# - Placas encontradas apenas por imagem ficam pendentes para confirmação.
+# - Não altera modelos de mandado, dossiê, procurados, boletins ou mesas.
+# =====================================================
+
+import hashlib
+import threading
+
+try:
+    from rapidocr import RapidOCR
+except Exception as _banco_ocr_import_exception:
+    RapidOCR = None
+    _BANCO_OCR_IMPORT_ERRO = f"{type(_banco_ocr_import_exception).__name__}: {_banco_ocr_import_exception}"
+else:
+    _BANCO_OCR_IMPORT_ERRO = ""
+
+BANCO_OCR_ATIVO = str(os.getenv("BANCO_OCR_ATIVO", "1")).strip().lower() not in {"0", "false", "nao", "não", "off"}
+BANCO_OCR_CONFIANCA_MIN = max(0.20, min(0.99, env_float("BANCO_OCR_CONFIANCA_MIN", 0.45)))
+BANCO_OCR_MAX_IMAGENS_MENSAGEM = max(1, min(10, env_int("BANCO_OCR_MAX_IMAGENS_MENSAGEM", 4)))
+BANCO_OCR_MAX_POR_SYNC = max(1, min(250, env_int("BANCO_OCR_MAX_POR_SYNC", 30)))
+BANCO_OCR_MAX_BYTES = max(1_000_000, env_int("BANCO_OCR_MAX_BYTES", 12_000_000))
+
+_BANCO_OCR_ENGINE = None
+_BANCO_OCR_ENGINE_ERRO = ""
+_BANCO_OCR_THREAD_LOCK = threading.Lock()
+_BANCO_OCR_AVISO_IMPORT_JA_ENVIADO = False
+
+_BANCO_INIT_ANTES_OCR = inicializar_banco_dicor
+
+
+def inicializar_banco_dicor() -> None:
+    _BANCO_INIT_ANTES_OCR()
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS banco_config (
+                chave TEXT PRIMARY KEY,
+                valor TEXT DEFAULT '',
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ocr_fontes_processadas (
+                fonte_id TEXT PRIMARY KEY,
+                mensagem_id INTEGER NOT NULL,
+                canal_id INTEGER NOT NULL,
+                imagem_url TEXT DEFAULT '',
+                status TEXT NOT NULL,
+                candidatos INTEGER DEFAULT 0,
+                erro TEXT DEFAULT '',
+                processado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS placas_ocr_pendentes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mensagem_id INTEGER NOT NULL,
+                canal_id INTEGER NOT NULL,
+                fonte_id TEXT NOT NULL,
+                imagem_url TEXT DEFAULT '',
+                imagem_path TEXT DEFAULT '',
+                placa_sugerida TEXT NOT NULL,
+                confianca REAL DEFAULT 0,
+                texto_ocr TEXT DEFAULT '',
+                modelo TEXT DEFAULT '',
+                cor TEXT DEFAULT '',
+                proprietario_rg TEXT DEFAULT '',
+                proprietario_nome TEXT DEFAULT '',
+                faccao TEXT DEFAULT '',
+                local TEXT DEFAULT '',
+                observacoes TEXT DEFAULT '',
+                mensagem_url TEXT DEFAULT '',
+                autor_origem_id INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'PENDENTE',
+                resolvido_por_id INTEGER DEFAULT 0,
+                placa_final TEXT DEFAULT '',
+                revisao_canal_id INTEGER DEFAULT 0,
+                revisao_mensagem_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                UNIQUE(fonte_id, placa_sugerida)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ocr_pendentes_status
+                ON placas_ocr_pendentes(status, criado_em);
+            CREATE INDEX IF NOT EXISTS idx_ocr_fontes_mensagem
+                ON ocr_fontes_processadas(mensagem_id, status);
+            """
+        )
+
+
+def _banco_config_set(chave: str, valor: Any) -> None:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            INSERT INTO banco_config(chave, valor, atualizado_em)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor, atualizado_em=excluded.atualizado_em
+            """,
+            (str(chave), str(valor or ""), _banco_agora_iso()),
+        )
+
+
+def _banco_config_get(chave: str, padrao: str = "") -> str:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        row = db.execute("SELECT valor FROM banco_config WHERE chave=?", (str(chave),)).fetchone()
+    return str(row["valor"] if row else padrao)
+
+
+def _banco_placa_valida(valor: Any) -> bool:
+    placa = _banco_normalizar_placa(valor)
+    if not (6 <= len(placa) <= 8):
+        return False
+    if not re.fullmatch(r"[A-Z0-9]+", placa):
+        return False
+    letras = sum(c.isalpha() for c in placa)
+    numeros = sum(c.isdigit() for c in placa)
+    if letras < 3 or numeros < 2:
+        return False
+    # Padrões usados no RP, padrão antigo e Mercosul.
+    return bool(
+        re.fullmatch(r"[A-Z]{3}[0-9]{4}", placa)
+        or re.fullmatch(r"[A-Z]{3}[0-9][A-Z][0-9]{2}", placa)
+        or re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9]{1,3}", placa)
+        or re.fullmatch(r"[A-Z]{2,4}[0-9][A-Z0-9]{1,4}", placa)
+    )
+
+
+def _banco_extrair_placas_rotuladas(texto: str) -> List[str]:
+    encontrados: List[str] = []
+    for linha in str(texto or "").replace("**", "").replace("`", "").splitlines():
+        linha_limpa = linha.strip()
+        # Ignora instruções/comandos como: "Detalhes em: /placa {ABC 1D23}".
+        if re.search(r"(?:^|\s)/placa\b", linha_limpa, flags=re.I):
+            continue
+        m = re.search(r"\b(?:placa(?:\s+do\s+ve[ií]culo)?|plate)\s*[:\-]\s*(.+)$", linha_limpa, flags=re.I)
+        if not m:
+            continue
+        resto = m.group(1).strip()
+        # Prioriza um bloco parecido com placa e evita engolir outros campos da linha.
+        blocos = re.findall(r"[A-Za-z0-9]+(?:[\s\-]+[A-Za-z0-9]+){0,2}", resto)
+        candidatos = [resto] + blocos
+        for bruto in candidatos:
+            placa = _banco_normalizar_placa(bruto)
+            if _banco_placa_valida(placa) and placa not in encontrados:
+                encontrados.append(placa)
+                break
+    return encontrados
+
+
+def banco_extrair_veiculos_pericia(texto: str) -> List[Dict[str, str]]:
+    texto_limpo = str(texto or "").replace("**", "").replace("`", "")
+    placas = _banco_extrair_placas_rotuladas(texto_limpo)
+
+    modelo = _banco_extrair_label(texto_limpo, [r"modelo", r"ve[ií]culo", r"carro"], 120)
+    cor = _banco_extrair_label(texto_limpo, [r"cor"], 80)
+    proprietario_rg = _banco_extrair_label(texto_limpo, [r"rg\s+do\s+propriet[aá]rio", r"rg\s+propriet[aá]rio", r"passaporte"], 40)
+    proprietario_nome = _banco_extrair_label(texto_limpo, [r"propriet[aá]rio", r"dono"], 120)
+    faccao = _banco_extrair_label(texto_limpo, [r"fac[cç][aã]o", r"organiza[cç][aã]o", r"fam[ií]lia"], 120)
+    local = _banco_extrair_label(texto_limpo, [r"local", r"localiza[cç][aã]o"], 180)
+    observacoes = _banco_extrair_label(texto_limpo, [r"observa[cç][aã]o", r"conclus[aã]o", r"an[aá]lise"], 600)
+
+    return [
+        {
+            "placa": placa,
+            "modelo": modelo,
+            "cor": cor,
+            "proprietario_rg": proprietario_rg,
+            "proprietario_nome": proprietario_nome,
+            "faccao": faccao,
+            "local": local,
+            "observacoes": observacoes,
+        }
+        for placa in placas
+    ]
+
+
+def _banco_ocr_obter_engine():
+    global _BANCO_OCR_ENGINE, _BANCO_OCR_ENGINE_ERRO
+    if not BANCO_OCR_ATIVO:
+        raise RuntimeError("OCR desativado por BANCO_OCR_ATIVO=0.")
+    if RapidOCR is None:
+        raise RuntimeError(
+            "RapidOCR não instalado. Adicione rapidocr e onnxruntime ao requirements.txt. "
+            + (_BANCO_OCR_IMPORT_ERRO or "")
+        )
+    with _BANCO_OCR_THREAD_LOCK:
+        if _BANCO_OCR_ENGINE is None:
+            try:
+                _BANCO_OCR_ENGINE = RapidOCR()
+                _BANCO_OCR_ENGINE_ERRO = ""
+            except Exception as erro:
+                _BANCO_OCR_ENGINE_ERRO = f"{type(erro).__name__}: {erro}"
+                raise
+    return _BANCO_OCR_ENGINE
+
+
+def _banco_ocr_variantes(caminho: str) -> Tuple[List[str], List[str]]:
+    variantes = [str(caminho)]
+    temporarios: List[str] = []
+    if PILImage is None:
+        return variantes, temporarios
+    try:
+        from PIL import ImageOps, ImageEnhance, ImageFilter
+        img = PILImage.open(caminho).convert("RGB")
+        w, h = img.size
+        # Evita imagem gigantesca e aumenta fotos pequenas/borradas.
+        escala = min(3.0, max(1.0, 1600.0 / max(w, h)))
+        novo = img.resize((max(1, int(w * escala)), max(1, int(h * escala)))) if escala != 1.0 else img.copy()
+        cinza = ImageOps.grayscale(novo)
+        cinza = ImageOps.autocontrast(cinza)
+        cinza = ImageEnhance.Contrast(cinza).enhance(1.8)
+        cinza = cinza.filter(ImageFilter.SHARPEN)
+        p1 = str(BANCO_ARQUIVOS_DIR / f"ocr-enh-{int(time.time()*1000)}-{secrets.token_hex(3)}.png")
+        cinza.save(p1, "PNG")
+        variantes.append(p1)
+        temporarios.append(p1)
+
+        # Em fotos de veículos, a placa costuma aparecer na metade inferior.
+        w2, h2 = novo.size
+        if h2 >= 220:
+            crop = novo.crop((0, int(h2 * 0.40), w2, h2))
+            crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+            crop = ImageEnhance.Contrast(crop).enhance(2.0).filter(ImageFilter.SHARPEN)
+            p2 = str(BANCO_ARQUIVOS_DIR / f"ocr-crop-{int(time.time()*1000)}-{secrets.token_hex(3)}.png")
+            crop.save(p2, "PNG")
+            variantes.append(p2)
+            temporarios.append(p2)
+    except Exception:
+        traceback.print_exc()
+    return variantes, temporarios
+
+
+def _banco_ocr_ler_imagem_sync(caminho: str) -> List[Tuple[str, float]]:
+    engine = _banco_ocr_obter_engine()
+    variantes, temporarios = _banco_ocr_variantes(caminho)
+    melhores: Dict[str, float] = {}
+    try:
+        for variante in variantes:
+            try:
+                resultado = engine(variante, use_det=True, use_cls=True, use_rec=True)
+                textos = list(getattr(resultado, "txts", None) or [])
+                scores = list(getattr(resultado, "scores", None) or [])
+                # Compatibilidade com retorno antigo: (resultado, tempo).
+                if not textos and isinstance(resultado, tuple) and resultado:
+                    bruto = resultado[0]
+                    if isinstance(bruto, list):
+                        for item in bruto:
+                            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                dados = item[1]
+                                if isinstance(dados, (list, tuple)) and dados:
+                                    txt = str(dados[0])
+                                    score = float(dados[1] if len(dados) > 1 else 0.5)
+                                    melhores[txt] = max(melhores.get(txt, 0.0), score)
+                        continue
+                for indice, txt in enumerate(textos):
+                    texto = str(txt or "").strip()
+                    if not texto:
+                        continue
+                    score = float(scores[indice]) if indice < len(scores) else 0.5
+                    melhores[texto] = max(melhores.get(texto, 0.0), score)
+            except Exception:
+                traceback.print_exc()
+    finally:
+        for temporario in temporarios:
+            try:
+                Path(temporario).unlink(missing_ok=True)
+            except Exception:
+                pass
+    return sorted(melhores.items(), key=lambda item: item[1], reverse=True)
+
+
+def _banco_ocr_extrair_candidatos(linhas: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
+    candidatos: Dict[str, Dict[str, Any]] = {}
+    for texto, score in linhas:
+        texto_upper = str(texto or "").upper()
+        # Prints do COPOM podem mostrar um exemplo de comando; isso não é a placa real.
+        if re.search(r"(?:^|\s)/PLACA\b", texto_upper):
+            continue
+        # Caso explícito: "Placa: YXC 2XG6".
+        for placa in _banco_extrair_placas_rotuladas(texto_upper):
+            conf = min(0.99, max(float(score), 0.55) + 0.08)
+            atual = candidatos.get(placa)
+            if atual is None or conf > atual["confianca"]:
+                candidatos[placa] = {"placa": placa, "confianca": conf, "linha": texto}
+
+        # Caso de foto aproximada da traseira do veículo: somente os caracteres da placa.
+        padroes = re.findall(
+            r"(?<![A-Z0-9])([A-Z]{2,4}[\s\-]?[0-9][A-Z0-9\s\-]{1,5})(?![A-Z0-9])",
+            texto_upper,
+        )
+        tokens = re.findall(r"[A-Z0-9][A-Z0-9\s\-]{4,10}[A-Z0-9]", texto_upper)
+        for bruto in padroes + tokens:
+            placa = _banco_normalizar_placa(bruto)
+            if not _banco_placa_valida(placa):
+                continue
+            conf = min(0.98, max(0.0, float(score)) * 0.92)
+            if conf < BANCO_OCR_CONFIANCA_MIN:
+                continue
+            atual = candidatos.get(placa)
+            if atual is None or conf > atual["confianca"]:
+                candidatos[placa] = {"placa": placa, "confianca": conf, "linha": texto}
+    return sorted(candidatos.values(), key=lambda item: item["confianca"], reverse=True)[:3]
+
+
+def _banco_fontes_imagem_mensagem(msg: discord.Message) -> List[Dict[str, Any]]:
+    fontes: List[Dict[str, Any]] = []
+    urls_vistas = set()
+    for attachment in list(getattr(msg, "attachments", []) or []):
+        extensao = Path(attachment.filename or "").suffix.lower()
+        if not ((attachment.content_type or "").startswith("image/") or extensao in {".png", ".jpg", ".jpeg", ".webp"}):
+            continue
+        url = str(attachment.url or "")
+        if not url or url in urls_vistas:
+            continue
+        urls_vistas.add(url)
+        fontes.append(
+            {
+                "fonte_id": f"attachment:{int(attachment.id)}",
+                "url": url,
+                "attachment": attachment,
+                "size": int(getattr(attachment, "size", 0) or 0),
+                "filename": attachment.filename or "imagem.png",
+            }
+        )
+    for indice, embed in enumerate(list(getattr(msg, "embeds", []) or [])):
+        for tipo, media in (("image", getattr(embed, "image", None)), ("thumb", getattr(embed, "thumbnail", None))):
+            url = str(getattr(media, "url", "") or "")
+            if not url or url in urls_vistas:
+                continue
+            urls_vistas.add(url)
+            digest = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()[:24]
+            fontes.append(
+                {
+                    "fonte_id": f"embed:{tipo}:{indice}:{digest}",
+                    "url": url,
+                    "attachment": None,
+                    "size": 0,
+                    "filename": f"embed-{digest}.png",
+                }
+            )
+    return fontes[:BANCO_OCR_MAX_IMAGENS_MENSAGEM]
+
+
+async def _banco_salvar_fonte_imagem(fonte: Dict[str, Any], prefixo: str) -> str:
+    attachment = fonte.get("attachment")
+    if attachment is not None:
+        if int(fonte.get("size") or 0) > BANCO_OCR_MAX_BYTES:
+            raise ValueError("Imagem maior que o limite configurado para OCR.")
+        return await _banco_salvar_attachment(attachment, prefixo)
+
+    url = str(fonte.get("url") or "")
+    if not url:
+        raise ValueError("URL da imagem não encontrada.")
+    timeout = ClientTimeout(total=45)
+    async with ClientSession(timeout=timeout) as sessao:
+        async with sessao.get(url) as resposta:
+            if resposta.status != 200:
+                raise RuntimeError(f"Falha ao baixar imagem do embed: HTTP {resposta.status}")
+            tamanho = int(resposta.headers.get("Content-Length", "0") or 0)
+            if tamanho and tamanho > BANCO_OCR_MAX_BYTES:
+                raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
+            dados = await resposta.read()
+            if len(dados) > BANCO_OCR_MAX_BYTES:
+                raise ValueError("Imagem do embed maior que o limite configurado para OCR.")
+            content_type = str(resposta.headers.get("Content-Type", "")).lower()
+    extensao = ".jpg" if "jpeg" in content_type else ".webp" if "webp" in content_type else ".png"
+    destino = BANCO_ARQUIVOS_DIR / f"{slugify(prefixo)}-{int(time.time()*1000)}-{secrets.token_hex(3)}{extensao}"
+    destino.write_bytes(dados)
+    return str(destino)
+
+
+def _banco_ocr_criar_pendente(
+    *,
+    msg: discord.Message,
+    canal_id: int,
+    fonte: Dict[str, Any],
+    imagem_path: str,
+    placa: str,
+    confianca: float,
+    texto_ocr: str,
+    dados: Dict[str, str],
+) -> Dict[str, Any]:
+    agora = _banco_agora_iso()
+    placa_n = _banco_normalizar_placa(placa)
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO placas_ocr_pendentes
+            (mensagem_id, canal_id, fonte_id, imagem_url, imagem_path, placa_sugerida,
+             confianca, texto_ocr, modelo, cor, proprietario_rg, proprietario_nome,
+             faccao, local, observacoes, mensagem_url, autor_origem_id, status,
+             criado_em, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDENTE', ?, ?)
+            """,
+            (
+                int(msg.id), int(canal_id), str(fonte.get("fonte_id") or ""),
+                str(fonte.get("url") or "")[:1000], str(imagem_path or "")[:500], placa_n,
+                float(confianca), str(texto_ocr or "")[:3500],
+                _banco_limpar_texto(dados.get("modelo"), 120),
+                _banco_limpar_texto(dados.get("cor"), 80),
+                _banco_normalizar_rg(dados.get("proprietario_rg")),
+                _banco_limpar_texto(dados.get("proprietario_nome"), 120),
+                _banco_limpar_texto(dados.get("faccao"), 120),
+                _banco_limpar_texto(dados.get("local"), 180),
+                str(dados.get("observacoes") or "")[:1800],
+                str(getattr(msg, "jump_url", "") or "")[:1000],
+                int(getattr(msg.author, "id", 0) or 0), agora, agora,
+            ),
+        )
+        row = db.execute(
+            "SELECT * FROM placas_ocr_pendentes WHERE fonte_id=? AND placa_sugerida=?",
+            (str(fonte.get("fonte_id") or ""), placa_n),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def _banco_ocr_pendente_por_id(pendente_id: int) -> Dict[str, Any]:
+    with _banco_conexao() as db:
+        row = db.execute("SELECT * FROM placas_ocr_pendentes WHERE id=?", (int(pendente_id),)).fetchone()
+    return dict(row) if row else {}
+
+
+def _banco_ocr_pendentes(limite: int = 30, apenas_sem_mensagem: bool = False) -> List[Dict[str, Any]]:
+    where = "status='PENDENTE'"
+    if apenas_sem_mensagem:
+        where += " AND revisao_mensagem_id=0"
+    with _banco_conexao() as db:
+        rows = db.execute(
+            f"SELECT * FROM placas_ocr_pendentes WHERE {where} ORDER BY criado_em ASC LIMIT ?",
+            (max(1, min(int(limite), 100)),),
+        ).fetchall()
+    return [dict(x) for x in rows]
+
+
+def _banco_ocr_embed_revisao(pendente: Dict[str, Any]) -> discord.Embed:
+    confianca = max(0.0, min(1.0, float(pendente.get("confianca") or 0)))
+    embed = discord.Embed(
+        title="🔎 PLACA ENCONTRADA EM IMAGEM",
+        description=(
+            "O OCR encontrou uma possível placa em uma foto/print da **Perícia Externa**.\n"
+            "Confirme ou corrija antes de salvar no banco."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="🚗 Placa sugerida", value=f"`{pendente.get('placa_sugerida') or 'N/A'}`", inline=True)
+    embed.add_field(name="📊 Confiança", value=f"{confianca * 100:.0f}%", inline=True)
+    if pendente.get("modelo"):
+        embed.add_field(name="Modelo", value=str(pendente["modelo"])[:1024], inline=True)
+    if pendente.get("proprietario_nome") or pendente.get("proprietario_rg"):
+        embed.add_field(
+            name="Proprietário identificado",
+            value=(f"{pendente.get('proprietario_nome') or 'Nome N/A'}"
+                   f" — RG `{pendente.get('proprietario_rg') or 'N/A'}`")[:1024],
+            inline=False,
+        )
+    texto = str(pendente.get("texto_ocr") or "").strip()
+    if texto:
+        embed.add_field(name="Texto lido na imagem", value=f"```{texto[:900]}```", inline=False)
+    if pendente.get("mensagem_url"):
+        embed.add_field(name="Origem", value=f"[Abrir Perícia Externa]({pendente['mensagem_url']})", inline=False)
+    if pendente.get("imagem_url"):
+        embed.set_image(url=str(pendente["imagem_url"]))
+    embed.set_footer(text=f"OCR-ID:{int(pendente.get('id') or 0)} • nada será salvo sem confirmação")
+    return embed
+
+
+async def _banco_ocr_postar_revisao(
+    guild: Optional[discord.Guild],
+    pendente: Dict[str, Any],
+    *,
+    canal_fallback_id: int = 0,
+) -> bool:
+    if guild is None or not pendente or str(pendente.get("status")) != "PENDENTE":
+        return False
+    if int(pendente.get("revisao_mensagem_id") or 0):
+        return False
+    canal_id = int(_banco_config_get("painel_canal_id", "0") or 0) or int(canal_fallback_id or 0)
+    if not canal_id:
+        return False
+    canal = guild.get_channel(canal_id)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(canal_id)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, "send"):
+        return False
+    mensagem = await canal.send(embed=_banco_ocr_embed_revisao(pendente), view=BancoOCRReviewView())
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            UPDATE placas_ocr_pendentes
+            SET revisao_canal_id=?, revisao_mensagem_id=?, atualizado_em=?
+            WHERE id=?
+            """,
+            (int(canal.id), int(mensagem.id), _banco_agora_iso(), int(pendente["id"])),
+        )
+    return True
+
+
+def _banco_ocr_id_da_interacao(interaction: discord.Interaction) -> int:
+    mensagem = getattr(interaction, "message", None)
+    if mensagem is None or not mensagem.embeds:
+        return 0
+    footer = str(getattr(mensagem.embeds[0].footer, "text", "") or "")
+    m = re.search(r"OCR-ID:(\d+)", footer)
+    return int(m.group(1)) if m else 0
+
+
+def _banco_ocr_resolver(
+    pendente_id: int,
+    usuario_id: int,
+    *,
+    placa_final: str = "",
+    modelo: Optional[str] = None,
+    cor: Optional[str] = None,
+    proprietario_nome: Optional[str] = None,
+    faccao: Optional[str] = None,
+    status_final: str = "CONFIRMADO",
+) -> Dict[str, Any]:
+    pendente = _banco_ocr_pendente_por_id(pendente_id)
+    if not pendente:
+        raise ValueError("Leitura OCR não encontrada.")
+    if str(pendente.get("status")) != "PENDENTE":
+        raise ValueError("Esta leitura OCR já foi resolvida.")
+    placa = _banco_normalizar_placa(placa_final or pendente.get("placa_sugerida"))
+    if status_final != "IGNORADO" and not _banco_placa_valida(placa):
+        raise ValueError("Placa inválida. Use apenas letras e números no formato do RP.")
+
+    if status_final == "IGNORADO":
+        with _banco_conexao() as db:
+            db.execute(
+                """
+                UPDATE placas_ocr_pendentes SET status='IGNORADO', resolvido_por_id=?,
+                    placa_final='', atualizado_em=? WHERE id=?
+                """,
+                (int(usuario_id), _banco_agora_iso(), int(pendente_id)),
+            )
+        return {**pendente, "status": "IGNORADO", "placa_final": ""}
+
+    item = banco_upsert_veiculo(
+        placa=placa,
+        modelo=str(modelo if modelo is not None else pendente.get("modelo") or ""),
+        cor=str(cor if cor is not None else pendente.get("cor") or ""),
+        proprietario_rg=str(pendente.get("proprietario_rg") or ""),
+        proprietario_nome=str(
+            proprietario_nome if proprietario_nome is not None else pendente.get("proprietario_nome") or ""
+        ),
+        faccao=str(faccao if faccao is not None else pendente.get("faccao") or ""),
+        local=str(pendente.get("local") or ""),
+        observacoes=(
+            str(pendente.get("observacoes") or "")
+            + f" | Placa confirmada por OCR (confiança {float(pendente.get('confianca') or 0)*100:.0f}%)."
+        ).strip(" |"),
+        foto_path=str(pendente.get("imagem_path") or ""),
+        foto_url=str(pendente.get("imagem_url") or ""),
+        origem_tipo="pericia_externa_ocr",
+        origem_id=str(pendente.get("mensagem_id") or ""),
+        mensagem_url=str(pendente.get("mensagem_url") or ""),
+        criado_por_id=int(usuario_id),
+    )
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            UPDATE placas_ocr_pendentes SET status=?, resolvido_por_id=?, placa_final=?, atualizado_em=?
+            WHERE id=?
+            """,
+            (str(status_final), int(usuario_id), placa, _banco_agora_iso(), int(pendente_id)),
+        )
+        _banco_historico(
+            "OCR_PLACA", str(pendente_id), str(status_final),
+            f"Sugestão {pendente.get('placa_sugerida')} -> {placa}", int(usuario_id), db,
+        )
+    return item
+
+
+class BancoOCRCorrecaoModal(Modal, title="Corrigir placa encontrada pelo OCR"):
+    def __init__(self, pendente_id: int, pendente: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.pendente_id = int(pendente_id)
+        self.placa = TextInput(label="Placa correta", default=str(pendente.get("placa_sugerida") or "")[:16], max_length=16)
+        self.modelo = TextInput(label="Modelo", default=str(pendente.get("modelo") or "")[:120], required=False, max_length=120)
+        self.cor = TextInput(label="Cor", default=str(pendente.get("cor") or "")[:80], required=False, max_length=80)
+        self.proprietario = TextInput(label="Proprietário", default=str(pendente.get("proprietario_nome") or "")[:120], required=False, max_length=120)
+        self.faccao = TextInput(label="Facção", default=str(pendente.get("faccao") or "")[:120], required=False, max_length=120)
+        for item in (self.placa, self.modelo, self.cor, self.proprietario, self.faccao):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            item = _banco_ocr_resolver(
+                self.pendente_id, interaction.user.id,
+                placa_final=str(self.placa.value), modelo=str(self.modelo.value or ""),
+                cor=str(self.cor.value or ""), proprietario_nome=str(self.proprietario.value or ""),
+                faccao=str(self.faccao.value or ""), status_final="CORRIGIDO",
+            )
+            await interaction.followup.send(
+                f"✅ OCR corrigido e placa `{item.get('placa')}` salva no banco.", ephemeral=True
+            )
+            if interaction.message:
+                embed = discord.Embed(
+                    title="✅ PLACA OCR CORRIGIDA",
+                    description=f"Placa final: `{item.get('placa')}`\nCorrigida por {interaction.user.mention}.",
+                    color=discord.Color.green(),
+                )
+                await interaction.message.edit(embed=embed, view=None)
+        except Exception as erro:
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+class BancoOCRReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode revisar o OCR.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar placa", emoji="✅", style=discord.ButtonStyle.success, custom_id="dicor_banco_ocr_confirmar")
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            item = _banco_ocr_resolver(pendente_id, interaction.user.id, status_final="CONFIRMADO")
+            await interaction.followup.send(f"✅ Placa `{item.get('placa')}` salva no banco.", ephemeral=True)
+            embed = discord.Embed(
+                title="✅ PLACA OCR CONFIRMADA",
+                description=f"Placa: `{item.get('placa')}`\nConfirmada por {interaction.user.mention}.",
+                color=discord.Color.green(),
+            )
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception as erro:
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+    @discord.ui.button(label="Corrigir", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="dicor_banco_ocr_corrigir")
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        pendente = _banco_ocr_pendente_por_id(pendente_id)
+        if not pendente or str(pendente.get("status")) != "PENDENTE":
+            return await interaction.response.send_message("❌ Esta leitura já foi resolvida ou não existe.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRCorrecaoModal(pendente_id, pendente))
+
+    @discord.ui.button(label="Ignorar", emoji="❌", style=discord.ButtonStyle.danger, custom_id="dicor_banco_ocr_ignorar")
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            _banco_ocr_resolver(pendente_id, interaction.user.id, status_final="IGNORADO")
+            await interaction.followup.send("✅ Leitura ignorada. Nenhuma placa foi cadastrada.", ephemeral=True)
+            embed = discord.Embed(
+                title="❌ LEITURA OCR IGNORADA",
+                description=f"Ignorada por {interaction.user.mention}. Nenhum registro foi criado.",
+                color=discord.Color.red(),
+            )
+            await interaction.message.edit(embed=embed, view=None)
+        except Exception as erro:
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+async def banco_sincronizar_pericias(
+    guild: Optional[discord.Guild],
+    *,
+    limite: Optional[int] = None,
+    canal_revisao_id: int = 0,
+) -> Dict[str, int]:
+    global _BANCO_OCR_AVISO_IMPORT_JA_ENVIADO
+    if guild is None:
+        return {
+            "mensagens": 0, "novas": 0, "placas": 0, "erros": 0,
+            "ocr_imagens": 0, "ocr_pendentes": 0, "ocr_sem_placa": 0,
+            "ocr_indisponivel": 0, "ocr_postados": 0,
+        }
+    inicializar_banco_dicor()
+    canal = guild.get_channel(BANCO_PERICIA_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(BANCO_PERICIA_CHANNEL_ID)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, "history"):
+        raise RuntimeError("Canal de Perícia Externa não encontrado.")
+
+    historico_limite = limite
+    if historico_limite is None:
+        historico_limite = None if BANCO_PERICIA_SCAN_LIMIT <= 0 else BANCO_PERICIA_SCAN_LIMIT
+    resultado = {
+        "mensagens": 0, "novas": 0, "placas": 0, "erros": 0,
+        "ocr_imagens": 0, "ocr_pendentes": 0, "ocr_sem_placa": 0,
+        "ocr_indisponivel": 0, "ocr_postados": 0,
+    }
+    ocr_processados_nesta_sync = 0
+
+    async for msg in canal.history(limit=historico_limite, oldest_first=True):
+        resultado["mensagens"] += 1
+        texto = coletar_texto_embed(msg) if "coletar_texto_embed" in globals() else (msg.content or "")
+        alguma_novidade = False
+        with _banco_conexao() as db:
+            texto_ja = db.execute(
+                "SELECT 1 FROM pericia_sincronizada WHERE mensagem_id=?", (int(msg.id),)
+            ).fetchone()
+
+        placas_diretas = set()
+        if not texto_ja:
+            try:
+                encontrados = banco_extrair_veiculos_pericia(texto)
+                placas_diretas = {str(x.get("placa") or "") for x in encontrados}
+                fontes = _banco_fontes_imagem_mensagem(msg)
+                foto_path = ""
+                foto_url = ""
+                if fontes and encontrados:
+                    try:
+                        foto_path = await _banco_salvar_fonte_imagem(fontes[0], f"pericia-{msg.id}")
+                        foto_url = str(fontes[0].get("url") or "")
+                    except Exception:
+                        traceback.print_exc()
+                for item in encontrados:
+                    banco_upsert_veiculo(
+                        **item,
+                        foto_path=foto_path,
+                        foto_url=foto_url,
+                        origem_tipo="pericia_externa",
+                        origem_id=str(msg.id),
+                        mensagem_url=getattr(msg, "jump_url", ""),
+                        criado_por_id=int(getattr(msg.author, "id", 0) or 0),
+                    )
+                    resultado["placas"] += 1
+                with _banco_conexao() as db:
+                    db.execute(
+                        """
+                        INSERT OR REPLACE INTO pericia_sincronizada
+                        (mensagem_id, canal_id, placas_encontradas, sincronizado_em)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (int(msg.id), int(canal.id), len(encontrados), _banco_agora_iso()),
+                    )
+                alguma_novidade = True
+            except Exception as erro:
+                resultado["erros"] += 1
+                await enviar_log(f"⚠️ Banco DICOR: falha ao importar texto da perícia `{msg.id}`: {erro}")
+
+        if BANCO_OCR_ATIVO and ocr_processados_nesta_sync < BANCO_OCR_MAX_POR_SYNC:
+            for fonte in _banco_fontes_imagem_mensagem(msg):
+                if ocr_processados_nesta_sync >= BANCO_OCR_MAX_POR_SYNC:
+                    break
+                fonte_id = str(fonte.get("fonte_id") or "")
+                with _banco_conexao() as db:
+                    processada = db.execute(
+                        "SELECT status FROM ocr_fontes_processadas WHERE fonte_id=?", (fonte_id,)
+                    ).fetchone()
+                if processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE"}:
+                    continue
+                if RapidOCR is None:
+                    resultado["ocr_indisponivel"] += 1
+                    if not _BANCO_OCR_AVISO_IMPORT_JA_ENVIADO:
+                        _BANCO_OCR_AVISO_IMPORT_JA_ENVIADO = True
+                        await enviar_log(
+                            "⚠️ OCR de placas indisponível: adicione `rapidocr` e `onnxruntime` ao requirements.txt. "
+                            + (_BANCO_OCR_IMPORT_ERRO or "")
+                        )
+                    break
+
+                try:
+                    tamanho = int(fonte.get("size") or 0)
+                    if tamanho and tamanho > BANCO_OCR_MAX_BYTES:
+                        with _banco_conexao() as db:
+                            db.execute(
+                                """
+                                INSERT OR REPLACE INTO ocr_fontes_processadas
+                                (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                                VALUES (?, ?, ?, ?, 'MUITO_GRANDE', 0, ?, ?)
+                                """,
+                                (fonte_id, int(msg.id), int(canal.id), str(fonte.get("url") or "")[:1000],
+                                 f"{tamanho} bytes", _banco_agora_iso()),
+                            )
+                        continue
+                    imagem_path = await _banco_salvar_fonte_imagem(fonte, f"ocr-pericia-{msg.id}")
+                    linhas = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, imagem_path)
+                    resultado["ocr_imagens"] += 1
+                    ocr_processados_nesta_sync += 1
+                    texto_ocr = "\n".join(texto_linha for texto_linha, _ in linhas)
+                    candidatos = _banco_ocr_extrair_candidatos(linhas)
+                    candidatos = [x for x in candidatos if x["placa"] not in placas_diretas]
+                    combinado = f"{texto}\n{texto_ocr}".strip()
+                    dados_lista = banco_extrair_veiculos_pericia(combinado)
+                    dados_base = dados_lista[0] if dados_lista else {
+                        "modelo": _banco_extrair_label(combinado, [r"modelo", r"ve[ií]culo", r"carro"], 120),
+                        "cor": _banco_extrair_label(combinado, [r"cor"], 80),
+                        "proprietario_rg": _banco_extrair_label(combinado, [r"rg\s+do\s+propriet[aá]rio", r"passaporte"], 40),
+                        "proprietario_nome": _banco_extrair_label(combinado, [r"propriet[aá]rio", r"dono"], 120),
+                        "faccao": _banco_extrair_label(combinado, [r"fac[cç][aã]o", r"organiza[cç][aã]o", r"fam[ií]lia"], 120),
+                        "local": _banco_extrair_label(combinado, [r"local", r"localiza[cç][aã]o"], 180),
+                        "observacoes": _banco_extrair_label(combinado, [r"observa[cç][aã]o", r"conclus[aã]o", r"an[aá]lise"], 600),
+                    }
+                    novos_pendentes = 0
+                    for candidato in candidatos:
+                        pendente = _banco_ocr_criar_pendente(
+                            msg=msg, canal_id=int(canal.id), fonte=fonte, imagem_path=imagem_path,
+                            placa=candidato["placa"], confianca=float(candidato["confianca"]),
+                            texto_ocr=texto_ocr, dados=dados_base,
+                        )
+                        if pendente and str(pendente.get("status")) == "PENDENTE":
+                            novos_pendentes += 1
+                            if await _banco_ocr_postar_revisao(
+                                guild, pendente, canal_fallback_id=int(canal_revisao_id or 0)
+                            ):
+                                resultado["ocr_postados"] += 1
+                    if candidatos:
+                        resultado["ocr_pendentes"] += novos_pendentes
+                    else:
+                        resultado["ocr_sem_placa"] += 1
+                    with _banco_conexao() as db:
+                        db.execute(
+                            """
+                            INSERT OR REPLACE INTO ocr_fontes_processadas
+                            (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                            VALUES (?, ?, ?, ?, ?, ?, '', ?)
+                            """,
+                            (
+                                fonte_id, int(msg.id), int(canal.id), str(fonte.get("url") or "")[:1000],
+                                "OK" if candidatos else "SEM_PLACA", len(candidatos), _banco_agora_iso(),
+                            ),
+                        )
+                    alguma_novidade = True
+                except Exception as erro:
+                    resultado["erros"] += 1
+                    with _banco_conexao() as db:
+                        db.execute(
+                            """
+                            INSERT OR REPLACE INTO ocr_fontes_processadas
+                            (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                            VALUES (?, ?, ?, ?, 'ERRO', 0, ?, ?)
+                            """,
+                            (
+                                fonte_id, int(msg.id), int(canal.id), str(fonte.get("url") or "")[:1000],
+                                f"{type(erro).__name__}: {erro}"[:1000], _banco_agora_iso(),
+                            ),
+                        )
+                    await enviar_log(f"⚠️ Banco DICOR: OCR falhou na perícia `{msg.id}`: {erro}")
+        if alguma_novidade:
+            resultado["novas"] += 1
+    return resultado
+
+
+_BANCO_RESUMO_ANTES_OCR = banco_resumo
+
+
+def banco_resumo() -> Dict[str, int]:
+    r = _BANCO_RESUMO_ANTES_OCR()
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        r["ocr_processadas"] = int(db.execute("SELECT COUNT(*) FROM ocr_fontes_processadas").fetchone()[0])
+        r["ocr_pendentes"] = int(db.execute("SELECT COUNT(*) FROM placas_ocr_pendentes WHERE status='PENDENTE'").fetchone()[0])
+        r["ocr_confirmadas"] = int(db.execute("SELECT COUNT(*) FROM placas_ocr_pendentes WHERE status IN ('CONFIRMADO','CORRIGIDO')").fetchone()[0])
+    return r
+
+
+def banco_embed_painel() -> discord.Embed:
+    r = banco_resumo()
+    ocr_status = "✅ Ativo" if BANCO_OCR_ATIVO and RapidOCR is not None else "⚠️ Dependências ausentes"
+    embed = discord.Embed(
+        title="🗃️ BANCO DE DADOS DICOR",
+        description=(
+            "Cadastre e consulte indivíduos, placas e painéis completos de organizações.\n"
+            "A Perícia Externa é lida por **texto, embeds e OCR de fotos/prints**. "
+            "Leituras de imagem exigem confirmação antes de entrar no banco."
+        ),
+        color=discord.Color.dark_blue(),
+    )
+    embed.add_field(name="👤 Indivíduos", value=str(r["individuos"]), inline=True)
+    embed.add_field(name="🚗 Placas", value=str(r["placas"]), inline=True)
+    embed.add_field(name="🏴 Facções", value=str(r["faccoes"]), inline=True)
+    embed.add_field(name="👥 Membros ativos", value=str(r["membros_ativos"]), inline=True)
+    embed.add_field(name="📄 Painéis salvos", value=str(r["paineis"]), inline=True)
+    embed.add_field(name="🔬 Perícias lidas", value=str(r["pericias"]), inline=True)
+    embed.add_field(name="🖼️ Imagens processadas", value=str(r["ocr_processadas"]), inline=True)
+    embed.add_field(name="⏳ OCR pendente", value=str(r["ocr_pendentes"]), inline=True)
+    embed.add_field(name="🔤 OCR", value=ocr_status, inline=True)
+    embed.set_footer(text="DICOR • Banco persistente em /data • OCR local com confirmação")
+    return embed
+
+
+# Redefine o painel para acrescentar revisão OCR sem mexer em nenhum painel das mesas.
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar o banco.", ephemeral=True)
+            return False
+        if interaction.channel:
+            _banco_config_set("painel_canal_id", int(interaction.channel.id))
+        return True
+
+    @discord.ui.button(label="Adicionar indivíduo", emoji="👤", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_individuo", row=0)
+    async def adicionar_individuo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoAdicionarIndividuoModal())
+
+    @discord.ui.button(label="Adicionar placa", emoji="🚗", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_placa", row=0)
+    async def adicionar_placa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoAdicionarVeiculoModal())
+
+    @discord.ui.button(label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary, custom_id="dicor_banco_importar_painel", row=0)
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoImportarPainelModal())
+
+    @discord.ui.button(label="Consultar", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_consultar", row=0)
+    async def consultar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(label="Sincronizar tudo", emoji="🔄", style=discord.ButtonStyle.success, custom_id="dicor_banco_sync_tudo", row=1)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            mesas = banco_sincronizar_mesas()
+            procurados = banco_sincronizar_procurados()
+            pericias = await banco_sincronizar_pericias(
+                interaction.guild, canal_revisao_id=int(getattr(interaction.channel, "id", 0) or 0)
+            )
+            await interaction.followup.send(
+                "✅ **Sincronização concluída**\n"
+                f"🕵️ Mesas/facções: {mesas['total']}\n"
+                f"🚨 Procurados importados/atualizados: {procurados['total']}\n"
+                f"🔬 Novas mensagens de perícia lidas: {pericias['novas']}\n"
+                f"🚗 Placas encontradas no texto: {pericias['placas']}\n"
+                f"🖼️ Imagens analisadas por OCR: {pericias['ocr_imagens']}\n"
+                f"⏳ Placas aguardando confirmação: {pericias['ocr_pendentes']}\n"
+                f"📨 Cartões de revisão publicados: {pericias['ocr_postados']}\n"
+                f"⚠️ Erros: {mesas['erros'] + procurados['erros'] + pericias['erros']}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha na sincronização: {erro}", ephemeral=True)
+
+    @discord.ui.button(label="Atualizar resumo", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_resumo", row=1)
+    async def resumo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=banco_embed_painel(), ephemeral=True)
+
+    @discord.ui.button(label="Editar registro", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_editar", row=1)
+    async def editar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode editar registros.", ephemeral=True)
+        await interaction.response.send_modal(BancoEditarRegistroModal())
+
+    @discord.ui.button(label="Arquivar", emoji="🗄️", style=discord.ButtonStyle.danger, custom_id="dicor_banco_arquivar", row=1)
+    async def arquivar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode arquivar registros.", ephemeral=True)
+        await interaction.response.send_modal(BancoArquivarRegistroModal())
+
+    @discord.ui.button(label="Revisar OCR", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_revisar_ocr", row=2)
+    async def revisar_ocr(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        pendentes = _banco_ocr_pendentes(25, apenas_sem_mensagem=True)
+        publicados = 0
+        for pendente in pendentes:
+            try:
+                if await _banco_ocr_postar_revisao(
+                    interaction.guild, pendente,
+                    canal_fallback_id=int(getattr(interaction.channel, "id", 0) or 0),
+                ):
+                    publicados += 1
+            except Exception:
+                traceback.print_exc()
+        total = len(_banco_ocr_pendentes(100, apenas_sem_mensagem=False))
+        await interaction.followup.send(
+            f"🖼️ Cartões publicados agora: **{publicados}**\n"
+            f"⏳ Total ainda aguardando confirmação: **{total}**",
+            ephemeral=True,
+        )
+
+
+# Acrescenta a view persistente dos cartões OCR ao carregamento já existente.
+_BANCO_ON_READY_ANTES_OCR = bot.on_ready
+
+
+@bot.event
+async def on_ready():
+    await _BANCO_ON_READY_ANTES_OCR()
+    try:
+        inicializar_banco_dicor()
+        bot.add_view(BancoOCRReviewView())
+        estado = "ativo" if RapidOCR is not None and BANCO_OCR_ATIVO else "indisponível"
+        print(f"✅ OCR de placas da Perícia Externa carregado ({estado}).")
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao carregar OCR de placas: {erro}")
+
 if __name__ == '__main__':
     asyncio.run(main())
