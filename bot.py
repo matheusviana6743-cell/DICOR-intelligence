@@ -24595,5 +24595,309 @@ async def sincronizar_catalogo_core(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
+# =====================================================
+# PATCH FINAL — LIMPEZA DO FLUXO DE PROCURADOS + LISTA COMPLETA
+# =====================================================
+# Regras desta versão:
+# - no tópico do boletim, após a publicação, ficam apenas os resumos finais
+#   "PROCURADO PUBLICADO";
+# - painel de pesquisa, pedidos de foto e mensagens enviadas pelos usuários com
+#   as fotos são apagados somente depois de a publicação oficial ter sucesso;
+# - a mensagem oficial no canal de procurados permanece com as duas imagens
+#   anexadas no mesmo envio;
+# - a lista de procurados mostra TODOS os ativos, em páginas, sem "... e mais".
+
+_SOLICITAR_AUTORIZACAO_PROCURADO_ANTES_LIMPEZA = solicitar_autorizacao_procurado_boletim
+_PUBLICAR_PROCURADO_BOLETIM_ANTES_LIMPEZA = _publicar_procurado_boletim_aprovado
+
+
+async def solicitar_autorizacao_procurado_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    """Guarda o ID do painel de crimes para apagá-lo após a publicação."""
+    dados_fluxo = dict(dados or {})
+    mensagem = getattr(interaction, 'message', None)
+    if mensagem is not None:
+        try:
+            dados_fluxo['_crime_panel_message_id'] = int(mensagem.id)
+        except Exception:
+            pass
+    return await _SOLICITAR_AUTORIZACAO_PROCURADO_ANTES_LIMPEZA(
+        interaction, dados_fluxo
+    )
+
+
+async def _apagar_mensagem_fluxo_procurado(
+    canal: Any,
+    mensagem_id: Any,
+    descricao: str,
+) -> bool:
+    try:
+        mid = int(mensagem_id or 0)
+    except (TypeError, ValueError):
+        return False
+    if not mid or canal is None or not hasattr(canal, 'fetch_message'):
+        return False
+    try:
+        mensagem = await canal.fetch_message(mid)
+        await mensagem.delete()
+        return True
+    except discord.NotFound:
+        return True
+    except discord.Forbidden as erro:
+        await enviar_log(
+            f'⚠️ Sem permissão para apagar `{descricao}` do fluxo de procurado '
+            f'(`{mid}`) no canal `{getattr(canal, "id", 0)}`: {erro}'
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ Falha ao apagar `{descricao}` do fluxo de procurado '
+            f'(`{mid}`) no canal `{getattr(canal, "id", 0)}`: {erro}'
+        )
+    return False
+
+
+async def _limpar_mensagens_intermediarias_procurado_boletim(
+    atendimento: Dict[str, Any],
+    dados_publicados: Dict[str, Any],
+) -> None:
+    """Remove somente as mensagens temporárias do pedido que foi publicado."""
+    pedido_id = str(dados_publicados.get('_pedido_id') or '').strip()
+    pedidos = atendimento.get('procurado_pedidos', {})
+    pedido = (
+        pedidos.get(pedido_id)
+        if pedido_id and isinstance(pedidos, dict)
+        else None
+    )
+    pedido = pedido if isinstance(pedido, dict) else {}
+    dados_pedido = dict(pedido.get('dados') or {})
+    dados_mesclados = dict(dados_pedido)
+    dados_mesclados.update(dict(dados_publicados or {}))
+
+    canal = await obter_canal_bot(
+        atendimento.get('thread_id') or atendimento.get('area_id')
+    )
+    if canal is None:
+        await enviar_log(
+            f'⚠️ Não encontrei o tópico do boletim para limpar o pedido `{pedido_id}`.'
+        )
+        return
+
+    alvos = [
+        ('painel de pesquisa de crimes', dados_mesclados.get('_crime_panel_message_id')),
+        ('pedido da foto do indivíduo', pedido.get('foto_individuo_prompt_id') or dados_mesclados.get('foto_individuo_prompt_id')),
+        ('foto do indivíduo enviada pelo usuário', dados_mesclados.get('foto_individuo_msg_id')),
+        ('pedido da foto do RG', pedido.get('foto_rg_prompt_id') or dados_mesclados.get('foto_rg_prompt_id')),
+        ('foto do RG enviada pelo usuário', dados_mesclados.get('foto_rg_msg_id')),
+    ]
+
+    vistos = set()
+    apagadas = 0
+    for descricao, mensagem_id in alvos:
+        try:
+            mid = int(mensagem_id or 0)
+        except (TypeError, ValueError):
+            mid = 0
+        if not mid or mid in vistos:
+            continue
+        vistos.add(mid)
+        if await _apagar_mensagem_fluxo_procurado(canal, mid, descricao):
+            apagadas += 1
+        await asyncio.sleep(0.15)
+
+    # Compatibilidade com pedidos antigos que não salvaram todos os IDs:
+    # apaga mensagens do bot contendo o código exato do pedido, preservando
+    # qualquer resumo final "PROCURADO PUBLICADO".
+    if pedido_id and hasattr(canal, 'history'):
+        try:
+            async for mensagem in canal.history(limit=180, oldest_first=False):
+                if int(getattr(mensagem, 'id', 0) or 0) in vistos:
+                    continue
+                conteudo = str(getattr(mensagem, 'content', '') or '')
+                if pedido_id not in conteudo:
+                    continue
+                if 'PROCURADO PUBLICADO' in conteudo.upper():
+                    continue
+                if not getattr(getattr(mensagem, 'author', None), 'bot', False):
+                    continue
+                try:
+                    await mensagem.delete()
+                    apagadas += 1
+                except discord.NotFound:
+                    pass
+                except Exception as erro:
+                    await enviar_log(
+                        f'⚠️ Falha ao limpar mensagem antiga do pedido `{pedido_id}` '
+                        f'(`{getattr(mensagem, "id", 0)}`): {erro}'
+                    )
+                await asyncio.sleep(0.15)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Falha ao revisar mensagens antigas do pedido `{pedido_id}`: {erro}'
+            )
+
+    if pedido_id and isinstance(pedidos, dict) and isinstance(pedidos.get(pedido_id), dict):
+        pedido_atualizado = pedidos[pedido_id]
+        pedido_atualizado['mensagens_intermediarias_limpas_em'] = agora_br()
+        pedido_atualizado['mensagens_intermediarias_apagadas'] = apagadas
+        pedidos[pedido_id] = pedido_atualizado
+        atendimento['procurado_pedidos'] = pedidos
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+    await enviar_log(
+        f'🧹 Fluxo do procurado `{pedido_id or dados_mesclados.get("rg", "sem-id")}` '
+        f'limpo no tópico do boletim | mensagens apagadas: `{apagadas}`.'
+    )
+
+
+async def _publicar_procurado_boletim_aprovado(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+) -> str:
+    """Publica primeiro; somente depois limpa o material temporário."""
+    resultado = await _PUBLICAR_PROCURADO_BOLETIM_ANTES_LIMPEZA(
+        atendimento, dados, autorizador
+    )
+    try:
+        await _limpar_mensagens_intermediarias_procurado_boletim(
+            atendimento, dados
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ O procurado foi publicado, mas a limpeza do tópico falhou: {erro}'
+        )
+    return resultado
+
+
+def _paginar_lista_procurados_completa(
+    ativos: List[Dict[str, Any]],
+    limite: int = 1750,
+) -> List[str]:
+    linhas: List[str] = []
+    for indice, registro in enumerate(ativos, start=1):
+        nome = str(registro.get('nome') or 'Sem nome').strip()
+        rg = str(registro.get('rg') or 'Não informado').strip()
+        ultimo = str(
+            registro.get('ultimo_avistamento')
+            or registro.get('informacoes')
+            or 'Não informado'
+        ).strip()
+        linhas.append(
+            f'**{indice}. {nome}** — RG: `{rg}`\n'
+            f'📍 **Último avistamento:** {ultimo}'
+        )
+
+    paginas: List[str] = []
+    atual = ''
+    for linha in linhas:
+        candidato = linha if not atual else atual + '\n\n' + linha
+        if len(candidato) > limite and atual:
+            paginas.append(atual)
+            atual = linha
+        else:
+            atual = candidato
+    if atual:
+        paginas.append(atual)
+    return paginas or ['Nenhum procurado ativo cadastrado.']
+
+
+class PainelProcuradosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Novo Procurado',
+        emoji='➕',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_novo_procurado',
+    )
+    async def novo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(NovoProcuradoModal())
+
+    @discord.ui.button(
+        label='Lista de Procurados',
+        emoji='📋',
+        style=discord.ButtonStyle.blurple,
+        custom_id='dic_lista_procurados',
+    )
+    async def lista(self, interaction: discord.Interaction, button: Button):
+        ativos = [
+            p for p in carregar_procurados()
+            if procurado_esta_ativo(p)
+        ]
+        ativos.sort(
+            key=lambda p: (
+                str(p.get('nome') or '').casefold(),
+                limpar_rg(p.get('rg', '')),
+            )
+        )
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        paginas = _paginar_lista_procurados_completa(ativos)
+        total_paginas = len(paginas)
+        total_ativos = len(ativos)
+        for numero, pagina in enumerate(paginas, start=1):
+            cabecalho = (
+                f'📋 **PROCURADOS ATIVOS — {total_ativos} CADASTRADOS**\n'
+                f'**Página {numero}/{total_paginas}**\n\n'
+            )
+            rodape = (
+                f'\n\n🔗 {CATALOG_PUBLIC_URL}'
+                if numero == total_paginas
+                else ''
+            )
+            await interaction.followup.send(
+                cabecalho + pagina + rodape,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @discord.ui.button(
+        label='Retirar Procurado',
+        emoji='❌',
+        style=discord.ButtonStyle.gray,
+        custom_id='dic_retirar_procurado',
+    )
+    async def retirar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(RetirarProcuradoModal())
+
+    @discord.ui.button(
+        label='Modificar Procurado',
+        emoji='✏️',
+        style=discord.ButtonStyle.primary,
+        custom_id='dic_modificar_procurado',
+        row=1,
+    )
+    async def modificar(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            return await interaction.response.send_message(
+                '❌ Apenas a equipe DICOR pode modificar procurados.',
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(BuscarModificarProcuradoModal())
+
+    @discord.ui.button(
+        label='Abrir Catálogo',
+        emoji='📄',
+        style=discord.ButtonStyle.green,
+        custom_id='dic_abrir_catalogo',
+    )
+    async def abrir_catalogo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            f'📄 **Catálogo de Procurados:**\n{CATALOG_PUBLIC_URL}',
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label='Sincronizar Antigos',
+        emoji='🔄',
+        style=discord.ButtonStyle.secondary,
+        custom_id='dic_sync_catalogo',
+    )
+    async def sync_old(self, interaction: discord.Interaction, button: Button):
+        await sincronizar_catalogo_core(interaction)
+
 if __name__ == '__main__':
     asyncio.run(main())
