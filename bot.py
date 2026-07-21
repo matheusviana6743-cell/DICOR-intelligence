@@ -26752,6 +26752,12 @@ async def painelbanco(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ Apenas a equipe DICOR pode enviar este painel.", ephemeral=True)
     inicializar_banco_dicor()
     await interaction.response.send_message(embed=banco_embed_painel(), view=BancoDadosView())
+    try:
+        mensagem = await interaction.original_response()
+        _banco_config_set("painel_canal_id", int(getattr(mensagem.channel, "id", 0) or 0))
+        _banco_config_set("painel_mensagem_id", int(getattr(mensagem, "id", 0) or 0))
+    except Exception:
+        traceback.print_exc()
 
 
 @bot.tree.command(name="consultarbanco", description="Consulta nome, RG, placa ou facção no Banco DICOR.")
@@ -27918,6 +27924,14 @@ class BancoDadosView(View):
             return False
         if interaction.channel:
             _banco_config_set("painel_canal_id", int(interaction.channel.id))
+        if interaction.message:
+            _banco_config_set("painel_mensagem_id", int(interaction.message.id))
+            # O embed é estático no Discord. Atualiza o painel antigo sem atrasar
+            # a resposta do botão.
+            try:
+                asyncio.create_task(interaction.message.edit(embed=banco_embed_painel(), view=self))
+            except Exception:
+                pass
         return True
 
     @discord.ui.button(label="Adicionar indivíduo", emoji="👤", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_individuo", row=0)
@@ -27963,7 +27977,14 @@ class BancoDadosView(View):
 
     @discord.ui.button(label="Atualizar resumo", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_resumo", row=1)
     async def resumo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(embed=banco_embed_painel(), ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        embed = banco_embed_painel()
+        try:
+            if interaction.message:
+                await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            traceback.print_exc()
+        await interaction.followup.send("✅ Painel atualizado com o estado atual do banco e do OCR.", ephemeral=True)
 
     @discord.ui.button(label="Editar registro", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_editar", row=1)
     async def editar(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -28000,34 +28021,44 @@ class BancoDadosView(View):
 
     @discord.ui.button(label="Importar perícias antigas", emoji="📚", style=discord.ButtonStyle.success, custom_id="dicor_banco_importar_pericias_antigas", row=2)
     async def importar_pericias_antigas(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Responde ao Discord antes de iniciar qualquer leitura pesada.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⏳ Uma importação histórica já está em andamento. Aguarde a mensagem de conclusão.",
                 ephemeral=True,
             )
         if not BANCO_OCR_ATIVO:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ O OCR está desativado. Defina `BANCO_OCR_ATIVO=1` no Railway.",
                 ephemeral=True,
             )
         if RapidOCR is None:
             detalhe = (_BANCO_OCR_IMPORT_ERRO or "dependências não carregadas")[:1200]
-            return await interaction.response.send_message(
-                "❌ O OCR ainda não está instalado no Railway. Substitua também o `requirements.txt` "
-                "e faça um novo deploy.\n"
+            return await interaction.followup.send(
+                "❌ O OCR ainda não está disponível neste container. Confira o deploy atual.\n"
                 f"**Erro carregado pelo bot:** `{detalhe}`",
                 ephemeral=True,
             )
         canal = interaction.channel
         if canal is None or not hasattr(canal, "send"):
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Não foi possível identificar o canal do painel.", ephemeral=True
             )
+
         _banco_config_set("painel_canal_id", int(canal.id))
-        await interaction.response.send_message(
+        if interaction.message:
+            _banco_config_set("painel_mensagem_id", int(interaction.message.id))
+            try:
+                await interaction.message.edit(embed=banco_embed_painel(), view=self)
+            except Exception:
+                traceback.print_exc()
+
+        await interaction.followup.send(
             "📚 **Importação histórica iniciada.** O bot vai reler todas as Perícias Externas antigas, "
             "analisar as imagens e enviar os cartões de confirmação neste canal. "
-            "A conclusão será avisada aqui.",
+            "Você pode continuar usando o Discord; a conclusão será avisada aqui.",
             ephemeral=True,
         )
         asyncio.create_task(
@@ -28035,6 +28066,29 @@ class BancoDadosView(View):
                 interaction.guild, canal, int(interaction.user.id)
             )
         )
+
+
+async def _banco_atualizar_painel_salvo() -> None:
+    """Atualiza o último painel conhecido após reinício ou redeploy."""
+    try:
+        canal_id = int(_banco_config_get("painel_canal_id", "0") or 0)
+        mensagem_id = int(_banco_config_get("painel_mensagem_id", "0") or 0)
+        if not canal_id or not mensagem_id:
+            return
+        canal = bot.get_channel(canal_id)
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(canal_id)
+            except Exception:
+                return
+        if not hasattr(canal, "fetch_message"):
+            return
+        mensagem = await canal.fetch_message(mensagem_id)
+        await mensagem.edit(embed=banco_embed_painel(), view=BancoDadosView())
+    except discord.NotFound:
+        return
+    except Exception:
+        traceback.print_exc()
 
 
 # Acrescenta a view persistente dos cartões OCR ao carregamento já existente.
@@ -28049,9 +28103,1102 @@ async def on_ready():
         bot.add_view(BancoOCRReviewView())
         estado = "ativo" if RapidOCR is not None and BANCO_OCR_ATIVO else "indisponível"
         print(f"✅ OCR de placas da Perícia Externa carregado ({estado}).")
+        await _banco_atualizar_painel_salvo()
     except Exception as erro:
         traceback.print_exc()
         print(f"⚠️ Falha ao carregar OCR de placas: {erro}")
+
+
+# =====================================================
+# PATCH — FICHAS PROFISSIONAIS DE PROPRIETÁRIOS E VEÍCULOS
+# - Extrai placa, proprietário, RG/passaporte, telefone, modelo, cor,
+#   facção, local, ano e chassi de imagens/prints da Perícia Externa.
+# - Confirmação cria/atualiza ficha do indivíduo, veículo, vínculo e evidência.
+# - Mantém a foto original e o link da Perícia Externa.
+# - Interações respondem imediatamente para evitar "não respondeu a tempo".
+# =====================================================
+
+import json as _banco_json
+
+_BANCO_INIT_ANTES_FICHAS = inicializar_banco_dicor
+
+
+def _banco_adicionar_coluna_se_ausente(db: sqlite3.Connection, tabela: str, coluna: str, definicao: str) -> None:
+    existentes = {str(row[1]) for row in db.execute(f"PRAGMA table_info({tabela})").fetchall()}
+    if coluna not in existentes:
+        db.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
+
+
+def inicializar_banco_dicor() -> None:
+    _BANCO_INIT_ANTES_FICHAS()
+    with _banco_conexao() as db:
+        for coluna, definicao in [
+            ("documento_tipo", "TEXT DEFAULT 'RG'"),
+            ("foto_ficha_path", "TEXT DEFAULT ''"),
+            ("foto_ficha_url", "TEXT DEFAULT ''"),
+            ("ultima_origem_url", "TEXT DEFAULT ''"),
+            ("dados_extras_json", "TEXT DEFAULT '{}'"),
+        ]:
+            _banco_adicionar_coluna_se_ausente(db, "individuos", coluna, definicao)
+
+        for coluna, definicao in [
+            ("proprietario_individuo_id", "INTEGER DEFAULT 0"),
+            ("telefone_proprietario", "TEXT DEFAULT ''"),
+            ("ano", "TEXT DEFAULT ''"),
+            ("chassi", "TEXT DEFAULT ''"),
+            ("status_veiculo", "TEXT DEFAULT 'CADASTRADO'"),
+            ("dados_extras_json", "TEXT DEFAULT '{}'"),
+            ("evidencia_id", "INTEGER DEFAULT 0"),
+        ]:
+            _banco_adicionar_coluna_se_ausente(db, "veiculos", coluna, definicao)
+
+        for coluna, definicao in [
+            ("telefone", "TEXT DEFAULT ''"),
+            ("documento_tipo", "TEXT DEFAULT 'RG'"),
+            ("ano", "TEXT DEFAULT ''"),
+            ("chassi", "TEXT DEFAULT ''"),
+            ("dados_extras_json", "TEXT DEFAULT '{}'"),
+        ]:
+            _banco_adicionar_coluna_se_ausente(db, "placas_ocr_pendentes", coluna, definicao)
+
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS evidencias_banco (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tipo TEXT NOT NULL DEFAULT 'PERICIA_OCR',
+                mensagem_id INTEGER DEFAULT 0,
+                canal_id INTEGER DEFAULT 0,
+                fonte_id TEXT DEFAULT '',
+                imagem_url TEXT DEFAULT '',
+                imagem_path TEXT DEFAULT '',
+                texto_ocr TEXT DEFAULT '',
+                dados_json TEXT DEFAULT '{}',
+                placa TEXT DEFAULT '',
+                documento TEXT DEFAULT '',
+                confianca REAL DEFAULT 0,
+                mensagem_url TEXT DEFAULT '',
+                status TEXT DEFAULT 'CONFIRMADA',
+                confirmado_por_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS vinculos_individuo_veiculo (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                individuo_id INTEGER NOT NULL,
+                veiculo_id INTEGER NOT NULL,
+                ativo INTEGER DEFAULT 1,
+                origem TEXT DEFAULT '',
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                UNIQUE(individuo_id, veiculo_id),
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE CASCADE,
+                FOREIGN KEY(veiculo_id) REFERENCES veiculos(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evidencias_placa ON evidencias_banco(placa, criado_em);
+            CREATE INDEX IF NOT EXISTS idx_evidencias_documento ON evidencias_banco(documento, criado_em);
+            CREATE INDEX IF NOT EXISTS idx_vinculos_individuo ON vinculos_individuo_veiculo(individuo_id, ativo);
+            CREATE INDEX IF NOT EXISTS idx_vinculos_veiculo ON vinculos_individuo_veiculo(veiculo_id, ativo);
+            """
+        )
+
+
+def _banco_json_seguro(valor: Any) -> str:
+    try:
+        return _banco_json.dumps(valor or {}, ensure_ascii=False, separators=(",", ":"))[:12000]
+    except Exception:
+        return "{}"
+
+
+def _banco_tipo_documento(valor: Any, padrao: str = "RG") -> str:
+    normalizado = normalizar_busca(str(valor or ""))
+    if "passaporte" in normalizado:
+        return "PASSAPORTE"
+    if "cpf" in normalizado:
+        return "CPF"
+    if "documento" in normalizado:
+        return "DOCUMENTO"
+    return str(padrao or "RG").upper()[:30]
+
+
+def _banco_separar_documento(valor: Any, tipo_padrao: str = "RG") -> Tuple[str, str]:
+    texto = str(valor or "").strip()
+    tipo = _banco_tipo_documento(texto, tipo_padrao)
+    texto = re.sub(r"^\s*(?:RG|PASSAPORTE|CPF|DOCUMENTO)\s*[:\-]?\s*", "", texto, flags=re.I)
+    return _banco_normalizar_rg(texto), tipo
+
+
+_BANCO_UPSERT_INDIVIDUO_ANTES_FICHAS = banco_upsert_individuo
+
+
+def banco_upsert_individuo(
+    *args,
+    documento_tipo: str = "",
+    foto_ficha_path: str = "",
+    foto_ficha_url: str = "",
+    ultima_origem_url: str = "",
+    dados_extras: Optional[Dict[str, Any]] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    db_externa = kwargs.get("db")
+    item = _BANCO_UPSERT_INDIVIDUO_ANTES_FICHAS(*args, **kwargs)
+    if not item:
+        return item
+    rg = str(item.get("rg") or "")
+
+    def atualizar(conexao: sqlite3.Connection) -> Dict[str, Any]:
+        atual = conexao.execute("SELECT * FROM individuos WHERE rg=?", (rg,)).fetchone()
+        if not atual:
+            return item
+        tipo = str(documento_tipo or atual["documento_tipo"] or "RG").upper()[:30]
+        ficha_path = str(foto_ficha_path or atual["foto_ficha_path"] or "")[:500]
+        ficha_url = str(foto_ficha_url or atual["foto_ficha_url"] or "")[:1000]
+        origem_url = str(ultima_origem_url or atual["ultima_origem_url"] or "")[:1000]
+        extras = _banco_json_seguro(dados_extras) if dados_extras else str(atual["dados_extras_json"] or "{}")
+        conexao.execute(
+            """
+            UPDATE individuos SET documento_tipo=?, foto_ficha_path=?, foto_ficha_url=?,
+                ultima_origem_url=?, dados_extras_json=?, atualizado_em=? WHERE rg=?
+            """,
+            (tipo, ficha_path, ficha_url, origem_url, extras, _banco_agora_iso(), rg),
+        )
+        row = conexao.execute("SELECT * FROM individuos WHERE rg=?", (rg,)).fetchone()
+        return dict(row) if row else item
+
+    if db_externa is not None:
+        return atualizar(db_externa)
+    with _banco_conexao() as db:
+        return atualizar(db)
+
+
+_BANCO_UPSERT_VEICULO_ANTES_FICHAS = banco_upsert_veiculo
+
+
+def banco_upsert_veiculo(
+    *args,
+    telefone_proprietario: str = "",
+    documento_tipo: str = "RG",
+    ano: str = "",
+    chassi: str = "",
+    status_veiculo: str = "CADASTRADO",
+    dados_extras: Optional[Dict[str, Any]] = None,
+    foto_ficha_path: str = "",
+    foto_ficha_url: str = "",
+    **kwargs,
+) -> Dict[str, Any]:
+    db_externa = kwargs.get("db")
+    item = _BANCO_UPSERT_VEICULO_ANTES_FICHAS(*args, **kwargs)
+    if not item:
+        return item
+    placa = str(item.get("placa") or "")
+    telefone = _banco_limpar_texto(telefone_proprietario, 80)
+    ano_limpo = _banco_limpar_texto(ano, 20)
+    chassi_limpo = _banco_limpar_texto(chassi, 80)
+    extras_json = _banco_json_seguro(dados_extras) if dados_extras else ""
+    individuo_id = 0
+    proprietario_rg = _banco_normalizar_rg(item.get("proprietario_rg"))
+    proprietario_nome = _banco_limpar_texto(item.get("proprietario_nome"), 120)
+
+    if proprietario_rg:
+        pessoa_kwargs = dict(
+            nome=proprietario_nome or "PROPRIETÁRIO NÃO IDENTIFICADO",
+            rg=proprietario_rg,
+            telefone=telefone,
+            observacoes=f"Vínculo automático com o veículo {placa}.",
+            origem=str(kwargs.get("origem_tipo") or "banco_veiculos"),
+            criado_por_id=int(kwargs.get("criado_por_id") or 0),
+            foto_ficha_path=str(foto_ficha_path or kwargs.get("foto_path") or ""),
+            foto_ficha_url=str(foto_ficha_url or kwargs.get("foto_url") or ""),
+            ultima_origem_url=str(kwargs.get("mensagem_url") or ""),
+            documento_tipo=documento_tipo,
+            dados_extras=dados_extras,
+        )
+        if db_externa is not None:
+            pessoa_kwargs["db"] = db_externa
+        individuo = banco_upsert_individuo(**pessoa_kwargs)
+        individuo_id = int(individuo.get("id") or 0)
+    elif proprietario_nome:
+        if db_externa is not None:
+            rows = db_externa.execute(
+                "SELECT id, rg FROM individuos WHERE nome=? COLLATE NOCASE LIMIT 2",
+                (proprietario_nome,),
+            ).fetchall()
+        else:
+            with _banco_conexao() as db:
+                rows = db.execute(
+                    "SELECT id, rg FROM individuos WHERE nome=? COLLATE NOCASE LIMIT 2",
+                    (proprietario_nome,),
+                ).fetchall()
+        if len(rows) == 1:
+            individuo_id = int(rows[0]["id"] or 0)
+            proprietario_rg = str(rows[0]["rg"] or "")
+
+    def atualizar(conexao: sqlite3.Connection) -> Dict[str, Any]:
+        nonlocal telefone, ano_limpo, chassi_limpo, extras_json, individuo_id
+        atual = conexao.execute("SELECT * FROM veiculos WHERE placa=?", (placa,)).fetchone()
+        if not atual:
+            return item
+        if not telefone:
+            telefone = str(atual["telefone_proprietario"] or "")
+        if not ano_limpo:
+            ano_limpo = str(atual["ano"] or "")
+        if not chassi_limpo:
+            chassi_limpo = str(atual["chassi"] or "")
+        if not extras_json:
+            extras_json = str(atual["dados_extras_json"] or "{}")
+        if not individuo_id:
+            individuo_id = int(atual["proprietario_individuo_id"] or 0)
+        conexao.execute(
+            """
+            UPDATE veiculos SET proprietario_individuo_id=?, proprietario_rg=?,
+                telefone_proprietario=?, ano=?, chassi=?, status_veiculo=?,
+                dados_extras_json=?, atualizado_em=? WHERE placa=?
+            """,
+            (
+                individuo_id, proprietario_rg, telefone, ano_limpo, chassi_limpo,
+                _banco_limpar_texto(status_veiculo or "CADASTRADO", 50).upper(),
+                extras_json, _banco_agora_iso(), placa,
+            ),
+        )
+        veiculo = conexao.execute("SELECT * FROM veiculos WHERE placa=?", (placa,)).fetchone()
+        if individuo_id and veiculo:
+            conexao.execute(
+                """
+                INSERT INTO vinculos_individuo_veiculo
+                (individuo_id, veiculo_id, ativo, origem, criado_em, atualizado_em)
+                VALUES (?, ?, 1, ?, ?, ?)
+                ON CONFLICT(individuo_id, veiculo_id) DO UPDATE SET
+                    ativo=1, origem=excluded.origem, atualizado_em=excluded.atualizado_em
+                """,
+                (
+                    individuo_id, int(veiculo["id"]),
+                    _banco_limpar_texto(kwargs.get("origem_tipo") or "banco", 80),
+                    _banco_agora_iso(), _banco_agora_iso(),
+                ),
+            )
+        return dict(veiculo) if veiculo else item
+
+    if db_externa is not None:
+        return atualizar(db_externa)
+    with _banco_conexao() as db:
+        return atualizar(db)
+
+
+_BANCO_EXTRAIR_VEICULOS_ANTES_FICHAS = banco_extrair_veiculos_pericia
+
+
+def banco_extrair_veiculos_pericia(texto: str) -> List[Dict[str, str]]:
+    itens = _BANCO_EXTRAIR_VEICULOS_ANTES_FICHAS(texto)
+    texto_limpo = str(texto or "").replace("**", "").replace("`", "")
+    telefone = _banco_extrair_label(texto_limpo, [r"telefone", r"celular", r"contato"], 80)
+    ano = _banco_extrair_label(texto_limpo, [r"ano"], 20)
+    chassi = _banco_extrair_label(texto_limpo, [r"chassi"], 80)
+    documento_tipo = "PASSAPORTE" if re.search(r"passaporte\s*[:\-]", texto_limpo, flags=re.I) else "RG"
+    for item in itens:
+        item["telefone_proprietario"] = telefone
+        item["ano"] = ano
+        item["chassi"] = chassi
+        item["documento_tipo"] = documento_tipo
+        item["dados_extras"] = {"texto_origem": texto_limpo[:2500]}
+    return itens
+
+
+def _banco_ocr_extrair_campos_completos(linhas: List[Tuple[str, float]]) -> Dict[str, Any]:
+    preparadas: List[Tuple[str, float]] = []
+    for texto, score in linhas:
+        limpo = re.sub(r"\s+", " ", str(texto or "")).strip()
+        if limpo:
+            preparadas.append((limpo, max(0.0, min(1.0, float(score or 0.0)))))
+
+    aliases = [
+        ("placa", ["placa do veiculo", "placa do veículo", "placa", "plate"]),
+        ("proprietario_nome", ["proprietario", "proprietário", "dono", "owner"]),
+        ("proprietario_rg", ["rg do proprietario", "rg do proprietário", "passaporte", "documento", "rg", "cpf"]),
+        ("telefone", ["telefone", "celular", "contato", "phone"]),
+        ("modelo", ["modelo", "veiculo", "veículo", "carro"]),
+        ("cor", ["cor"]),
+        ("faccao", ["faccao", "facção", "organizacao", "organização", "familia", "família"]),
+        ("local", ["localizacao", "localização", "ultimo avistamento", "último avistamento", "local"]),
+        ("chassi", ["chassi"]),
+        ("ano", ["ano"]),
+        ("observacoes", ["observacoes", "observações", "observacao", "observação", "analise", "análise"]),
+    ]
+    mapa_alias = []
+    for campo, nomes in aliases:
+        for nome in nomes:
+            mapa_alias.append((campo, normalizar_busca(nome)))
+    mapa_alias.sort(key=lambda x: len(x[1]), reverse=True)
+
+    encontrados: Dict[str, Any] = {}
+    confiancas: Dict[str, float] = {}
+
+    for indice, (texto, score) in enumerate(preparadas):
+        normal = normalizar_busca(texto).strip()
+        if re.search(r"(?:^|\s)/placa\b", normal):
+            continue
+        campo_encontrado = ""
+        alias_encontrado = ""
+        for campo, alias in mapa_alias:
+            if normal == alias or normal.startswith(alias + ":") or normal.startswith(alias + " -") or normal.startswith(alias + " "):
+                campo_encontrado = campo
+                alias_encontrado = alias
+                break
+        if not campo_encontrado:
+            continue
+
+        valor = texto
+        if ":" in valor:
+            valor = valor.split(":", 1)[1].strip()
+        elif " - " in valor:
+            valor = valor.split(" - ", 1)[1].strip()
+        else:
+            # Remove o rótulo no começo preservando acentos do valor original.
+            palavras_alias = max(1, len(alias_encontrado.split()))
+            valor = " ".join(valor.split()[palavras_alias:]).strip()
+        if not valor and indice + 1 < len(preparadas):
+            proximo, score_proximo = preparadas[indice + 1]
+            proximo_n = normalizar_busca(proximo)
+            if not any(proximo_n == a or proximo_n.startswith(a + ":") for _, a in mapa_alias):
+                valor = proximo.strip()
+                score = min(score, score_proximo)
+        if not valor:
+            continue
+
+        if campo_encontrado == "placa":
+            valor_n = _banco_normalizar_placa(valor)
+            if not _banco_placa_valida(valor_n):
+                continue
+            valor = valor_n
+        elif campo_encontrado == "proprietario_rg":
+            valor, tipo_doc = _banco_separar_documento(valor, "PASSAPORTE" if "passaporte" in normal else "RG")
+            if not valor:
+                continue
+            encontrados["documento_tipo"] = tipo_doc
+        elif campo_encontrado == "telefone":
+            valor = re.sub(r"[^0-9+()\-\s]", "", valor).strip()[:80]
+        elif campo_encontrado == "ano":
+            m_ano = re.search(r"\b(?:19|20)\d{2}\b", valor)
+            valor = m_ano.group(0) if m_ano else _banco_limpar_texto(valor, 20)
+        else:
+            valor = _banco_limpar_texto(valor, 500 if campo_encontrado == "observacoes" else 150)
+
+        if valor and (campo_encontrado not in encontrados or score >= confiancas.get(campo_encontrado, 0.0)):
+            encontrados[campo_encontrado] = valor
+            confiancas[campo_encontrado] = score
+
+    encontrados["confiancas"] = confiancas
+    encontrados["texto_bruto"] = "\n".join(x[0] for x in preparadas)[:3500]
+    return encontrados
+
+
+_BANCO_OCR_EXTRAIR_CANDIDATOS_ANTES_FICHAS = _banco_ocr_extrair_candidatos
+
+
+def _banco_ocr_extrair_candidatos(linhas: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
+    candidatos = _BANCO_OCR_EXTRAIR_CANDIDATOS_ANTES_FICHAS(linhas)
+    campos = _banco_ocr_extrair_campos_completos(linhas)
+    for candidato in candidatos:
+        placa = str(candidato.get("placa") or campos.get("placa") or "")
+        estruturado = [f"Placa: {placa}"]
+        rotulos = [
+            ("proprietario_nome", "Proprietário"),
+            ("proprietario_rg", str(campos.get("documento_tipo") or "RG").title()),
+            ("telefone", "Telefone"),
+            ("modelo", "Modelo"),
+            ("cor", "Cor"),
+            ("ano", "Ano"),
+            ("chassi", "Chassi"),
+            ("faccao", "Facção"),
+            ("local", "Local"),
+            ("observacoes", "Observações"),
+        ]
+        for chave, rotulo in rotulos:
+            if campos.get(chave):
+                estruturado.append(f"{rotulo}: {campos[chave]}")
+        candidato["linha"] = "\n".join(estruturado)[:300]
+        candidato["dados_ocr"] = campos
+    return candidatos
+
+
+_BANCO_OCR_CRIAR_PENDENTE_ANTES_FICHAS = _banco_ocr_criar_pendente
+
+
+def _banco_ocr_criar_pendente(
+    *,
+    msg: discord.Message,
+    canal_id: int,
+    fonte: Dict[str, Any],
+    imagem_path: str,
+    placa: str,
+    confianca: float,
+    texto_ocr: str,
+    dados: Dict[str, str],
+) -> Dict[str, Any]:
+    campos_ocr = _banco_ocr_extrair_campos_completos([(linha, confianca) for linha in str(texto_ocr or "").splitlines()])
+    combinado = dict(dados or {})
+    for chave in ["modelo", "cor", "proprietario_rg", "proprietario_nome", "faccao", "local", "observacoes"]:
+        if campos_ocr.get(chave):
+            combinado[chave] = campos_ocr[chave]
+    pendente = _BANCO_OCR_CRIAR_PENDENTE_ANTES_FICHAS(
+        msg=msg, canal_id=canal_id, fonte=fonte, imagem_path=imagem_path,
+        placa=placa, confianca=confianca, texto_ocr=texto_ocr, dados=combinado,
+    )
+    if not pendente:
+        return pendente
+    extras = {
+        "telefone": campos_ocr.get("telefone") or combinado.get("telefone_proprietario") or "",
+        "documento_tipo": campos_ocr.get("documento_tipo") or combinado.get("documento_tipo") or "RG",
+        "ano": campos_ocr.get("ano") or combinado.get("ano") or "",
+        "chassi": campos_ocr.get("chassi") or combinado.get("chassi") or "",
+        "texto_bruto": campos_ocr.get("texto_bruto") or texto_ocr,
+        "confiancas": campos_ocr.get("confiancas") or {},
+    }
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            UPDATE placas_ocr_pendentes SET texto_ocr=?, modelo=?, cor=?, proprietario_rg=?,
+                proprietario_nome=?, faccao=?, local=?, observacoes=?, telefone=?,
+                documento_tipo=?, ano=?, chassi=?, dados_extras_json=?, atualizado_em=?
+            WHERE id=?
+            """,
+            (
+                str(campos_ocr.get("texto_bruto") or texto_ocr)[:3500],
+                _banco_limpar_texto(combinado.get("modelo"), 120),
+                _banco_limpar_texto(combinado.get("cor"), 80),
+                _banco_normalizar_rg(combinado.get("proprietario_rg")),
+                _banco_limpar_texto(combinado.get("proprietario_nome"), 120),
+                _banco_limpar_texto(combinado.get("faccao"), 120),
+                _banco_limpar_texto(combinado.get("local"), 180),
+                str(combinado.get("observacoes") or "")[:1800],
+                _banco_limpar_texto(extras["telefone"], 80),
+                _banco_tipo_documento(extras["documento_tipo"]),
+                _banco_limpar_texto(extras["ano"], 20),
+                _banco_limpar_texto(extras["chassi"], 80),
+                _banco_json_seguro(extras), _banco_agora_iso(), int(pendente["id"]),
+            ),
+        )
+        row = db.execute("SELECT * FROM placas_ocr_pendentes WHERE id=?", (int(pendente["id"]),)).fetchone()
+    return dict(row) if row else pendente
+
+
+def _banco_valor_ficha(valor: Any, padrao: str = "Não identificado") -> str:
+    texto = str(valor or "").strip()
+    return texto if texto else padrao
+
+
+def _banco_ocr_embed_revisao(pendente: Dict[str, Any]) -> discord.Embed:
+    confianca = max(0.0, min(1.0, float(pendente.get("confianca") or 0)))
+    doc_tipo = str(pendente.get("documento_tipo") or "RG").upper()
+    proprietario = _banco_valor_ficha(pendente.get("proprietario_nome"))
+    documento = _banco_valor_ficha(pendente.get("proprietario_rg"), "Não informado")
+    telefone = _banco_valor_ficha(pendente.get("telefone"), "Não informado")
+    placa = _banco_valor_ficha(pendente.get("placa_sugerida"), "N/A")
+    modelo = _banco_valor_ficha(pendente.get("modelo"), "Não informado")
+    cor = _banco_valor_ficha(pendente.get("cor"), "Não informada")
+
+    embed = discord.Embed(
+        title="📋 FICHA IDENTIFICADA — PROPRIETÁRIO E VEÍCULO",
+        description=(
+            "O OCR encontrou uma possível ficha completa na **Perícia Externa**. "
+            "Confira os dados antes de registrar oficialmente no banco."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="👤 PROPRIETÁRIO",
+        value=(
+            f"**Nome:** {proprietario}\n"
+            f"**{doc_tipo}:** `{documento}`\n"
+            f"**Telefone:** {telefone}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🚗 VEÍCULO",
+        value=(
+            f"**Placa:** `{placa}`\n"
+            f"**Modelo:** {modelo}\n"
+            f"**Cor:** {cor}"
+        ),
+        inline=True,
+    )
+    adicionais = []
+    for rotulo, chave in [
+        ("Ano", "ano"), ("Chassi", "chassi"), ("Facção", "faccao"), ("Local", "local")
+    ]:
+        if pendente.get(chave):
+            adicionais.append(f"**{rotulo}:** {pendente[chave]}")
+    embed.add_field(
+        name="📌 DADOS COMPLEMENTARES",
+        value="\n".join(adicionais) if adicionais else "Nenhum dado complementar identificado.",
+        inline=True,
+    )
+    embed.add_field(name="📊 Confiança da placa", value=f"**{confianca * 100:.0f}%**", inline=True)
+    if pendente.get("mensagem_url"):
+        embed.add_field(name="🔗 Origem", value=f"[Abrir Perícia Externa]({pendente['mensagem_url']})", inline=False)
+    if pendente.get("imagem_url"):
+        embed.set_image(url=str(pendente["imagem_url"]))
+    embed.set_footer(text=f"OCR-ID:{int(pendente.get('id') or 0)} • nada será salvo sem confirmação")
+    return embed
+
+
+def _banco_inserir_evidencia_ficha(pendente: Dict[str, Any], dados: Dict[str, Any], usuario_id: int) -> int:
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        cur = db.execute(
+            """
+            INSERT INTO evidencias_banco
+            (tipo, mensagem_id, canal_id, fonte_id, imagem_url, imagem_path, texto_ocr,
+             dados_json, placa, documento, confianca, mensagem_url, status,
+             confirmado_por_id, criado_em, atualizado_em)
+            VALUES ('PERICIA_OCR', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIRMADA', ?, ?, ?)
+            """,
+            (
+                int(pendente.get("mensagem_id") or 0), int(pendente.get("canal_id") or 0),
+                str(pendente.get("fonte_id") or "")[:200], str(pendente.get("imagem_url") or "")[:1000],
+                str(pendente.get("imagem_path") or "")[:500], str(pendente.get("texto_ocr") or "")[:3500],
+                _banco_json_seguro(dados), _banco_normalizar_placa(dados.get("placa")),
+                _banco_normalizar_rg(dados.get("proprietario_rg")),
+                float(pendente.get("confianca") or 0), str(pendente.get("mensagem_url") or "")[:1000],
+                int(usuario_id), agora, agora,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _banco_ocr_resolver(
+    pendente_id: int,
+    usuario_id: int,
+    *,
+    placa_final: str = "",
+    modelo: Optional[str] = None,
+    cor: Optional[str] = None,
+    proprietario_nome: Optional[str] = None,
+    proprietario_rg: Optional[str] = None,
+    telefone: Optional[str] = None,
+    documento_tipo: Optional[str] = None,
+    faccao: Optional[str] = None,
+    local: Optional[str] = None,
+    ano: Optional[str] = None,
+    chassi: Optional[str] = None,
+    observacoes: Optional[str] = None,
+    status_final: str = "CONFIRMADO",
+) -> Dict[str, Any]:
+    pendente = _banco_ocr_pendente_por_id(pendente_id)
+    if not pendente:
+        raise ValueError("Leitura OCR não encontrada.")
+    if str(pendente.get("status")) != "PENDENTE":
+        raise ValueError("Esta ficha já foi resolvida.")
+
+    if status_final == "IGNORADO":
+        with _banco_conexao() as db:
+            db.execute(
+                """
+                UPDATE placas_ocr_pendentes SET status='IGNORADO', resolvido_por_id=?,
+                    placa_final='', atualizado_em=? WHERE id=?
+                """,
+                (int(usuario_id), _banco_agora_iso(), int(pendente_id)),
+            )
+        return {**pendente, "status": "IGNORADO", "placa_final": ""}
+
+    placa = _banco_normalizar_placa(placa_final or pendente.get("placa_sugerida"))
+    if not _banco_placa_valida(placa):
+        raise ValueError("Placa inválida. Confira letras e números.")
+
+    documento, tipo_doc_detectado = _banco_separar_documento(
+        proprietario_rg if proprietario_rg is not None else pendente.get("proprietario_rg"),
+        documento_tipo or pendente.get("documento_tipo") or "RG",
+    )
+    dados = {
+        "placa": placa,
+        "modelo": _banco_limpar_texto(modelo if modelo is not None else pendente.get("modelo"), 120),
+        "cor": _banco_limpar_texto(cor if cor is not None else pendente.get("cor"), 80),
+        "proprietario_nome": _banco_limpar_texto(
+            proprietario_nome if proprietario_nome is not None else pendente.get("proprietario_nome"), 120
+        ),
+        "proprietario_rg": documento,
+        "documento_tipo": _banco_tipo_documento(documento_tipo or tipo_doc_detectado),
+        "telefone": _banco_limpar_texto(telefone if telefone is not None else pendente.get("telefone"), 80),
+        "faccao": _banco_limpar_texto(faccao if faccao is not None else pendente.get("faccao"), 120),
+        "local": _banco_limpar_texto(local if local is not None else pendente.get("local"), 180),
+        "ano": _banco_limpar_texto(ano if ano is not None else pendente.get("ano"), 20),
+        "chassi": _banco_limpar_texto(chassi if chassi is not None else pendente.get("chassi"), 80),
+        "observacoes": str(observacoes if observacoes is not None else pendente.get("observacoes") or "")[:1800],
+        "origem": "Perícia Externa / OCR",
+        "mensagem_url": str(pendente.get("mensagem_url") or ""),
+    }
+    dados["observacoes"] = (
+        dados["observacoes"]
+        + f" | Dados confirmados por OCR com confiança de placa {float(pendente.get('confianca') or 0)*100:.0f}%."
+    ).strip(" |")
+
+    item = banco_upsert_veiculo(
+        placa=dados["placa"], modelo=dados["modelo"], cor=dados["cor"],
+        proprietario_rg=dados["proprietario_rg"], proprietario_nome=dados["proprietario_nome"],
+        faccao=dados["faccao"], local=dados["local"], observacoes=dados["observacoes"],
+        foto_path=str(pendente.get("imagem_path") or ""), foto_url=str(pendente.get("imagem_url") or ""),
+        origem_tipo="pericia_externa_ocr", origem_id=str(pendente.get("mensagem_id") or ""),
+        mensagem_url=dados["mensagem_url"], criado_por_id=int(usuario_id),
+        telefone_proprietario=dados["telefone"], documento_tipo=dados["documento_tipo"],
+        ano=dados["ano"], chassi=dados["chassi"], dados_extras=dados,
+        foto_ficha_path=str(pendente.get("imagem_path") or ""),
+        foto_ficha_url=str(pendente.get("imagem_url") or ""),
+    )
+    evidencia_id = _banco_inserir_evidencia_ficha(pendente, dados, int(usuario_id))
+    with _banco_conexao() as db:
+        db.execute("UPDATE veiculos SET evidencia_id=? WHERE placa=?", (evidencia_id, placa))
+        db.execute(
+            """
+            UPDATE placas_ocr_pendentes SET status=?, resolvido_por_id=?, placa_final=?,
+                modelo=?, cor=?, proprietario_rg=?, proprietario_nome=?, telefone=?,
+                documento_tipo=?, faccao=?, local=?, ano=?, chassi=?, observacoes=?,
+                atualizado_em=? WHERE id=?
+            """,
+            (
+                str(status_final), int(usuario_id), placa, dados["modelo"], dados["cor"],
+                dados["proprietario_rg"], dados["proprietario_nome"], dados["telefone"],
+                dados["documento_tipo"], dados["faccao"], dados["local"], dados["ano"],
+                dados["chassi"], dados["observacoes"], _banco_agora_iso(), int(pendente_id),
+            ),
+        )
+        _banco_historico(
+            "FICHA_OCR", str(pendente_id), str(status_final),
+            f"{dados['proprietario_nome'] or 'Sem proprietário'} | {dados['documento_tipo']} {dados['proprietario_rg'] or 'N/A'} | Placa {placa}",
+            int(usuario_id), db,
+        )
+        veiculo = db.execute("SELECT * FROM veiculos WHERE placa=?", (placa,)).fetchone()
+        individuo = None
+        if veiculo and int(veiculo["proprietario_individuo_id"] or 0):
+            individuo = db.execute(
+                "SELECT * FROM individuos WHERE id=?", (int(veiculo["proprietario_individuo_id"]),)
+            ).fetchone()
+    resposta = dict(veiculo) if veiculo else dict(item)
+    resposta["individuo"] = dict(individuo) if individuo else {}
+    resposta["evidencia_id"] = evidencia_id
+    resposta["dados_ficha"] = dados
+    return resposta
+
+
+def _banco_embed_ficha_confirmada(item: Dict[str, Any], pendente: Dict[str, Any], usuario: discord.abc.User) -> discord.Embed:
+    individuo = dict(item.get("individuo") or {})
+    dados = dict(item.get("dados_ficha") or {})
+    nome = individuo.get("nome") or dados.get("proprietario_nome") or item.get("proprietario_nome") or "Não identificado"
+    doc_tipo = individuo.get("documento_tipo") or dados.get("documento_tipo") or "RG"
+    documento = individuo.get("rg") or dados.get("proprietario_rg") or item.get("proprietario_rg") or "Não informado"
+    telefone = individuo.get("telefone") or dados.get("telefone") or item.get("telefone_proprietario") or "Não informado"
+
+    embed = discord.Embed(
+        title="✅ FICHA REGISTRADA — PROPRIETÁRIO E VEÍCULO",
+        description="Registro confirmado e salvo no Banco de Dados DICOR.",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="👤 FICHA DO PROPRIETÁRIO",
+        value=(
+            f"**Nome:** {nome}\n"
+            f"**{str(doc_tipo).upper()}:** `{documento}`\n"
+            f"**Telefone:** {telefone}\n"
+            f"**Facção:** {dados.get('faccao') or item.get('faccao') or 'Não informada'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🚗 FICHA DO VEÍCULO",
+        value=(
+            f"**Placa:** `{item.get('placa') or dados.get('placa')}`\n"
+            f"**Modelo:** {item.get('modelo') or 'Não informado'}\n"
+            f"**Cor:** {item.get('cor') or 'Não informada'}\n"
+            f"**Ano:** {item.get('ano') or 'Não informado'}\n"
+            f"**Chassi:** {item.get('chassi') or 'Não informado'}"
+        ),
+        inline=False,
+    )
+    origem = str(pendente.get("mensagem_url") or "")
+    if origem:
+        embed.add_field(name="🔗 Origem da evidência", value=f"[Abrir Perícia Externa]({origem})", inline=False)
+    embed.add_field(name="✅ Confirmado por", value=getattr(usuario, "mention", str(usuario)), inline=True)
+    embed.add_field(name="🗂️ Evidência", value=f"`#{int(item.get('evidencia_id') or 0):05d}`", inline=True)
+    if pendente.get("imagem_url"):
+        embed.set_image(url=str(pendente["imagem_url"]))
+    embed.set_footer(text="DICOR • ficha persistente vinculada ao indivíduo, veículo e perícia")
+    return embed
+
+
+async def _banco_ocr_editar_cartao_resolvido(
+    interaction: discord.Interaction,
+    pendente_id: int,
+    item: Dict[str, Any],
+) -> None:
+    pendente = _banco_ocr_pendente_por_id(pendente_id)
+    mensagem = getattr(interaction, "message", None)
+    if mensagem is None:
+        canal_id = int(pendente.get("revisao_canal_id") or 0)
+        mensagem_id = int(pendente.get("revisao_mensagem_id") or 0)
+        if canal_id and mensagem_id:
+            try:
+                canal = interaction.guild.get_channel(canal_id) if interaction.guild else None
+                canal = canal or await bot.fetch_channel(canal_id)
+                mensagem = await canal.fetch_message(mensagem_id)
+            except Exception:
+                mensagem = None
+    if mensagem is not None:
+        await mensagem.edit(embed=_banco_embed_ficha_confirmada(item, pendente, interaction.user), view=None)
+
+
+class BancoOCRCorrecaoModal(Modal, title="Corrigir ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.pendente_id = int(pendente_id)
+        self.placa = TextInput(label="Placa correta", default=str(pendente.get("placa_sugerida") or "")[:16], max_length=16)
+        self.proprietario = TextInput(label="Nome do proprietário", default=str(pendente.get("proprietario_nome") or "")[:120], required=False, max_length=120)
+        self.documento = TextInput(
+            label="RG ou Passaporte", default=str(pendente.get("proprietario_rg") or "")[:40],
+            placeholder="Ex: 32096 ou PASSAPORTE: 32096", required=False, max_length=40,
+        )
+        self.telefone = TextInput(label="Telefone", default=str(pendente.get("telefone") or "")[:80], required=False, max_length=80)
+        self.modelo = TextInput(label="Modelo do veículo", default=str(pendente.get("modelo") or "")[:120], required=False, max_length=120)
+        for item in (self.placa, self.proprietario, self.documento, self.telefone, self.modelo):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            item = await asyncio.to_thread(
+                _banco_ocr_resolver,
+                self.pendente_id, int(interaction.user.id),
+                placa_final=str(self.placa.value), proprietario_nome=str(self.proprietario.value or ""),
+                proprietario_rg=str(self.documento.value or ""), telefone=str(self.telefone.value or ""),
+                modelo=str(self.modelo.value or ""), status_final="CORRIGIDO",
+            )
+            await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+            await interaction.followup.send(
+                f"✅ Ficha corrigida e salva. Placa `{item.get('placa')}`.", ephemeral=True
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+class BancoOCRCompletarModal(Modal, title="Completar ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.pendente_id = int(pendente_id)
+        self.cor = TextInput(label="Cor", default=str(pendente.get("cor") or "")[:80], required=False, max_length=80)
+        self.faccao = TextInput(label="Facção/organização", default=str(pendente.get("faccao") or "")[:120], required=False, max_length=120)
+        self.local = TextInput(label="Local/último avistamento", default=str(pendente.get("local") or "")[:180], required=False, max_length=180)
+        self.ano_chassi = TextInput(
+            label="Ano | Chassi", default=f"{pendente.get('ano') or ''} | {pendente.get('chassi') or ''}"[:180],
+            required=False, max_length=180,
+        )
+        self.observacoes = TextInput(
+            label="Observações", default=str(pendente.get("observacoes") or "")[:500],
+            required=False, style=discord.TextStyle.paragraph, max_length=800,
+        )
+        for item in (self.cor, self.faccao, self.local, self.ano_chassi, self.observacoes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            partes = str(self.ano_chassi.value or "").split("|", 1)
+            ano = partes[0].strip() if partes else ""
+            chassi = partes[1].strip() if len(partes) > 1 else ""
+            item = await asyncio.to_thread(
+                _banco_ocr_resolver,
+                self.pendente_id, int(interaction.user.id),
+                cor=str(self.cor.value or ""), faccao=str(self.faccao.value or ""),
+                local=str(self.local.value or ""), ano=ano, chassi=chassi,
+                observacoes=str(self.observacoes.value or ""), status_final="CORRIGIDO",
+            )
+            await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+            await interaction.followup.send(
+                f"✅ Ficha completada e salva. Placa `{item.get('placa')}`.", ephemeral=True
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+class BancoOCRReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Apenas a equipe DICOR pode revisar fichas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar ficha", emoji="✅", style=discord.ButtonStyle.success, custom_id="dicor_banco_ocr_confirmar", row=0)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        try:
+            item = await asyncio.to_thread(
+                _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="CONFIRMADO"
+            )
+            await _banco_ocr_editar_cartao_resolvido(interaction, pendente_id, item)
+            await interaction.followup.send(
+                f"✅ Ficha completa salva. Proprietário e veículo foram vinculados à placa `{item.get('placa')}`.",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+    @discord.ui.button(label="Corrigir ficha", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="dicor_banco_ocr_corrigir", row=0)
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        pendente = _banco_ocr_pendente_por_id(pendente_id)
+        if not pendente or str(pendente.get("status")) != "PENDENTE":
+            return await interaction.response.send_message("❌ Esta ficha já foi resolvida ou não existe.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRCorrecaoModal(pendente_id, pendente))
+
+    @discord.ui.button(label="Completar dados", emoji="📝", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_ocr_completar", row=0)
+    async def completar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        pendente = _banco_ocr_pendente_por_id(pendente_id)
+        if not pendente or str(pendente.get("status")) != "PENDENTE":
+            return await interaction.response.send_message("❌ Esta ficha já foi resolvida ou não existe.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRCompletarModal(pendente_id, pendente))
+
+    @discord.ui.button(label="Ignorar", emoji="❌", style=discord.ButtonStyle.danger, custom_id="dicor_banco_ocr_ignorar", row=0)
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        try:
+            await asyncio.to_thread(
+                _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="IGNORADO"
+            )
+            if interaction.message:
+                embed = discord.Embed(
+                    title="❌ FICHA OCR IGNORADA",
+                    description=f"Ignorada por {interaction.user.mention}. Nenhum registro foi criado.",
+                    color=discord.Color.red(),
+                )
+                await interaction.message.edit(embed=embed, view=None)
+            await interaction.followup.send("✅ Ficha ignorada.", ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+
+_BANCO_BUSCAR_ANTES_FICHAS = banco_buscar
+
+
+def banco_buscar(consulta: str) -> Dict[str, List[Dict[str, Any]]]:
+    q = str(consulta or "").strip()
+    q_norm = f"%{q}%"
+    rg = _banco_normalizar_rg(q)
+    placa = _banco_normalizar_placa(q)
+    with _banco_conexao() as db:
+        individuos = db.execute(
+            """
+            SELECT * FROM individuos
+            WHERE rg LIKE ? OR nome LIKE ? COLLATE NOCASE OR apelido LIKE ? COLLATE NOCASE
+               OR faccao_atual LIKE ? COLLATE NOCASE OR telefone LIKE ?
+            ORDER BY nome LIMIT 20
+            """,
+            (f"%{rg}%", q_norm, q_norm, q_norm, q_norm),
+        ).fetchall()
+        veiculos = db.execute(
+            """
+            SELECT * FROM veiculos
+            WHERE placa LIKE ? OR modelo LIKE ? COLLATE NOCASE OR cor LIKE ? COLLATE NOCASE
+               OR proprietario_rg LIKE ? OR proprietario_nome LIKE ? COLLATE NOCASE
+               OR faccao LIKE ? COLLATE NOCASE OR telefone_proprietario LIKE ?
+               OR ano LIKE ? OR chassi LIKE ? COLLATE NOCASE
+            ORDER BY placa LIMIT 20
+            """,
+            (f"%{placa}%", q_norm, q_norm, f"%{rg}%", q_norm, q_norm, q_norm, q_norm, q_norm),
+        ).fetchall()
+        faccoes = db.execute(
+            """
+            SELECT f.*, (SELECT COUNT(*) FROM faccao_membros m WHERE m.faccao_id=f.id AND m.ativo=1) AS membros
+            FROM faccoes f
+            WHERE f.nome LIKE ? COLLATE NOCASE OR f.mesa_nome LIKE ? COLLATE NOCASE
+            ORDER BY f.nome LIMIT 20
+            """,
+            (q_norm, q_norm),
+        ).fetchall()
+    return {
+        "individuos": [dict(x) for x in individuos],
+        "veiculos": [dict(x) for x in veiculos],
+        "faccoes": [dict(x) for x in faccoes],
+    }
+
+
+def _banco_embed_consulta_individuo(ind: Dict[str, Any]) -> discord.Embed:
+    with _banco_conexao() as db:
+        veiculos = db.execute(
+            """
+            SELECT v.* FROM veiculos v
+            LEFT JOIN vinculos_individuo_veiculo l ON l.veiculo_id=v.id AND l.ativo=1
+            WHERE l.individuo_id=? OR v.proprietario_rg=?
+            ORDER BY v.atualizado_em DESC LIMIT 10
+            """,
+            (int(ind.get("id") or 0), str(ind.get("rg") or "")),
+        ).fetchall()
+    embed = discord.Embed(
+        title="📋 FICHA DO PROPRIETÁRIO",
+        color=discord.Color.dark_blue(),
+    )
+    embed.add_field(
+        name="👤 Identificação",
+        value=(
+            f"**Nome:** {ind.get('nome') or 'Não informado'}\n"
+            f"**{str(ind.get('documento_tipo') or 'RG').upper()}:** `{ind.get('rg') or 'N/A'}`\n"
+            f"**Apelido:** {ind.get('apelido') or 'Não informado'}\n"
+            f"**Telefone:** {ind.get('telefone') or 'Não informado'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏴 Situação",
+        value=(
+            f"**Facção:** {ind.get('faccao_atual') or 'Não informada'}\n"
+            f"**Cargo:** {ind.get('cargo_faccao') or 'Não informado'}\n"
+            f"**Status:** {ind.get('status') or 'CADASTRADO'}"
+        ),
+        inline=False,
+    )
+    if veiculos:
+        linhas = [
+            f"• `{v['placa']}` — **{v['modelo'] or 'Modelo N/A'}** / {v['cor'] or 'cor N/A'}"
+            for v in veiculos
+        ]
+        embed.add_field(name=f"🚗 Veículos vinculados ({len(veiculos)})", value="\n".join(linhas)[:1024], inline=False)
+    if ind.get("ultima_origem_url"):
+        embed.add_field(name="🔗 Última origem", value=f"[Abrir registro]({ind['ultima_origem_url']})", inline=False)
+    imagem = ind.get("foto_individuo_url") or ind.get("foto_ficha_url")
+    if imagem:
+        embed.set_image(url=str(imagem))
+    embed.set_footer(text="DICOR • ficha persistente do indivíduo")
+    return embed
+
+
+def _banco_embed_consulta_veiculo(v: Dict[str, Any]) -> discord.Embed:
+    embed = discord.Embed(title="🚗 FICHA DO VEÍCULO", color=discord.Color.dark_blue())
+    embed.add_field(
+        name="🚘 Identificação do veículo",
+        value=(
+            f"**Placa:** `{v.get('placa') or 'N/A'}`\n"
+            f"**Modelo:** {v.get('modelo') or 'Não informado'}\n"
+            f"**Cor:** {v.get('cor') or 'Não informada'}\n"
+            f"**Ano:** {v.get('ano') or 'Não informado'}\n"
+            f"**Chassi:** {v.get('chassi') or 'Não informado'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="👤 Proprietário vinculado",
+        value=(
+            f"**Nome:** {v.get('proprietario_nome') or 'Não identificado'}\n"
+            f"**Documento:** `{v.get('proprietario_rg') or 'Não informado'}`\n"
+            f"**Telefone:** {v.get('telefone_proprietario') or 'Não informado'}\n"
+            f"**Facção:** {v.get('faccao') or 'Não informada'}"
+        ),
+        inline=False,
+    )
+    if v.get("local_ultimo_avistamento"):
+        embed.add_field(name="📍 Último local", value=str(v["local_ultimo_avistamento"]), inline=False)
+    if v.get("mensagem_url"):
+        embed.add_field(name="🔗 Origem", value=f"[Abrir Perícia Externa]({v['mensagem_url']})", inline=False)
+    if v.get("foto_url"):
+        embed.set_image(url=str(v["foto_url"]))
+    embed.set_footer(text=f"DICOR • evidência #{int(v.get('evidencia_id') or 0):05d}")
+    return embed
+
+
+class BancoConsultaModal(Modal, title="Consultar banco de dados"):
+    consulta = TextInput(label="Nome, RG, telefone, placa ou facção", placeholder="Ex: Carlos Pinto, 32096 ou DYW3J57", max_length=120)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            r = banco_buscar(str(self.consulta.value))
+            if len(r["individuos"]) == 1 and not r["veiculos"]:
+                return await interaction.followup.send(embed=_banco_embed_consulta_individuo(r["individuos"][0]), ephemeral=True)
+            if len(r["veiculos"]) == 1 and not r["individuos"]:
+                return await interaction.followup.send(embed=_banco_embed_consulta_veiculo(r["veiculos"][0]), ephemeral=True)
+            # Quando nome/documento e veículo apontam para a mesma ficha, prioriza o proprietário.
+            if len(r["individuos"]) == 1:
+                return await interaction.followup.send(embed=_banco_embed_consulta_individuo(r["individuos"][0]), ephemeral=True)
+            if len(r["veiculos"]) == 1:
+                return await interaction.followup.send(embed=_banco_embed_consulta_veiculo(r["veiculos"][0]), ephemeral=True)
+
+            embed = discord.Embed(title=f"🔍 RESULTADOS — {str(self.consulta.value)[:80]}", color=discord.Color.blue())
+            if r["individuos"]:
+                embed.add_field(
+                    name=f"👤 Proprietários ({len(r['individuos'])})",
+                    value="\n".join(
+                        f"• **{x['nome']}** — {str(x.get('documento_tipo') or 'RG').upper()} `{x['rg']}` • {x.get('telefone') or 'sem telefone'}"
+                        for x in r["individuos"]
+                    )[:1024], inline=False,
+                )
+            if r["veiculos"]:
+                embed.add_field(
+                    name=f"🚗 Veículos ({len(r['veiculos'])})",
+                    value="\n".join(
+                        f"• `{x['placa']}` — **{x.get('modelo') or 'Modelo N/A'}** • {x.get('proprietario_nome') or 'sem proprietário'}"
+                        for x in r["veiculos"]
+                    )[:1024], inline=False,
+                )
+            if r["faccoes"]:
+                embed.add_field(
+                    name=f"🏴 Facções ({len(r['faccoes'])})",
+                    value="\n".join(f"• **{x['nome']}** — {x['membros']} membros" for x in r["faccoes"])[:1024],
+                    inline=False,
+                )
+            if not any(r.values()):
+                embed.description = "Nenhum registro encontrado."
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha na consulta: {erro}", ephemeral=True)
+
+
+_BANCO_RESUMO_ANTES_FICHAS = banco_resumo
+
+
+def banco_resumo() -> Dict[str, int]:
+    r = _BANCO_RESUMO_ANTES_FICHAS()
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        r["fichas_confirmadas"] = int(
+            db.execute("SELECT COUNT(*) FROM evidencias_banco WHERE status='CONFIRMADA'").fetchone()[0]
+        )
+    return r
+
+
+def banco_embed_painel() -> discord.Embed:
+    r = banco_resumo()
+    ocr_status = "✅ Ativo" if BANCO_OCR_ATIVO and RapidOCR is not None else "⚠️ Dependências ausentes"
+    embed = discord.Embed(
+        title="🗃️ BANCO DE DADOS DICOR",
+        description=(
+            "Banco completo de indivíduos, veículos, placas, facções e painéis.\n"
+            "A Perícia Externa é lida por **texto, embeds e OCR**. Prints como o COPOM geram "
+            "uma **ficha profissional do proprietário e do veículo**, sempre com confirmação."
+        ),
+        color=discord.Color.dark_blue(),
+    )
+    embed.add_field(name="👤 Indivíduos", value=str(r["individuos"]), inline=True)
+    embed.add_field(name="🚗 Veículos/placas", value=str(r["placas"]), inline=True)
+    embed.add_field(name="📋 Fichas OCR", value=str(r.get("fichas_confirmadas", 0)), inline=True)
+    embed.add_field(name="🏴 Facções", value=str(r["faccoes"]), inline=True)
+    embed.add_field(name="👥 Membros ativos", value=str(r["membros_ativos"]), inline=True)
+    embed.add_field(name="📄 Painéis salvos", value=str(r["paineis"]), inline=True)
+    embed.add_field(name="🔬 Perícias lidas", value=str(r["pericias"]), inline=True)
+    embed.add_field(name="🖼️ Imagens processadas", value=str(r.get("ocr_processadas", 0)), inline=True)
+    embed.add_field(name="⏳ Fichas pendentes", value=str(r.get("ocr_pendentes", 0)), inline=True)
+    embed.add_field(name="🔤 OCR", value=ocr_status, inline=True)
+    embed.set_footer(text="DICOR • dados persistentes em /data • fichas vinculadas às perícias")
+    return embed
+
 
 if __name__ == '__main__':
     asyncio.run(main())
