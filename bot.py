@@ -26839,8 +26839,17 @@ import threading
 try:
     from rapidocr import RapidOCR
 except Exception as _banco_ocr_import_exception:
-    RapidOCR = None
-    _BANCO_OCR_IMPORT_ERRO = f"{type(_banco_ocr_import_exception).__name__}: {_banco_ocr_import_exception}"
+    try:
+        # Compatibilidade com instalações que usam o pacote legado.
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception as _banco_ocr_import_exception_legacy:
+        RapidOCR = None
+        _BANCO_OCR_IMPORT_ERRO = (
+            f"rapidocr: {type(_banco_ocr_import_exception).__name__}: {_banco_ocr_import_exception}; "
+            f"rapidocr_onnxruntime: {type(_banco_ocr_import_exception_legacy).__name__}: {_banco_ocr_import_exception_legacy}"
+        )
+    else:
+        _BANCO_OCR_IMPORT_ERRO = ""
 else:
     _BANCO_OCR_IMPORT_ERRO = ""
 
@@ -26848,6 +26857,7 @@ BANCO_OCR_ATIVO = str(os.getenv("BANCO_OCR_ATIVO", "1")).strip().lower() not in 
 BANCO_OCR_CONFIANCA_MIN = max(0.20, min(0.99, env_float("BANCO_OCR_CONFIANCA_MIN", 0.45)))
 BANCO_OCR_MAX_IMAGENS_MENSAGEM = max(1, min(10, env_int("BANCO_OCR_MAX_IMAGENS_MENSAGEM", 4)))
 BANCO_OCR_MAX_POR_SYNC = max(1, min(250, env_int("BANCO_OCR_MAX_POR_SYNC", 30)))
+BANCO_OCR_HISTORICO_MAX_IMAGENS = max(1, min(5000, env_int("BANCO_OCR_HISTORICO_MAX_IMAGENS", 1000)))
 BANCO_OCR_MAX_BYTES = max(1_000_000, env_int("BANCO_OCR_MAX_BYTES", 12_000_000))
 
 _BANCO_OCR_ENGINE = None
@@ -27496,6 +27506,8 @@ async def banco_sincronizar_pericias(
     *,
     limite: Optional[int] = None,
     canal_revisao_id: int = 0,
+    forcar_historico: bool = False,
+    max_ocr_override: Optional[int] = None,
 ) -> Dict[str, int]:
     global _BANCO_OCR_AVISO_IMPORT_JA_ENVIADO
     if guild is None:
@@ -27523,6 +27535,11 @@ async def banco_sincronizar_pericias(
         "ocr_indisponivel": 0, "ocr_postados": 0,
     }
     ocr_processados_nesta_sync = 0
+    limite_ocr_sync = (
+        BANCO_OCR_MAX_POR_SYNC
+        if max_ocr_override is None
+        else max(1, min(5000, int(max_ocr_override)))
+    )
 
     async for msg in canal.history(limit=historico_limite, oldest_first=True):
         resultado["mensagens"] += 1
@@ -27534,7 +27551,7 @@ async def banco_sincronizar_pericias(
             ).fetchone()
 
         placas_diretas = set()
-        if not texto_ja:
+        if not texto_ja or forcar_historico:
             try:
                 encontrados = banco_extrair_veiculos_pericia(texto)
                 placas_diretas = {str(x.get("placa") or "") for x in encontrados}
@@ -27572,16 +27589,16 @@ async def banco_sincronizar_pericias(
                 resultado["erros"] += 1
                 await enviar_log(f"⚠️ Banco DICOR: falha ao importar texto da perícia `{msg.id}`: {erro}")
 
-        if BANCO_OCR_ATIVO and ocr_processados_nesta_sync < BANCO_OCR_MAX_POR_SYNC:
+        if BANCO_OCR_ATIVO and ocr_processados_nesta_sync < limite_ocr_sync:
             for fonte in _banco_fontes_imagem_mensagem(msg):
-                if ocr_processados_nesta_sync >= BANCO_OCR_MAX_POR_SYNC:
+                if ocr_processados_nesta_sync >= limite_ocr_sync:
                     break
                 fonte_id = str(fonte.get("fonte_id") or "")
                 with _banco_conexao() as db:
                     processada = db.execute(
                         "SELECT status FROM ocr_fontes_processadas WHERE fonte_id=?", (fonte_id,)
                     ).fetchone()
-                if processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE"}:
+                if (not forcar_historico) and processada and str(processada["status"]) in {"OK", "SEM_PLACA", "MUITO_GRANDE"}:
                     continue
                 if RapidOCR is None:
                     resultado["ocr_indisponivel"] += 1
@@ -27696,7 +27713,7 @@ def banco_embed_painel() -> discord.Embed:
         description=(
             "Cadastre e consulte indivíduos, placas e painéis completos de organizações.\n"
             "A Perícia Externa é lida por **texto, embeds e OCR de fotos/prints**. "
-            "Leituras de imagem exigem confirmação antes de entrar no banco."
+            "Leituras de imagem exigem confirmação antes de entrar no banco. Use **Importar perícias antigas** para reler todo o histórico."
         ),
         color=discord.Color.dark_blue(),
     )
@@ -27711,6 +27728,73 @@ def banco_embed_painel() -> discord.Embed:
     embed.add_field(name="🔤 OCR", value=ocr_status, inline=True)
     embed.set_footer(text="DICOR • Banco persistente em /data • OCR local com confirmação")
     return embed
+
+
+# Importação histórica completa: relê texto, embeds e todas as imagens antigas.
+_BANCO_IMPORTACAO_HISTORICO_LOCK = asyncio.Lock()
+
+
+async def _banco_publicar_todos_ocr_pendentes(
+    guild: Optional[discord.Guild], canal_fallback_id: int
+) -> int:
+    publicados = 0
+    vistos = set()
+    while True:
+        pendentes = _banco_ocr_pendentes(100, apenas_sem_mensagem=True)
+        pendentes = [p for p in pendentes if int(p.get("id") or 0) not in vistos]
+        if not pendentes:
+            break
+        houve_progresso = False
+        for pendente in pendentes:
+            pendente_id = int(pendente.get("id") or 0)
+            vistos.add(pendente_id)
+            try:
+                if await _banco_ocr_postar_revisao(
+                    guild, pendente, canal_fallback_id=int(canal_fallback_id or 0)
+                ):
+                    publicados += 1
+                    houve_progresso = True
+            except Exception:
+                traceback.print_exc()
+        if not houve_progresso:
+            break
+    return publicados
+
+
+async def _banco_importar_pericias_antigas_tarefa(
+    guild: Optional[discord.Guild], canal_destino: Any, solicitado_por_id: int
+) -> None:
+    async with _BANCO_IMPORTACAO_HISTORICO_LOCK:
+        try:
+            resultado = await banco_sincronizar_pericias(
+                guild,
+                limite=None,
+                canal_revisao_id=int(getattr(canal_destino, "id", 0) or 0),
+                forcar_historico=True,
+                max_ocr_override=BANCO_OCR_HISTORICO_MAX_IMAGENS,
+            )
+            publicados_extra = await _banco_publicar_todos_ocr_pendentes(
+                guild, int(getattr(canal_destino, "id", 0) or 0)
+            )
+            mencao = f"<@{int(solicitado_por_id)}>" if solicitado_por_id else ""
+            await canal_destino.send(
+                f"{mencao}\n✅ **IMPORTAÇÃO DAS PERÍCIAS ANTIGAS CONCLUÍDA**\n"
+                f"📨 Mensagens antigas verificadas: **{resultado['mensagens']}**\n"
+                f"🚗 Placas encontradas no texto/embeds: **{resultado['placas']}**\n"
+                f"🖼️ Imagens analisadas pelo OCR: **{resultado['ocr_imagens']}**\n"
+                f"⏳ Leituras aguardando confirmação: **{resultado['ocr_pendentes']}**\n"
+                f"📋 Cartões de revisão enviados: **{resultado['ocr_postados'] + publicados_extra}**\n"
+                f"⚠️ Erros: **{resultado['erros']}**"
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await canal_destino.send(
+                    f"<@{int(solicitado_por_id)}> ❌ Falha ao importar as perícias antigas: "
+                    f"`{type(erro).__name__}: {erro}`"
+                )
+            except Exception:
+                pass
 
 
 # Redefine o painel para acrescentar revisão OCR sem mexer em nenhum painel das mesas.
@@ -27802,6 +27886,44 @@ class BancoDadosView(View):
             f"🖼️ Cartões publicados agora: **{publicados}**\n"
             f"⏳ Total ainda aguardando confirmação: **{total}**",
             ephemeral=True,
+        )
+
+    @discord.ui.button(label="Importar perícias antigas", emoji="📚", style=discord.ButtonStyle.success, custom_id="dicor_banco_importar_pericias_antigas", row=2)
+    async def importar_pericias_antigas(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
+            return await interaction.response.send_message(
+                "⏳ Uma importação histórica já está em andamento. Aguarde a mensagem de conclusão.",
+                ephemeral=True,
+            )
+        if not BANCO_OCR_ATIVO:
+            return await interaction.response.send_message(
+                "❌ O OCR está desativado. Defina `BANCO_OCR_ATIVO=1` no Railway.",
+                ephemeral=True,
+            )
+        if RapidOCR is None:
+            detalhe = (_BANCO_OCR_IMPORT_ERRO or "dependências não carregadas")[:1200]
+            return await interaction.response.send_message(
+                "❌ O OCR ainda não está instalado no Railway. Substitua também o `requirements.txt` "
+                "e faça um novo deploy.\n"
+                f"**Erro carregado pelo bot:** `{detalhe}`",
+                ephemeral=True,
+            )
+        canal = interaction.channel
+        if canal is None or not hasattr(canal, "send"):
+            return await interaction.response.send_message(
+                "❌ Não foi possível identificar o canal do painel.", ephemeral=True
+            )
+        _banco_config_set("painel_canal_id", int(canal.id))
+        await interaction.response.send_message(
+            "📚 **Importação histórica iniciada.** O bot vai reler todas as Perícias Externas antigas, "
+            "analisar as imagens e enviar os cartões de confirmação neste canal. "
+            "A conclusão será avisada aqui.",
+            ephemeral=True,
+        )
+        asyncio.create_task(
+            _banco_importar_pericias_antigas_tarefa(
+                interaction.guild, canal, int(interaction.user.id)
+            )
         )
 
 
