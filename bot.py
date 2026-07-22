@@ -34179,11 +34179,21 @@ class BancoOCRReviewView(View):
                     _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="CONFIRMADO"
                 )
                 await _banco_ocr_editar_cartao_resolvido(interaction, pendente_id, item)
-                texto = "✅ Esta ficha já estava salva." if item.get("ja_resolvida") else "✅ Ficha confirmada e salva permanentemente."
-                await interaction.followup.send(texto, ephemeral=True, delete_after=30)
-                await _banco_prof_atualizar_painel()
             except Exception as erro:
                 await _banco_prof_erro_interacao(interaction, "Não foi possível confirmar a ficha.", erro)
+                return
+
+            # O salvamento já terminou. Falhas na mensagem temporária ou na atualização
+            # do painel não podem transformar uma confirmação válida em erro.
+            texto = "✅ Esta ficha já estava salva." if item.get("ja_resolvida") else "✅ Ficha confirmada e salva permanentemente."
+            try:
+                await interaction.followup.send(texto, ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            try:
+                await _banco_prof_atualizar_painel()
+            except Exception:
+                traceback.print_exc()
 
     @discord.ui.button(
         label="Corrigir ficha", emoji="✏️", style=discord.ButtonStyle.primary,
@@ -34228,10 +34238,18 @@ class BancoOCRReviewView(View):
                         view=None,
                     )
                     asyncio.create_task(_banco_v3_apagar_mensagem_depois(interaction.message, 30))
-                await interaction.followup.send("✅ Ficha retirada da fila.", ephemeral=True, delete_after=30)
-                await _banco_prof_atualizar_painel()
             except Exception as erro:
                 await _banco_prof_erro_interacao(interaction, "Não foi possível ignorar a ficha.", erro)
+                return
+
+            try:
+                await interaction.followup.send("✅ Ficha retirada da fila.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            try:
+                await _banco_prof_atualizar_painel()
+            except Exception:
+                traceback.print_exc()
 
 
 # Garante que o comando e as views usem sempre a versão V3 mais recente.
@@ -34296,7 +34314,7 @@ def _banco_v4_placa_rotulada(texto: str) -> str:
         )
         if not m:
             continue
-        valor = re.split(r"\s{2,}|\s+(?:propriet[aá]rio|modelo|telefone|rg|passaporte|cor)\b", m.group(1), 1, flags=re.I)[0]
+        valor = re.split(r"\s{2,}|\s+(?:propriet[aá]rio|modelo|telefone|rg|passaporte|cor)\b", m.group(1), maxsplit=1, flags=re.I)[0]
         placa = _banco_normalizar_placa(valor)
         if _banco_placa_valida(placa):
             return placa
