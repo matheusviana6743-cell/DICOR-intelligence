@@ -30964,5 +30964,572 @@ async def _banco_importar_pericias_antigas_tarefa(
     finally:
         await _banco_prof_atualizar_painel()
 
+
+
+# =====================================================
+# PATCH FINAL — IMPORTAÇÃO HISTÓRICA ESTÁVEL + LOGS SEM SPAM
+# - Evita repetir mensagens administrativas a cada reconexão/reinício.
+# - Importa Perícias Externas em fluxo persistente, com progresso e retomada.
+# - Revalida cartões OCR pendentes e publica todos os que estiverem faltando.
+# - Reduz uso de memória do OCR para impedir reinícios durante o histórico.
+# =====================================================
+
+import gc as _dicor_gc
+
+# ---------- Antispam persistente dos logs administrativos ----------
+_DICOR_ENVIAR_LOG_ANTES_ANTISPAM = enviar_log
+_DICOR_LOG_ANTISPAM_LOCK = asyncio.Lock()
+_DICOR_LOG_ANTISPAM_PATH = Path(str(DATA_DIR)) / 'dicor_log_antispam.json'
+
+
+def _dicor_log_antispam_carregar() -> Dict[str, Any]:
+    try:
+        if _DICOR_LOG_ANTISPAM_PATH.exists():
+            bruto = json.loads(_DICOR_LOG_ANTISPAM_PATH.read_text(encoding='utf-8'))
+            return bruto if isinstance(bruto, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _dicor_log_antispam_salvar(dados: Dict[str, Any]) -> None:
+    try:
+        _DICOR_LOG_ANTISPAM_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporario = _DICOR_LOG_ANTISPAM_PATH.with_suffix('.tmp')
+        temporario.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding='utf-8')
+        temporario.replace(_DICOR_LOG_ANTISPAM_PATH)
+    except Exception:
+        pass
+
+
+def _dicor_log_categoria(texto: str) -> Tuple[str, int, bool]:
+    """Retorna (categoria, TTL em segundos, suprimir quando não houve mudança)."""
+    t = str(texto or '')
+    if 'Persistência de assinaturas verificada' in t:
+        sem_mudanca = bool(re.search(r"restauradas\s+`?0`?.*novos backups\s+`?0`?", t, re.I | re.S))
+        return 'persistencia_assinaturas', 86400, sem_mudanca
+    if 'Proteção fixa de canal aplicada' in t:
+        sem_mudanca = bool(re.search(r"Canais atualizados:\s*`?0`?.*Falhas:\s*`?0`?", t, re.I | re.S))
+        return 'protecao_fixa', 86400, sem_mudanca
+    if 'Canal protegido' in t and 'não encontrado' in t:
+        return 'canal_protegido_ausente', 86400, False
+    if 'Acessos privados dos boletins revisados' in t:
+        sem_mudanca = bool(re.search(r"revisados:\s*`?0`?.*falhas:\s*`?0`?", t, re.I | re.S))
+        return 'acessos_boletins_sem_mudanca', 86400, sem_mudanca
+    if 'Hierarquia única garantida na mensagem' in t:
+        return 'hierarquia_unica', 86400, False
+    if 'Views persistentes' in t and 'carregadas' in t:
+        return 'views_persistentes', 86400, False
+    return '', 0, False
+
+
+async def enviar_log(texto: str):
+    conteudo = str(texto or '')
+    categoria, ttl, sem_mudanca = _dicor_log_categoria(conteudo)
+    if not categoria:
+        return await _DICOR_ENVIAR_LOG_ANTES_ANTISPAM(conteudo)
+
+    # Mensagens rotineiras sem nenhuma alteração deixam de poluir o canal.
+    if sem_mudanca:
+        return None
+
+    async with _DICOR_LOG_ANTISPAM_LOCK:
+        dados = _dicor_log_antispam_carregar()
+        agora_ts = time.time()
+        registro = dados.get(categoria) if isinstance(dados.get(categoria), dict) else {}
+        ultima = float(registro.get('timestamp', 0) or 0)
+        assinatura = hashlib.sha1(conteudo.encode('utf-8', errors='ignore')).hexdigest()
+        mesma = str(registro.get('assinatura') or '') == assinatura
+        if mesma and ttl and (agora_ts - ultima) < ttl:
+            return None
+        dados[categoria] = {
+            'timestamp': agora_ts,
+            'assinatura': assinatura,
+            'ultima_mensagem': conteudo[:1000],
+        }
+        _dicor_log_antispam_salvar(dados)
+    return await _DICOR_ENVIAR_LOG_ANTES_ANTISPAM(conteudo)
+
+
+# ---------- OCR com uso de memória controlado ----------
+def _banco_ocr_variantes(caminho: str) -> Tuple[List[str], List[str]]:
+    """Cria no máximo duas imagens otimizadas; nunca entrega a foto gigante original ao OCR."""
+    if PILImage is None:
+        return [str(caminho)], []
+    temporarios: List[str] = []
+    variantes: List[str] = []
+    try:
+        from PIL import ImageOps, ImageEnhance, ImageFilter
+        with PILImage.open(caminho) as origem:
+            img = ImageOps.exif_transpose(origem).convert('RGB')
+        # Limita pixels para reduzir RAM no Railway sem perder leitura de prints.
+        img.thumbnail((1500, 1500), PILImage.Resampling.LANCZOS)
+        p_full = str(BANCO_ARQUIVOS_DIR / f"ocr-safe-{int(time.time()*1000)}-{secrets.token_hex(3)}.jpg")
+        img.save(p_full, 'JPEG', quality=90, optimize=True)
+        variantes.append(p_full)
+        temporarios.append(p_full)
+
+        # Segunda variante apenas para a metade inferior, útil em fotos de veículos.
+        w, h = img.size
+        if w >= 420 and h >= 320:
+            crop = img.crop((0, int(h * 0.38), w, h))
+            crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+            crop = ImageEnhance.Contrast(crop).enhance(1.7)
+            crop = crop.filter(ImageFilter.SHARPEN)
+            p_crop = str(BANCO_ARQUIVOS_DIR / f"ocr-safe-crop-{int(time.time()*1000)}-{secrets.token_hex(3)}.png")
+            crop.save(p_crop, 'PNG', optimize=True)
+            variantes.append(p_crop)
+            temporarios.append(p_crop)
+            crop.close()
+        img.close()
+    except Exception:
+        traceback.print_exc()
+        if not variantes:
+            variantes = [str(caminho)]
+    return variantes, temporarios
+
+
+def _banco_ocr_ler_imagem_sync(caminho: str) -> List[Tuple[str, float]]:
+    engine = _banco_ocr_obter_engine()
+    variantes, temporarios = _banco_ocr_variantes(caminho)
+    ordem: List[str] = []
+    melhores: Dict[str, Tuple[str, float]] = {}
+    try:
+        for variante in variantes:
+            resultado = None
+            try:
+                resultado = engine(variante, use_det=True, use_cls=True, use_rec=True)
+                textos = list(getattr(resultado, 'txts', None) or [])
+                scores = list(getattr(resultado, 'scores', None) or [])
+                if not textos and isinstance(resultado, tuple) and resultado:
+                    bruto = resultado[0]
+                    if isinstance(bruto, list):
+                        for item in bruto:
+                            if not (isinstance(item, (list, tuple)) and len(item) >= 2):
+                                continue
+                            dados_item = item[1]
+                            if not (isinstance(dados_item, (list, tuple)) and dados_item):
+                                continue
+                            texto_lido = str(dados_item[0] or '').strip()
+                            score = float(dados_item[1] if len(dados_item) > 1 else 0.5)
+                            chave = re.sub(r'\s+', ' ', texto_lido).strip().upper()
+                            if chave and chave not in melhores:
+                                ordem.append(chave)
+                                melhores[chave] = (texto_lido, score)
+                            elif chave and score > melhores[chave][1]:
+                                melhores[chave] = (texto_lido, score)
+                else:
+                    for indice, txt in enumerate(textos):
+                        texto_lido = str(txt or '').strip()
+                        if not texto_lido:
+                            continue
+                        score = float(scores[indice]) if indice < len(scores) else 0.5
+                        chave = re.sub(r'\s+', ' ', texto_lido).strip().upper()
+                        if chave not in melhores:
+                            ordem.append(chave)
+                            melhores[chave] = (texto_lido, score)
+                        elif score > melhores[chave][1]:
+                            melhores[chave] = (texto_lido, score)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                resultado = None
+                _dicor_gc.collect()
+    finally:
+        for temporario in temporarios:
+            try:
+                Path(temporario).unlink(missing_ok=True)
+            except Exception:
+                pass
+        _dicor_gc.collect()
+    return [melhores[chave] for chave in ordem]
+
+
+# ---------- Importação histórica persistente e retomável ----------
+_BANCO_HIST_STATUS_KEY_PREFIX = 'historico_prof_'
+
+
+def _banco_hist_get(chave: str, padrao: str = '') -> str:
+    return _banco_config_get(_BANCO_HIST_STATUS_KEY_PREFIX + chave, padrao)
+
+
+def _banco_hist_set(chave: str, valor: Any) -> None:
+    _banco_config_set(_BANCO_HIST_STATUS_KEY_PREFIX + chave, valor)
+
+
+async def _banco_hist_status_message(canal: Any, solicitado_por_id: int) -> Optional[discord.Message]:
+    mensagem_id = int(_banco_hist_get('status_message_id', '0') or 0)
+    if mensagem_id and hasattr(canal, 'fetch_message'):
+        try:
+            return await canal.fetch_message(mensagem_id)
+        except Exception:
+            pass
+    try:
+        embed = discord.Embed(
+            title='📚 IMPORTAÇÃO HISTÓRICA — EM ANDAMENTO',
+            description='Preparando a leitura das Perícias Externas antigas…',
+            color=discord.Color.blurple(),
+        )
+        mensagem = await canal.send(
+            content=f'<@{int(solicitado_por_id)}>' if solicitado_por_id else None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        _banco_hist_set('status_message_id', int(mensagem.id))
+        return mensagem
+    except Exception:
+        return None
+
+
+async def _banco_hist_editar_status(
+    mensagem: Optional[discord.Message],
+    *,
+    titulo: str,
+    descricao: str,
+    stats: Dict[str, int],
+    cor: discord.Color,
+) -> None:
+    if mensagem is None:
+        return
+    try:
+        embed = discord.Embed(title=titulo, description=descricao, color=cor)
+        embed.add_field(name='📨 Mensagens verificadas', value=str(stats.get('mensagens', 0)), inline=True)
+        embed.add_field(name='🚗 Veículos/placas no texto', value=str(stats.get('placas', 0)), inline=True)
+        embed.add_field(name='🖼️ Imagens analisadas', value=str(stats.get('ocr_imagens', 0)), inline=True)
+        embed.add_field(name='📋 Novas fichas OCR', value=str(stats.get('ocr_pendentes', 0)), inline=True)
+        embed.add_field(name='📤 Cartões publicados', value=str(stats.get('ocr_postados', 0)), inline=True)
+        embed.add_field(name='⏭️ Imagens já processadas', value=str(stats.get('ocr_puladas', 0)), inline=True)
+        embed.add_field(name='🗃️ Imagens indisponíveis', value=str(stats.get('ocr_indisponiveis', 0)), inline=True)
+        embed.add_field(name='⚠️ Erros', value=str(stats.get('erros', 0)), inline=True)
+        embed.set_footer(text='O progresso é salvo no volume /data e continua após reinício do bot.')
+        await mensagem.edit(embed=embed)
+    except Exception:
+        pass
+
+
+async def _banco_hist_revalidar_cartoes(guild: Optional[discord.Guild]) -> int:
+    """Zera IDs de cartões apagados, para que todos os pendentes possam ser publicados."""
+    if guild is None:
+        return 0
+    corrigidos = 0
+    with _banco_conexao() as db:
+        rows = db.execute(
+            "SELECT id, revisao_canal_id, revisao_mensagem_id FROM placas_ocr_pendentes "
+            "WHERE status='PENDENTE' AND revisao_mensagem_id<>0 ORDER BY id"
+        ).fetchall()
+    for row in rows:
+        canal_id = int(row['revisao_canal_id'] or 0)
+        mensagem_id = int(row['revisao_mensagem_id'] or 0)
+        existe = False
+        if canal_id and mensagem_id:
+            canal = guild.get_channel(canal_id)
+            if canal is None:
+                try:
+                    canal = await bot.fetch_channel(canal_id)
+                except Exception:
+                    canal = None
+            if canal is not None and hasattr(canal, 'fetch_message'):
+                try:
+                    await canal.fetch_message(mensagem_id)
+                    existe = True
+                except discord.NotFound:
+                    existe = False
+                except discord.Forbidden:
+                    existe = True
+                except Exception:
+                    existe = True
+        if not existe:
+            with _banco_conexao() as db:
+                db.execute(
+                    "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0, atualizado_em=? WHERE id=?",
+                    (_banco_agora_iso(), int(row['id'])),
+                )
+            corrigidos += 1
+        await asyncio.sleep(0)
+    return corrigidos
+
+
+async def _banco_hist_processar_mensagem(
+    guild: Optional[discord.Guild],
+    msg: discord.Message,
+    canal_revisao_id: int,
+) -> Dict[str, int]:
+    stats = {
+        'mensagens': 1, 'placas': 0, 'ocr_imagens': 0, 'ocr_pendentes': 0,
+        'ocr_postados': 0, 'ocr_puladas': 0, 'ocr_indisponiveis': 0, 'erros': 0,
+    }
+    texto = coletar_texto_embed(msg) if 'coletar_texto_embed' in globals() else (msg.content or '')
+    fontes = _banco_fontes_imagem_mensagem(msg)
+    placas_diretas: set[str] = set()
+
+    try:
+        encontrados = banco_extrair_veiculos_pericia(texto)
+        placas_diretas = {str(x.get('placa') or '') for x in encontrados if x.get('placa')}
+        foto_path = ''
+        foto_url = ''
+        if fontes and encontrados:
+            try:
+                foto_path = await _banco_salvar_fonte_imagem(fontes[0], f'pericia-{msg.id}')
+                foto_url = str(fontes[0].get('url') or '')
+            except BancoImagemIndisponivel:
+                pass
+            except Exception:
+                pass
+        for item in encontrados:
+            banco_upsert_veiculo(
+                **item,
+                foto_path=foto_path,
+                foto_url=foto_url,
+                origem_tipo='pericia_externa',
+                origem_id=str(msg.id),
+                mensagem_url=getattr(msg, 'jump_url', ''),
+                criado_por_id=int(getattr(msg.author, 'id', 0) or 0),
+            )
+            stats['placas'] += 1
+        with _banco_conexao() as db:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO pericia_sincronizada
+                (mensagem_id, canal_id, placas_encontradas, sincronizado_em)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(msg.id), int(msg.channel.id), len(encontrados), _banco_agora_iso()),
+            )
+    except Exception:
+        stats['erros'] += 1
+        traceback.print_exc()
+
+    for fonte in fontes:
+        fonte_id = str(fonte.get('fonte_id') or '')
+        try:
+            with _banco_conexao() as db:
+                processada = db.execute(
+                    'SELECT status FROM ocr_fontes_processadas WHERE fonte_id=?', (fonte_id,)
+                ).fetchone()
+            status_anterior = str(processada['status']) if processada else ''
+            if status_anterior in {'OK', 'SEM_PLACA', 'MUITO_GRANDE', 'INDISPONIVEL'}:
+                stats['ocr_puladas'] += 1
+                continue
+
+            tamanho = int(fonte.get('size') or 0)
+            if tamanho and tamanho > BANCO_OCR_MAX_BYTES:
+                with _banco_conexao() as db:
+                    db.execute(
+                        """
+                        INSERT OR REPLACE INTO ocr_fontes_processadas
+                        (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                        VALUES (?, ?, ?, ?, 'MUITO_GRANDE', 0, ?, ?)
+                        """,
+                        (fonte_id, int(msg.id), int(msg.channel.id), str(fonte.get('url') or '')[:1000],
+                         f'{tamanho} bytes', _banco_agora_iso()),
+                    )
+                continue
+
+            imagem_path = await _banco_salvar_fonte_imagem(fonte, f'ocr-historico-{msg.id}')
+            linhas = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, imagem_path)
+            stats['ocr_imagens'] += 1
+            candidatos = [
+                x for x in _banco_ocr_extrair_candidatos(linhas)
+                if str(x.get('placa') or '') not in placas_diretas
+            ]
+            dados_lista = banco_extrair_veiculos_pericia(texto)
+            dados_base = dados_lista[0] if dados_lista else {
+                'modelo': '', 'cor': '', 'proprietario_rg': '', 'proprietario_nome': '',
+                'faccao': '', 'local': '', 'observacoes': '',
+            }
+            for candidato in candidatos:
+                pendente = _banco_ocr_criar_pendente(
+                    msg=msg,
+                    canal_id=int(msg.channel.id),
+                    fonte=fonte,
+                    imagem_path=imagem_path,
+                    placa=str(candidato.get('placa') or ''),
+                    confianca=float(candidato.get('confianca') or 0),
+                    texto_ocr=str(candidato.get('linha') or '')[:3500],
+                    dados=dados_base,
+                )
+                if pendente and str(pendente.get('status')) == 'PENDENTE':
+                    stats['ocr_pendentes'] += 1
+                    if await _banco_ocr_postar_revisao(
+                        guild, pendente, canal_fallback_id=int(canal_revisao_id or 0)
+                    ):
+                        stats['ocr_postados'] += 1
+                        await asyncio.sleep(0.35)
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO ocr_fontes_processadas
+                    (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                    VALUES (?, ?, ?, ?, ?, ?, '', ?)
+                    """,
+                    (
+                        fonte_id, int(msg.id), int(msg.channel.id), str(fonte.get('url') or '')[:1000],
+                        'OK' if candidatos else 'SEM_PLACA', len(candidatos), _banco_agora_iso(),
+                    ),
+                )
+        except BancoImagemIndisponivel as erro:
+            stats['ocr_indisponiveis'] += 1
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO ocr_fontes_processadas
+                    (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                    VALUES (?, ?, ?, ?, 'INDISPONIVEL', 0, ?, ?)
+                    """,
+                    (fonte_id, int(msg.id), int(msg.channel.id), str(fonte.get('url') or '')[:1000],
+                     str(erro)[:1000], _banco_agora_iso()),
+                )
+        except Exception as erro:
+            stats['erros'] += 1
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO ocr_fontes_processadas
+                    (fonte_id, mensagem_id, canal_id, imagem_url, status, candidatos, erro, processado_em)
+                    VALUES (?, ?, ?, ?, 'ERRO', 0, ?, ?)
+                    """,
+                    (fonte_id, int(msg.id), int(msg.channel.id), str(fonte.get('url') or '')[:1000],
+                     f'{type(erro).__name__}: {erro}'[:1000], _banco_agora_iso()),
+                )
+            traceback.print_exc()
+        finally:
+            _dicor_gc.collect()
+            await asyncio.sleep(0.20)
+    return stats
+
+
+def _banco_hist_stats_carregar() -> Dict[str, int]:
+    chaves = ['mensagens', 'placas', 'ocr_imagens', 'ocr_pendentes', 'ocr_postados',
+              'ocr_puladas', 'ocr_indisponiveis', 'erros']
+    return {chave: int(_banco_hist_get('stats_' + chave, '0') or 0) for chave in chaves}
+
+
+def _banco_hist_stats_salvar(stats: Dict[str, int]) -> None:
+    for chave, valor in stats.items():
+        _banco_hist_set('stats_' + chave, int(valor or 0))
+
+
+async def _banco_importar_pericias_antigas_tarefa(
+    guild: Optional[discord.Guild], canal_destino: Any, solicitado_por_id: int
+) -> None:
+    # Não enfileira uma segunda importação depois da atual.
+    if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
+        return
+    async with _BANCO_IMPORTACAO_HISTORICO_LOCK:
+        retomando = _banco_hist_get('running', '0') == '1'
+        if not retomando:
+            _banco_hist_set('cursor_message_id', 0)
+            _banco_hist_set('status_message_id', 0)
+            stats = {chave: 0 for chave in [
+                'mensagens', 'placas', 'ocr_imagens', 'ocr_pendentes', 'ocr_postados',
+                'ocr_puladas', 'ocr_indisponiveis', 'erros'
+            ]}
+            _banco_hist_stats_salvar(stats)
+        else:
+            stats = _banco_hist_stats_carregar()
+
+        _banco_hist_set('running', 1)
+        _banco_hist_set('channel_id', int(getattr(canal_destino, 'id', 0) or 0))
+        _banco_hist_set('requester_id', int(solicitado_por_id or 0))
+        status_msg = await _banco_hist_status_message(canal_destino, solicitado_por_id)
+        await _banco_hist_editar_status(
+            status_msg,
+            titulo='📚 IMPORTAÇÃO HISTÓRICA — EM ANDAMENTO',
+            descricao=('Retomando do último ponto salvo…' if retomando else 'Lendo todas as Perícias Externas antigas…'),
+            stats=stats,
+            cor=discord.Color.blurple(),
+        )
+
+        try:
+            if guild is None:
+                raise RuntimeError('Servidor não identificado.')
+            canal_pericia = guild.get_channel(BANCO_PERICIA_CHANNEL_ID)
+            if canal_pericia is None:
+                canal_pericia = await bot.fetch_channel(BANCO_PERICIA_CHANNEL_ID)
+            if canal_pericia is None or not hasattr(canal_pericia, 'history'):
+                raise RuntimeError('Canal de Perícia Externa não encontrado ou sem acesso ao histórico.')
+
+            cursor = int(_banco_hist_get('cursor_message_id', '0') or 0)
+            after = discord.Object(id=cursor) if cursor else None
+            ultimo_update = time.monotonic()
+            desde_update = 0
+            async for msg in canal_pericia.history(limit=None, oldest_first=True, after=after):
+                parcial = await _banco_hist_processar_mensagem(
+                    guild, msg, int(getattr(canal_destino, 'id', 0) or 0)
+                )
+                for chave in stats:
+                    stats[chave] += int(parcial.get(chave, 0) or 0)
+                _banco_hist_set('cursor_message_id', int(msg.id))
+                _banco_hist_stats_salvar(stats)
+                desde_update += 1
+
+                if desde_update >= 5 or (time.monotonic() - ultimo_update) >= 25:
+                    await _banco_hist_editar_status(
+                        status_msg,
+                        titulo='📚 IMPORTAÇÃO HISTÓRICA — EM ANDAMENTO',
+                        descricao='Processamento ativo. O ponto atual já está salvo no volume `/data`.',
+                        stats=stats,
+                        cor=discord.Color.blurple(),
+                    )
+                    await _banco_prof_atualizar_painel()
+                    desde_update = 0
+                    ultimo_update = time.monotonic()
+                await asyncio.sleep(0.10)
+
+            # Verifica cartões que foram apagados e publica todos os pendentes faltantes.
+            await _banco_hist_revalidar_cartoes(guild)
+            publicados_extra = await _banco_publicar_todos_ocr_pendentes(
+                guild, int(getattr(canal_destino, 'id', 0) or 0)
+            )
+            stats['ocr_postados'] += int(publicados_extra or 0)
+            _banco_hist_stats_salvar(stats)
+            _banco_hist_set('running', 0)
+            _banco_hist_set('cursor_message_id', 0)
+            await _banco_hist_editar_status(
+                status_msg,
+                titulo='✅ IMPORTAÇÃO HISTÓRICA CONCLUÍDA',
+                descricao='Todo o histórico acessível foi verificado. As fichas pendentes foram publicadas neste canal.',
+                stats=stats,
+                cor=discord.Color.green(),
+            )
+            await _banco_prof_atualizar_painel()
+        except asyncio.CancelledError:
+            # Mantém running=1 e cursor salvo para continuar no próximo start.
+            raise
+        except Exception as erro:
+            traceback.print_exc()
+            stats['erros'] += 1
+            _banco_hist_stats_salvar(stats)
+            # Mantém running=1 para retomada automática após reconexão/reinício.
+            await _banco_hist_editar_status(
+                status_msg,
+                titulo='⚠️ IMPORTAÇÃO INTERROMPIDA — RETOMADA AUTOMÁTICA',
+                descricao=f'Falha temporária: `{type(erro).__name__}: {str(erro)[:500]}`\nO progresso foi salvo e será retomado automaticamente.',
+                stats=stats,
+                cor=discord.Color.orange(),
+            )
+
+
+@bot.listen('on_ready')
+async def _banco_retomar_historico_automaticamente():
+    await asyncio.sleep(6)
+    if _banco_hist_get('running', '0') != '1' or _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
+        return
+    canal_id = int(_banco_hist_get('channel_id', '0') or 0)
+    requester_id = int(_banco_hist_get('requester_id', '0') or 0)
+    if not canal_id:
+        _banco_hist_set('running', 0)
+        return
+    canal = bot.get_channel(canal_id)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(canal_id)
+        except Exception:
+            canal = None
+    guild = getattr(canal, 'guild', None) if canal else None
+    if canal is not None and hasattr(canal, 'send'):
+        asyncio.create_task(_banco_importar_pericias_antigas_tarefa(guild, canal, requester_id))
+
+
 if __name__ == '__main__':
     asyncio.run(main())
