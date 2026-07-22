@@ -31531,5 +31531,339 @@ async def _banco_retomar_historico_automaticamente():
         asyncio.create_task(_banco_importar_pericias_antigas_tarefa(guild, canal, requester_id))
 
 
+
+# =====================================================
+# PATCH FINAL — FICHAS OCR SEM TIMEOUT DE INTERAÇÃO
+# - Os modais são enviados como PRIMEIRA ação do clique, sem consulta SQLite antes.
+# - Consultas e gravações pesadas rodam fora do event loop.
+# - OCR histórico cede tempo ao Discord entre imagens e limita threads nativas.
+# =====================================================
+
+# Evita que ONNX/OpenCV consumam toda a CPU do container e atrasem interações do Discord.
+for _variavel_cpu in (
+    "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "ORT_NUM_THREADS",
+):
+    os.environ[_variavel_cpu] = "1"
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+try:
+    import cv2 as _dicor_cv2
+    _dicor_cv2.setNumThreads(1)
+except Exception:
+    _dicor_cv2 = None
+
+
+def _banco_ocr_valor_embed(texto: str, rotulo: str, padrao: str = "") -> str:
+    bruto = str(texto or "")
+    padrao_regex = rf"(?im)^\s*\*\*{re.escape(rotulo)}:\*\*\s*`?([^`\n]+?)`?\s*$"
+    achado = re.search(padrao_regex, bruto)
+    return str(achado.group(1)).strip() if achado else padrao
+
+
+def _banco_ocr_defaults_da_mensagem(interaction: discord.Interaction) -> Dict[str, Any]:
+    """Lê os valores já exibidos no cartão, sem tocar no SQLite antes de abrir o modal."""
+    dados: Dict[str, Any] = {
+        "placa_sugerida": "", "proprietario_nome": "", "proprietario_rg": "",
+        "telefone": "", "modelo": "", "cor": "", "faccao": "", "local": "",
+        "ano": "", "chassi": "", "observacoes": "",
+    }
+    mensagem = getattr(interaction, "message", None)
+    embeds = list(getattr(mensagem, "embeds", []) or [])
+    if not embeds:
+        return dados
+    embed = embeds[0]
+    campos = {str(c.name or "").upper(): str(c.value or "") for c in getattr(embed, "fields", [])}
+    proprietario = campos.get("👤 PROPRIETÁRIO", "")
+    veiculo = campos.get("🚗 VEÍCULO", "")
+    complementares = campos.get("📌 DADOS COMPLEMENTARES", "")
+
+    dados["proprietario_nome"] = _banco_ocr_valor_embed(proprietario, "Nome")
+    dados["telefone"] = _banco_ocr_valor_embed(proprietario, "Telefone")
+    for doc in ("RG", "PASSAPORTE", "DOCUMENTO", "CPF"):
+        valor = _banco_ocr_valor_embed(proprietario, doc)
+        if valor and valor.lower() not in {"não informado", "n/a"}:
+            dados["proprietario_rg"] = valor
+            break
+
+    dados["placa_sugerida"] = _banco_ocr_valor_embed(veiculo, "Placa")
+    dados["modelo"] = _banco_ocr_valor_embed(veiculo, "Modelo")
+    dados["cor"] = _banco_ocr_valor_embed(veiculo, "Cor")
+    dados["ano"] = _banco_ocr_valor_embed(complementares, "Ano")
+    dados["chassi"] = _banco_ocr_valor_embed(complementares, "Chassi")
+    dados["faccao"] = _banco_ocr_valor_embed(complementares, "Facção")
+    dados["local"] = _banco_ocr_valor_embed(complementares, "Local")
+    return dados
+
+
+async def _banco_ocr_editar_cartao_resolvido(
+    interaction: discord.Interaction,
+    pendente_id: int,
+    item: Dict[str, Any],
+) -> None:
+    # A leitura do SQLite é deslocada para thread para nunca travar o Discord.
+    pendente = await asyncio.to_thread(_banco_ocr_pendente_por_id, int(pendente_id))
+    mensagem = getattr(interaction, "message", None)
+    if mensagem is None:
+        canal_id = int(pendente.get("revisao_canal_id") or 0)
+        mensagem_id = int(pendente.get("revisao_mensagem_id") or 0)
+        if canal_id and mensagem_id:
+            try:
+                canal = interaction.guild.get_channel(canal_id) if interaction.guild else None
+                canal = canal or await bot.fetch_channel(canal_id)
+                mensagem = await canal.fetch_message(mensagem_id)
+            except Exception:
+                mensagem = None
+    if mensagem is not None:
+        try:
+            await mensagem.edit(
+                embed=_banco_embed_ficha_confirmada(item, pendente, interaction.user),
+                view=None,
+            )
+        except discord.NotFound:
+            pass
+
+
+class BancoOCRCorrecaoModal(Modal, title="Corrigir ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Optional[Dict[str, Any]] = None):
+        super().__init__(timeout=300)
+        pendente = dict(pendente or {})
+        self.pendente_id = int(pendente_id)
+        self.placa = TextInput(
+            label="Placa correta",
+            default=str(pendente.get("placa_sugerida") or pendente.get("placa") or "")[:16],
+            max_length=16,
+        )
+        self.proprietario = TextInput(
+            label="Nome do proprietário",
+            default=str(pendente.get("proprietario_nome") or "")[:120],
+            required=False,
+            max_length=120,
+        )
+        self.documento = TextInput(
+            label="RG ou Passaporte",
+            default=str(pendente.get("proprietario_rg") or "")[:40],
+            required=False,
+            max_length=40,
+        )
+        self.telefone = TextInput(
+            label="Telefone",
+            default=str(pendente.get("telefone") or "")[:80],
+            required=False,
+            max_length=80,
+        )
+        self.modelo = TextInput(
+            label="Modelo do veículo",
+            default=str(pendente.get("modelo") or "")[:120],
+            required=False,
+            max_length=120,
+        )
+        for campo in (self.placa, self.proprietario, self.documento, self.telefone, self.modelo):
+            self.add_item(campo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_ocr(self.pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver,
+                    self.pendente_id,
+                    int(interaction.user.id),
+                    placa_final=str(self.placa.value),
+                    proprietario_nome=str(self.proprietario.value or ""),
+                    proprietario_rg=str(self.documento.value or ""),
+                    telefone=str(self.telefone.value or ""),
+                    modelo=str(self.modelo.value or ""),
+                    status_final="CORRIGIDO",
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+                await interaction.followup.send(
+                    f"✅ Ficha corrigida e salva na placa `{item.get('placa')}`.",
+                    ephemeral=True,
+                )
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível corrigir a ficha OCR.", erro)
+
+
+class BancoOCRCompletarModal(Modal, title="Completar ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Optional[Dict[str, Any]] = None):
+        super().__init__(timeout=300)
+        pendente = dict(pendente or {})
+        self.pendente_id = int(pendente_id)
+        self.cor = TextInput(
+            label="Cor", default=str(pendente.get("cor") or "")[:80], required=False, max_length=80
+        )
+        self.faccao = TextInput(
+            label="Facção/organização",
+            default=str(pendente.get("faccao") or "")[:120],
+            required=False,
+            max_length=120,
+        )
+        self.local = TextInput(
+            label="Local/último avistamento",
+            default=str(pendente.get("local") or "")[:180],
+            required=False,
+            max_length=180,
+        )
+        self.ano_chassi = TextInput(
+            label="Ano | Chassi",
+            default=f"{pendente.get('ano') or ''} | {pendente.get('chassi') or ''}"[:180],
+            required=False,
+            max_length=180,
+        )
+        self.observacoes = TextInput(
+            label="Observações",
+            default=str(pendente.get("observacoes") or "")[:500],
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+        )
+        for campo in (self.cor, self.faccao, self.local, self.ano_chassi, self.observacoes):
+            self.add_item(campo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_ocr(self.pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                ano, chassi = _banco_prof_parse_duplo(self.ano_chassi.value)
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver,
+                    self.pendente_id,
+                    int(interaction.user.id),
+                    cor=str(self.cor.value or ""),
+                    faccao=str(self.faccao.value or ""),
+                    local=str(self.local.value or ""),
+                    ano=ano,
+                    chassi=chassi,
+                    observacoes=str(self.observacoes.value or ""),
+                    status_final="CORRIGIDO",
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+                await interaction.followup.send(
+                    f"✅ Ficha completada e salva na placa `{item.get('placa')}`.",
+                    ephemeral=True,
+                )
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível completar a ficha OCR.", erro)
+
+
+class BancoOCRReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Apenas a equipe DICOR pode revisar fichas.", ephemeral=True
+                )
+            return False
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        # Erro 10062 significa que o clique expirou antes do callback. Não gera outro traceback infinito.
+        if isinstance(error, discord.NotFound) and getattr(error, "code", 0) == 10062:
+            print("⚠️ Interação OCR expirada antes da resposta; clique novamente no botão.", flush=True)
+            return
+        await _banco_prof_erro_interacao(interaction, "A ação da ficha OCR apresentou uma falha.", error)
+
+    @discord.ui.button(
+        label="Confirmar ficha", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id="dicor_banco_ocr_confirmar", row=0,
+    )
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ACK é sempre a primeira operação.
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="CONFIRMADO"
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, pendente_id, item)
+                await interaction.followup.send(
+                    f"✅ Ficha confirmada. Proprietário, veículo e evidência vinculados à placa `{item.get('placa')}`.",
+                    ephemeral=True,
+                )
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível confirmar a ficha.", erro)
+
+    @discord.ui.button(
+        label="Corrigir ficha", emoji="✏️", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_ocr_corrigir", row=0,
+    )
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # IMPORTANTE: nenhuma consulta ao banco acontece antes do send_modal.
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        defaults = _banco_ocr_defaults_da_mensagem(interaction)
+        await interaction.response.send_modal(BancoOCRCorrecaoModal(pendente_id, defaults))
+
+    @discord.ui.button(
+        label="Completar dados", emoji="📝", style=discord.ButtonStyle.secondary,
+        custom_id="dicor_banco_ocr_completar", row=0,
+    )
+    async def completar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # IMPORTANTE: nenhuma consulta ao banco acontece antes do send_modal.
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        defaults = _banco_ocr_defaults_da_mensagem(interaction)
+        await interaction.response.send_modal(BancoOCRCompletarModal(pendente_id, defaults))
+
+    @discord.ui.button(
+        label="Ignorar", emoji="❌", style=discord.ButtonStyle.danger,
+        custom_id="dicor_banco_ocr_ignorar", row=0,
+    )
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="IGNORADO"
+                )
+                if interaction.message:
+                    await interaction.message.edit(
+                        embed=discord.Embed(
+                            title="❌ FICHA OCR IGNORADA",
+                            description=f"Ignorada por {interaction.user.mention}. Nenhum cadastro foi criado.",
+                            color=discord.Color.red(),
+                        ),
+                        view=None,
+                    )
+                await interaction.followup.send("✅ Ficha ignorada e retirada da fila.", ephemeral=True)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível ignorar a ficha.", erro)
+
+
+# Faz a importação histórica dar espaço para interações entre cada mensagem/imagem.
+_BANCO_HIST_PROCESSAR_ANTES_MODAL_SAFE = _banco_hist_processar_mensagem
+
+
+async def _banco_hist_processar_mensagem(
+    guild: Optional[discord.Guild],
+    msg: discord.Message,
+    canal_revisao_id: int,
+) -> Dict[str, int]:
+    await asyncio.sleep(0.35)
+    resultado = await _BANCO_HIST_PROCESSAR_ANTES_MODAL_SAFE(guild, msg, canal_revisao_id)
+    # Pausa curta deliberada: evita que OCR/SQLite ocupem o container continuamente.
+    await asyncio.sleep(0.75)
+    return resultado
+
+
 if __name__ == '__main__':
     asyncio.run(main())
