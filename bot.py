@@ -35484,5 +35484,633 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# CENTRAL DE FICHAS V6 — OCR ESTRUTURADO DE PAINÉIS
+# Corrige tabelas em imagem: preserva linhas/colunas e nunca divide telefone
+# em nome + RG. O painel é convertido para um formato canônico antes de salvar.
+# =====================================================
+
+_BANCO_EXTRAIR_MEMBROS_ANTES_V6 = banco_extrair_membros_painel
+_BANCO_V6_JSON_PREFIX = "__DICOR_MEMBROS_JSON__="
+_BANCO_V6_ORIGINAL_PREFIX = "__DICOR_PAINEL_ORIGINAL__"
+_BANCO_V6_PAINEL_DIR = Path(DATA_DIR) / "paineis_originais"
+_BANCO_V6_PAINEL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def banco_extrair_membros_painel(texto: str) -> List[Dict[str, str]]:
+    """Usa os membros estruturados da V6 quando presentes.
+
+    Isso impede que a confirmação execute novamente o parser genérico e transforme
+    telefones como ``(011) 543-327`` em nome ``(011) 543`` e RG ``327``.
+    """
+    bruto = str(texto or "")
+    for linha in bruto.splitlines():
+        if not linha.startswith(_BANCO_V6_JSON_PREFIX):
+            continue
+        try:
+            payload = _banco_json.loads(linha[len(_BANCO_V6_JSON_PREFIX):])
+            membros = list(payload.get("membros") or []) if isinstance(payload, dict) else []
+            saida: List[Dict[str, str]] = []
+            vistos: set[str] = set()
+            for item in membros:
+                if not isinstance(item, dict):
+                    continue
+                nome = _banco_limpar_texto(item.get("nome"), 120).strip(" -|:;,")
+                rg = _banco_normalizar_rg(item.get("rg"))
+                telefone = _banco_v5_normalizar_telefone(item.get("telefone"))
+                cargo = _banco_v5_cargo_normalizado(item.get("cargo") or "MEMBRO")
+                if not nome or not rg or rg in vistos:
+                    continue
+                vistos.add(rg)
+                saida.append({"nome": nome, "rg": rg, "telefone": telefone, "cargo": cargo})
+            if saida:
+                return saida
+        except Exception:
+            traceback.print_exc()
+        break
+    return _BANCO_EXTRAIR_MEMBROS_ANTES_V6(bruto)
+
+
+def _banco_v6_box_limites(box: Any) -> Tuple[float, float, float, float]:
+    pontos: List[Tuple[float, float]] = []
+    try:
+        for ponto in list(box or []):
+            if isinstance(ponto, (list, tuple)) and len(ponto) >= 2:
+                pontos.append((float(ponto[0]), float(ponto[1])))
+    except Exception:
+        pontos = []
+    if not pontos:
+        return 0.0, 0.0, 0.0, 0.0
+    xs = [p[0] for p in pontos]
+    ys = [p[1] for p in pontos]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _banco_v6_ocr_blocos_sync(caminho: str) -> Dict[str, Any]:
+    """Lê OCR mantendo caixa, posição X/Y e confiança de cada trecho."""
+    engine = _banco_ocr_obter_engine()
+    temporario: Optional[Path] = None
+    largura = altura = 0
+    try:
+        arquivo_ocr = str(caminho)
+        if PILImage is not None:
+            from PIL import ImageOps, ImageEnhance, ImageFilter
+            with PILImage.open(caminho) as origem:
+                imagem = ImageOps.exif_transpose(origem).convert("RGB")
+            # Painéis têm letras pequenas. Amplia, mas limita pixels para não estourar RAM.
+            w, h = imagem.size
+            escala = min(3.0, max(1.0, 2400.0 / max(1, max(w, h))))
+            if escala != 1.0:
+                imagem = imagem.resize(
+                    (max(1, int(w * escala)), max(1, int(h * escala))),
+                    PILImage.Resampling.LANCZOS,
+                )
+            imagem = ImageOps.autocontrast(imagem)
+            imagem = ImageEnhance.Contrast(imagem).enhance(1.35)
+            imagem = ImageEnhance.Sharpness(imagem).enhance(1.45)
+            imagem = imagem.filter(ImageFilter.SHARPEN)
+            largura, altura = imagem.size
+            temporario = _BANCO_V6_PAINEL_DIR / (
+                f"ocr-painel-{int(time.time() * 1000)}-{secrets.token_hex(4)}.jpg"
+            )
+            imagem.save(temporario, "JPEG", quality=94, optimize=True)
+            imagem.close()
+            arquivo_ocr = str(temporario)
+
+        resultado = engine(arquivo_ocr, use_det=True, use_cls=True, use_rec=True)
+        blocos: List[Dict[str, Any]] = []
+        textos = list(getattr(resultado, "txts", None) or [])
+        scores = list(getattr(resultado, "scores", None) or [])
+        boxes = list(getattr(resultado, "boxes", None) or [])
+        if textos:
+            for i, texto_lido in enumerate(textos):
+                texto_limpo = re.sub(r"\s+", " ", str(texto_lido or "")).strip()
+                if not texto_limpo:
+                    continue
+                box = boxes[i] if i < len(boxes) else []
+                x1, y1, x2, y2 = _banco_v6_box_limites(box)
+                blocos.append({
+                    "texto": texto_limpo,
+                    "score": float(scores[i]) if i < len(scores) else 0.5,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                    "h": max(1.0, y2 - y1),
+                })
+        elif isinstance(resultado, tuple) and resultado:
+            bruto = resultado[0]
+            if isinstance(bruto, list):
+                for item in bruto:
+                    if not (isinstance(item, (list, tuple)) and len(item) >= 2):
+                        continue
+                    box = item[0]
+                    dados = item[1]
+                    if not (isinstance(dados, (list, tuple)) and dados):
+                        continue
+                    texto_limpo = re.sub(r"\s+", " ", str(dados[0] or "")).strip()
+                    if not texto_limpo:
+                        continue
+                    x1, y1, x2, y2 = _banco_v6_box_limites(box)
+                    blocos.append({
+                        "texto": texto_limpo,
+                        "score": float(dados[1] if len(dados) > 1 else 0.5),
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                        "h": max(1.0, y2 - y1),
+                    })
+        if not largura and blocos:
+            largura = int(max((b["x2"] for b in blocos), default=0))
+            altura = int(max((b["y2"] for b in blocos), default=0))
+        return {"blocos": blocos, "largura": largura, "altura": altura}
+    finally:
+        if temporario is not None:
+            try:
+                temporario.unlink(missing_ok=True)
+            except Exception:
+                pass
+        _dicor_gc.collect()
+
+
+_BANCO_V6_TELEFONE_RE = re.compile(
+    r"(?<!\d)(?:\(\s*0?\d{2,3}\s*\)|0?\d{2,3})?\s*\d{3,5}\s*[-–— ]\s*\d{3,5}(?!\d)"
+)
+_BANCO_V6_CARGOS = (
+    "SUBCHEFE", "VICE-LÍDER", "VICE LÍDER", "SUBLÍDER", "SUB LÍDER",
+    "LÍDER", "LIDER", "CHEFE", "GERENTE", "CONSELHEIRO", "TESOUREIRO",
+    "RESPONSÁVEL", "RESPONSAVEL", "VAPOR", "OLHEIRO", "RECRUTA", "MEMBRO",
+    "INTEGRANTE",
+)
+_BANCO_V6_UI = {
+    "membros", "membro", "sair", "facção", "faccao", "painel", "lista",
+    "status", "ações", "acoes", "ação", "acao", "capital", "morada",
+    "adicionar", "remover", "editar", "gerenciar", "organização", "organizacao",
+}
+
+
+def _banco_v6_extrair_telefone(texto: str) -> str:
+    m = _BANCO_V6_TELEFONE_RE.search(str(texto or ""))
+    return _banco_v5_normalizar_telefone(m.group(0)) if m else ""
+
+
+def _banco_v6_cargo_texto(texto: str) -> str:
+    n = normalizar_busca(texto)
+    for cargo in _BANCO_V6_CARGOS:
+        if normalizar_busca(cargo) in n:
+            return _banco_v5_cargo_normalizado(cargo)
+    return ""
+
+
+def _banco_v6_agrupar_linhas(blocos: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    validos = [b for b in blocos if str(b.get("texto") or "").strip() and float(b.get("score") or 0) >= 0.20]
+    if not validos:
+        return []
+    alturas = sorted(float(b.get("h") or 1.0) for b in validos)
+    mediana = alturas[len(alturas) // 2] if alturas else 12.0
+    tolerancia = max(10.0, mediana * 0.85)
+    linhas: List[List[Dict[str, Any]]] = []
+    for bloco in sorted(validos, key=lambda b: (float(b.get("cy") or 0), float(b.get("x1") or 0))):
+        melhor: Optional[List[Dict[str, Any]]] = None
+        melhor_dist = 10**9
+        cy = float(bloco.get("cy") or 0)
+        for linha in linhas[-4:]:
+            centro = sum(float(x.get("cy") or 0) for x in linha) / max(1, len(linha))
+            dist = abs(cy - centro)
+            if dist <= tolerancia and dist < melhor_dist:
+                melhor = linha
+                melhor_dist = dist
+        if melhor is None:
+            linhas.append([bloco])
+        else:
+            melhor.append(bloco)
+    for linha in linhas:
+        linha.sort(key=lambda b: float(b.get("x1") or 0))
+    return linhas
+
+
+def _banco_v6_registro_da_linha(linha: List[Dict[str, Any]], largura: float) -> Optional[Dict[str, str]]:
+    """Converte uma linha visual do painel em uma pessoa sem misturar colunas.
+
+    Regra principal: telefone nunca pode virar nome ou RG. Um RG sem rótulo só é
+    aceito quando aparece como uma célula curta na parte esquerda da tabela.
+    """
+    if not linha:
+        return None
+
+    pares: List[Tuple[str, Dict[str, Any]]] = [
+        (str(bloco.get("texto") or "").strip(), bloco)
+        for bloco in linha
+        if str(bloco.get("texto") or "").strip()
+    ]
+    if not pares:
+        return None
+    pares.sort(key=lambda item: float(item[1].get("x1") or 0))
+    tokens = [item[0] for item in pares]
+    texto_linha = " | ".join(tokens)
+    telefone = _banco_v6_extrair_telefone(texto_linha)
+    cargo = _banco_v6_cargo_texto(texto_linha)
+    telefone_digitos = re.sub(r"\D", "", telefone)
+
+    usados: set[int] = set()
+    for i, token in enumerate(tokens):
+        token_tel = _banco_v6_extrair_telefone(token)
+        token_cargo = _banco_v6_cargo_texto(token)
+        if token_tel or token_cargo:
+            usados.add(i)
+            continue
+        digitos_token = re.sub(r"\D", "", token)
+        if telefone_digitos and digitos_token and len(digitos_token) >= 3 and digitos_token in telefone_digitos:
+            xpos = float(pares[i][1].get("cx") or 0) / max(1.0, float(largura or 1))
+            if xpos >= 0.55:
+                usados.add(i)
+
+    rg = ""
+    rg_indice: Optional[int] = None
+
+    for i, token in enumerate(tokens):
+        m = re.search(
+            r"(?i)(?:\bRG\b|\bID\b|PASSAPORTE|DOCUMENTO|IDENTIDADE|REGISTRO)\s*[:#=-]?\s*([A-Za-z0-9.-]{2,16})",
+            token,
+        )
+        if not m:
+            m = re.search(r"#\s*([A-Za-z0-9.-]{2,16})", token)
+        if m:
+            candidato = _banco_normalizar_rg(m.group(1))
+            if candidato:
+                rg = candidato
+                rg_indice = i
+                usados.add(i)
+                break
+
+    if not rg:
+        candidatos_rg: List[Tuple[float, int, str]] = []
+        for i, (token, bloco) in enumerate(pares):
+            if i in usados:
+                continue
+            limpo = token.strip(" #|:;,-")
+            if not re.fullmatch(r"[A-Za-z0-9.-]{2,10}", limpo):
+                continue
+            digitos = re.sub(r"\D", "", limpo)
+            if not (2 <= len(digitos) <= 7):
+                continue
+            xpos = float(bloco.get("cx") or 0) / max(1.0, float(largura or 1))
+            if xpos > 0.30:
+                continue
+            if telefone_digitos and digitos and digitos in telefone_digitos and xpos >= 0.45:
+                continue
+            candidatos_rg.append((xpos, i, limpo))
+        if candidatos_rg:
+            candidatos_rg.sort(key=lambda item: (item[0], len(item[2])))
+            _, rg_indice, valor = candidatos_rg[0]
+            rg = _banco_normalizar_rg(valor)
+            usados.add(rg_indice)
+
+    if not rg and pares:
+        primeiro_texto, primeiro_bloco = pares[0]
+        primeiro_x = float(primeiro_bloco.get("x1") or 0) / max(1.0, float(largura or 1))
+        m_inicio = re.match(r"^\s*#?\s*([0-9]{2,7})\s+(?=[A-Za-zÀ-ÿ])", primeiro_texto)
+        if m_inicio and primeiro_x <= 0.25:
+            rg = _banco_normalizar_rg(m_inicio.group(1))
+            rg_indice = 0
+
+    nome_partes: List[str] = []
+    for i, (token, bloco) in enumerate(pares):
+        limpo = token.strip(" |:;,-")
+        if not limpo:
+            continue
+        limpo = _BANCO_V6_TELEFONE_RE.sub(" ", limpo)
+        for cargo_nome in sorted(_BANCO_V6_CARGOS, key=len, reverse=True):
+            limpo = re.sub(rf"(?i)\b{re.escape(cargo_nome)}\b", " ", limpo)
+        limpo = re.sub(
+            r"(?i)(?:\bRG\b|\bID\b|PASSAPORTE|DOCUMENTO|IDENTIDADE|REGISTRO)\s*[:#=-]?\s*[A-Za-z0-9.-]+",
+            " ", limpo,
+        )
+        limpo = re.sub(r"#\s*[A-Za-z0-9.-]{2,16}", " ", limpo)
+        if rg and i == rg_indice:
+            limpo = re.sub(rf"^\s*#?\s*{re.escape(str(rg))}\s*", " ", limpo, count=1, flags=re.I)
+        limpo = re.sub(r"\s+", " ", limpo).strip(" |:;,-")
+
+        n = normalizar_busca(limpo)
+        if not limpo or n in _BANCO_V6_UI:
+            continue
+        if any(ui in n for ui in ("adicionar membro", "gerenciar membro", "remover membro")):
+            continue
+        if re.fullmatch(r"[\d()./#\-\s]+", limpo):
+            continue
+        if sum(ch.isalpha() for ch in limpo) < 3:
+            continue
+
+        xpos = float(bloco.get("cx") or 0) / max(1.0, float(largura or 1))
+        if xpos > 0.72 and len(pares) > 1:
+            continue
+        nome_partes.append(limpo)
+
+    nome = _banco_limpar_texto(" ".join(nome_partes), 120).strip()
+    nome_norm = normalizar_busca(nome)
+    if not nome or nome_norm in _BANCO_V6_UI:
+        return None
+    if _banco_v6_extrair_telefone(nome):
+        return None
+    if sum(ch.isalpha() for ch in nome) < 3:
+        return None
+
+    return {
+        "nome": nome,
+        "rg": rg,
+        "telefone": telefone,
+        "cargo": cargo or "MEMBRO",
+    }
+
+def _banco_v6_membros_de_blocos(payload: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    blocos = list(payload.get("blocos") or [])
+    largura = float(payload.get("largura") or 1)
+    linhas = _banco_v6_agrupar_linhas(blocos)
+    completos: List[Dict[str, str]] = []
+    incompletos: List[Dict[str, str]] = []
+    for linha in linhas:
+        registro = _banco_v6_registro_da_linha(linha, largura)
+        if not registro:
+            continue
+        if registro.get("nome") and registro.get("rg"):
+            completos.append(registro)
+        elif registro.get("nome") and (registro.get("telefone") or registro.get("cargo") != "MEMBRO"):
+            incompletos.append(registro)
+    return completos, incompletos
+
+
+def _banco_v6_mesclar_membros(registros: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    saida: List[Dict[str, str]] = []
+    por_chave: Dict[str, Dict[str, str]] = {}
+    for item in registros:
+        nome = _banco_limpar_texto(item.get("nome"), 120).strip()
+        rg = _banco_normalizar_rg(item.get("rg"))
+        telefone = _banco_v5_normalizar_telefone(item.get("telefone"))
+        cargo = _banco_v5_cargo_normalizado(item.get("cargo") or "MEMBRO")
+        if not nome:
+            continue
+        chave_nome = normalizar_busca(nome)
+        chave_tel = re.sub(r"\D", "", telefone)
+        chave = f"rg:{rg}" if rg else (f"nome:{chave_nome}" if chave_nome else f"tel:{chave_tel}")
+        existente = por_chave.get(chave)
+        if existente is None:
+            # Tenta unir a mesma pessoa entre screenshots por nome ou telefone.
+            for candidato in saida:
+                if chave_nome and normalizar_busca(candidato.get("nome")) == chave_nome:
+                    existente = candidato
+                    break
+                if chave_tel and re.sub(r"\D", "", candidato.get("telefone") or "") == chave_tel:
+                    existente = candidato
+                    break
+        if existente is None:
+            existente = {"nome": nome, "rg": rg, "telefone": telefone, "cargo": cargo}
+            saida.append(existente)
+        else:
+            if rg and not existente.get("rg"):
+                existente["rg"] = rg
+            if telefone and not existente.get("telefone"):
+                existente["telefone"] = telefone
+            if cargo and (not existente.get("cargo") or existente.get("cargo") == "MEMBRO"):
+                existente["cargo"] = cargo
+            if len(nome) > len(existente.get("nome") or ""):
+                existente["nome"] = nome
+        por_chave[chave] = existente
+    return saida
+
+
+async def _banco_v6_extrair_mensagem_painel(msg: discord.Message) -> Tuple[str, List[Dict[str, str]], List[Dict[str, str]], Dict[str, int]]:
+    """Extrai painel mantendo OCR visual separado do parser de texto.
+
+    O OCR bruto das imagens é guardado apenas para auditoria. Ele NÃO é reenviado
+    ao parser genérico, porque isso era o que transformava ``(011) 543-327`` em
+    nome ``(011) 543`` e RG ``327``.
+    """
+    fontes_textuais: List[str] = []
+    textos_ocr_auditoria: List[str] = []
+    registros: List[Dict[str, str]] = []
+    incompletos: List[Dict[str, str]] = []
+    metricas = {
+        "texto": 0,
+        "embeds": 0,
+        "arquivos_texto": 0,
+        "imagens_ocr": 0,
+        "linhas_estruturadas": 0,
+    }
+
+    if str(msg.content or "").strip():
+        fontes_textuais.append(str(msg.content))
+        metricas["texto"] += 1
+    for embed in list(getattr(msg, "embeds", []) or []):
+        pedacos = [str(embed.title or ""), str(embed.description or "")]
+        for field in list(getattr(embed, "fields", []) or []):
+            pedacos.append(f"{field.name}: {field.value}")
+        bloco = "\n".join(x for x in pedacos if x.strip())
+        if bloco.strip():
+            fontes_textuais.append(bloco)
+            metricas["embeds"] += 1
+
+    pasta = _BANCO_V6_PAINEL_DIR / str(int(msg.id))
+    pasta.mkdir(parents=True, exist_ok=True)
+    for indice, anexo in enumerate(list(getattr(msg, "attachments", []) or [])[:10]):
+        nome_original = Path(str(getattr(anexo, "filename", "") or f"anexo-{indice}")).name
+        nome_seguro = re.sub(r"[^0-9A-Za-z._-]+", "_", nome_original)[:150] or f"anexo-{indice}.bin"
+        destino = pasta / f"{indice:02d}-{nome_seguro}"
+        try:
+            dados = await anexo.read()
+            destino.write_bytes(dados)
+        except Exception:
+            traceback.print_exc()
+            continue
+
+        sufixo = destino.suffix.lower()
+        content_type = str(getattr(anexo, "content_type", "") or "").lower()
+        if sufixo in {".txt", ".csv", ".md", ".log"} or content_type.startswith("text/"):
+            conteudo = ""
+            for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    conteudo = dados.decode(encoding)
+                    break
+                except Exception:
+                    pass
+            if conteudo.strip():
+                fontes_textuais.append(conteudo)
+                metricas["arquivos_texto"] += 1
+            continue
+
+        if content_type.startswith("image/") or sufixo in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            payload = await asyncio.to_thread(_banco_v6_ocr_blocos_sync, str(destino))
+            completos_img, incompletos_img = await asyncio.to_thread(_banco_v6_membros_de_blocos, payload)
+            registros.extend(completos_img)
+            incompletos.extend(incompletos_img)
+            metricas["imagens_ocr"] += 1
+            metricas["linhas_estruturadas"] += len(completos_img)
+            texto_ocr = "\n".join(
+                str(x.get("texto") or "")
+                for x in payload.get("blocos", [])
+                if str(x.get("texto") or "").strip()
+            )
+            if texto_ocr.strip():
+                textos_ocr_auditoria.append(f"[OCR IMAGEM {indice + 1}]\n{texto_ocr}")
+
+    texto_digitado = "\n\n".join(x.strip() for x in fontes_textuais if x and x.strip())
+    if texto_digitado.strip():
+        try:
+            registros.extend(await asyncio.to_thread(_BANCO_EXTRAIR_MEMBROS_ANTES_V6, texto_digitado))
+        except Exception:
+            traceback.print_exc()
+
+    mesclados = _banco_v6_mesclar_membros(registros + incompletos)
+    completos: List[Dict[str, str]] = []
+    pendencias: List[Dict[str, str]] = []
+    for item in mesclados:
+        nome = str(item.get("nome") or "").strip()
+        rg = _banco_normalizar_rg(item.get("rg"))
+        telefone = _banco_v5_normalizar_telefone(item.get("telefone"))
+        if not nome or _banco_v6_extrair_telefone(nome):
+            continue
+        item_limpo = {
+            "nome": _banco_limpar_texto(nome, 120),
+            "rg": rg,
+            "telefone": telefone,
+            "cargo": _banco_v5_cargo_normalizado(item.get("cargo") or "MEMBRO"),
+        }
+        if item_limpo["rg"]:
+            completos.append(item_limpo)
+        else:
+            pendencias.append(item_limpo)
+
+    payload_json = _banco_json.dumps({"membros": completos}, ensure_ascii=False, separators=(",", ":"))
+    auditoria = "\n\n".join([texto_digitado] + textos_ocr_auditoria).strip()
+    texto_canonico = (
+        _BANCO_V6_JSON_PREFIX + payload_json + "\n" +
+        _BANCO_V6_ORIGINAL_PREFIX + "\n" + auditoria
+    )
+    return texto_canonico, completos, pendencias, metricas
+
+def _banco_v6_campos_embed_membros(embed: discord.Embed, membros: List[Dict[str, str]]) -> None:
+    linhas = []
+    for membro in membros:
+        telefone = f" • ☎️ {membro.get('telefone')}" if membro.get("telefone") else ""
+        linhas.append(
+            f"• **{membro.get('nome') or 'Sem nome'}** — RG `{membro.get('rg') or 'N/I'}` • "
+            f"{membro.get('cargo') or 'MEMBRO'}{telefone}"
+        )
+    bloco: List[str] = []
+    tamanho = 0
+    pagina = 1
+    for linha in linhas:
+        if bloco and tamanho + len(linha) + 1 > 900:
+            embed.add_field(name=f"👥 Integrantes • parte {pagina}", value="\n".join(bloco), inline=False)
+            pagina += 1
+            bloco = []
+            tamanho = 0
+        bloco.append(linha)
+        tamanho += len(linha) + 1
+    if bloco:
+        embed.add_field(
+            name="👥 Integrantes" if pagina == 1 else f"👥 Integrantes • parte {pagina}",
+            value="\n".join(bloco)[:1024], inline=False,
+        )
+
+
+class BancoImportarPainelModal(Modal, title="Importar painel completo"):
+    def __init__(self, painel_canal_id: int = 0, painel_mensagem_id: int = 0, *, modo: str = "mesclar"):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.modo = "substituir" if normalizar_busca(modo).startswith("sub") else "mesclar"
+        self.faccao = TextInput(label="Facção ou nome da mesa", placeholder="Ex.: Olimpo", max_length=120)
+        self.add_item(self.faccao)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send("⏳ Você já possui outra operação aberta.", ephemeral=True)
+        async with lock:
+            msg: Optional[discord.Message] = None
+            try:
+                descricao_modo = (
+                    "**MESCLAR:** adiciona e atualiza os encontrados, mantendo os demais integrantes ativos."
+                    if self.modo == "mesclar"
+                    else "**SUBSTITUIR:** o painel enviado vira a lista atual; ausentes ficam inativos, mas fichas e histórico não são apagados."
+                )
+                msg = await _banco_esperar_mensagem_usuario(
+                    interaction,
+                    f"🏴 **MODO SELECIONADO: {self.modo.upper()}**\n{descricao_modo}\n\n"
+                    "Envie o painel em **uma única mensagem**. Prints são lidos mantendo as linhas e colunas: "
+                    "**RG, nome, cargo e telefone não serão misturados**.\n\n"
+                    "Formatos: texto, tabela, imagens/prints ou arquivo `.txt`, `.csv` e `.md`.",
+                    timeout=600,
+                )
+                if msg is None:
+                    return
+                texto, membros, pendencias, origem_metricas = await _banco_v6_extrair_mensagem_painel(msg)
+                if not membros:
+                    detalhes = ""
+                    if pendencias:
+                        detalhes = " Nomes encontrados sem RG: " + ", ".join(x.get("nome", "") for x in pendencias[:8])
+                    raise ValueError(
+                        "Nenhuma linha completa com NOME e RG foi identificada. Envie imagens mais nítidas ou uma tabela de texto."
+                        + detalhes
+                    )
+                mesa = banco_encontrar_mesa(str(self.faccao.value))
+                embed = discord.Embed(
+                    title="📋 PRÉVIA ESTRUTURADA DO PAINEL",
+                    description=(
+                        "O bot preservou as linhas/colunas do print. **Telefone não é usado como nome ou RG.** "
+                        "Revise todos os dados antes de confirmar."
+                    ),
+                    color=discord.Color.gold(),
+                )
+                embed.add_field(name="🏴 Organização", value=str(self.faccao.value), inline=True)
+                embed.add_field(name="🔄 Modo", value="MESCLAR" if self.modo == "mesclar" else "SUBSTITUIR LISTA ATUAL", inline=True)
+                embed.add_field(name="🕵️ Mesa associada", value=str(mesa.get("nome_canal") or "Não encontrada"), inline=False)
+                embed.add_field(
+                    name="📥 Leitura",
+                    value=(
+                        f"Imagens: **{origem_metricas['imagens_ocr']}** • Linhas estruturadas: **{origem_metricas['linhas_estruturadas']}**\n"
+                        f"Texto/embeds/arquivos: **{origem_metricas['texto'] + origem_metricas['embeds'] + origem_metricas['arquivos_texto']}**"
+                    ), inline=False,
+                )
+                embed.add_field(
+                    name="📊 Resultado válido",
+                    value=(
+                        f"Pessoas: **{len(membros)}** • RGs: **{sum(1 for x in membros if x.get('rg'))}** • "
+                        f"Telefones: **{sum(1 for x in membros if x.get('telefone'))}** • "
+                        f"Cargos: **{sum(1 for x in membros if x.get('cargo'))}**"
+                    ), inline=False,
+                )
+                if pendencias:
+                    exemplos = "\n".join(
+                        f"• {x.get('nome')} • {x.get('cargo') or 'MEMBRO'} • {x.get('telefone') or 'sem telefone'}"
+                        for x in pendencias[:12]
+                    )
+                    embed.add_field(
+                        name=f"⚠️ Não importados — RG não identificado ({len(pendencias)})",
+                        value=(exemplos or "Nenhum")[:1024], inline=False,
+                    )
+                _banco_v6_campos_embed_membros(embed, membros)
+                await interaction.followup.send(
+                    embed=embed,
+                    view=BancoConfirmarPainelView(
+                        usuario_id=int(interaction.user.id), faccao=str(self.faccao.value), modo=self.modo,
+                        texto=texto, painel_canal_id=self.painel_canal_id,
+                        painel_mensagem_id=self.painel_mensagem_id,
+                    ),
+                    ephemeral=True,
+                )
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            except Exception as erro:
+                traceback.print_exc()
+                await _banco_prof_erro_interacao(interaction, "Não foi possível preparar a importação estruturada.", erro)
+
+
+print(
+    "✅ Central de Fichas V6 ativa: OCR de painel por linhas/colunas; nome, RG, telefone e cargo separados com segurança.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
