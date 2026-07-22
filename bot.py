@@ -34935,5 +34935,554 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# CENTRAL DE FICHAS V5 — IMPORTAÇÃO PROFISSIONAL DE PAINÉIS
+# Aceita texto, tabelas, imagens/prints e arquivos .txt/.csv/.md.
+# Extrai nome, RG/passaporte, telefone e cargo, mesclando com fichas existentes.
+# =====================================================
+
+_BANCO_EXTRAIR_MEMBROS_PAINEL_ANTES_V5 = banco_extrair_membros_painel
+
+
+def _banco_v5_limpar_linha_painel(valor: Any) -> str:
+    linha = str(valor or "").replace("｜", "|").replace("—", "-").replace("–", "-")
+    linha = re.sub(r"[*_`>#]+", "", linha)
+    linha = re.sub(r"^[\s•·▪▫◦‣⁃\-–—]+", "", linha)
+    return re.sub(r"\s+", " ", linha).strip()
+
+
+def _banco_v5_normalizar_telefone(valor: Any) -> str:
+    telefone = _banco_limpar_texto(valor, 80).strip(" -|:;,")
+    if not telefone:
+        return ""
+    # Mantém a formatação original, mas rejeita valores curtos que claramente não são telefone.
+    digitos = re.sub(r"\D", "", telefone)
+    if len(digitos) < 5:
+        return ""
+    return telefone
+
+
+def _banco_v5_cargo_normalizado(valor: Any, padrao: str = "MEMBRO") -> str:
+    bruto = _banco_limpar_texto(valor, 100).strip(" -|:;,")
+    n = normalizar_busca(bruto)
+    mapa = [
+        ("sub chefe", "SUBCHEFE"), ("subchefe", "SUBCHEFE"),
+        ("vice lider", "VICE-LÍDER"), ("vice-lider", "VICE-LÍDER"),
+        ("sub lider", "SUBLÍDER"), ("sublider", "SUBLÍDER"),
+        ("lider", "LÍDER"), ("chefe", "CHEFE"),
+        ("gerente", "GERENTE"), ("conselheiro", "CONSELHEIRO"),
+        ("tesoureiro", "TESOUREIRO"), ("responsavel", "RESPONSÁVEL"),
+        ("vapor", "VAPOR"), ("olheiro", "OLHEIRO"),
+        ("recruta", "RECRUTA"), ("membro", "MEMBRO"),
+        ("integrante", "MEMBRO"),
+    ]
+    for chave, cargo in mapa:
+        if chave in n:
+            return cargo
+    return bruto.upper() if bruto and len(bruto) <= 60 else str(padrao or "MEMBRO")
+
+
+def _banco_v5_rotulo_canonico(rotulo: str) -> str:
+    n = normalizar_busca(rotulo).strip()
+    if n in {"nome", "nome completo", "integrante", "membro", "proprietario", "proprietário"}:
+        return "nome"
+    if n in {"rg", "passaporte", "documento", "identidade", "id", "registro"}:
+        return "rg"
+    if n in {"telefone", "tel", "celular", "contato", "numero", "número"}:
+        return "telefone"
+    if n in {"cargo", "funcao", "função", "patente", "posicao", "posição", "hierarquia"}:
+        return "cargo"
+    return ""
+
+
+_BANCO_V5_LABEL_RE = re.compile(
+    r"(?i)(nome\s+completo|nome|integrante|membro|propriet[aá]rio|passaporte|documento|identidade|registro|rg|id|telefone|tel|celular|contato|n[uú]mero|cargo|fun[cç][aã]o|patente|posi[cç][aã]o|hierarquia)\s*[:=\-]\s*"
+)
+
+
+def _banco_v5_campos_inline(linha: str) -> Dict[str, str]:
+    resultado: Dict[str, str] = {}
+    linha_texto = str(linha or "")
+    matches = list(_BANCO_V5_LABEL_RE.finditer(linha_texto))
+    # Ex.: "Pedro Alves - RG: 77777 - Telefone: ...".
+    # Tudo antes do primeiro rótulo é o nome, desde que não seja apenas pontuação.
+    if matches and matches[0].start() > 0:
+        prefixo = linha_texto[:matches[0].start()].strip(" |;,-")
+        if prefixo and re.search(r"[A-Za-zÀ-ÿ]", prefixo):
+            resultado["nome"] = prefixo
+    for i, match in enumerate(matches):
+        inicio = match.end()
+        fim = matches[i + 1].start() if i + 1 < len(matches) else len(linha_texto)
+        valor = linha_texto[inicio:fim].strip(" |;,-")
+        chave = _banco_v5_rotulo_canonico(match.group(1))
+        if chave and valor:
+            resultado[chave] = valor
+    return resultado
+
+
+def _banco_v5_dividir_colunas(linha: str) -> List[str]:
+    if "|" in linha or ";" in linha or "\t" in linha:
+        return [x.strip() for x in re.split(r"\s*[|;\t]\s*", linha) if x.strip()]
+    return [x.strip() for x in re.split(r"\s{2,}", linha) if x.strip()]
+
+
+def banco_extrair_membros_painel(texto: str) -> List[Dict[str, str]]:
+    bruto = str(texto or "").replace("\r\n", "\n").replace("\r", "\n")
+    linhas_originais = bruto.split("\n")
+    linhas = [_banco_v5_limpar_linha_painel(x) for x in linhas_originais]
+
+    membros: List[Dict[str, str]] = []
+    por_rg: Dict[str, Dict[str, str]] = {}
+    cargo_secao = "MEMBRO"
+    atual: Dict[str, str] = {"nome": "", "rg": "", "telefone": "", "cargo": ""}
+    cabecalho_tabela: Optional[Dict[str, int]] = None
+
+    def finalizar(registro: Optional[Dict[str, str]] = None) -> None:
+        nonlocal atual
+        item = dict(registro or atual)
+        nome = _banco_limpar_texto(item.get("nome"), 120).strip(" -|:;,")
+        rg = _banco_normalizar_rg(item.get("rg"))
+        telefone = _banco_v5_normalizar_telefone(item.get("telefone"))
+        cargo = _banco_v5_cargo_normalizado(item.get("cargo") or cargo_secao, cargo_secao)
+        if not rg:
+            # O painel de RP frequentemente exibe o RG como #12345.
+            m_hash = re.search(r"#\s*([A-Za-z0-9.\-/]{2,20})", " ".join(item.values()))
+            if m_hash:
+                rg = _banco_normalizar_rg(m_hash.group(1))
+        if not nome or not rg or len(rg) < 2:
+            if registro is None:
+                atual = {"nome": "", "rg": "", "telefone": "", "cargo": ""}
+            return
+        # Evita títulos e rótulos virarem nomes.
+        if normalizar_busca(nome) in {"nome", "membro", "integrante", "painel", "lista", "organizacao", "facçao", "faccao"}:
+            if registro is None:
+                atual = {"nome": "", "rg": "", "telefone": "", "cargo": ""}
+            return
+        novo = {"nome": nome, "rg": rg, "telefone": telefone, "cargo": cargo or "MEMBRO"}
+        existente = por_rg.get(rg)
+        if existente:
+            for chave in ("nome", "telefone", "cargo"):
+                if novo.get(chave) and (not existente.get(chave) or existente.get(chave) == "MEMBRO"):
+                    existente[chave] = novo[chave]
+        else:
+            por_rg[rg] = novo
+            membros.append(novo)
+        if registro is None:
+            atual = {"nome": "", "rg": "", "telefone": "", "cargo": ""}
+
+    for indice, linha in enumerate(linhas):
+        if not linha:
+            # Um bloco em branco normalmente encerra uma pessoa.
+            if atual.get("nome") and atual.get("rg"):
+                finalizar()
+            cabecalho_tabela = None
+            continue
+
+        # Cargo explícito isolado: "Cargo: Subchefe" também define a seção atual.
+        campos_pre = _banco_v5_campos_inline(linha)
+        if set(campos_pre.keys()) == {"cargo"} and not atual.get("nome") and not atual.get("rg"):
+            cargo_secao = _banco_v5_cargo_normalizado(campos_pre["cargo"], cargo_secao)
+            atual["cargo"] = cargo_secao
+            continue
+
+        # Cabeçalhos de cargo: LÍDER, SUBLÍDER, MEMBROS, GERÊNCIA etc.
+        novo_cargo = _banco_cargo_cabecalho(linha, cargo_secao)
+        linha_norm = normalizar_busca(linha).strip(" :*-#[]()")
+        tem_identificador = bool(re.search(r"(?i)\b(?:rg|passaporte|documento|id)\b\s*[:=#\-]?\s*[A-Za-z0-9]", linha))
+        if novo_cargo != cargo_secao and len(linha) <= 70 and not tem_identificador:
+            if atual.get("nome") and atual.get("rg"):
+                finalizar()
+            cargo_secao = novo_cargo
+            continue
+        if re.fullmatch(r"(?i)(l[ií]der(?:es)?|sub\s*l[ií]der(?:es)?|vice\s*l[ií]der(?:es)?|subchefe(?:s)?|gerente(?:s)?|membro(?:s)?|integrante(?:s)?|recruta(?:s)?)\s*:??", linha):
+            cargo_secao = _banco_v5_cargo_normalizado(linha.rstrip(":"), cargo_secao)
+            continue
+
+        colunas = _banco_v5_dividir_colunas(linha)
+        # Detecta tabela: NOME | RG | TELEFONE | CARGO, em qualquer ordem.
+        if len(colunas) >= 2:
+            mapa_header: Dict[str, int] = {}
+            for i, col in enumerate(colunas):
+                chave = _banco_v5_rotulo_canonico(col.strip(" :"))
+                if chave:
+                    mapa_header[chave] = i
+            if "nome" in mapa_header and "rg" in mapa_header:
+                cabecalho_tabela = mapa_header
+                continue
+            if cabecalho_tabela:
+                registro = {"nome": "", "rg": "", "telefone": "", "cargo": cargo_secao}
+                for chave, pos in cabecalho_tabela.items():
+                    if pos < len(colunas):
+                        registro[chave] = colunas[pos]
+                finalizar(registro)
+                continue
+
+        campos = campos_pre
+        if campos:
+            # Se uma nova pessoa começa e a anterior já está completa, encerra a anterior.
+            if "nome" in campos and atual.get("nome") and atual.get("rg"):
+                finalizar()
+            for chave, valor in campos.items():
+                if chave == "cargo":
+                    atual[chave] = _banco_v5_cargo_normalizado(valor, cargo_secao)
+                else:
+                    atual[chave] = valor
+            if atual.get("nome") and atual.get("rg") and len(campos) >= 2:
+                # Linha completa, por exemplo: Nome: X RG: Y Telefone: Z Cargo: W.
+                finalizar()
+            continue
+
+        # RG isolado em linha: RG: 123 / Passaporte: 123 / #12345.
+        m_rg = re.match(r"(?i)^(?:rg|passaporte|documento|identidade|id|registro)\s*[:=#\-]?\s*([A-Za-z0-9.\-/]{2,20})\s*$", linha)
+        if not m_rg:
+            m_rg = re.match(r"^#\s*([A-Za-z0-9.\-/]{2,20})\s*$", linha)
+        if m_rg:
+            atual["rg"] = m_rg.group(1)
+            if atual.get("nome"):
+                # Aguarda telefone/cargo nas próximas linhas, se existirem.
+                prox = linhas[indice + 1] if indice + 1 < len(linhas) else ""
+                if not re.match(r"(?i)^(?:telefone|tel|celular|contato|cargo|fun[cç][aã]o|patente)\b", prox):
+                    finalizar()
+            continue
+
+        m_tel = re.match(r"(?i)^(?:telefone|tel|celular|contato|n[uú]mero)\s*[:=\-]?\s*(.+)$", linha)
+        if m_tel:
+            atual["telefone"] = m_tel.group(1)
+            if atual.get("nome") and atual.get("rg"):
+                prox = linhas[indice + 1] if indice + 1 < len(linhas) else ""
+                if not re.match(r"(?i)^(?:cargo|fun[cç][aã]o|patente)\b", prox):
+                    finalizar()
+            continue
+
+        m_cargo = re.match(r"(?i)^(?:cargo|fun[cç][aã]o|patente|posi[cç][aã]o|hierarquia)\s*[:=\-]?\s*(.+)$", linha)
+        if m_cargo:
+            atual["cargo"] = _banco_v5_cargo_normalizado(m_cargo.group(1), cargo_secao)
+            if atual.get("nome") and atual.get("rg"):
+                finalizar()
+            continue
+
+        m_nome = re.match(r"(?i)^(?:nome(?:\s+completo)?|integrante|membro|propriet[aá]rio)\s*[:=\-]\s*(.+)$", linha)
+        if m_nome:
+            if atual.get("nome") and atual.get("rg"):
+                finalizar()
+            atual["nome"] = m_nome.group(1)
+            continue
+
+        # Formatos comuns em uma linha sem rótulos rígidos.
+        # Fulano | 12345 | (011) 999-999 | Gerente
+        if len(colunas) >= 2:
+            registro = {"nome": "", "rg": "", "telefone": "", "cargo": cargo_secao}
+            sobras: List[str] = []
+            for token in colunas:
+                token_limpo = token.strip()
+                token_norm = normalizar_busca(token_limpo)
+                if not registro["telefone"] and len(re.sub(r"\D", "", token_limpo)) >= 7 and re.search(r"[()\-\s]", token_limpo):
+                    registro["telefone"] = token_limpo
+                elif not registro["rg"] and (re.fullmatch(r"#?\s*[A-Za-z0-9.\-/]{2,20}", token_limpo) and len(re.sub(r"\D", "", token_limpo)) >= 2):
+                    # Não trata telefones longos como RG.
+                    if len(re.sub(r"\D", "", token_limpo)) <= 7 or token_limpo.strip().startswith("#"):
+                        registro["rg"] = token_limpo.lstrip("# ")
+                    else:
+                        sobras.append(token_limpo)
+                elif any(x in token_norm for x in ("lider", "chefe", "gerente", "membro", "recruta", "conselheiro", "vapor", "olheiro")):
+                    registro["cargo"] = _banco_v5_cargo_normalizado(token_limpo, cargo_secao)
+                else:
+                    sobras.append(token_limpo)
+            if sobras:
+                registro["nome"] = sobras[0]
+            if registro["nome"] and registro["rg"]:
+                finalizar(registro)
+                continue
+
+        # Formato: Fulano - RG 12345 - Telefone ... - Cargo ...
+        m_livre = re.search(r"(?i)^(.{2,120}?)\s*[-|]\s*(?:rg|passaporte|documento|id)?\s*[:#\-]?\s*([A-Za-z0-9.\/\-]{2,20})(.*)$", linha)
+        if m_livre:
+            resto = m_livre.group(3) or ""
+            telefone = ""
+            cargo = cargo_secao
+            mt = re.search(r"(?i)(?:telefone|tel|celular|contato)\s*[:=\-]?\s*([^|;]+)", resto)
+            mc = re.search(r"(?i)(?:cargo|fun[cç][aã]o|patente)\s*[:=\-]?\s*([^|;]+)", resto)
+            if mt:
+                telefone = mt.group(1)
+            if mc:
+                cargo = mc.group(1)
+            finalizar({"nome": m_livre.group(1), "rg": m_livre.group(2), "telefone": telefone, "cargo": cargo})
+            continue
+
+        # Linha de nome simples, seguida por RG/telefone/cargo nas linhas seguintes.
+        if (not atual.get("nome") and len(linha) <= 120 and re.search(r"[A-Za-zÀ-ÿ]", linha)
+                and not re.search(r"(?i)\b(?:painel|organiza[cç][aã]o|fac[cç][aã]o|lista|total|status|radio|local)\b", linha)):
+            prox = linhas[indice + 1] if indice + 1 < len(linhas) else ""
+            if re.match(r"(?i)^(?:rg|passaporte|documento|identidade|id|registro)\b|^#\s*[A-Za-z0-9]", prox):
+                atual["nome"] = linha
+
+    if atual.get("nome") and atual.get("rg"):
+        finalizar()
+
+    return membros
+
+
+async def _banco_v5_texto_da_mensagem_painel(msg: discord.Message) -> Tuple[str, Dict[str, int]]:
+    partes: List[str] = []
+    metricas = {"texto": 0, "embeds": 0, "arquivos_texto": 0, "imagens_ocr": 0}
+    if str(msg.content or "").strip():
+        partes.append(str(msg.content))
+        metricas["texto"] += 1
+
+    for embed in list(getattr(msg, "embeds", []) or []):
+        pedacos = [str(embed.title or ""), str(embed.description or "")]
+        for field in list(getattr(embed, "fields", []) or []):
+            pedacos.append(f"{field.name}: {field.value}")
+        bloco = "\n".join(x for x in pedacos if x.strip())
+        if bloco.strip():
+            partes.append(bloco)
+            metricas["embeds"] += 1
+
+    tmp_dir = Path(DATA_DIR) / "tmp_importacao_paineis"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for anexo in list(getattr(msg, "attachments", []) or [])[:10]:
+        nome = str(getattr(anexo, "filename", "") or "arquivo").lower()
+        sufixo = Path(nome).suffix.lower()
+        content_type = str(getattr(anexo, "content_type", "") or "").lower()
+        try:
+            dados = await anexo.read()
+        except Exception:
+            continue
+        if sufixo in {".txt", ".csv", ".md", ".log"} or content_type.startswith("text/"):
+            for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    conteudo = dados.decode(encoding)
+                    break
+                except Exception:
+                    conteudo = ""
+            if conteudo.strip():
+                partes.append(conteudo)
+                metricas["arquivos_texto"] += 1
+            continue
+        if content_type.startswith("image/") or sufixo in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            caminho = tmp_dir / f"painel-{int(msg.id)}-{int(time.time() * 1000)}-{len(partes)}{sufixo or '.png'}"
+            try:
+                caminho.write_bytes(dados)
+                linhas_ocr = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, str(caminho))
+                texto_ocr = "\n".join(str(x[0]) for x in linhas_ocr if str(x[0]).strip())
+                if texto_ocr.strip():
+                    partes.append(texto_ocr)
+                    metricas["imagens_ocr"] += 1
+            finally:
+                try:
+                    caminho.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    texto_final = "\n\n".join(x.strip() for x in partes if x and x.strip())
+    return texto_final, metricas
+
+
+_BANCO_IMPORTAR_PAINEL_ANTES_V5 = banco_importar_painel
+
+
+def banco_importar_painel(
+    nome_faccao: str,
+    texto_painel: str,
+    *,
+    modo: str = "substituir",
+    autor_id: int = 0,
+    mensagem_url: str = "",
+) -> Dict[str, Any]:
+    # Mantém toda a lógica de mesclagem da V4 e complementa telefone/cargo na ficha geral.
+    resultado = _BANCO_IMPORTAR_PAINEL_ANTES_V5(
+        nome_faccao,
+        texto_painel,
+        modo=modo,
+        autor_id=autor_id,
+        mensagem_url=mensagem_url,
+    )
+    membros = banco_extrair_membros_painel(texto_painel)
+    telefones_atualizados = 0
+    with _banco_conexao() as db:
+        for membro in membros:
+            telefone = _banco_v5_normalizar_telefone(membro.get("telefone"))
+            cargo = _banco_v5_cargo_normalizado(membro.get("cargo") or "MEMBRO")
+            encontrado = _banco_v3_individuo_por_identificador(
+                db,
+                rg=_banco_normalizar_rg(membro.get("rg")),
+                nome=_banco_limpar_texto(membro.get("nome"), 120),
+            )
+            if not encontrado:
+                continue
+            atual = db.execute("SELECT telefone, cargo_faccao FROM individuos WHERE id=?", (int(encontrado["id"]),)).fetchone()
+            telefone_final = telefone or str(atual["telefone"] or "")
+            cargo_final = cargo or str(atual["cargo_faccao"] or "MEMBRO")
+            db.execute(
+                "UPDATE individuos SET telefone=?, cargo_faccao=?, faccao_atual=?, atualizado_em=? WHERE id=?",
+                (telefone_final, cargo_final, _banco_limpar_texto(nome_faccao, 120), _banco_agora_iso(), int(encontrado["id"])),
+            )
+            if telefone and telefone != str(atual["telefone"] or ""):
+                telefones_atualizados += 1
+    resultado["telefones_atualizados"] = telefones_atualizados
+    resultado["campos_extraidos"] = {
+        "nome": sum(1 for x in membros if x.get("nome")),
+        "rg": sum(1 for x in membros if x.get("rg")),
+        "telefone": sum(1 for x in membros if x.get("telefone")),
+        "cargo": sum(1 for x in membros if x.get("cargo")),
+    }
+    try:
+        _banco_criar_backup_duravel("painel-v5-importado")
+    except Exception:
+        pass
+    return resultado
+
+
+def _banco_v5_campos_embed_membros(embed: discord.Embed, membros: List[Dict[str, str]]) -> None:
+    linhas: List[str] = []
+    for membro in membros:
+        telefone = f" • ☎️ {membro['telefone']}" if membro.get("telefone") else ""
+        linhas.append(
+            f"• **{membro.get('nome') or 'Sem nome'}** — RG `{membro.get('rg') or 'N/I'}` • "
+            f"{membro.get('cargo') or 'MEMBRO'}{telefone}"
+        )
+    # Exibe todos os integrantes sem usar “... e mais X”.
+    bloco: List[str] = []
+    tamanho = 0
+    pagina = 1
+    for linha in linhas:
+        if bloco and tamanho + len(linha) + 1 > 900:
+            embed.add_field(name=f"👥 Integrantes • parte {pagina}", value="\n".join(bloco), inline=False)
+            pagina += 1
+            bloco = []
+            tamanho = 0
+        bloco.append(linha)
+        tamanho += len(linha) + 1
+    if bloco:
+        embed.add_field(
+            name="👥 Integrantes" if pagina == 1 else f"👥 Integrantes • parte {pagina}",
+            value="\n".join(bloco)[:1024],
+            inline=False,
+        )
+
+
+class BancoImportarPainelModal(Modal, title="Importar painel completo"):
+    def __init__(
+        self,
+        painel_canal_id: int = 0,
+        painel_mensagem_id: int = 0,
+        *,
+        modo: str = "mesclar",
+    ):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.modo = "substituir" if normalizar_busca(modo).startswith("sub") else "mesclar"
+        self.faccao = TextInput(
+            label="Facção ou nome da mesa",
+            placeholder="Ex.: Olimpo",
+            max_length=120,
+        )
+        self.add_item(self.faccao)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send("⏳ Você já possui outra operação aberta.", ephemeral=True)
+        async with lock:
+            msg: Optional[discord.Message] = None
+            try:
+                descricao_modo = (
+                    "**MESCLAR:** adiciona e atualiza os encontrados, mantendo os demais integrantes ativos."
+                    if self.modo == "mesclar"
+                    else "**SUBSTITUIR:** o painel enviado vira a lista atual; ausentes ficam inativos, mas fichas e histórico não são apagados."
+                )
+                msg = await _banco_esperar_mensagem_usuario(
+                    interaction,
+                    f"🏴 **MODO SELECIONADO: {self.modo.upper()}**\n{descricao_modo}\n\n"
+                    "Envie o painel em **uma única mensagem**. Pode ser:\n"
+                    "• texto colado;\n• tabela com `Nome | RG | Telefone | Cargo`;\n"
+                    "• print/imagem do painel;\n• arquivo `.txt`, `.csv` ou `.md`.\n\n"
+                    "O bot extrairá **nome, RG/passaporte, telefone e cargo**, mostrará todos na prévia e só salvará após confirmação.",
+                    timeout=600,
+                )
+                if msg is None:
+                    return
+                texto, origem_metricas = await _banco_v5_texto_da_mensagem_painel(msg)
+                if not texto.strip():
+                    raise ValueError(
+                        "Não encontrei texto legível. Envie texto, uma imagem nítida ou um arquivo .txt/.csv/.md."
+                    )
+                membros = await asyncio.to_thread(banco_extrair_membros_painel, texto)
+                if not membros:
+                    amostra = _banco_limpar_texto(texto, 500)
+                    raise ValueError(
+                        "Nenhum integrante com NOME e RG foi identificado. Formatos aceitos: "
+                        "`Nome: Fulano | RG: 12345 | Telefone: ... | Cargo: Gerente` ou tabela "
+                        "`Nome | RG | Telefone | Cargo`. Texto lido: " + amostra
+                    )
+                mesa = banco_encontrar_mesa(str(self.faccao.value))
+                embed = discord.Embed(
+                    title="📋 PRÉVIA PROFISSIONAL DO PAINEL",
+                    description=(
+                        "Revise antes de confirmar. Fichas existentes serão unidas por "
+                        "**RG → identificador alternativo → nome exato**. Telefone e cargo também serão atualizados."
+                    ),
+                    color=discord.Color.gold(),
+                )
+                embed.add_field(name="🏴 Organização", value=str(self.faccao.value), inline=True)
+                embed.add_field(
+                    name="🔄 Modo",
+                    value="MESCLAR" if self.modo == "mesclar" else "SUBSTITUIR LISTA ATUAL",
+                    inline=True,
+                )
+                embed.add_field(name="🕵️ Mesa associada", value=str(mesa.get("nome_canal") or "Não encontrada"), inline=False)
+                embed.add_field(
+                    name="📥 Fonte recebida",
+                    value=(
+                        f"Texto: {origem_metricas['texto']} • Embeds: {origem_metricas['embeds']} • "
+                        f"Arquivos: {origem_metricas['arquivos_texto']} • Imagens OCR: {origem_metricas['imagens_ocr']}"
+                    ),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="📊 Campos identificados",
+                    value=(
+                        f"Pessoas: **{len(membros)}**\n"
+                        f"Nomes: **{sum(1 for x in membros if x.get('nome'))}** • "
+                        f"RGs: **{sum(1 for x in membros if x.get('rg'))}** • "
+                        f"Telefones: **{sum(1 for x in membros if x.get('telefone'))}** • "
+                        f"Cargos: **{sum(1 for x in membros if x.get('cargo'))}**"
+                    ),
+                    inline=False,
+                )
+                _banco_v5_campos_embed_membros(embed, membros)
+                await interaction.followup.send(
+                    embed=embed,
+                    view=BancoConfirmarPainelView(
+                        usuario_id=int(interaction.user.id),
+                        faccao=str(self.faccao.value),
+                        modo=self.modo,
+                        texto=texto,
+                        painel_canal_id=self.painel_canal_id,
+                        painel_mensagem_id=self.painel_mensagem_id,
+                    ),
+                    ephemeral=True,
+                )
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            except Exception as erro:
+                traceback.print_exc()
+                await _banco_prof_erro_interacao(interaction, "Não foi possível preparar a importação.", erro)
+
+
+# Melhora o relatório final sem alterar o fluxo de confirmação existente.
+_BANCO_CONFIRMAR_PAINEL_ANTES_V5 = BancoConfirmarPainelView
+
+
+print(
+    "✅ Central de Fichas V5 ativa: importação de painel por texto, tabela, imagem e arquivo; nome, RG, telefone e cargo.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
