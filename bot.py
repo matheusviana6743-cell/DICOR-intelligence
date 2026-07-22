@@ -24026,7 +24026,7 @@ async def _mensagens_cofre_assinaturas(canal: Any) -> List[discord.Message]:
     mensagens: Dict[int, discord.Message] = {}
     try:
         if hasattr(canal, 'pins'):
-            for msg in await canal.pins():
+            async for msg in canal.pins():
                 mensagens[msg.id] = msg
     except Exception:
         pass
@@ -26462,7 +26462,7 @@ class BancoAdicionarVeiculoModal(Modal, title="Cadastrar placa/veículo"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             placa = _banco_normalizar_placa(self.placa.value)
-            foto_path, foto_url = await _banco_coletar_foto_veiculo(interaction, placa)
+            foto_path, foto_url = await _banco_prof_coletar_foto_veiculo(interaction, placa)
             dono_nome = ""
             rg_dono = _banco_normalizar_rg(self.proprietario_rg.value)
             if rg_dono:
@@ -29253,6 +29253,1716 @@ def banco_embed_painel() -> discord.Embed:
     embed.set_footer(text="DICOR • dados persistentes em /data • fichas vinculadas às perícias")
     return embed
 
+
+# =====================================================
+# PATCH FINAL — BANCO DE DADOS DICOR PROFISSIONAL V2
+# Revisão completa do painel, modais, sincronização, edição,
+# arquivamento, consulta e revisão OCR.
+# =====================================================
+
+_BANCO_PROF_SYNC_LOCK = asyncio.Lock()
+_BANCO_PROF_USUARIO_LOCKS: Dict[int, asyncio.Lock] = {}
+_BANCO_PROF_OCR_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _banco_prof_lock_usuario(usuario_id: int) -> asyncio.Lock:
+    chave = int(usuario_id or 0)
+    lock = _BANCO_PROF_USUARIO_LOCKS.get(chave)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BANCO_PROF_USUARIO_LOCKS[chave] = lock
+    return lock
+
+
+def _banco_prof_lock_ocr(pendente_id: int) -> asyncio.Lock:
+    chave = int(pendente_id or 0)
+    lock = _BANCO_PROF_OCR_LOCKS.get(chave)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BANCO_PROF_OCR_LOCKS[chave] = lock
+    return lock
+
+
+def _banco_prof_equipe(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and usuario_tem_equipe(interaction.user)
+
+
+def _banco_prof_admin(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and usuario_e_administrador(interaction.user)
+
+
+async def _banco_prof_erro_interacao(
+    interaction: discord.Interaction,
+    mensagem: str,
+    erro: Optional[BaseException] = None,
+) -> None:
+    if erro is not None:
+        traceback.print_exception(type(erro), erro, erro.__traceback__)
+    texto = f"❌ {mensagem}"[:1900]
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(texto, ephemeral=True)
+        else:
+            await interaction.response.send_message(texto, ephemeral=True)
+    except Exception:
+        pass
+
+
+async def _banco_prof_salvar_contexto_painel(interaction: discord.Interaction) -> None:
+    try:
+        canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+        mensagem_id = int(getattr(interaction.message, "id", 0) or 0)
+        if canal_id:
+            await asyncio.to_thread(_banco_config_set, "painel_canal_id", canal_id)
+        if mensagem_id:
+            await asyncio.to_thread(_banco_config_set, "painel_mensagem_id", mensagem_id)
+    except Exception:
+        traceback.print_exc()
+
+
+async def _banco_prof_atualizar_painel(
+    canal_id: int = 0,
+    mensagem_id: int = 0,
+    *,
+    mensagem: Optional[discord.Message] = None,
+) -> bool:
+    try:
+        alvo = mensagem
+        if alvo is None:
+            canal_id = int(canal_id or _banco_config_get("painel_canal_id", "0") or 0)
+            mensagem_id = int(mensagem_id or _banco_config_get("painel_mensagem_id", "0") or 0)
+            if not canal_id or not mensagem_id:
+                return False
+            canal = bot.get_channel(canal_id)
+            if canal is None:
+                canal = await bot.fetch_channel(canal_id)
+            if not hasattr(canal, "fetch_message"):
+                return False
+            alvo = await canal.fetch_message(mensagem_id)
+        await alvo.edit(embed=banco_embed_painel(), view=BancoDadosView())
+        return True
+    except discord.NotFound:
+        return False
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _banco_prof_metricas() -> Dict[str, Any]:
+    r = banco_resumo()
+    with _banco_conexao() as db:
+        r["individuos_ativos"] = int(
+            db.execute("SELECT COUNT(*) FROM individuos WHERE UPPER(COALESCE(status,'')) <> 'ARQUIVADO'").fetchone()[0]
+        )
+        try:
+            r["veiculos_ativos"] = int(
+                db.execute("SELECT COUNT(*) FROM veiculos WHERE UPPER(COALESCE(status_veiculo,'CADASTRADO')) <> 'ARQUIVADO'").fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            r["veiculos_ativos"] = int(r.get("placas", 0))
+        r["faccoes_ativas"] = int(
+            db.execute("SELECT COUNT(*) FROM faccoes WHERE UPPER(COALESCE(status,'')) = 'ATIVA'").fetchone()[0]
+        )
+        r["historico"] = int(db.execute("SELECT COUNT(*) FROM historico_banco").fetchone()[0])
+        try:
+            r["imagens_indisponiveis"] = int(
+                db.execute("SELECT COUNT(*) FROM ocr_fontes_processadas WHERE status='INDISPONIVEL'").fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            r["imagens_indisponiveis"] = 0
+    return r
+
+
+def banco_embed_painel() -> discord.Embed:
+    r = _banco_prof_metricas()
+    ocr_ativo = bool(BANCO_OCR_ATIVO and RapidOCR is not None)
+    ocr_status = "🟢 Operacional" if ocr_ativo else "🔴 Indisponível"
+    sync_status = "🟡 Em execução" if _BANCO_PROF_SYNC_LOCK.locked() else "🟢 Disponível"
+    historico_status = "🟡 Em execução" if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked() else "🟢 Disponível"
+
+    embed = discord.Embed(
+        title="🗃️ CENTRAL DE DADOS • DICOR",
+        description=(
+            "Sistema persistente para **indivíduos, veículos, placas, facções, painéis e evidências**.\n"
+            "A Perícia Externa é analisada por texto, embeds e OCR; toda leitura de imagem exige revisão antes de entrar no banco."
+        ),
+        color=discord.Color.from_rgb(25, 82, 145),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="👤 INDIVÍDUOS",
+        value=f"**Ativos:** {r.get('individuos_ativos', 0)}\n**Total histórico:** {r.get('individuos', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🚗 VEÍCULOS",
+        value=f"**Ativos:** {r.get('veiculos_ativos', 0)}\n**Placas registradas:** {r.get('placas', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏴 ORGANIZAÇÕES",
+        value=f"**Ativas:** {r.get('faccoes_ativas', 0)}\n**Membros ativos:** {r.get('membros_ativos', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="📄 PAINÉIS E HISTÓRICO",
+        value=f"**Versões de painéis:** {r.get('paineis', 0)}\n**Alterações auditadas:** {r.get('historico', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔬 PERÍCIA EXTERNA",
+        value=f"**Mensagens lidas:** {r.get('pericias', 0)}\n**Imagens processadas:** {r.get('ocr_processadas', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="📋 REVISÃO OCR",
+        value=f"**Fichas confirmadas:** {r.get('fichas_confirmadas', 0)}\n**Aguardando revisão:** {r.get('ocr_pendentes', 0)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="⚙️ ESTADO DOS SERVIÇOS",
+        value=(
+            f"**OCR:** {ocr_status}\n"
+            f"**Sincronização:** {sync_status}\n"
+            f"**Importação histórica:** {historico_status}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔐 CONTROLE DE ACESSO",
+        value=(
+            "A equipe DICOR pode cadastrar, consultar, importar painéis e revisar fichas. "
+            "Edição, arquivamento e importação histórica são restritos a **Inspetor+**."
+        ),
+        inline=False,
+    )
+    if r.get("imagens_indisponiveis", 0):
+        embed.add_field(
+            name="ℹ️ Arquivos antigos indisponíveis",
+            value=(
+                f"{r['imagens_indisponiveis']} imagem(ns) antiga(s) não existem mais no Discord/CDN. "
+                "Os textos dessas perícias continuam sendo importados normalmente."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Capital Morada do Valley • dados persistentes em /data")
+    return embed
+
+
+def _banco_prof_parse_duplo(valor: str) -> Tuple[str, str]:
+    partes = str(valor or "").split("|", 1)
+    primeiro = partes[0].strip() if partes else ""
+    segundo = partes[1].strip() if len(partes) > 1 else ""
+    return primeiro, segundo
+
+
+def _banco_prof_registro_por_id(tipo: str, registro_id: int) -> Dict[str, Any]:
+    tipo = str(tipo or "").lower()
+    with _banco_conexao() as db:
+        if tipo == "individuo":
+            row = db.execute("SELECT * FROM individuos WHERE id=?", (int(registro_id),)).fetchone()
+        elif tipo == "veiculo":
+            row = db.execute("SELECT * FROM veiculos WHERE id=?", (int(registro_id),)).fetchone()
+        elif tipo == "faccao":
+            row = db.execute(
+                """
+                SELECT f.*, (SELECT COUNT(*) FROM faccao_membros m WHERE m.faccao_id=f.id AND m.ativo=1) AS membros
+                FROM faccoes f WHERE f.id=?
+                """,
+                (int(registro_id),),
+            ).fetchone()
+        else:
+            row = None
+    return dict(row) if row else {}
+
+
+def _banco_embed_consulta_faccao(faccao: Dict[str, Any]) -> discord.Embed:
+    with _banco_conexao() as db:
+        membros = db.execute(
+            """
+            SELECT nome, rg, cargo FROM faccao_membros
+            WHERE faccao_id=? AND ativo=1 ORDER BY cargo, nome LIMIT 30
+            """,
+            (int(faccao.get("id") or 0),),
+        ).fetchall()
+        veiculos = db.execute(
+            "SELECT placa, modelo, proprietario_nome FROM veiculos WHERE faccao=? COLLATE NOCASE ORDER BY atualizado_em DESC LIMIT 15",
+            (str(faccao.get("nome") or ""),),
+        ).fetchall()
+        versoes = int(
+            db.execute("SELECT COUNT(*) FROM painel_versoes WHERE faccao_id=?", (int(faccao.get("id") or 0),)).fetchone()[0]
+        )
+    embed = discord.Embed(
+        title=f"🏴 FICHA DA ORGANIZAÇÃO • {faccao.get('nome') or 'SEM NOME'}",
+        color=discord.Color.from_rgb(25, 82, 145),
+    )
+    embed.add_field(
+        name="📌 Situação",
+        value=(
+            f"**Status:** {faccao.get('status') or 'N/A'}\n"
+            f"**Mesa vinculada:** {faccao.get('mesa_nome') or 'Não vinculada'}\n"
+            f"**Versões do painel:** {versoes}"
+        ),
+        inline=False,
+    )
+    if membros:
+        linhas = [f"• **{m['nome']}** — RG `{m['rg'] or 'N/A'}` • {m['cargo'] or 'MEMBRO'}" for m in membros]
+        embed.add_field(name=f"👥 Integrantes ativos ({len(membros)})", value="\n".join(linhas)[:1024], inline=False)
+    if veiculos:
+        linhas = [
+            f"• `{v['placa']}` — {v['modelo'] or 'Modelo N/A'} • {v['proprietario_nome'] or 'sem proprietário'}"
+            for v in veiculos
+        ]
+        embed.add_field(name=f"🚗 Veículos relacionados ({len(veiculos)})", value="\n".join(linhas)[:1024], inline=False)
+    if faccao.get("painel_mensagem_url"):
+        embed.add_field(name="🔗 Origem do painel", value=f"[Abrir mensagem]({faccao['painel_mensagem_url']})", inline=False)
+    embed.set_footer(text="DICOR • organização vinculada às mesas e painéis importados")
+    return embed
+
+
+def _banco_prof_embed_resultados(consulta: str, resultados: Dict[str, List[Dict[str, Any]]]) -> discord.Embed:
+    total = sum(len(resultados.get(k, [])) for k in ("individuos", "veiculos", "faccoes"))
+    embed = discord.Embed(
+        title=f"🔍 CONSULTA AO BANCO • {consulta[:70]}",
+        description=f"Foram localizados **{total} registro(s)**. Selecione abaixo para abrir a ficha completa.",
+        color=discord.Color.from_rgb(25, 82, 145),
+    )
+    if resultados.get("individuos"):
+        embed.add_field(
+            name=f"👤 Indivíduos ({len(resultados['individuos'])})",
+            value="\n".join(
+                f"• **{x.get('nome') or 'Sem nome'}** — `{x.get('rg') or 'N/A'}` • {x.get('faccao_atual') or 'sem facção'}"
+                for x in resultados["individuos"][:8]
+            )[:1024],
+            inline=False,
+        )
+    if resultados.get("veiculos"):
+        embed.add_field(
+            name=f"🚗 Veículos ({len(resultados['veiculos'])})",
+            value="\n".join(
+                f"• `{x.get('placa') or 'N/A'}` — **{x.get('modelo') or 'Modelo N/A'}** • {x.get('proprietario_nome') or 'sem proprietário'}"
+                for x in resultados["veiculos"][:8]
+            )[:1024],
+            inline=False,
+        )
+    if resultados.get("faccoes"):
+        embed.add_field(
+            name=f"🏴 Organizações ({len(resultados['faccoes'])})",
+            value="\n".join(
+                f"• **{x.get('nome') or 'Sem nome'}** — {x.get('membros', 0)} membros • {x.get('status') or 'N/A'}"
+                for x in resultados["faccoes"][:8]
+            )[:1024],
+            inline=False,
+        )
+    return embed
+
+
+class BancoResultadoSelect(discord.ui.Select):
+    def __init__(self, resultados: Dict[str, List[Dict[str, Any]]]):
+        opcoes: List[discord.SelectOption] = []
+        for x in resultados.get("individuos", []):
+            opcoes.append(
+                discord.SelectOption(
+                    label=str(x.get("nome") or "Indivíduo")[:100],
+                    value=f"individuo:{int(x.get('id') or 0)}",
+                    description=f"Documento {x.get('rg') or 'N/A'} • {x.get('faccao_atual') or 'sem facção'}"[:100],
+                    emoji="👤",
+                )
+            )
+        for x in resultados.get("veiculos", []):
+            opcoes.append(
+                discord.SelectOption(
+                    label=f"{x.get('placa') or 'SEM PLACA'} • {x.get('modelo') or 'Modelo N/A'}"[:100],
+                    value=f"veiculo:{int(x.get('id') or 0)}",
+                    description=f"Proprietário: {x.get('proprietario_nome') or 'não identificado'}"[:100],
+                    emoji="🚗",
+                )
+            )
+        for x in resultados.get("faccoes", []):
+            opcoes.append(
+                discord.SelectOption(
+                    label=str(x.get("nome") or "Organização")[:100],
+                    value=f"faccao:{int(x.get('id') or 0)}",
+                    description=f"{x.get('membros', 0)} membros • {x.get('status') or 'N/A'}"[:100],
+                    emoji="🏴",
+                )
+            )
+        super().__init__(
+            placeholder="Selecione uma ficha para visualizar",
+            min_values=1,
+            max_values=1,
+            options=opcoes[:25],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            tipo, registro_id = self.values[0].split(":", 1)
+            registro = await asyncio.to_thread(_banco_prof_registro_por_id, tipo, int(registro_id))
+            if not registro:
+                return await interaction.followup.send("❌ O registro não existe mais.", ephemeral=True)
+            if tipo == "individuo":
+                embed = _banco_embed_consulta_individuo(registro)
+            elif tipo == "veiculo":
+                embed = _banco_embed_consulta_veiculo(registro)
+            else:
+                embed = _banco_embed_consulta_faccao(registro)
+            await interaction.edit_original_response(embed=embed, view=self.view)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível abrir a ficha selecionada.", erro)
+
+
+class BancoResultadoView(View):
+    def __init__(self, resultados: Dict[str, List[Dict[str, Any]]], usuario_id: int):
+        super().__init__(timeout=300)
+        self.usuario_id = int(usuario_id)
+        self.add_item(BancoResultadoSelect(resultados))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta consulta pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+
+async def _banco_prof_enviar_consulta(
+    interaction: discord.Interaction,
+    consulta: str,
+    *,
+    editar_original: bool = False,
+) -> None:
+    resultados = await asyncio.to_thread(banco_buscar, consulta)
+    todos = [
+        *(('individuo', x) for x in resultados.get('individuos', [])),
+        *(('veiculo', x) for x in resultados.get('veiculos', [])),
+        *(('faccao', x) for x in resultados.get('faccoes', [])),
+    ]
+    if not todos:
+        embed = discord.Embed(
+            title="🔍 CONSULTA AO BANCO",
+            description=f"Nenhum registro foi localizado para **{consulta[:100]}**.",
+            color=discord.Color.orange(),
+        )
+        if editar_original:
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    if len(todos) == 1:
+        tipo, item = todos[0]
+        if tipo == "individuo":
+            embed = _banco_embed_consulta_individuo(item)
+        elif tipo == "veiculo":
+            embed = _banco_embed_consulta_veiculo(item)
+        else:
+            embed = _banco_embed_consulta_faccao(item)
+        if editar_original:
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    embed = _banco_prof_embed_resultados(consulta, resultados)
+    view = BancoResultadoView(resultados, int(interaction.user.id))
+    if editar_original:
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class BancoConsultaModal(Modal, title="Consultar Banco DICOR"):
+    consulta = TextInput(
+        label="Pesquisa",
+        placeholder="Nome, RG/passaporte, telefone, placa, modelo ou facção",
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await _banco_prof_enviar_consulta(interaction, str(self.consulta.value))
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Falha ao consultar o banco.", erro)
+
+
+class BancoAdicionarIndividuoModal(Modal, title="Cadastrar ou atualizar indivíduo"):
+    def __init__(self, painel_canal_id: int = 0, painel_mensagem_id: int = 0):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.nome = TextInput(label="Nome completo", placeholder="Ex.: Carlos Pinto", max_length=120)
+        self.documento = TextInput(label="RG ou Passaporte", placeholder="Ex.: 32096", max_length=40)
+        self.apelido_telefone = TextInput(
+            label="Apelido | Telefone",
+            placeholder="Ex.: Carlinhos | (011) 897-101",
+            required=False,
+            max_length=180,
+        )
+        self.faccao_cargo = TextInput(
+            label="Facção | Cargo",
+            placeholder="Ex.: Olimpo | Membro",
+            required=False,
+            max_length=180,
+        )
+        self.observacoes = TextInput(
+            label="Observações",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+        )
+        for item in (self.nome, self.documento, self.apelido_telefone, self.faccao_cargo, self.observacoes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send(
+                "⏳ Você já possui outro cadastro aguardando foto ou confirmação.", ephemeral=True
+            )
+        async with lock:
+            try:
+                documento = _banco_normalizar_rg(self.documento.value)
+                if not documento:
+                    raise ValueError("Informe um RG ou passaporte válido.")
+                apelido, telefone = _banco_prof_parse_duplo(self.apelido_telefone.value)
+                faccao, cargo = _banco_prof_parse_duplo(self.faccao_cargo.value)
+                mesa = banco_encontrar_mesa(faccao) if faccao else {}
+                with _banco_conexao() as db:
+                    existente = db.execute("SELECT id FROM individuos WHERE rg=?", (documento,)).fetchone()
+                foto_pessoa, foto_rg, url_pessoa, url_rg = await _banco_prof_coletar_fotos_individuo(interaction, documento)
+                item = await asyncio.to_thread(
+                    banco_upsert_individuo,
+                    nome=str(self.nome.value),
+                    rg=documento,
+                    apelido=apelido,
+                    telefone=telefone,
+                    faccao=faccao,
+                    cargo=cargo,
+                    observacoes=str(self.observacoes.value or ""),
+                    origem="manual_painel_profissional",
+                    mesa_canal_id=int(mesa.get("canal_id", 0) or 0),
+                    mesa_nome=str(mesa.get("nome_canal") or ""),
+                    criado_por_id=int(interaction.user.id),
+                    foto_individuo_path=foto_pessoa,
+                    foto_rg_path=foto_rg,
+                    foto_individuo_url=url_pessoa,
+                    foto_rg_url=url_rg,
+                )
+                acao = "atualizada" if existente else "criada"
+                embed = _banco_embed_consulta_individuo(item)
+                embed.title = f"✅ FICHA DO INDIVÍDUO {acao.upper()}"
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível salvar o indivíduo.", erro)
+
+
+class BancoAdicionarVeiculoModal(Modal, title="Cadastrar ou atualizar veículo"):
+    def __init__(self, painel_canal_id: int = 0, painel_mensagem_id: int = 0):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.placa = TextInput(label="Placa", placeholder="Ex.: DYW3J57", max_length=16)
+        self.modelo_cor = TextInput(label="Modelo | Cor", placeholder="Ex.: Pfister Comet 5 | Preto", required=False, max_length=200)
+        self.dono = TextInput(label="Proprietário | RG/Passaporte", placeholder="Ex.: Carlos Pinto | 32096", required=False, max_length=200)
+        self.contato_faccao = TextInput(label="Telefone | Facção", placeholder="Ex.: (011) 897-101 | Olimpo", required=False, max_length=200)
+        self.local_observacoes = TextInput(
+            label="Local | Observações",
+            placeholder="Ex.: Nova Holanda | Veículo visto durante perícia",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=700,
+        )
+        for item in (self.placa, self.modelo_cor, self.dono, self.contato_faccao, self.local_observacoes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send(
+                "⏳ Você já possui outro cadastro aguardando foto ou confirmação.", ephemeral=True
+            )
+        async with lock:
+            try:
+                placa = _banco_normalizar_placa(self.placa.value)
+                if len(placa) < 5:
+                    raise ValueError("Informe uma placa válida.")
+                modelo, cor = _banco_prof_parse_duplo(self.modelo_cor.value)
+                dono_nome, dono_rg = _banco_prof_parse_duplo(self.dono.value)
+                telefone, faccao = _banco_prof_parse_duplo(self.contato_faccao.value)
+                local, observacoes = _banco_prof_parse_duplo(self.local_observacoes.value)
+                dono_rg = _banco_normalizar_rg(dono_rg)
+                with _banco_conexao() as db:
+                    existente = db.execute("SELECT id FROM veiculos WHERE placa=?", (placa,)).fetchone()
+                foto_path, foto_url = await _banco_prof_coletar_foto_veiculo(interaction, placa)
+                item = await asyncio.to_thread(
+                    banco_upsert_veiculo,
+                    placa=placa,
+                    modelo=modelo,
+                    cor=cor,
+                    proprietario_rg=dono_rg,
+                    proprietario_nome=dono_nome,
+                    telefone_proprietario=telefone,
+                    faccao=faccao,
+                    local=local,
+                    observacoes=observacoes,
+                    foto_path=foto_path,
+                    foto_url=foto_url,
+                    origem_tipo="manual_painel_profissional",
+                    criado_por_id=int(interaction.user.id),
+                )
+                if dono_rg and dono_nome:
+                    await asyncio.to_thread(
+                        banco_upsert_individuo,
+                        nome=dono_nome,
+                        rg=dono_rg,
+                        telefone=telefone,
+                        faccao=faccao,
+                        origem="veiculo_manual",
+                        criado_por_id=int(interaction.user.id),
+                        foto_individuo_path=foto_path,
+                        foto_individuo_url=foto_url,
+                    )
+                    item = await asyncio.to_thread(_banco_prof_registro_por_id, "veiculo", int(item.get("id") or 0))
+                acao = "atualizada" if existente else "criada"
+                embed = _banco_embed_consulta_veiculo(item)
+                embed.title = f"✅ FICHA DO VEÍCULO {acao.upper()}"
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível salvar o veículo.", erro)
+
+
+class BancoConfirmarPainelView(View):
+    def __init__(
+        self,
+        *,
+        usuario_id: int,
+        faccao: str,
+        modo: str,
+        texto: str,
+        painel_canal_id: int,
+        painel_mensagem_id: int,
+    ):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        self.faccao = str(faccao)
+        self.modo = str(modo)
+        self.texto = str(texto)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta importação pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar importação", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            resultado = await asyncio.to_thread(
+                banco_importar_painel,
+                self.faccao,
+                self.texto,
+                modo=self.modo,
+                autor_id=int(interaction.user.id),
+                mensagem_url="",
+            )
+            embed = discord.Embed(
+                title="✅ PAINEL IMPORTADO COM SUCESSO",
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="🏴 Organização", value=resultado["faccao"], inline=True)
+            embed.add_field(name="📄 Versão", value=f"`{resultado['versao']}`", inline=True)
+            embed.add_field(name="🕵️ Mesa vinculada", value=resultado["mesa_nome"] or "Não encontrada", inline=False)
+            embed.add_field(name="👥 Integrantes identificados", value=str(resultado["membros"]), inline=True)
+            embed.add_field(name="➕ Novos vínculos", value=str(resultado["novos"]), inline=True)
+            embed.add_field(name="♻️ Atualizados", value=str(resultado["atualizados"]), inline=True)
+            await interaction.edit_original_response(embed=embed, view=None)
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Falha ao importar o painel.", erro)
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✖️ IMPORTAÇÃO CANCELADA",
+                description="Nenhuma informação foi alterada no banco.",
+                color=discord.Color.greyple(),
+            ),
+            view=None,
+        )
+
+
+class BancoImportarPainelModal(Modal, title="Importar painel completo"):
+    def __init__(self, painel_canal_id: int = 0, painel_mensagem_id: int = 0):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.faccao = TextInput(label="Facção ou nome da mesa", placeholder="Ex.: Olimpo", max_length=120)
+        self.modo = TextInput(
+            label="Modo de atualização",
+            placeholder="substituir ou mesclar",
+            default="substituir",
+            max_length=20,
+        )
+        self.add_item(self.faccao)
+        self.add_item(self.modo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send("⏳ Você já possui outra operação aberta.", ephemeral=True)
+        async with lock:
+            try:
+                modo = normalizar_busca(self.modo.value).strip()
+                if not (modo.startswith("sub") or modo.startswith("mes")):
+                    raise ValueError("Use o modo `substituir` ou `mesclar`.")
+                modo = "substituir" if modo.startswith("sub") else "mesclar"
+                msg = await _banco_esperar_mensagem_usuario(
+                    interaction,
+                    "📄 Envie agora o **painel completo em uma única mensagem**.\n"
+                    "O bot vai ler nomes, documentos e cargos, mostrar uma prévia e só salvar após sua confirmação.\n"
+                    "A mensagem original será removida para não poluir o canal.",
+                    timeout=600,
+                )
+                if msg is None:
+                    return
+                texto = str(msg.content or "").strip()
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                if not texto:
+                    raise ValueError("A mensagem enviada não contém texto.")
+                membros = await asyncio.to_thread(banco_extrair_membros_painel, texto)
+                if not membros:
+                    raise ValueError(
+                        "Nenhum integrante foi identificado. Use formatos como `Nome | RG: 12345` ou `Nome: X` seguido de `RG: Y`."
+                    )
+                mesa = banco_encontrar_mesa(str(self.faccao.value))
+                linhas = [
+                    f"• **{m['nome']}** — `{m['rg']}` • {m['cargo']}"
+                    for m in membros[:20]
+                ]
+                if len(membros) > 20:
+                    linhas.append(f"• ... e mais {len(membros) - 20} integrante(s) na importação")
+                embed = discord.Embed(
+                    title="📋 PRÉVIA DO PAINEL IDENTIFICADO",
+                    description="Revise os dados antes de confirmar.",
+                    color=discord.Color.gold(),
+                )
+                embed.add_field(name="🏴 Organização", value=str(self.faccao.value), inline=True)
+                embed.add_field(name="🔄 Modo", value=modo.upper(), inline=True)
+                embed.add_field(name="🕵️ Mesa associada", value=str(mesa.get("nome_canal") or "Não encontrada"), inline=False)
+                embed.add_field(name=f"👥 Integrantes ({len(membros)})", value="\n".join(linhas)[:1024], inline=False)
+                await interaction.followup.send(
+                    embed=embed,
+                    view=BancoConfirmarPainelView(
+                        usuario_id=int(interaction.user.id),
+                        faccao=str(self.faccao.value),
+                        modo=modo,
+                        texto=texto,
+                        painel_canal_id=self.painel_canal_id,
+                        painel_mensagem_id=self.painel_mensagem_id,
+                    ),
+                    ephemeral=True,
+                )
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível preparar a importação.", erro)
+
+
+def _banco_prof_editar_individuo(
+    rg: str,
+    nome: str,
+    apelido_telefone: str,
+    faccao_cargo: str,
+    observacoes: str,
+    autor_id: int,
+) -> Dict[str, Any]:
+    rg_n = _banco_normalizar_rg(rg)
+    apelido, telefone = _banco_prof_parse_duplo(apelido_telefone)
+    faccao, cargo = _banco_prof_parse_duplo(faccao_cargo)
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        atual = db.execute("SELECT * FROM individuos WHERE rg=?", (rg_n,)).fetchone()
+        if not atual:
+            raise ValueError("Indivíduo não encontrado.")
+        db.execute(
+            """
+            UPDATE individuos SET nome=?, apelido=?, telefone=?, faccao_atual=?, cargo_faccao=?,
+                observacoes=?, atualizado_em=? WHERE rg=?
+            """,
+            (
+                str(nome or atual["nome"])[:120],
+                str(apelido or atual["apelido"])[:100],
+                str(telefone or atual["telefone"])[:80],
+                str(faccao or atual["faccao_atual"])[:120],
+                str(cargo or atual["cargo_faccao"])[:100],
+                str(observacoes or atual["observacoes"])[:1800],
+                agora,
+                rg_n,
+            ),
+        )
+        _banco_historico("INDIVIDUO", rg_n, "EDITADO", "Edição profissional pelo painel", autor_id, db)
+        row = db.execute("SELECT * FROM individuos WHERE rg=?", (rg_n,)).fetchone()
+    return dict(row)
+
+
+def _banco_prof_editar_veiculo(
+    placa: str,
+    modelo_cor: str,
+    dono: str,
+    contato_faccao: str,
+    local_status: str,
+    autor_id: int,
+) -> Dict[str, Any]:
+    placa_n = _banco_normalizar_placa(placa)
+    modelo, cor = _banco_prof_parse_duplo(modelo_cor)
+    dono_nome, dono_rg = _banco_prof_parse_duplo(dono)
+    telefone, faccao = _banco_prof_parse_duplo(contato_faccao)
+    local, status = _banco_prof_parse_duplo(local_status)
+    dono_rg = _banco_normalizar_rg(dono_rg)
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        atual = db.execute("SELECT * FROM veiculos WHERE placa=?", (placa_n,)).fetchone()
+        if not atual:
+            raise ValueError("Veículo não encontrado.")
+        individuo_id = int(atual["proprietario_individuo_id"] or 0) if "proprietario_individuo_id" in atual.keys() else 0
+        if dono_rg:
+            ind = db.execute("SELECT id FROM individuos WHERE rg=?", (dono_rg,)).fetchone()
+            if ind:
+                individuo_id = int(ind["id"])
+        db.execute(
+            """
+            UPDATE veiculos SET modelo=?, cor=?, proprietario_nome=?, proprietario_rg=?,
+                proprietario_individuo_id=?, telefone_proprietario=?, faccao=?,
+                local_ultimo_avistamento=?, status_veiculo=?, atualizado_em=? WHERE placa=?
+            """,
+            (
+                str(modelo or atual["modelo"])[:120],
+                str(cor or atual["cor"])[:80],
+                str(dono_nome or atual["proprietario_nome"])[:120],
+                str(dono_rg or atual["proprietario_rg"])[:40],
+                individuo_id,
+                str(telefone or atual["telefone_proprietario"])[:80],
+                str(faccao or atual["faccao"])[:120],
+                str(local or atual["local_ultimo_avistamento"])[:180],
+                str(status or atual["status_veiculo"] or "CADASTRADO")[:60].upper(),
+                agora,
+                placa_n,
+            ),
+        )
+        _banco_historico("VEICULO", placa_n, "EDITADO", "Edição profissional pelo painel", autor_id, db)
+        row = db.execute("SELECT * FROM veiculos WHERE placa=?", (placa_n,)).fetchone()
+    return dict(row)
+
+
+def _banco_prof_editar_faccao(
+    nome_atual: str,
+    novo_nome: str,
+    status: str,
+    mesa: str,
+    observacoes: str,
+    autor_id: int,
+) -> Dict[str, Any]:
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        atual = db.execute("SELECT * FROM faccoes WHERE nome=? COLLATE NOCASE", (nome_atual.strip(),)).fetchone()
+        if not atual:
+            raise ValueError("Organização não encontrada.")
+        antigo_nome = str(atual["nome"])
+        nome_final = str(novo_nome or antigo_nome).strip()[:120]
+        status_final = str(status or atual["status"] or "ATIVA").strip().upper()[:60]
+        mesa_nome = str(mesa or atual["mesa_nome"] or "").strip()[:150]
+        mesa_info = banco_encontrar_mesa(mesa_nome or nome_final)
+        mesa_id = int(mesa_info.get("canal_id", 0) or atual["mesa_canal_id"] or 0)
+        if mesa_info.get("nome_canal"):
+            mesa_nome = str(mesa_info["nome_canal"])
+        db.execute(
+            "UPDATE faccoes SET nome=?, status=?, mesa_canal_id=?, mesa_nome=?, atualizado_em=? WHERE id=?",
+            (nome_final, status_final, mesa_id, mesa_nome, agora, int(atual["id"])),
+        )
+        if normalizar_busca(nome_final) != normalizar_busca(antigo_nome):
+            db.execute("UPDATE individuos SET faccao_atual=? WHERE faccao_atual=? COLLATE NOCASE", (nome_final, antigo_nome))
+            db.execute("UPDATE veiculos SET faccao=? WHERE faccao=? COLLATE NOCASE", (nome_final, antigo_nome))
+        _banco_historico("FACCAO", nome_final, "EDITADA", str(observacoes or "Edição profissional pelo painel"), autor_id, db)
+        row = db.execute(
+            """
+            SELECT f.*, (SELECT COUNT(*) FROM faccao_membros m WHERE m.faccao_id=f.id AND m.ativo=1) AS membros
+            FROM faccoes f WHERE f.id=?
+            """,
+            (int(atual["id"]),),
+        ).fetchone()
+    return dict(row)
+
+
+class BancoEditarIndividuoModal(Modal, title="Editar indivíduo"):
+    def __init__(self, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=300)
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+        self.rg = TextInput(label="RG ou Passaporte do registro", max_length=40)
+        self.nome = TextInput(label="Novo nome (vazio mantém)", required=False, max_length=120)
+        self.apelido_telefone = TextInput(label="Apelido | Telefone (vazio mantém)", required=False, max_length=180)
+        self.faccao_cargo = TextInput(label="Facção | Cargo (vazio mantém)", required=False, max_length=180)
+        self.observacoes = TextInput(label="Observações (vazio mantém)", required=False, style=discord.TextStyle.paragraph, max_length=800)
+        for x in (self.rg, self.nome, self.apelido_telefone, self.faccao_cargo, self.observacoes):
+            self.add_item(x)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            item = await asyncio.to_thread(
+                _banco_prof_editar_individuo,
+                str(self.rg.value), str(self.nome.value or ""), str(self.apelido_telefone.value or ""),
+                str(self.faccao_cargo.value or ""), str(self.observacoes.value or ""), int(interaction.user.id),
+            )
+            embed = _banco_embed_consulta_individuo(item)
+            embed.title = "✅ INDIVÍDUO ATUALIZADO"
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível editar o indivíduo.", erro)
+
+
+class BancoEditarVeiculoModal(Modal, title="Editar veículo"):
+    def __init__(self, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=300)
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+        self.placa = TextInput(label="Placa do registro", max_length=16)
+        self.modelo_cor = TextInput(label="Modelo | Cor (vazio mantém)", required=False, max_length=200)
+        self.dono = TextInput(label="Proprietário | Documento (vazio mantém)", required=False, max_length=200)
+        self.contato_faccao = TextInput(label="Telefone | Facção (vazio mantém)", required=False, max_length=200)
+        self.local_status = TextInput(label="Local | Status (vazio mantém)", required=False, max_length=240)
+        for x in (self.placa, self.modelo_cor, self.dono, self.contato_faccao, self.local_status):
+            self.add_item(x)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            item = await asyncio.to_thread(
+                _banco_prof_editar_veiculo,
+                str(self.placa.value), str(self.modelo_cor.value or ""), str(self.dono.value or ""),
+                str(self.contato_faccao.value or ""), str(self.local_status.value or ""), int(interaction.user.id),
+            )
+            embed = _banco_embed_consulta_veiculo(item)
+            embed.title = "✅ VEÍCULO ATUALIZADO"
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível editar o veículo.", erro)
+
+
+class BancoEditarFaccaoModal(Modal, title="Editar organização"):
+    def __init__(self, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=300)
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+        self.nome_atual = TextInput(label="Nome atual", max_length=120)
+        self.novo_nome = TextInput(label="Novo nome (vazio mantém)", required=False, max_length=120)
+        self.status = TextInput(label="Status (ATIVA/ARQUIVADA)", required=False, max_length=60)
+        self.mesa = TextInput(label="Mesa vinculada (vazio mantém)", required=False, max_length=150)
+        self.observacoes = TextInput(label="Motivo/observações", required=False, style=discord.TextStyle.paragraph, max_length=500)
+        for x in (self.nome_atual, self.novo_nome, self.status, self.mesa, self.observacoes):
+            self.add_item(x)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            item = await asyncio.to_thread(
+                _banco_prof_editar_faccao,
+                str(self.nome_atual.value), str(self.novo_nome.value or ""), str(self.status.value or ""),
+                str(self.mesa.value or ""), str(self.observacoes.value or ""), int(interaction.user.id),
+            )
+            embed = _banco_embed_consulta_faccao(item)
+            embed.title = "✅ ORGANIZAÇÃO ATUALIZADA"
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível editar a organização.", erro)
+
+
+class BancoEscolherEdicaoView(View):
+    def __init__(self, usuario_id: int, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=180)
+        self.usuario_id = int(usuario_id)
+        self.painel_canal_id = int(painel_canal_id)
+        self.painel_mensagem_id = int(painel_mensagem_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Este menu pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Indivíduo", emoji="👤", style=discord.ButtonStyle.primary)
+    async def individuo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoEditarIndividuoModal(self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Veículo", emoji="🚗", style=discord.ButtonStyle.primary)
+    async def veiculo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoEditarVeiculoModal(self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Organização", emoji="🏴", style=discord.ButtonStyle.primary)
+    async def faccao(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoEditarFaccaoModal(self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✖️ Edição cancelada.", embed=None, view=None)
+
+
+def _banco_prof_arquivar(tipo: str, chave: str, motivo: str, autor_id: int) -> Dict[str, Any]:
+    tipo = str(tipo).lower()
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        if tipo == "individuo":
+            key = _banco_normalizar_rg(chave)
+            row = db.execute("SELECT * FROM individuos WHERE rg=?", (key,)).fetchone()
+            if not row:
+                raise ValueError("Indivíduo não encontrado.")
+            db.execute("UPDATE individuos SET status='ARQUIVADO', atualizado_em=? WHERE rg=?", (agora, key))
+            entidade = "INDIVIDUO"
+        elif tipo == "veiculo":
+            key = _banco_normalizar_placa(chave)
+            row = db.execute("SELECT * FROM veiculos WHERE placa=?", (key,)).fetchone()
+            if not row:
+                raise ValueError("Veículo não encontrado.")
+            db.execute("UPDATE veiculos SET status_veiculo='ARQUIVADO', atualizado_em=? WHERE placa=?", (agora, key))
+            entidade = "VEICULO"
+        elif tipo == "faccao":
+            key = str(chave).strip()
+            row = db.execute("SELECT * FROM faccoes WHERE nome=? COLLATE NOCASE", (key,)).fetchone()
+            if not row:
+                raise ValueError("Organização não encontrada.")
+            db.execute("UPDATE faccoes SET status='ARQUIVADA', atualizado_em=? WHERE id=?", (agora, int(row["id"])))
+            db.execute("UPDATE faccao_membros SET ativo=0, atualizado_em=? WHERE faccao_id=?", (agora, int(row["id"])))
+            entidade = "FACCAO"
+        else:
+            raise ValueError("Tipo inválido.")
+        _banco_historico(entidade, key, "ARQUIVADO", motivo or "Sem motivo informado", autor_id, db)
+    return {"tipo": tipo, "chave": key, "motivo": motivo}
+
+
+class BancoConfirmarArquivamentoView(View):
+    def __init__(self, usuario_id: int, tipo: str, chave: str, motivo: str, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=180)
+        self.usuario_id = int(usuario_id)
+        self.tipo = tipo
+        self.chave = chave
+        self.motivo = motivo
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta confirmação pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar arquivamento", emoji="🗄️", style=discord.ButtonStyle.danger)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(
+                _banco_prof_arquivar, self.tipo, self.chave, self.motivo, int(interaction.user.id)
+            )
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="🗄️ REGISTRO ARQUIVADO",
+                    description=(
+                        f"**Tipo:** {self.tipo.title()}\n**Chave:** `{self.chave}`\n"
+                        f"**Motivo:** {self.motivo or 'Não informado'}\n\nO histórico foi preservado."
+                    ),
+                    color=discord.Color.red(),
+                ),
+                view=None,
+            )
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível arquivar o registro.", erro)
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✖️ Arquivamento cancelado.", embed=None, view=None)
+
+
+class BancoArquivarEspecificoModal(Modal, title="Preparar arquivamento"):
+    def __init__(self, tipo: str, usuario_id: int, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=300)
+        self.tipo = tipo
+        self.usuario_id = int(usuario_id)
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+        rotulo = "RG/Passaporte" if tipo == "individuo" else ("Placa" if tipo == "veiculo" else "Nome da organização")
+        self.chave = TextInput(label=rotulo, max_length=120)
+        self.motivo = TextInput(label="Motivo do arquivamento", required=False, style=discord.TextStyle.paragraph, max_length=500)
+        self.add_item(self.chave)
+        self.add_item(self.motivo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        chave = str(self.chave.value).strip()
+        motivo = str(self.motivo.value or "").strip()
+        embed = discord.Embed(
+            title="⚠️ CONFIRMAR ARQUIVAMENTO",
+            description=(
+                f"**Tipo:** {self.tipo.title()}\n**Chave:** `{chave}`\n"
+                f"**Motivo:** {motivo or 'Não informado'}\n\n"
+                "O registro não será apagado; ficará arquivado e continuará disponível no histórico."
+            ),
+            color=discord.Color.orange(),
+        )
+        await interaction.followup.send(
+            embed=embed,
+            view=BancoConfirmarArquivamentoView(
+                int(interaction.user.id), self.tipo, chave, motivo,
+                self.painel_canal_id, self.painel_mensagem_id,
+            ),
+            ephemeral=True,
+        )
+
+
+class BancoEscolherArquivamentoView(View):
+    def __init__(self, usuario_id: int, painel_canal_id: int, painel_mensagem_id: int):
+        super().__init__(timeout=180)
+        self.usuario_id = int(usuario_id)
+        self.painel_canal_id = painel_canal_id
+        self.painel_mensagem_id = painel_mensagem_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Este menu pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Indivíduo", emoji="👤", style=discord.ButtonStyle.danger)
+    async def individuo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoArquivarEspecificoModal("individuo", self.usuario_id, self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Veículo", emoji="🚗", style=discord.ButtonStyle.danger)
+    async def veiculo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoArquivarEspecificoModal("veiculo", self.usuario_id, self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Organização", emoji="🏴", style=discord.ButtonStyle.danger)
+    async def faccao(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoArquivarEspecificoModal("faccao", self.usuario_id, self.painel_canal_id, self.painel_mensagem_id))
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✖️ Arquivamento cancelado.", embed=None, view=None)
+
+
+async def _banco_prof_sync_tarefa(interaction: discord.Interaction, canal_id: int, mensagem_id: int) -> None:
+    async with _BANCO_PROF_SYNC_LOCK:
+        inicio = time.monotonic()
+        try:
+            mesas = await asyncio.to_thread(banco_sincronizar_mesas)
+            procurados = await asyncio.to_thread(banco_sincronizar_procurados)
+            pericias = await banco_sincronizar_pericias(
+                interaction.guild,
+                canal_revisao_id=int(getattr(interaction.channel, "id", 0) or 0),
+            )
+            await _banco_prof_atualizar_painel(canal_id, mensagem_id)
+            duracao = max(1, int(time.monotonic() - inicio))
+            embed = discord.Embed(title="✅ SINCRONIZAÇÃO CONCLUÍDA", color=discord.Color.green())
+            embed.add_field(name="🏴 Mesas/facções", value=str(mesas.get("total", 0)), inline=True)
+            embed.add_field(name="🚨 Procurados", value=str(procurados.get("total", 0)), inline=True)
+            embed.add_field(name="🔬 Novas perícias", value=str(pericias.get("novas", 0)), inline=True)
+            embed.add_field(name="🚗 Placas no texto", value=str(pericias.get("placas", 0)), inline=True)
+            embed.add_field(name="🖼️ Imagens OCR", value=str(pericias.get("ocr_imagens", 0)), inline=True)
+            embed.add_field(name="📋 Fichas pendentes", value=str(pericias.get("ocr_pendentes", 0)), inline=True)
+            erros = int(mesas.get("erros", 0)) + int(procurados.get("erros", 0)) + int(pericias.get("erros", 0))
+            embed.add_field(name="⚠️ Erros", value=str(erros), inline=True)
+            embed.add_field(name="⏱️ Duração", value=f"{duracao}s", inline=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "A sincronização não foi concluída.", erro)
+
+
+class BancoConfirmarImportacaoHistoricaView(View):
+    def __init__(self, usuario_id: int, guild: Optional[discord.Guild], canal: Any, painel_mensagem_id: int):
+        super().__init__(timeout=180)
+        self.usuario_id = int(usuario_id)
+        self.guild = guild
+        self.canal = canal
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta confirmação pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Iniciar importação completa", emoji="📚", style=discord.ButtonStyle.success)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
+            return await interaction.edit_original_response(
+                content="⏳ Uma importação histórica já está em andamento.", embed=None, view=None
+            )
+        await interaction.edit_original_response(
+            content=(
+                "📚 **Importação histórica iniciada.** O processamento ocorrerá em segundo plano. "
+                "Os cartões encontrados serão publicados neste canal e a conclusão será avisada aqui."
+            ),
+            embed=None,
+            view=None,
+        )
+        asyncio.create_task(
+            _banco_importar_pericias_antigas_tarefa(
+                self.guild, self.canal, int(interaction.user.id)
+            )
+        )
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✖️ Importação histórica cancelada.", embed=None, view=None)
+
+
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Não executa consultas ou edição do painel antes da resposta do botão.
+        # Isso elimina o erro "o bot não respondeu a tempo".
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar este painel.", ephemeral=True)
+            return False
+        asyncio.create_task(_banco_prof_salvar_contexto_painel(interaction))
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "O comando do painel apresentou uma falha inesperada.", error)
+
+    def _ids(self, interaction: discord.Interaction) -> Tuple[int, int]:
+        return (
+            int(getattr(interaction.channel, "id", 0) or 0),
+            int(getattr(interaction.message, "id", 0) or 0),
+        )
+
+    @discord.ui.button(label="Cadastrar indivíduo", emoji="👤", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_individuo", row=0)
+    async def adicionar_individuo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.response.send_modal(BancoAdicionarIndividuoModal(canal_id, msg_id))
+
+    @discord.ui.button(label="Cadastrar veículo", emoji="🚗", style=discord.ButtonStyle.primary, custom_id="dicor_banco_add_placa", row=0)
+    async def adicionar_placa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.response.send_modal(BancoAdicionarVeiculoModal(canal_id, msg_id))
+
+    @discord.ui.button(label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary, custom_id="dicor_banco_importar_painel", row=0)
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.response.send_modal(BancoImportarPainelModal(canal_id, msg_id))
+
+    @discord.ui.button(label="Consultar fichas", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_consultar", row=0)
+    async def consultar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success, custom_id="dicor_banco_sync_tudo", row=1)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send("⏳ Já existe uma sincronização em andamento.", ephemeral=True)
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.followup.send(
+            "🔄 **Sincronização iniciada.** O resultado será enviado assim que o processamento terminar.",
+            ephemeral=True,
+        )
+        asyncio.create_task(_banco_prof_sync_tarefa(interaction, canal_id, msg_id))
+
+    @discord.ui.button(label="Atualizar painel", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_resumo", row=1)
+    async def resumo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        sucesso = await _banco_prof_atualizar_painel(mensagem=interaction.message)
+        await interaction.followup.send(
+            "✅ Painel atualizado com os dados e estados atuais." if sucesso else "❌ Não foi possível atualizar o painel.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Editar registro", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_editar", row=1)
+    async def editar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_prof_admin(interaction):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode editar registros.", ephemeral=True)
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="✏️ EDITAR REGISTRO",
+                description="Escolha o tipo de ficha que deseja atualizar.",
+                color=discord.Color.from_rgb(25, 82, 145),
+            ),
+            view=BancoEscolherEdicaoView(int(interaction.user.id), canal_id, msg_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Arquivar registro", emoji="🗄️", style=discord.ButtonStyle.danger, custom_id="dicor_banco_arquivar", row=1)
+    async def arquivar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_prof_admin(interaction):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode arquivar registros.", ephemeral=True)
+        canal_id, msg_id = self._ids(interaction)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🗄️ ARQUIVAR REGISTRO",
+                description="Escolha o tipo. Uma confirmação será exigida antes da alteração.",
+                color=discord.Color.orange(),
+            ),
+            view=BancoEscolherArquivamentoView(int(interaction.user.id), canal_id, msg_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Revisar fichas OCR", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_revisar_ocr", row=2)
+    async def revisar_ocr(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            pendentes = await asyncio.to_thread(_banco_ocr_pendentes, 25, True)
+            publicados = 0
+            for pendente in pendentes:
+                if await _banco_ocr_postar_revisao(
+                    interaction.guild,
+                    pendente,
+                    canal_fallback_id=int(getattr(interaction.channel, "id", 0) or 0),
+                ):
+                    publicados += 1
+            total = len(await asyncio.to_thread(_banco_ocr_pendentes, 5000, False))
+            await interaction.followup.send(
+                f"🖼️ **Revisão OCR atualizada**\n📨 Cartões publicados agora: **{publicados}**\n"
+                f"⏳ Total aguardando decisão: **{total}**",
+                ephemeral=True,
+            )
+            await _banco_prof_atualizar_painel(mensagem=interaction.message)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível publicar as fichas pendentes.", erro)
+
+    @discord.ui.button(label="Importar perícias antigas", emoji="📚", style=discord.ButtonStyle.success, custom_id="dicor_banco_importar_pericias_antigas", row=2)
+    async def importar_pericias_antigas(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_prof_admin(interaction):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode iniciar a importação histórica.", ephemeral=True)
+        if not BANCO_OCR_ATIVO or RapidOCR is None:
+            return await interaction.response.send_message("❌ O OCR não está operacional neste deploy.", ephemeral=True)
+        if _BANCO_IMPORTACAO_HISTORICO_LOCK.locked():
+            return await interaction.response.send_message("⏳ Uma importação histórica já está em andamento.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="📚 IMPORTAÇÃO HISTÓRICA COMPLETA",
+                description=(
+                    "O bot relerá todas as mensagens da Perícia Externa, analisará imagens disponíveis e "
+                    "recriará as fichas pendentes de revisão. O processo pode demorar."
+                ),
+                color=discord.Color.orange(),
+            ),
+            view=BancoConfirmarImportacaoHistoricaView(
+                int(interaction.user.id), interaction.guild, interaction.channel,
+                int(getattr(interaction.message, "id", 0) or 0),
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Ajuda", emoji="❔", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_ajuda", row=2)
+    async def ajuda(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="❔ MANUAL RÁPIDO • BANCO DICOR", color=discord.Color.from_rgb(25, 82, 145))
+        embed.add_field(name="👤 Cadastrar indivíduo", value="Salva nome, documento, contato, facção, cargo, observações e até duas fotos.", inline=False)
+        embed.add_field(name="🚗 Cadastrar veículo", value="Salva placa, modelo, cor, proprietário, facção, local e foto.", inline=False)
+        embed.add_field(name="🏴 Importar painel", value="Envie o painel inteiro em texto. O bot mostra uma prévia antes de salvar todos os membros.", inline=False)
+        embed.add_field(name="🔍 Consultar fichas", value="Pesquisa por nome, documento, telefone, placa, modelo ou organização.", inline=False)
+        embed.add_field(name="🔄 Sincronizar", value="Atualiza mesas, procurados e novas Perícias Externas sem reler todo o histórico.", inline=False)
+        embed.add_field(name="📚 Importação histórica", value="Inspetor+ pode reler todas as perícias antigas e imagens disponíveis.", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Reforça a confiabilidade dos botões de confirmação das fichas OCR.
+class BancoOCRCorrecaoModal(Modal, title="Corrigir ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.pendente_id = int(pendente_id)
+        self.placa = TextInput(label="Placa correta", default=str(pendente.get("placa_sugerida") or "")[:16], max_length=16)
+        self.proprietario = TextInput(label="Nome do proprietário", default=str(pendente.get("proprietario_nome") or "")[:120], required=False, max_length=120)
+        self.documento = TextInput(label="RG ou Passaporte", default=str(pendente.get("proprietario_rg") or "")[:40], required=False, max_length=40)
+        self.telefone = TextInput(label="Telefone", default=str(pendente.get("telefone") or "")[:80], required=False, max_length=80)
+        self.modelo = TextInput(label="Modelo do veículo", default=str(pendente.get("modelo") or "")[:120], required=False, max_length=120)
+        for item in (self.placa, self.proprietario, self.documento, self.telefone, self.modelo):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_ocr(self.pendente_id)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver,
+                    self.pendente_id,
+                    int(interaction.user.id),
+                    placa_final=str(self.placa.value),
+                    proprietario_nome=str(self.proprietario.value or ""),
+                    proprietario_rg=str(self.documento.value or ""),
+                    telefone=str(self.telefone.value or ""),
+                    modelo=str(self.modelo.value or ""),
+                    status_final="CORRIGIDO",
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+                await interaction.followup.send(f"✅ Ficha corrigida e salva na placa `{item.get('placa')}`.", ephemeral=True)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível corrigir a ficha OCR.", erro)
+
+
+class BancoOCRCompletarModal(Modal, title="Completar ficha identificada"):
+    def __init__(self, pendente_id: int, pendente: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.pendente_id = int(pendente_id)
+        self.cor = TextInput(label="Cor", default=str(pendente.get("cor") or "")[:80], required=False, max_length=80)
+        self.faccao = TextInput(label="Facção/organização", default=str(pendente.get("faccao") or "")[:120], required=False, max_length=120)
+        self.local = TextInput(label="Local/último avistamento", default=str(pendente.get("local") or "")[:180], required=False, max_length=180)
+        self.ano_chassi = TextInput(label="Ano | Chassi", default=f"{pendente.get('ano') or ''} | {pendente.get('chassi') or ''}"[:180], required=False, max_length=180)
+        self.observacoes = TextInput(label="Observações", default=str(pendente.get("observacoes") or "")[:500], required=False, style=discord.TextStyle.paragraph, max_length=800)
+        for item in (self.cor, self.faccao, self.local, self.ano_chassi, self.observacoes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_ocr(self.pendente_id)
+        async with lock:
+            try:
+                ano, chassi = _banco_prof_parse_duplo(self.ano_chassi.value)
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver,
+                    self.pendente_id,
+                    int(interaction.user.id),
+                    cor=str(self.cor.value or ""),
+                    faccao=str(self.faccao.value or ""),
+                    local=str(self.local.value or ""),
+                    ano=ano,
+                    chassi=chassi,
+                    observacoes=str(self.observacoes.value or ""),
+                    status_final="CORRIGIDO",
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, self.pendente_id, item)
+                await interaction.followup.send(f"✅ Ficha completada e salva na placa `{item.get('placa')}`.", ephemeral=True)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível completar a ficha OCR.", erro)
+
+
+class BancoOCRReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode revisar fichas.", ephemeral=True)
+            return False
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "A ação da ficha OCR apresentou uma falha.", error)
+
+    @discord.ui.button(label="Confirmar ficha", emoji="✅", style=discord.ButtonStyle.success, custom_id="dicor_banco_ocr_confirmar", row=0)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="CONFIRMADO"
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, pendente_id, item)
+                await interaction.followup.send(
+                    f"✅ Ficha confirmada. Proprietário, veículo e evidência foram vinculados à placa `{item.get('placa')}`.",
+                    ephemeral=True,
+                )
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível confirmar a ficha.", erro)
+
+    @discord.ui.button(label="Corrigir ficha", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="dicor_banco_ocr_corrigir", row=0)
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        pendente = _banco_ocr_pendente_por_id(pendente_id)
+        if not pendente or str(pendente.get("status")) != "PENDENTE":
+            return await interaction.response.send_message("❌ Esta ficha já foi resolvida ou não existe.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRCorrecaoModal(pendente_id, pendente))
+
+    @discord.ui.button(label="Completar dados", emoji="📝", style=discord.ButtonStyle.secondary, custom_id="dicor_banco_ocr_completar", row=0)
+    async def completar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        pendente = _banco_ocr_pendente_por_id(pendente_id)
+        if not pendente or str(pendente.get("status")) != "PENDENTE":
+            return await interaction.response.send_message("❌ Esta ficha já foi resolvida ou não existe.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRCompletarModal(pendente_id, pendente))
+
+    @discord.ui.button(label="Ignorar", emoji="❌", style=discord.ButtonStyle.danger, custom_id="dicor_banco_ocr_ignorar", row=0)
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        if lock.locked():
+            return await interaction.followup.send("⏳ Esta ficha já está sendo processada.", ephemeral=True)
+        async with lock:
+            try:
+                await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="IGNORADO"
+                )
+                if interaction.message:
+                    await interaction.message.edit(
+                        embed=discord.Embed(
+                            title="❌ FICHA OCR IGNORADA",
+                            description=f"Ignorada por {interaction.user.mention}. Nenhum cadastro foi criado.",
+                            color=discord.Color.red(),
+                        ),
+                        view=None,
+                    )
+                await interaction.followup.send("✅ Ficha ignorada e retirada da fila.", ephemeral=True)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível ignorar a ficha.", erro)
+
+
+async def _painelbanco_profissional(interaction: discord.Interaction):
+    if not _banco_prof_equipe(interaction):
+        return await interaction.response.send_message("❌ Apenas a equipe DICOR pode publicar este painel.", ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    try:
+        await asyncio.to_thread(inicializar_banco_dicor)
+        mensagem = await interaction.followup.send(embed=banco_embed_painel(), view=BancoDadosView(), wait=True)
+        await asyncio.to_thread(_banco_config_set, "painel_canal_id", int(mensagem.channel.id))
+        await asyncio.to_thread(_banco_config_set, "painel_mensagem_id", int(mensagem.id))
+    except Exception as erro:
+        await _banco_prof_erro_interacao(interaction, "Não foi possível publicar o painel do banco.", erro)
+
+
+async def _consultarbanco_profissional(interaction: discord.Interaction, consulta: str):
+    if not _banco_prof_equipe(interaction):
+        return await interaction.response.send_message("❌ Apenas a equipe DICOR pode consultar o banco.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await _banco_prof_enviar_consulta(interaction, consulta)
+    except Exception as erro:
+        await _banco_prof_erro_interacao(interaction, "Falha ao consultar o banco.", erro)
+
+
+# Atualiza os callbacks dos comandos já registrados sem criar comandos duplicados.
+try:
+    _cmd_painelbanco = bot.tree.get_command("painelbanco")
+    if _cmd_painelbanco is not None:
+        _cmd_painelbanco._callback = _painelbanco_profissional
+    _cmd_consultarbanco = bot.tree.get_command("consultarbanco")
+    if _cmd_consultarbanco is not None:
+        _cmd_consultarbanco._callback = _consultarbanco_profissional
+except Exception:
+    traceback.print_exc()
+
+
+async def _banco_prof_remover_views_antigas() -> None:
+    try:
+        for view in list(getattr(bot, "persistent_views", [])):
+            ids = {
+                str(getattr(item, "custom_id", "") or "")
+                for item in getattr(view, "children", [])
+            }
+            if any(x.startswith("dicor_banco_") for x in ids):
+                try:
+                    bot.remove_view(view)
+                except Exception:
+                    pass
+        bot.add_view(BancoDadosView())
+        bot.add_view(BancoOCRReviewView())
+    except Exception:
+        traceback.print_exc()
+
+
+_BANCO_ON_READY_ANTES_PROFISSIONAL = bot.on_ready
+
+
+@bot.event
+async def on_ready():
+    await _BANCO_ON_READY_ANTES_PROFISSIONAL()
+    try:
+        await _banco_prof_remover_views_antigas()
+        await _banco_prof_atualizar_painel()
+        print("✅ Banco de Dados DICOR Profissional V2 carregado: todos os botões e fluxos revisados.")
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao finalizar Banco Profissional V2: {erro}")
+
+# Ajustes finais de confiabilidade do Banco Profissional V2.
+async def _banco_prof_esperar_upload_opcional(
+    interaction: discord.Interaction,
+    instrucao: str,
+    *,
+    timeout: float,
+) -> Optional[discord.Message]:
+    await interaction.followup.send(instrucao, ephemeral=True)
+    canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+    usuario_id = int(interaction.user.id)
+
+    def check(msg: discord.Message) -> bool:
+        return (
+            int(getattr(msg.author, "id", 0) or 0) == usuario_id
+            and int(getattr(msg.channel, "id", 0) or 0) == canal_id
+            and not getattr(msg.author, "bot", False)
+        )
+
+    try:
+        return await bot.wait_for("message", check=check, timeout=timeout)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            "⌛ Nenhuma imagem foi enviada. O cadastro continuará sem foto; ela poderá ser adicionada depois pela edição.",
+            ephemeral=True,
+        )
+        return None
+
+
+async def _banco_prof_coletar_fotos_individuo(
+    interaction: discord.Interaction, documento: str
+) -> Tuple[str, str, str, str]:
+    msg = await _banco_prof_esperar_upload_opcional(
+        interaction,
+        "📸 **Anexos opcionais**\nEnvie uma mensagem com até duas imagens:\n"
+        "1. foto do indivíduo;\n2. foto do RG/passaporte.\n\n"
+        "Digite `pular` para finalizar sem imagens. A mensagem será apagada após o salvamento.",
+        timeout=240,
+    )
+    if msg is None:
+        return "", "", "", ""
+    try:
+        if normalizar_busca(msg.content).strip() == "pular":
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return "", "", "", ""
+        imagens = [
+            a for a in msg.attachments
+            if (a.content_type or "").startswith("image/")
+            or Path(a.filename or "").suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ][:2]
+        pessoa_path = rg_path = pessoa_url = rg_url = ""
+        if imagens:
+            pessoa_path = await _banco_salvar_attachment(imagens[0], f"individuo-{documento}")
+            pessoa_url = imagens[0].url
+        if len(imagens) > 1:
+            rg_path = await _banco_salvar_attachment(imagens[1], f"documento-{documento}")
+            rg_url = imagens[1].url
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return pessoa_path, rg_path, pessoa_url, rg_url
+    except Exception as erro:
+        traceback.print_exc()
+        await interaction.followup.send(
+            f"⚠️ O cadastro continuará, mas as imagens não puderam ser salvas: `{type(erro).__name__}`.",
+            ephemeral=True,
+        )
+        return "", "", "", ""
+
+
+async def _banco_prof_coletar_foto_veiculo(
+    interaction: discord.Interaction, placa: str
+) -> Tuple[str, str]:
+    msg = await _banco_prof_esperar_upload_opcional(
+        interaction,
+        "📸 **Foto opcional do veículo**\nEnvie uma imagem em uma mensagem ou digite `pular`. "
+        "A mensagem será apagada após o salvamento.",
+        timeout=180,
+    )
+    if msg is None:
+        return "", ""
+    try:
+        if normalizar_busca(msg.content).strip() == "pular":
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            return "", ""
+        imagem = next(
+            (
+                a for a in msg.attachments
+                if (a.content_type or "").startswith("image/")
+                or Path(a.filename or "").suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            ),
+            None,
+        )
+        caminho = url = ""
+        if imagem:
+            caminho = await _banco_salvar_attachment(imagem, f"veiculo-{placa}")
+            url = imagem.url
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return caminho, url
+    except Exception as erro:
+        traceback.print_exc()
+        await interaction.followup.send(
+            f"⚠️ O cadastro continuará, mas a foto não pôde ser salva: `{type(erro).__name__}`.",
+            ephemeral=True,
+        )
+        return "", ""
+
+
+# Substitui a sincronização para atualizar o painel somente depois de liberar o lock.
+async def _banco_prof_sync_tarefa(interaction: discord.Interaction, canal_id: int, mensagem_id: int) -> None:
+    inicio = time.monotonic()
+    embed_resultado: Optional[discord.Embed] = None
+    erro_final: Optional[BaseException] = None
+    async with _BANCO_PROF_SYNC_LOCK:
+        try:
+            mesas = await asyncio.to_thread(banco_sincronizar_mesas)
+            procurados = await asyncio.to_thread(banco_sincronizar_procurados)
+            pericias = await banco_sincronizar_pericias(
+                interaction.guild,
+                canal_revisao_id=int(getattr(interaction.channel, "id", 0) or 0),
+            )
+            duracao = max(1, int(time.monotonic() - inicio))
+            embed_resultado = discord.Embed(title="✅ SINCRONIZAÇÃO CONCLUÍDA", color=discord.Color.green())
+            embed_resultado.add_field(name="🏴 Mesas/facções", value=str(mesas.get("total", 0)), inline=True)
+            embed_resultado.add_field(name="🚨 Procurados", value=str(procurados.get("total", 0)), inline=True)
+            embed_resultado.add_field(name="🔬 Novas perícias", value=str(pericias.get("novas", 0)), inline=True)
+            embed_resultado.add_field(name="🚗 Placas no texto", value=str(pericias.get("placas", 0)), inline=True)
+            embed_resultado.add_field(name="🖼️ Imagens OCR", value=str(pericias.get("ocr_imagens", 0)), inline=True)
+            embed_resultado.add_field(name="📋 Fichas pendentes", value=str(pericias.get("ocr_pendentes", 0)), inline=True)
+            erros = int(mesas.get("erros", 0)) + int(procurados.get("erros", 0)) + int(pericias.get("erros", 0))
+            embed_resultado.add_field(name="⚠️ Erros", value=str(erros), inline=True)
+            embed_resultado.add_field(name="⏱️ Duração", value=f"{duracao}s", inline=True)
+        except Exception as erro:
+            erro_final = erro
+    # O lock já foi liberado; agora o painel mostra corretamente "Disponível".
+    await _banco_prof_atualizar_painel(canal_id, mensagem_id)
+    if erro_final is not None:
+        await _banco_prof_erro_interacao(interaction, "A sincronização não foi concluída.", erro_final)
+    elif embed_resultado is not None:
+        try:
+            await interaction.followup.send(embed=embed_resultado, ephemeral=True)
+        except Exception:
+            canal = interaction.channel
+            if canal is not None and hasattr(canal, "send"):
+                await canal.send(embed=embed_resultado, delete_after=120)
+
+
+_BANCO_IMPORTACAO_HISTORICA_ANTES_ATUALIZACAO_PROF = _banco_importar_pericias_antigas_tarefa
+
+
+async def _banco_importar_pericias_antigas_tarefa(
+    guild: Optional[discord.Guild], canal_destino: Any, solicitado_por_id: int
+) -> None:
+    try:
+        await _BANCO_IMPORTACAO_HISTORICA_ANTES_ATUALIZACAO_PROF(
+            guild, canal_destino, solicitado_por_id
+        )
+    finally:
+        await _banco_prof_atualizar_painel()
 
 if __name__ == '__main__':
     asyncio.run(main())
