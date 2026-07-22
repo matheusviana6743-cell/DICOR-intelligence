@@ -36138,3 +36138,414 @@ print(
 
 if __name__ == '__main__':
     asyncio.run(main())
+
+# =====================================================
+# CENTRAL DE FICHAS V6 — PERMISSÕES FINAIS + ANEXOS DE PERÍCIA
+# Inspetor/Vice-Diretor/Diretor: controle total.
+# Investigador/Estagiário: somente pesquisa e visualização.
+# Sincronização também revisa pendências e vincula TODAS as fotos da perícia.
+# =====================================================
+
+_BANCO_V6_CARGOS_ADMIN = {
+    1490200388912156692,  # Inspetor
+    1490200383614615725,  # Vice-Diretor
+    1490200382776021132,  # Diretor
+}
+
+
+def _banco_v6_admin_usuario(usuario: Any) -> bool:
+    if not isinstance(usuario, discord.Member):
+        return False
+    if getattr(usuario.guild_permissions, "administrator", False):
+        return True
+    return any(int(getattr(cargo, "id", 0) or 0) in _BANCO_V6_CARGOS_ADMIN for cargo in usuario.roles)
+
+
+def _banco_v6_admin_interacao(interaction: discord.Interaction) -> bool:
+    return _banco_v6_admin_usuario(interaction.user)
+
+
+async def _banco_v6_negar_escrita(interaction: discord.Interaction) -> None:
+    texto = (
+        "❌ Você possui acesso somente para consulta. Apenas Inspetor, Vice-Diretor e Diretor "
+        "podem criar, editar, excluir, importar ou sincronizar fichas."
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(texto, ephemeral=True)
+    else:
+        await interaction.response.send_message(texto, ephemeral=True)
+
+
+# Ficha consultada: remove controles de alteração para Investigador/Estagiário.
+_BANCO_FICHA_GERAL_VIEW_ANTES_V6 = BancoFichaGeralView
+
+
+class BancoFichaGeralView(_BANCO_FICHA_GERAL_VIEW_ANTES_V6):
+    def __init__(
+        self,
+        usuario_id: int,
+        perfil: Optional[Dict[str, Any]] = None,
+        opcoes: Optional[List[Tuple[str, int, str, str, str]]] = None,
+        somente_leitura: bool = False,
+    ):
+        super().__init__(usuario_id, perfil=perfil, opcoes=opcoes)
+        self.somente_leitura = bool(somente_leitura)
+        if self.somente_leitura:
+            for item in list(self.children):
+                if isinstance(item, discord.ui.Button) and getattr(item, "label", "") in {
+                    "Adicionar arquivos", "Adicionar/editar informações"
+                }:
+                    self.remove_item(item)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message(
+                "❌ Esta ficha pertence à consulta de outro agente.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def adicionar_arquivos(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_v6_admin_interacao(interaction):
+            return await _banco_v6_negar_escrita(interaction)
+        return await super().adicionar_arquivos(interaction, button)
+
+    async def editar_informacoes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_v6_admin_interacao(interaction):
+            return await _banco_v6_negar_escrita(interaction)
+        return await super().editar_informacoes(interaction, button)
+
+
+# Consulta final: entrega ficha em modo somente leitura para Estagiário/Investigador.
+_BANCO_ENVIAR_CONSULTA_ANTES_V6 = _banco_prof_enviar_consulta
+
+
+async def _banco_prof_enviar_consulta(
+    interaction: discord.Interaction,
+    consulta: str,
+    *,
+    editar_original: bool = False,
+) -> None:
+    resultados = await asyncio.to_thread(banco_buscar, consulta)
+    opcoes = await asyncio.to_thread(_banco_ficha_geral_opcoes, resultados)
+    if not opcoes:
+        embed = discord.Embed(
+            title="🔍 CONSULTA AO BANCO",
+            description=f"Nenhum registro foi localizado para **{consulta[:100]}**.",
+            color=discord.Color.orange(),
+        )
+        if editar_original:
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    somente_leitura = not _banco_v6_admin_interacao(interaction)
+    if len(opcoes) == 1:
+        tipo, rid, _, _, _ = opcoes[0]
+        if tipo == "faccao":
+            return await _BANCO_ENVIAR_CONSULTA_ANTES_V6(
+                interaction, consulta, editar_original=editar_original
+            )
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, rid)
+        perfil = await asyncio.to_thread(_banco_v4_enriquecer_perfil_organizacao, perfil)
+        embed = _banco_embed_ficha_geral(perfil)
+        view = BancoFichaGeralView(
+            int(interaction.user.id), perfil=perfil, somente_leitura=somente_leitura
+        )
+    else:
+        embed = discord.Embed(
+            title="🔍 RESULTADOS DA PESQUISA",
+            description="Selecione uma ficha abaixo para visualizar os dados completos.",
+            color=discord.Color.blurple(),
+        )
+        view = BancoFichaGeralView(
+            int(interaction.user.id), opcoes=opcoes, somente_leitura=somente_leitura
+        )
+
+    if editar_original:
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class BancoDadosSomentePesquisaView(View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    @discord.ui.button(label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.primary)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_prof_equipe(interaction):
+            return await interaction.response.send_message(
+                "❌ Apenas a equipe DICOR pode consultar as fichas.", ephemeral=True
+            )
+        await interaction.response.send_modal(BancoConsultaModal())
+
+
+class BancoDadosView(View):
+    """Painel administrativo. Todas as ações são novamente validadas no backend."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message(
+                "❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True
+            )
+            return False
+        asyncio.create_task(_banco_prof_salvar_contexto_painel(interaction))
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "A Central de Fichas apresentou uma falha.", error)
+
+    @discord.ui.button(
+        label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_criar_ficha_v6", row=0,
+    )
+    async def criar_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_v6_admin_interacao(interaction):
+            return await _banco_v6_negar_escrita(interaction)
+        await interaction.response.defer(ephemeral=True)
+        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+
+    @discord.ui.button(
+        label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary,
+        custom_id="dicor_banco_consultar_v6", row=0,
+    )
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(
+        label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_importar_painel_v6", row=0,
+    )
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_v6_admin_interacao(interaction):
+            return await _banco_v6_negar_escrita(interaction)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🏴 ESCOLHA O MODO DE ATUALIZAÇÃO",
+                description="Escolha como o painel será aplicado.",
+                color=discord.Color.gold(),
+            ).add_field(
+                name="🔗 MESCLAR • recomendado",
+                value="Adiciona novos membros e atualiza os encontrados, mantendo os demais ativos.",
+                inline=False,
+            ).add_field(
+                name="♻️ SUBSTITUIR LISTA ATUAL",
+                value="Ausentes ficam inativos, mas fichas e histórico são preservados.",
+                inline=False,
+            ),
+            view=BancoEscolherModoPainelView(
+                int(interaction.user.id),
+                int(getattr(interaction.channel, "id", 0) or 0),
+                int(getattr(interaction.message, "id", 0) or 0),
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success,
+        custom_id="dicor_banco_sync_tudo_v6", row=0,
+    )
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _banco_v6_admin_interacao(interaction):
+            return await _banco_v6_negar_escrita(interaction)
+        await interaction.response.defer(ephemeral=True)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send(
+                "⏳ Já existe uma sincronização em andamento.", ephemeral=True
+            )
+        await interaction.followup.send(
+            "🔄 Sincronização completa iniciada: mesas, procurados, organizações, Perícia Externa, "
+            "todas as fotos das perícias e revisão das fichas pendentes.",
+            ephemeral=True,
+        )
+        asyncio.create_task(
+            _banco_v4_sync_com_revisao(
+                interaction,
+                int(getattr(interaction.channel, "id", 0) or 0),
+                int(getattr(interaction.message, "id", 0) or 0),
+            )
+        )
+
+
+# Vincula TODAS as imagens da mesma mensagem de Perícia às fichas identificadas nela.
+async def _banco_v6_anexar_todas_fotos_pericias(
+    guild: Optional[discord.Guild], *, limite: Optional[int] = None
+) -> Dict[str, int]:
+    resultado = {"mensagens": 0, "fotos_salvas": 0, "vinculos": 0, "erros": 0}
+    if guild is None:
+        return resultado
+    canal = guild.get_channel(BANCO_PERICIA_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(BANCO_PERICIA_CHANNEL_ID)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, "history"):
+        return resultado
+
+    historico_limite = limite
+    if historico_limite is None:
+        historico_limite = None if BANCO_PERICIA_SCAN_LIMIT <= 0 else BANCO_PERICIA_SCAN_LIMIT
+
+    async for msg in canal.history(limit=historico_limite, oldest_first=True):
+        fontes = list(_banco_fontes_imagem_mensagem(msg))
+        if not fontes:
+            continue
+        with _banco_conexao() as db:
+            veiculos = db.execute(
+                "SELECT * FROM veiculos WHERE origem_id=? OR mensagem_url=?",
+                (str(msg.id), str(getattr(msg, "jump_url", "") or "")),
+            ).fetchall()
+        if not veiculos:
+            continue
+        resultado["mensagens"] += 1
+
+        for indice, fonte in enumerate(fontes, start=1):
+            try:
+                caminho = await _banco_salvar_fonte_imagem(
+                    fonte, f"pericia-completa-{msg.id}-{indice}"
+                )
+                if not caminho:
+                    continue
+                resultado["fotos_salvas"] += 1
+                nome = Path(str(caminho)).name
+                url = str(fonte.get("url") or "")[:1000]
+                mime = str(fonte.get("content_type") or fonte.get("mime") or "image/*")[:120]
+                tamanho = int(fonte.get("size") or 0)
+
+                with _banco_conexao() as db:
+                    for row in veiculos:
+                        veiculo = dict(row)
+                        veiculo_id = int(veiculo.get("id") or 0)
+                        individuo = _banco_ficha_geral_individuo_do_veiculo(db, veiculo)
+                        individuo_id = int(individuo["id"] or 0) if individuo else 0
+                        existente = db.execute(
+                            """
+                            SELECT id FROM arquivos_ficha_geral
+                            WHERE individuo_id=? AND veiculo_id=?
+                              AND (url_original=? OR caminho=?)
+                            LIMIT 1
+                            """,
+                            (individuo_id, veiculo_id, url, str(caminho)),
+                        ).fetchone()
+                        if existente:
+                            continue
+                        db.execute(
+                            """
+                            INSERT INTO arquivos_ficha_geral
+                            (individuo_id, veiculo_id, nome_arquivo, caminho, url_original,
+                             descricao, mime_type, tamanho_bytes, criado_por_id, criado_em)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                individuo_id, veiculo_id, nome, str(caminho), url,
+                                f"Evidência completa anexada automaticamente da Perícia Externa #{msg.id}.",
+                                mime, tamanho, int(getattr(msg.author, "id", 0) or 0), _banco_agora_iso(),
+                            ),
+                        )
+                        resultado["vinculos"] += 1
+            except BancoImagemIndisponivel:
+                continue
+            except Exception:
+                resultado["erros"] += 1
+                traceback.print_exc()
+    return resultado
+
+
+_BANCO_SINCRONIZAR_PERICIAS_ANTES_V6 = banco_sincronizar_pericias
+
+
+async def banco_sincronizar_pericias(
+    guild: Optional[discord.Guild],
+    *,
+    limite: Optional[int] = None,
+    canal_revisao_id: int = 0,
+    forcar_historico: bool = False,
+    max_ocr_override: Optional[int] = None,
+) -> Dict[str, int]:
+    resultado = await _BANCO_SINCRONIZAR_PERICIAS_ANTES_V6(
+        guild,
+        limite=limite,
+        canal_revisao_id=canal_revisao_id,
+        forcar_historico=forcar_historico,
+        max_ocr_override=max_ocr_override,
+    )
+    anexos = await _banco_v6_anexar_todas_fotos_pericias(guild, limite=limite)
+    resultado["fotos_anexadas"] = int(anexos.get("vinculos", 0))
+    resultado["erros"] = int(resultado.get("erros", 0)) + int(anexos.get("erros", 0))
+    return resultado
+
+
+# /painelbanco agora é individual: Estagiário/Investigador recebem somente pesquisa;
+# Inspetor+ recebe o painel administrativo completo.
+async def _painelbanco_v6(interaction: discord.Interaction):
+    if not _banco_prof_equipe(interaction):
+        return await interaction.response.send_message(
+            "❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True
+        )
+    if _banco_v6_admin_interacao(interaction):
+        await interaction.response.send_message(
+            embed=banco_embed_painel(), view=BancoDadosView(), ephemeral=True
+        )
+    else:
+        embed = discord.Embed(
+            title="🔎 CONSULTA DE FICHAS • DICOR",
+            description=(
+                "Acesso em modo **somente leitura**. Você pode pesquisar e visualizar fichas, "
+                "mas não pode criar, editar, importar, sincronizar ou adicionar informações."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(
+            embed=embed, view=BancoDadosSomentePesquisaView(), ephemeral=True
+        )
+
+
+_cmd_painelbanco_v6 = bot.tree.get_command("painelbanco")
+if _cmd_painelbanco_v6 is not None:
+    _cmd_painelbanco_v6._callback = _painelbanco_v6
+
+print(
+    "✅ Central de Fichas V6 ativa: Inspetor+ com controle total; Estagiário/Investigador somente leitura; "
+    "sincronização revisa pendências e anexa todas as fotos das perícias.",
+    flush=True,
+)
+
+# Mantém o modo somente leitura também depois que o usuário escolhe um resultado no menu.
+_BANCO_FICHA_GERAL_SELECT_ANTES_V6 = BancoFichaGeralSelect
+
+
+class BancoFichaGeralSelect(_BANCO_FICHA_GERAL_SELECT_ANTES_V6):
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            tipo, registro_id = self.values[0].split(":", 1)
+            if tipo == "faccao":
+                registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", int(registro_id))
+                if not registro:
+                    return await interaction.followup.send("❌ Organização não encontrada.", ephemeral=True)
+                await interaction.edit_original_response(
+                    embed=_banco_embed_consulta_faccao(registro), view=self.view
+                )
+                return
+            perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, int(registro_id))
+            perfil = await asyncio.to_thread(_banco_v4_enriquecer_perfil_organizacao, perfil)
+            if not perfil:
+                return await interaction.followup.send("❌ Ficha não encontrada.", ephemeral=True)
+            nova_view = BancoFichaGeralView(
+                usuario_id=int(interaction.user.id),
+                perfil=perfil,
+                opcoes=self._opcoes_brutas,
+                somente_leitura=not _banco_v6_admin_interacao(interaction),
+            )
+            await interaction.edit_original_response(
+                embed=_banco_embed_ficha_geral(perfil), view=nova_view
+            )
+        except Exception as erro:
+            await _banco_prof_erro_interacao(
+                interaction, "Não foi possível abrir a ficha geral.", erro
+            )
