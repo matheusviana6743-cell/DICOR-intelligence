@@ -2905,14 +2905,52 @@ async def criar_mesa_core(interaction: discord.Interaction, apelido: str, famili
         await interaction.response.defer(ephemeral=True, thinking=True)
 
     categoria = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
-    overwrites = cargos_equipe_permissoes(guild)
+
+    # Visibilidade das mesas:
+    # - Investigador e cargos superiores enxergam todas as mesas;
+    # - Estagiário não enxerga mesas de terceiros;
+    # - O criador da mesa sempre enxerga e pode trabalhar na própria mesa.
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    cargos_que_veem_todas_as_mesas = {
+        1490200390426165290,  # Investigador
+        *CARGOS_ADMIN_IDS,
+        *CARGOS_AUTORIZADORES,
+    }
+    for cargo_id in cargos_que_veem_todas_as_mesas:
+        cargo = guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                attach_files=True,
+                read_message_history=True,
+                create_public_threads=True,
+                send_messages_in_threads=True,
+            )
+
+    # O dono da mesa possui acesso mesmo sendo Estagiário.
     overwrites[interaction.user] = discord.PermissionOverwrite(
         view_channel=True,
         send_messages=True,
         attach_files=True,
         read_message_history=True,
+        create_public_threads=True,
         send_messages_in_threads=True,
     )
+
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            attach_files=True,
+            read_message_history=True,
+            create_public_threads=True,
+            send_messages_in_threads=True,
+            manage_threads=True,
+        )
 
     nome_canal = f"🕵️┃{slugify(apelido)}-{slugify(familia)}"
     canal = await guild.create_text_channel(
@@ -6658,6 +6696,99 @@ class OrganizacaoAcoesView(View):
             await interaction.response.send_message("❌ Organização não encontrada.", ephemeral=True)
             return
         await interaction.response.send_modal(EditarOrganizacaoDetalhesModal(organizacao))
+
+    @discord.ui.button(label="Anexar Arquivos", emoji="📎", style=discord.ButtonStyle.secondary)
+    async def anexar_arquivos(self, interaction: discord.Interaction, button: Button):
+        membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+        ids_investigador_mais = {1490200390426165290, *CARGOS_ADMIN_IDS, *CARGOS_AUTORIZADORES}
+        if not membro or not any(role.id in ids_investigador_mais for role in membro.roles):
+            await interaction.response.send_message(
+                "❌ Apenas Investigador ou superior pode anexar arquivos no mapeamento de comunidades.",
+                ephemeral=True,
+            )
+            return
+
+        organizacao = obter_organizacao_por_id(self.numero)
+        if not organizacao:
+            await interaction.response.send_message("❌ Organização não encontrada.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "📎 Envie agora, neste mesmo canal, uma mensagem contendo as fotos ou arquivos do mapeamento. "
+            "Você pode anexar vários arquivos de uma vez. Digite `cancelar` para interromper.",
+            ephemeral=True,
+        )
+
+        def verificar(msg: discord.Message) -> bool:
+            return (
+                msg.author.id == interaction.user.id
+                and msg.channel.id == interaction.channel.id
+            )
+
+        try:
+            mensagem = await bot.wait_for("message", timeout=300, check=verificar)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⌛ Tempo encerrado. Nenhum arquivo foi anexado.", ephemeral=True)
+            return
+
+        if str(mensagem.content or "").strip().lower() == "cancelar":
+            try:
+                await mensagem.delete()
+            except Exception:
+                pass
+            await interaction.followup.send("❌ Anexação cancelada.", ephemeral=True)
+            return
+
+        if not mensagem.attachments:
+            await interaction.followup.send("❌ A mensagem não possui fotos ou arquivos anexados.", ephemeral=True)
+            return
+
+        organizacoes = carregar_organizacoes()
+        indice = next((i for i, org in enumerate(organizacoes) if int(org.get("id", 0) or 0) == self.numero), None)
+        if indice is None:
+            await interaction.followup.send("❌ Organização não encontrada no banco.", ephemeral=True)
+            return
+
+        arquivos = list(organizacoes[indice].get("arquivos_mapeamento") or [])
+        existentes = {str(a.get("url")) for a in arquivos if isinstance(a, dict)}
+        adicionados = 0
+        for anexo in mensagem.attachments:
+            if anexo.url in existentes:
+                continue
+            arquivos.append({
+                "nome": anexo.filename,
+                "url": anexo.url,
+                "content_type": anexo.content_type,
+                "tamanho": anexo.size,
+                "anexado_por_id": interaction.user.id,
+                "anexado_por_nome": str(interaction.user),
+                "anexado_em": agora_br(),
+                "mensagem_id": mensagem.id,
+                "canal_id": mensagem.channel.id,
+            })
+            existentes.add(anexo.url)
+            adicionados += 1
+
+        organizacoes[indice]["arquivos_mapeamento"] = arquivos
+        organizacoes[indice]["ultima_edicao"] = agora_br()
+        organizacoes[indice]["editado_por"] = str(interaction.user)
+        organizacoes[indice]["editado_por_id"] = interaction.user.id
+        organizacoes[indice]["versao"] = int(organizacoes[indice].get("versao", 1) or 1) + 1
+        salvar_organizacoes(organizacoes)
+
+        try:
+            await mensagem.delete()
+        except Exception:
+            pass
+
+        await enviar_log(
+            f"📎 {adicionados} arquivo(s) anexado(s) ao mapeamento da organização "
+            f"{self.numero:02d} por {interaction.user.mention}."
+        )
+        await interaction.followup.send(
+            f"✅ {adicionados} arquivo(s) anexado(s) ao mapeamento. Total salvo: {len(arquivos)}.",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Atualizar Ficha", emoji="🔄", style=discord.ButtonStyle.gray)
     async def atualizar(self, interaction: discord.Interaction, button: Button):
@@ -17332,7 +17463,17 @@ def formatar_ficha_organizacao(organizacao: Dict[str, Any]) -> str:
         f"👑 **Líder:** {valor_org(organizacao, 'lider')}\n\n"
         f"🔎 **Características:**\n{cortar_campo_org(valor_org(organizacao, 'caracteristicas'), 620)}\n\n"
         f"📂 **Histórico operacional:**\n{cortar_campo_org(valor_org(organizacao, 'historico', 'Sem registros.'), 620)}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + (
+            "📎 **Arquivos do mapeamento:**\n" +
+            "\n".join(
+                f"• [{cortar_campo_org(str(a.get('nome') or 'Arquivo'), 70)}]({a.get('url')})"
+                for a in list(organizacao.get('arquivos_mapeamento') or [])[-10:]
+                if isinstance(a, dict) and a.get('url')
+            ) + "\n\n"
+            if any(isinstance(a, dict) and a.get('url') for a in list(organizacao.get('arquivos_mapeamento') or []))
+            else ""
+        )
+        + f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✏️ **Última edição:** {ultima}\n"
         f"👤 **Editado por:** {editor}\n"
         f"🔢 **Versão:** {int(organizacao.get('versao', 1) or 1)}"
