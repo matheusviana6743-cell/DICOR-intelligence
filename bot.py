@@ -33175,5 +33175,1098 @@ print(
 )
 
 
+# =====================================================
+# PATCH FINAL — CENTRAL DE FICHAS DICOR PROFISSIONAL V3
+# - Painel limpo com quatro ações principais.
+# - Criação de ficha por texto, print de placa/COPOM ou documento com RG #xxxxx.
+# - Ficha geral unificada: pessoa + veículos + arquivos.
+# - Importação de painel mescla integrantes existentes e adiciona facção/cargo.
+# - Confirmação OCR idempotente e cartões concluídos removidos após 30 segundos.
+# =====================================================
+
+_BANCO_V3_UPLOAD_DIR = Path(str(DATA_DIR)) / "central_fichas_uploads"
+_BANCO_V3_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_BANCO_V3_CRIACAO_ATIVA: set[int] = set()
+_BANCO_V3_CRIACAO_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _banco_v3_lock_usuario(usuario_id: int) -> asyncio.Lock:
+    uid = int(usuario_id or 0)
+    lock = _BANCO_V3_CRIACAO_LOCKS.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BANCO_V3_CRIACAO_LOCKS[uid] = lock
+    return lock
+
+
+_BANCO_INIT_ANTES_V3 = inicializar_banco_dicor
+
+
+def inicializar_banco_dicor() -> None:
+    _BANCO_INIT_ANTES_V3()
+    _BANCO_V3_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS identificadores_ficha (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                individuo_id INTEGER NOT NULL,
+                tipo TEXT NOT NULL DEFAULT 'RG_ALTERNATIVO',
+                valor TEXT NOT NULL UNIQUE,
+                origem TEXT DEFAULT '',
+                criado_em TEXT NOT NULL,
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_identificadores_ficha_individuo
+                ON identificadores_ficha(individuo_id);
+            """
+        )
+
+
+def _banco_v3_individuo_por_identificador(
+    db: sqlite3.Connection,
+    *,
+    rg: str = "",
+    nome: str = "",
+) -> Optional[sqlite3.Row]:
+    rg_n = _banco_normalizar_rg(rg)
+    if rg_n:
+        row = db.execute("SELECT * FROM individuos WHERE rg=?", (rg_n,)).fetchone()
+        if row:
+            return row
+        alias = db.execute(
+            "SELECT individuo_id FROM identificadores_ficha WHERE valor=? LIMIT 1", (rg_n,)
+        ).fetchone()
+        if alias:
+            row = db.execute("SELECT * FROM individuos WHERE id=?", (int(alias["individuo_id"]),)).fetchone()
+            if row:
+                return row
+    nome_limpo = _banco_limpar_texto(nome, 120)
+    if nome_limpo:
+        diretos = db.execute(
+            "SELECT * FROM individuos WHERE nome=? COLLATE NOCASE ORDER BY atualizado_em DESC LIMIT 2",
+            (nome_limpo,),
+        ).fetchall()
+        if len(diretos) == 1:
+            return diretos[0]
+        alvo = normalizar_busca(nome_limpo)
+        candidatos = [
+            row for row in db.execute("SELECT * FROM individuos ORDER BY atualizado_em DESC").fetchall()
+            if normalizar_busca(str(row["nome"] or "")) == alvo
+        ]
+        if len(candidatos) == 1:
+            return candidatos[0]
+    return None
+
+
+def _banco_v3_registrar_alias(
+    db: sqlite3.Connection,
+    individuo_id: int,
+    valor: str,
+    origem: str,
+) -> None:
+    valor_n = _banco_normalizar_rg(valor)
+    if not individuo_id or not valor_n:
+        return
+    existente = db.execute("SELECT id FROM individuos WHERE rg=?", (valor_n,)).fetchone()
+    if existente and int(existente["id"]) != int(individuo_id):
+        return
+    db.execute(
+        """
+        INSERT INTO identificadores_ficha(individuo_id, tipo, valor, origem, criado_em)
+        VALUES (?, 'RG_ALTERNATIVO', ?, ?, ?)
+        ON CONFLICT(valor) DO UPDATE SET
+            individuo_id=excluded.individuo_id,
+            origem=excluded.origem
+        """,
+        (int(individuo_id), valor_n, _banco_limpar_texto(origem, 100), _banco_agora_iso()),
+    )
+
+
+_BANCO_BUSCAR_ANTES_V3 = banco_buscar
+
+
+def banco_buscar(consulta: str) -> Dict[str, List[Dict[str, Any]]]:
+    resultado = _BANCO_BUSCAR_ANTES_V3(consulta)
+    termo = _banco_normalizar_rg(consulta)
+    if not termo:
+        return resultado
+    try:
+        inicializar_banco_dicor()
+        with _banco_conexao() as db:
+            rows = db.execute(
+                """
+                SELECT i.* FROM identificadores_ficha a
+                JOIN individuos i ON i.id=a.individuo_id
+                WHERE a.valor=?
+                """,
+                (termo,),
+            ).fetchall()
+        existentes = {int(x.get("id") or 0) for x in resultado.get("individuos", [])}
+        for row in rows:
+            item = dict(row)
+            if int(item.get("id") or 0) not in existentes:
+                resultado.setdefault("individuos", []).append(item)
+    except Exception:
+        traceback.print_exc()
+    return resultado
+
+
+# ---------- Importação de painéis com mesclagem profissional ----------
+
+def banco_importar_painel(
+    nome_faccao: str,
+    texto_painel: str,
+    *,
+    modo: str = "substituir",
+    autor_id: int = 0,
+    mensagem_url: str = "",
+) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    faccao = _banco_limpar_texto(nome_faccao, 120)
+    texto = str(texto_painel or "").strip()
+    if not faccao:
+        raise ValueError("Nome da facção/mesa não informado.")
+    if not texto:
+        raise ValueError("Painel vazio.")
+    membros = banco_extrair_membros_painel(texto)
+    if not membros:
+        raise ValueError("Nenhum integrante com nome e RG foi identificado no painel.")
+
+    mesa = banco_encontrar_mesa(faccao)
+    mesa_id = int(mesa.get("canal_id", 0) or 0)
+    mesa_nome = str(mesa.get("nome_canal") or mesa.get("familia") or "")
+    agora = _banco_agora_iso()
+    novos = 0
+    atualizados = 0
+    mesclados = 0
+
+    with _banco_conexao() as db:
+        existente = db.execute("SELECT * FROM faccoes WHERE nome=? COLLATE NOCASE", (faccao,)).fetchone()
+        if existente:
+            faccao_id = int(existente["id"])
+            db.execute(
+                """
+                UPDATE faccoes SET painel_atual=?, painel_mensagem_url=?, atualizado_por_id=?,
+                    mesa_canal_id=?, mesa_nome=?, status='ATIVA', atualizado_em=? WHERE id=?
+                """,
+                (texto, mensagem_url, int(autor_id or 0), mesa_id, mesa_nome, agora, faccao_id),
+            )
+        else:
+            cur = db.execute(
+                """
+                INSERT INTO faccoes
+                (nome, status, mesa_canal_id, mesa_nome, painel_atual, painel_mensagem_url,
+                 atualizado_por_id, criado_em, atualizado_em)
+                VALUES (?, 'ATIVA', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (faccao, mesa_id, mesa_nome, texto, mensagem_url, int(autor_id or 0), agora, agora),
+            )
+            faccao_id = int(cur.lastrowid)
+
+        versao = int(db.execute(
+            "SELECT COALESCE(MAX(versao), 0) + 1 FROM painel_versoes WHERE faccao_id=?",
+            (faccao_id,),
+        ).fetchone()[0])
+        db.execute(
+            """
+            INSERT INTO painel_versoes
+            (faccao_id, versao, texto_original, mensagem_url, autor_id, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (faccao_id, versao, texto, mensagem_url, int(autor_id or 0), agora),
+        )
+        if normalizar_busca(modo).startswith("sub"):
+            db.execute("UPDATE faccao_membros SET ativo=0, atualizado_em=? WHERE faccao_id=?", (agora, faccao_id))
+
+        for membro in membros:
+            rg_painel = _banco_normalizar_rg(membro.get("rg"))
+            nome = _banco_limpar_texto(membro.get("nome"), 120)
+            cargo = _banco_limpar_texto(membro.get("cargo") or "MEMBRO", 100)
+            encontrado = _banco_v3_individuo_por_identificador(db, rg=rg_painel, nome=nome)
+            rg_canonico = str(encontrado["rg"] or "") if encontrado else rg_painel
+            if encontrado and rg_painel and rg_canonico != rg_painel:
+                _banco_v3_registrar_alias(db, int(encontrado["id"]), rg_painel, f"painel:{faccao}")
+                mesclados += 1
+
+            individuo = banco_upsert_individuo(
+                nome=nome or (str(encontrado["nome"] or "") if encontrado else "NOME NÃO IDENTIFICADO"),
+                rg=rg_canonico,
+                faccao=faccao,
+                cargo=cargo,
+                origem="painel_mesa",
+                mesa_canal_id=mesa_id,
+                mesa_nome=mesa_nome,
+                criado_por_id=int(autor_id or 0),
+                db=db,
+            )
+            individuo_id = int(individuo.get("id") or 0)
+            if rg_painel and rg_painel != rg_canonico:
+                _banco_v3_registrar_alias(db, individuo_id, rg_painel, f"painel:{faccao}")
+
+            membro_antigo = db.execute(
+                "SELECT id FROM faccao_membros WHERE faccao_id=? AND rg=?",
+                (faccao_id, rg_canonico),
+            ).fetchone()
+            if membro_antigo:
+                db.execute(
+                    """
+                    UPDATE faccao_membros SET individuo_id=?, nome=?, cargo=?, ativo=1,
+                        painel_versao=?, atualizado_em=? WHERE id=?
+                    """,
+                    (individuo_id or None, nome, cargo, versao, agora, int(membro_antigo["id"])),
+                )
+                atualizados += 1
+            else:
+                db.execute(
+                    """
+                    INSERT INTO faccao_membros
+                    (faccao_id, individuo_id, nome, rg, cargo, ativo, painel_versao, criado_em, atualizado_em)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (faccao_id, individuo_id or None, nome, rg_canonico, cargo, versao, agora, agora),
+                )
+                novos += 1
+
+        _banco_historico(
+            "FACCAO", faccao, "PAINEL_IMPORTADO",
+            f"Versão {versao} | {len(membros)} integrantes | {mesclados} mesclados | modo {modo}",
+            int(autor_id or 0), db,
+        )
+
+    try:
+        _banco_criar_backup_duravel("painel-importado")
+    except Exception:
+        pass
+    return {
+        "faccao": faccao,
+        "versao": versao,
+        "membros": len(membros),
+        "novos": novos,
+        "atualizados": atualizados,
+        "mesclados": mesclados,
+        "mesa_id": mesa_id,
+        "mesa_nome": mesa_nome,
+    }
+
+
+
+class BancoConfirmarPainelView(View):
+    def __init__(
+        self,
+        *,
+        usuario_id: int,
+        faccao: str,
+        modo: str,
+        texto: str,
+        painel_canal_id: int,
+        painel_mensagem_id: int,
+    ):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        self.faccao = str(faccao)
+        self.modo = str(modo)
+        self.texto = str(texto)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.processando = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta importação pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar importação", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.processando:
+            return await interaction.followup.send("⏳ Este painel já está sendo importado.", ephemeral=True)
+        self.processando = True
+        try:
+            resultado = await asyncio.to_thread(
+                banco_importar_painel,
+                self.faccao,
+                self.texto,
+                modo=self.modo,
+                autor_id=int(interaction.user.id),
+                mensagem_url="",
+            )
+            embed = discord.Embed(
+                title="✅ PAINEL IMPORTADO E MESCLADO",
+                description=(
+                    "Os integrantes foram associados à organização. Pessoas que já possuíam ficha "
+                    "foram atualizadas, sem criar cadastro duplicado."
+                ),
+                color=discord.Color.green(),
+            )
+            embed.add_field(name="🏴 Organização", value=resultado["faccao"], inline=True)
+            embed.add_field(name="📄 Versão", value=f"`{resultado['versao']}`", inline=True)
+            embed.add_field(name="🕵️ Mesa vinculada", value=resultado.get("mesa_nome") or "Não encontrada", inline=False)
+            embed.add_field(name="👥 Integrantes", value=str(resultado.get("membros", 0)), inline=True)
+            embed.add_field(name="➕ Novos vínculos", value=str(resultado.get("novos", 0)), inline=True)
+            embed.add_field(name="♻️ Fichas atualizadas", value=str(resultado.get("atualizados", 0)), inline=True)
+            embed.add_field(name="🔗 Registros mesclados", value=str(resultado.get("mesclados", 0)), inline=True)
+            await interaction.edit_original_response(embed=embed, view=None)
+            await _banco_prof_atualizar_painel(self.painel_canal_id, self.painel_mensagem_id)
+        except Exception as erro:
+            self.processando = False
+            await _banco_prof_erro_interacao(interaction, "Falha ao importar e mesclar o painel.", erro)
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✖️ IMPORTAÇÃO CANCELADA",
+                description="Nenhuma informação foi alterada no banco.",
+                color=discord.Color.greyple(),
+            ),
+            view=None,
+        )
+
+# ---------- Leitura profissional de texto, COPOM, placa e documento ----------
+
+def _banco_v3_linhas_validas(linhas: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    saida: List[Tuple[str, float]] = []
+    for texto, score in linhas:
+        limpo = re.sub(r"\s+", " ", str(texto or "")).strip()
+        if limpo:
+            saida.append((limpo, max(0.0, min(1.0, float(score or 0.0)))))
+    return saida
+
+
+def _banco_v3_nome_generico(linhas: List[Tuple[str, float]], indice_documento: int = -1) -> str:
+    bloqueadas = {
+        "carteira", "banco", "fator sanguineo", "idade", "telefone", "estado civil",
+        "habilitacao", "desempregado", "empregado", "solteiro", "casado", "copom",
+        "placa", "proprietario", "passaporte", "modelo", "detalhes em", "capital morada",
+    }
+    candidatos: List[Tuple[int, float, str]] = []
+    for idx, (texto, score) in enumerate(linhas):
+        n = normalizar_busca(texto).strip(" :#-|")
+        if not n or any(n == x or n.startswith(x + " ") for x in bloqueadas):
+            continue
+        if any(s in n for s in ("r$", "mhz", "normal", "ganhou", "videogame", "brincos")):
+            continue
+        if ":" in texto or re.search(r"\d{3,}", texto):
+            continue
+        palavras = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", texto)
+        if not (2 <= len(palavras) <= 5):
+            continue
+        letras = sum(ch.isalpha() for ch in texto)
+        if letras / max(1, len(texto)) < 0.65:
+            continue
+        distancia = abs(idx - indice_documento) if indice_documento >= 0 else 10
+        bonus = 2.0 if indice_documento >= 0 and distancia <= 2 else 0.0
+        candidatos.append((distancia, -(float(score) + bonus), _banco_limpar_texto(texto, 120)))
+    if not candidatos:
+        return ""
+    candidatos.sort(key=lambda x: (x[0], x[1], len(x[2])))
+    return candidatos[0][2]
+
+
+def _banco_v3_extrair_dados(linhas: List[Tuple[str, float]], texto_extra: str = "") -> Dict[str, Any]:
+    linhas = _banco_v3_linhas_validas(linhas)
+    if texto_extra:
+        linhas.extend((x.strip(), 1.0) for x in str(texto_extra).splitlines() if x.strip())
+    campos = _banco_ocr_extrair_campos_completos(linhas)
+    dados: Dict[str, Any] = {
+        "nome": str(campos.get("proprietario_nome") or ""),
+        "rg": str(campos.get("proprietario_rg") or ""),
+        "documento_tipo": str(campos.get("documento_tipo") or "RG"),
+        "telefone": str(campos.get("telefone") or ""),
+        "placa": str(campos.get("placa") or ""),
+        "modelo": str(campos.get("modelo") or ""),
+        "cor": str(campos.get("cor") or ""),
+        "faccao": str(campos.get("faccao") or ""),
+        "local": str(campos.get("local") or ""),
+        "ano": str(campos.get("ano") or ""),
+        "chassi": str(campos.get("chassi") or ""),
+        "observacoes": str(campos.get("observacoes") or ""),
+        "texto_bruto": str(campos.get("texto_bruto") or ""),
+        "confianca": 0.0,
+    }
+
+    indice_doc = -1
+    if not dados["rg"]:
+        for idx, (texto, _) in enumerate(linhas):
+            m = re.search(r"(?:^|\s)#\s*([A-Za-z0-9]{3,16})\b", texto)
+            if not m:
+                m = re.search(
+                    r"\b(?:RG|ID|PASSAPORTE|DOCUMENTO)\s*[:#-]?\s*([A-Za-z0-9.-]{3,20})\b",
+                    texto, flags=re.I,
+                )
+            if m:
+                dados["rg"] = _banco_normalizar_rg(m.group(1))
+                dados["documento_tipo"] = "PASSAPORTE" if "passaporte" in normalizar_busca(texto) else "RG"
+                indice_doc = idx
+                break
+    else:
+        for idx, (texto, _) in enumerate(linhas):
+            if dados["rg"] and dados["rg"] in _banco_normalizar_rg(texto):
+                indice_doc = idx
+                break
+
+    if not dados["nome"]:
+        # Primeiro tenta Nome: X; depois usa a linha de nome mais próxima do #RG.
+        for texto, _ in linhas:
+            m = re.search(r"\bnome\s*[:\-]\s*(.{3,120})$", texto, flags=re.I)
+            if m:
+                dados["nome"] = _banco_limpar_texto(m.group(1), 120)
+                break
+        if not dados["nome"]:
+            dados["nome"] = _banco_v3_nome_generico(linhas, indice_doc)
+
+    candidatos = _banco_ocr_extrair_candidatos(linhas)
+    if candidatos:
+        melhor = max(candidatos, key=lambda x: float(x.get("confianca") or 0.0))
+        dados["placa"] = dados["placa"] or str(melhor.get("placa") or "")
+        dados["confianca"] = float(melhor.get("confianca") or 0.0)
+        extras = dict(melhor.get("dados_ocr") or {})
+        for origem, destino in [
+            ("proprietario_nome", "nome"), ("proprietario_rg", "rg"),
+            ("telefone", "telefone"), ("modelo", "modelo"), ("cor", "cor"),
+            ("faccao", "faccao"), ("local", "local"), ("ano", "ano"), ("chassi", "chassi"),
+        ]:
+            if not dados.get(destino) and extras.get(origem):
+                dados[destino] = str(extras[origem])
+        if extras.get("documento_tipo"):
+            dados["documento_tipo"] = str(extras["documento_tipo"])
+
+    dados["rg"] = _banco_normalizar_rg(dados.get("rg"))
+    dados["placa"] = _banco_normalizar_placa(dados.get("placa"))
+    dados["nome"] = _banco_limpar_texto(dados.get("nome"), 120)
+    dados["telefone"] = _banco_limpar_texto(dados.get("telefone"), 80)
+    return dados
+
+
+async def _banco_v3_salvar_anexo(anexo: discord.Attachment, usuario_id: int) -> Dict[str, Any]:
+    nome_original = Path(str(anexo.filename or "arquivo")).name
+    nome_seguro = re.sub(r"[^0-9A-Za-z._-]+", "_", nome_original)[:140] or "arquivo"
+    pasta = _BANCO_V3_UPLOAD_DIR / str(int(usuario_id or 0))
+    pasta.mkdir(parents=True, exist_ok=True)
+    destino = pasta / f"{int(time.time() * 1000)}-{secrets.token_hex(4)}-{nome_seguro}"
+    await anexo.save(str(destino), use_cached=True)
+    mime = str(getattr(anexo, "content_type", "") or "")
+    return {
+        "nome": nome_original,
+        "path": str(destino),
+        "url": str(getattr(anexo, "url", "") or ""),
+        "mime": mime,
+        "tamanho": int(getattr(anexo, "size", 0) or 0),
+        "imagem": mime.startswith("image/") or destino.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"},
+    }
+
+
+def _banco_v3_mesclar_dados(base: Dict[str, Any], novos: Dict[str, Any]) -> None:
+    for chave, valor in novos.items():
+        if chave in {"texto_bruto", "confianca"}:
+            if valor:
+                base[chave] = valor
+            continue
+        if valor and not base.get(chave):
+            base[chave] = valor
+
+
+def _banco_v3_preview_embed(sessao: Dict[str, Any]) -> discord.Embed:
+    nome = sessao.get("nome") or "Não identificado"
+    rg = sessao.get("rg") or "Não identificado"
+    placa = sessao.get("placa") or "Não identificada"
+    embed = discord.Embed(
+        title="📋 PRÉVIA DA FICHA GERAL",
+        description=(
+            "O bot analisou o texto e os anexos. Confira os dados antes de salvar. "
+            "Campos ausentes podem ser preenchidos em **Corrigir informações**."
+        ),
+        color=discord.Color.from_rgb(20, 72, 130),
+    )
+    embed.add_field(
+        name="👤 INDIVÍDUO",
+        value=(
+            f"**Nome:** {nome}\n"
+            f"**{str(sessao.get('documento_tipo') or 'RG').upper()}:** `{rg}`\n"
+            f"**Telefone:** {sessao.get('telefone') or 'Não informado'}\n"
+            f"**Facção:** {sessao.get('faccao') or 'Não informada'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🚗 VEÍCULO",
+        value=(
+            f"**Placa:** `{placa}`\n"
+            f"**Modelo:** {sessao.get('modelo') or 'Não informado'}\n"
+            f"**Cor:** {sessao.get('cor') or 'Não informada'}\n"
+            f"**Local:** {sessao.get('local') or 'Não informado'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📎 ARQUIVOS",
+        value=f"{len(sessao.get('arquivos') or [])} arquivo(s) será(ão) vinculado(s) à ficha.",
+        inline=False,
+    )
+    primeira_url = next((str(x.get("url") or "") for x in sessao.get("arquivos", []) if x.get("imagem") and x.get("url")), "")
+    if primeira_url.startswith("http"):
+        embed.set_image(url=primeira_url)
+    embed.set_footer(text="DICOR • nada será salvo antes da confirmação")
+    return embed
+
+
+def _banco_v3_salvar_ficha(sessao: Dict[str, Any], usuario_id: int) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    nome = _banco_limpar_texto(sessao.get("nome"), 120)
+    rg_informado = _banco_normalizar_rg(sessao.get("rg"))
+    placa = _banco_normalizar_placa(sessao.get("placa"))
+    if not placa and not (nome or rg_informado):
+        raise ValueError("Nenhum nome, RG ou placa foi identificado. Corrija os dados antes de confirmar.")
+
+    arquivos = list(sessao.get("arquivos") or [])
+    identidade = next((
+        x for x in arquivos
+        if x.get("imagem")
+        and (x.get("dados_detectados") or {}).get("rg")
+        and not (x.get("dados_detectados") or {}).get("placa")
+    ), None)
+    imagem_veiculo = next((
+        x for x in arquivos
+        if x.get("imagem") and (x.get("dados_detectados") or {}).get("placa")
+    ), None)
+    primeira_imagem = next((x for x in arquivos if x.get("imagem")), None)
+    individuo: Dict[str, Any] = {}
+    veiculo: Dict[str, Any] = {}
+
+    with _banco_conexao() as db:
+        existente = _banco_v3_individuo_por_identificador(db, rg=rg_informado, nome=nome)
+        rg_canonico = str(existente["rg"] or "") if existente else rg_informado
+        nome_canonico = nome or (str(existente["nome"] or "") if existente else "")
+        if existente and rg_informado and rg_canonico != rg_informado:
+            _banco_v3_registrar_alias(db, int(existente["id"]), rg_informado, "criacao_ficha")
+        if (nome_canonico or rg_canonico) and rg_canonico:
+            individuo = banco_upsert_individuo(
+                nome=nome_canonico or "NOME NÃO IDENTIFICADO",
+                rg=rg_canonico,
+                telefone=str(sessao.get("telefone") or ""),
+                faccao=str(sessao.get("faccao") or ""),
+                cargo=str(sessao.get("cargo") or ""),
+                observacoes=str(sessao.get("observacoes") or ""),
+                origem="criacao_ficha_profissional",
+                criado_por_id=int(usuario_id or 0),
+                foto_rg_path=str((identidade or primeira_imagem or {}).get("path") or ""),
+                foto_rg_url=str((identidade or primeira_imagem or {}).get("url") or ""),
+                foto_ficha_path=str((identidade or primeira_imagem or {}).get("path") or ""),
+                foto_ficha_url=str((identidade or primeira_imagem or {}).get("url") or ""),
+                documento_tipo=str(sessao.get("documento_tipo") or "RG"),
+                dados_extras={"origem_criacao": "texto_ou_imagem", "texto_ocr": str(sessao.get("texto_bruto") or "")[:4000]},
+                db=db,
+            )
+            if rg_informado and rg_informado != str(individuo.get("rg") or ""):
+                _banco_v3_registrar_alias(db, int(individuo.get("id") or 0), rg_informado, "criacao_ficha")
+        elif nome_canonico and not rg_canonico:
+            raise ValueError("Foi identificado um nome, mas nenhum RG/documento. Use Corrigir informações.")
+
+        if placa:
+            veiculo = banco_upsert_veiculo(
+                placa=placa,
+                modelo=str(sessao.get("modelo") or ""),
+                cor=str(sessao.get("cor") or ""),
+                proprietario_rg=str(individuo.get("rg") or rg_canonico or ""),
+                proprietario_nome=str(individuo.get("nome") or nome_canonico or ""),
+                faccao=str(sessao.get("faccao") or ""),
+                local=str(sessao.get("local") or ""),
+                observacoes=str(sessao.get("observacoes") or ""),
+                foto_path=str((imagem_veiculo or primeira_imagem or {}).get("path") or ""),
+                foto_url=str((imagem_veiculo or primeira_imagem or {}).get("url") or ""),
+                origem_tipo="criacao_ficha_profissional",
+                origem_id=f"usuario:{int(usuario_id or 0)}",
+                criado_por_id=int(usuario_id or 0),
+                telefone_proprietario=str(sessao.get("telefone") or ""),
+                documento_tipo=str(sessao.get("documento_tipo") or "RG"),
+                ano=str(sessao.get("ano") or ""),
+                chassi=str(sessao.get("chassi") or ""),
+                dados_extras={"texto_ocr": str(sessao.get("texto_bruto") or "")[:4000]},
+                foto_ficha_path=str((imagem_veiculo or primeira_imagem or {}).get("path") or ""),
+                foto_ficha_url=str((imagem_veiculo or primeira_imagem or {}).get("url") or ""),
+                db=db,
+            )
+
+        individuo_id = int(individuo.get("id") or 0)
+        veiculo_id = int(veiculo.get("id") or 0)
+        for arquivo in arquivos:
+            caminho = str(arquivo.get("path") or "")
+            if not caminho:
+                continue
+            existe = db.execute(
+                "SELECT id FROM arquivos_ficha_geral WHERE caminho=? LIMIT 1", (caminho,)
+            ).fetchone()
+            if existe:
+                continue
+            db.execute(
+                """
+                INSERT INTO arquivos_ficha_geral
+                (individuo_id, veiculo_id, nome_arquivo, caminho, url_original,
+                 descricao, mime_type, tamanho_bytes, criado_por_id, criado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    individuo_id, veiculo_id, str(arquivo.get("nome") or "arquivo")[:200],
+                    caminho, str(arquivo.get("url") or "")[:1000],
+                    "Arquivo enviado na criação da ficha geral.",
+                    str(arquivo.get("mime") or "")[:120], int(arquivo.get("tamanho") or 0),
+                    int(usuario_id or 0), _banco_agora_iso(),
+                ),
+            )
+        _banco_historico(
+            "FICHA_GERAL", str(individuo_id or veiculo_id), "CRIADA_OU_MESCLADA",
+            f"Nome: {nome_canonico or 'N/A'} | RG: {rg_canonico or 'N/A'} | Placa: {placa or 'N/A'}",
+            int(usuario_id or 0), db,
+        )
+
+    if individuo:
+        perfil = _banco_ficha_geral_carregar("individuo", int(individuo["id"]))
+    elif veiculo:
+        perfil = _banco_ficha_geral_carregar("veiculo", int(veiculo["id"]))
+    else:
+        raise ValueError("Não foi possível montar a ficha geral.")
+    _banco_ficha_geral_snapshot(perfil)
+    try:
+        _banco_criar_backup_duravel("criacao-ficha-v3")
+    except Exception:
+        pass
+    return perfil
+
+
+class BancoCriarFichaEditarModal(Modal, title="Corrigir informações da ficha"):
+    def __init__(self, sessao: Dict[str, Any], view_ref: "BancoCriarFichaPreviewView"):
+        super().__init__(timeout=300)
+        self.sessao = sessao
+        self.view_ref = view_ref
+        self.nome = TextInput(label="Nome", default=str(sessao.get("nome") or "")[:120], required=False, max_length=120)
+        self.rg = TextInput(label="RG/Passaporte", default=str(sessao.get("rg") or "")[:40], required=False, max_length=40)
+        self.telefone = TextInput(label="Telefone", default=str(sessao.get("telefone") or "")[:80], required=False, max_length=80)
+        self.placa = TextInput(label="Placa", default=str(sessao.get("placa") or "")[:16], required=False, max_length=16)
+        self.modelo_cor = TextInput(
+            label="Modelo | Cor",
+            default=f"{sessao.get('modelo') or ''} | {sessao.get('cor') or ''}"[:180],
+            required=False, max_length=180,
+        )
+        for campo in (self.nome, self.rg, self.telefone, self.placa, self.modelo_cor):
+            self.add_item(campo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        partes = str(self.modelo_cor.value or "").split("|", 1)
+        self.sessao["nome"] = _banco_limpar_texto(self.nome.value, 120)
+        self.sessao["rg"] = _banco_normalizar_rg(self.rg.value)
+        self.sessao["telefone"] = _banco_limpar_texto(self.telefone.value, 80)
+        self.sessao["placa"] = _banco_normalizar_placa(self.placa.value)
+        self.sessao["modelo"] = _banco_limpar_texto(partes[0] if partes else "", 120)
+        self.sessao["cor"] = _banco_limpar_texto(partes[1] if len(partes) > 1 else "", 80)
+        try:
+            await interaction.response.edit_message(
+                embed=_banco_v3_preview_embed(self.sessao),
+                view=BancoCriarFichaPreviewView(int(interaction.user.id), self.sessao),
+            )
+        except Exception:
+            await interaction.response.send_message("✅ Dados atualizados. Volte à prévia e confirme a ficha.", ephemeral=True)
+
+
+class BancoCriarFichaPreviewView(View):
+    def __init__(self, usuario_id: int, sessao: Dict[str, Any]):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        self.sessao = sessao
+        self.processando = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta prévia pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar e salvar", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.processando:
+            return await interaction.followup.send("⏳ Esta ficha já está sendo salva.", ephemeral=True)
+        self.processando = True
+        try:
+            perfil = await asyncio.to_thread(_banco_v3_salvar_ficha, self.sessao, int(interaction.user.id))
+            await interaction.edit_original_response(
+                content="✅ **Ficha geral salva e protegida no volume `/data`.**",
+                embed=_banco_embed_ficha_geral(perfil),
+                view=BancoFichaGeralView(int(interaction.user.id), perfil),
+            )
+            await _banco_prof_atualizar_painel()
+        except Exception as erro:
+            self.processando = False
+            await interaction.followup.send(f"❌ {erro}", ephemeral=True)
+
+    @discord.ui.button(label="Corrigir informações", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoCriarFichaEditarModal(self.sessao, self))
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.danger)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="✖️ Criação cancelada. Nenhum registro foi salvo.", embed=None, view=None
+        )
+
+
+async def _banco_v3_fluxo_criar_ficha(interaction: discord.Interaction) -> None:
+    usuario_id = int(interaction.user.id)
+    lock = _banco_v3_lock_usuario(usuario_id)
+    if lock.locked():
+        return await interaction.followup.send("⏳ Você já possui uma criação de ficha em andamento.", ephemeral=True)
+    async with lock:
+        await interaction.followup.send(
+            "📥 **ENVIE OS DADOS DA FICHA**\n"
+            "Mande **uma mensagem neste canal** com texto, foto da placa/COPOM, print do documento "
+            "com o nome e o `#RG`, ou vários anexos juntos.\n"
+            "O bot fará a leitura automática, apagará sua mensagem e mostrará uma prévia para confirmação. "
+            "Tempo disponível: **5 minutos**.",
+            ephemeral=True,
+        )
+        canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+
+        def check(msg: discord.Message) -> bool:
+            return (
+                int(getattr(msg.author, "id", 0) or 0) == usuario_id
+                and int(getattr(msg.channel, "id", 0) or 0) == canal_id
+                and not getattr(msg.author, "bot", False)
+                and (bool(str(msg.content or "").strip()) or bool(msg.attachments))
+            )
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=300)
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("⌛ Tempo esgotado. Nenhuma ficha foi criada.", ephemeral=True)
+
+        sessao: Dict[str, Any] = {
+            "nome": "", "rg": "", "documento_tipo": "RG", "telefone": "",
+            "faccao": "", "cargo": "", "placa": "", "modelo": "", "cor": "",
+            "local": "", "ano": "", "chassi": "", "observacoes": "",
+            "texto_bruto": "", "confianca": 0.0, "arquivos": [],
+        }
+        try:
+            if str(msg.content or "").strip():
+                _banco_v3_mesclar_dados(
+                    sessao,
+                    _banco_v3_extrair_dados([], str(msg.content or "")),
+                )
+            for anexo in list(msg.attachments)[:10]:
+                if int(getattr(anexo, "size", 0) or 0) > 25 * 1024 * 1024:
+                    continue
+                arquivo = await _banco_v3_salvar_anexo(anexo, usuario_id)
+                sessao["arquivos"].append(arquivo)
+                if arquivo.get("imagem") and BANCO_OCR_ATIVO and RapidOCR is not None:
+                    try:
+                        linhas = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, arquivo["path"])
+                        dados_imagem = _banco_v3_extrair_dados(linhas)
+                        arquivo["dados_detectados"] = dict(dados_imagem)
+                        _banco_v3_mesclar_dados(sessao, dados_imagem)
+                    except Exception as erro:
+                        print(f"⚠️ OCR da criação de ficha falhou em {arquivo.get('nome')}: {type(erro).__name__}: {erro}", flush=True)
+        finally:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+        await interaction.followup.send(
+            embed=_banco_v3_preview_embed(sessao),
+            view=BancoCriarFichaPreviewView(usuario_id, sessao),
+            ephemeral=True,
+        )
+
+
+# ---------- Painel limpo e profissional ----------
+
+def banco_embed_painel() -> discord.Embed:
+    r = _banco_prof_metricas()
+    ocr = "🟢 Operacional" if BANCO_OCR_ATIVO and RapidOCR is not None else "🔴 Indisponível"
+    embed = discord.Embed(
+        title="🗂️ CENTRAL DE FICHAS • DICOR",
+        description=(
+            "Central unificada para criar, pesquisar e atualizar fichas de indivíduos, veículos e organizações.\n"
+            "A criação aceita **texto, placas, prints do COPOM e documentos com nome + `#RG`**."
+        ),
+        color=discord.Color.from_rgb(18, 67, 120),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="📊 REGISTROS",
+        value=(
+            f"**Fichas individuais:** {r.get('individuos', 0)}\n"
+            f"**Veículos/placas:** {r.get('placas', 0)}\n"
+            f"**Organizações:** {r.get('faccoes', 0)}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🔄 INTEGRAÇÕES",
+        value=(
+            f"**Perícias lidas:** {r.get('pericias', 0)}\n"
+            f"**Fichas OCR pendentes:** {r.get('ocr_pendentes', 0)}\n"
+            f"**OCR:** {ocr}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="ℹ️ FUNCIONAMENTO",
+        value=(
+            "**Criar ficha:** envie texto ou imagens e confirme a prévia.\n"
+            "**Importar painel:** todos os membros são associados à facção; registros existentes são mesclados.\n"
+            "**Sincronizar dados:** atualiza mesas, procurados e Perícia Externa."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • dados persistentes no volume /data")
+    return embed
+
+
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True)
+            return False
+        asyncio.create_task(_banco_prof_salvar_contexto_painel(interaction))
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "A Central de Fichas apresentou uma falha.", error)
+
+    @discord.ui.button(
+        label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_criar_ficha_v3", row=0,
+    )
+    async def criar_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+
+    @discord.ui.button(
+        label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary,
+        custom_id="dicor_banco_consultar", row=0,
+    )
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(
+        label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_importar_painel", row=0,
+    )
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+        mensagem_id = int(getattr(interaction.message, "id", 0) or 0)
+        await interaction.response.send_modal(BancoImportarPainelModal(canal_id, mensagem_id))
+
+    @discord.ui.button(
+        label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success,
+        custom_id="dicor_banco_sync_tudo", row=0,
+    )
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send("⏳ Já existe uma sincronização em andamento.", ephemeral=True)
+        await interaction.followup.send(
+            "🔄 Sincronização iniciada. Mesas, procurados e Perícia Externa serão atualizados.",
+            ephemeral=True,
+        )
+        asyncio.create_task(
+            _banco_prof_sync_tarefa(
+                interaction,
+                int(getattr(interaction.channel, "id", 0) or 0),
+                int(getattr(interaction.message, "id", 0) or 0),
+            )
+        )
+
+
+# ---------- Confirmação OCR sem erros repetidos ----------
+_BANCO_OCR_RESOLVER_ANTES_V3 = _banco_ocr_resolver
+
+
+def _banco_v3_item_ocr_ja_resolvido(pendente: Dict[str, Any]) -> Dict[str, Any]:
+    placa = _banco_normalizar_placa(pendente.get("placa_final") or pendente.get("placa_sugerida"))
+    with _banco_conexao() as db:
+        veiculo = db.execute("SELECT * FROM veiculos WHERE placa=?", (placa,)).fetchone() if placa else None
+        individuo = None
+        evidencia_id = 0
+        if veiculo:
+            iid = int(veiculo["proprietario_individuo_id"] or 0)
+            if iid:
+                individuo = db.execute("SELECT * FROM individuos WHERE id=?", (iid,)).fetchone()
+            ev = db.execute(
+                "SELECT id FROM evidencias_banco WHERE placa=? ORDER BY id DESC LIMIT 1", (placa,)
+            ).fetchone()
+            evidencia_id = int(ev["id"] or 0) if ev else 0
+    resposta = dict(veiculo) if veiculo else {"placa": placa}
+    resposta["individuo"] = dict(individuo) if individuo else {}
+    resposta["evidencia_id"] = evidencia_id
+    resposta["dados_ficha"] = {
+        "placa": placa,
+        "proprietario_nome": str(pendente.get("proprietario_nome") or ""),
+        "proprietario_rg": str(pendente.get("proprietario_rg") or ""),
+        "telefone": str(pendente.get("telefone") or ""),
+        "faccao": str(pendente.get("faccao") or ""),
+    }
+    resposta["ja_resolvida"] = True
+    return resposta
+
+
+def _banco_ocr_resolver(*args, **kwargs) -> Dict[str, Any]:
+    pendente_id = int(args[0] if args else kwargs.get("pendente_id", 0) or 0)
+    pendente = _banco_ocr_pendente_por_id(pendente_id)
+    if pendente and str(pendente.get("status") or "").upper() in {"CONFIRMADO", "CORRIGIDO"}:
+        return _banco_v3_item_ocr_ja_resolvido(pendente)
+    if pendente and str(pendente.get("status") or "").upper() == "IGNORADO":
+        return {**pendente, "ja_resolvida": True}
+    return _BANCO_OCR_RESOLVER_ANTES_V3(*args, **kwargs)
+
+
+async def _banco_v3_apagar_mensagem_depois(mensagem: Optional[discord.Message], segundos: int = 30) -> None:
+    if mensagem is None:
+        return
+    await asyncio.sleep(max(1, int(segundos)))
+    try:
+        await mensagem.delete()
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    except Exception:
+        traceback.print_exc()
+
+
+_BANCO_OCR_EDITAR_ANTES_V3 = _banco_ocr_editar_cartao_resolvido
+
+
+async def _banco_ocr_editar_cartao_resolvido(
+    interaction: discord.Interaction,
+    pendente_id: int,
+    item: Dict[str, Any],
+) -> None:
+    await _BANCO_OCR_EDITAR_ANTES_V3(interaction, pendente_id, item)
+    mensagem = getattr(interaction, "message", None)
+    if mensagem is not None:
+        asyncio.create_task(_banco_v3_apagar_mensagem_depois(mensagem, 30))
+
+
+class BancoOCRReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode revisar fichas.", ephemeral=True)
+            return False
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        if isinstance(error, discord.NotFound) and getattr(error, "code", 0) == 10062:
+            return
+        await _banco_prof_erro_interacao(interaction, "A ação da ficha apresentou uma falha.", error)
+
+    @discord.ui.button(
+        label="Confirmar ficha", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id="dicor_banco_ocr_confirmar", row=0,
+    )
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="CONFIRMADO"
+                )
+                await _banco_ocr_editar_cartao_resolvido(interaction, pendente_id, item)
+                texto = "✅ Esta ficha já estava salva." if item.get("ja_resolvida") else "✅ Ficha confirmada e salva permanentemente."
+                await interaction.followup.send(texto, ephemeral=True, delete_after=30)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível confirmar a ficha.", erro)
+
+    @discord.ui.button(
+        label="Corrigir ficha", emoji="✏️", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_ocr_corrigir", row=0,
+    )
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        await interaction.response.send_modal(
+            BancoOCRCorrecaoModal(pendente_id, _banco_ocr_defaults_da_mensagem(interaction))
+        )
+
+    @discord.ui.button(
+        label="Completar dados", emoji="📝", style=discord.ButtonStyle.secondary,
+        custom_id="dicor_banco_ocr_completar", row=0,
+    )
+    async def completar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        await interaction.response.send_modal(
+            BancoOCRCompletarModal(pendente_id, _banco_ocr_defaults_da_mensagem(interaction))
+        )
+
+    @discord.ui.button(
+        label="Ignorar", emoji="❌", style=discord.ButtonStyle.danger,
+        custom_id="dicor_banco_ocr_ignorar", row=0,
+    )
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        pendente_id = _banco_ocr_id_da_interacao(interaction)
+        lock = _banco_prof_lock_ocr(pendente_id)
+        async with lock:
+            try:
+                item = await asyncio.to_thread(
+                    _banco_ocr_resolver, pendente_id, int(interaction.user.id), status_final="IGNORADO"
+                )
+                if interaction.message:
+                    await interaction.message.edit(
+                        embed=discord.Embed(
+                            title="❌ FICHA IGNORADA",
+                            description=f"Ignorada por {interaction.user.mention}. Nenhum novo cadastro foi criado.",
+                            color=discord.Color.red(),
+                        ),
+                        view=None,
+                    )
+                    asyncio.create_task(_banco_v3_apagar_mensagem_depois(interaction.message, 30))
+                await interaction.followup.send("✅ Ficha retirada da fila.", ephemeral=True, delete_after=30)
+                await _banco_prof_atualizar_painel()
+            except Exception as erro:
+                await _banco_prof_erro_interacao(interaction, "Não foi possível ignorar a ficha.", erro)
+
+
+# Garante que o comando e as views usem sempre a versão V3 mais recente.
+async def _banco_v3_recarregar_views() -> None:
+    for view in list(getattr(bot, "persistent_views", [])):
+        ids = {str(getattr(item, "custom_id", "") or "") for item in getattr(view, "children", [])}
+        if any(x.startswith("dicor_banco_") for x in ids):
+            try:
+                bot.remove_view(view)
+            except Exception:
+                pass
+    bot.add_view(BancoDadosView())
+    bot.add_view(BancoOCRReviewView())
+
+
+_BANCO_ON_READY_ANTES_V3 = bot.on_ready
+
+
+@bot.event
+async def on_ready():
+    await _BANCO_ON_READY_ANTES_V3()
+    try:
+        await asyncio.to_thread(inicializar_banco_dicor)
+        await _banco_v3_recarregar_views()
+        await _banco_prof_atualizar_painel()
+        print("✅ Central de Fichas DICOR Profissional V3 carregada.", flush=True)
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao carregar Central de Fichas V3: {erro}", flush=True)
+
+
+print(
+    "✅ Central de Fichas V3 ativa: painel limpo, criação por imagem/texto, mesclagem de painéis e ficha geral.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
