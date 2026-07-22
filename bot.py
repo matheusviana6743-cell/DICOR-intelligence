@@ -35532,12 +35532,34 @@ def banco_extrair_membros_painel(texto: str) -> List[Dict[str, str]]:
     return _BANCO_EXTRAIR_MEMBROS_ANTES_V6(bruto)
 
 
+def _banco_v6_lista_segura(valor: Any) -> List[Any]:
+    """Converte listas, tuplas e arrays NumPy sem avaliar o array como booleano."""
+    if valor is None:
+        return []
+    try:
+        tolist = getattr(valor, "tolist", None)
+        if callable(tolist):
+            convertido = tolist()
+            if convertido is None:
+                return []
+            return convertido if isinstance(convertido, list) else [convertido]
+    except Exception:
+        pass
+    try:
+        return list(valor)
+    except TypeError:
+        return [valor]
+    except Exception:
+        return []
+
+
 def _banco_v6_box_limites(box: Any) -> Tuple[float, float, float, float]:
     pontos: List[Tuple[float, float]] = []
     try:
-        for ponto in list(box or []):
-            if isinstance(ponto, (list, tuple)) and len(ponto) >= 2:
-                pontos.append((float(ponto[0]), float(ponto[1])))
+        for ponto in _banco_v6_lista_segura(box):
+            coordenadas = _banco_v6_lista_segura(ponto)
+            if len(coordenadas) >= 2:
+                pontos.append((float(coordenadas[0]), float(coordenadas[1])))
     except Exception:
         pontos = []
     if not pontos:
@@ -35580,9 +35602,11 @@ def _banco_v6_ocr_blocos_sync(caminho: str) -> Dict[str, Any]:
 
         resultado = engine(arquivo_ocr, use_det=True, use_cls=True, use_rec=True)
         blocos: List[Dict[str, Any]] = []
-        textos = list(getattr(resultado, "txts", None) or [])
-        scores = list(getattr(resultado, "scores", None) or [])
-        boxes = list(getattr(resultado, "boxes", None) or [])
+        # RapidOCR pode devolver arrays NumPy. Nunca use ``array or []``, pois
+        # arrays com mais de um item geram: "truth value is ambiguous".
+        textos = _banco_v6_lista_segura(getattr(resultado, "txts", None))
+        scores = _banco_v6_lista_segura(getattr(resultado, "scores", None))
+        boxes = _banco_v6_lista_segura(getattr(resultado, "boxes", None))
         if textos:
             for i, texto_lido in enumerate(textos):
                 texto_limpo = re.sub(r"\s+", " ", str(texto_lido or "")).strip()
