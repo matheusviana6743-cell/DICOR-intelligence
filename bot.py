@@ -2905,52 +2905,14 @@ async def criar_mesa_core(interaction: discord.Interaction, apelido: str, famili
         await interaction.response.defer(ephemeral=True, thinking=True)
 
     categoria = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
-
-    # Visibilidade das mesas:
-    # - Investigador e cargos superiores enxergam todas as mesas;
-    # - Estagiário não enxerga mesas de terceiros;
-    # - O criador da mesa sempre enxerga e pode trabalhar na própria mesa.
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-    }
-    cargos_que_veem_todas_as_mesas = {
-        1490200390426165290,  # Investigador
-        *CARGOS_ADMIN_IDS,
-        *CARGOS_AUTORIZADORES,
-    }
-    for cargo_id in cargos_que_veem_todas_as_mesas:
-        cargo = guild.get_role(int(cargo_id))
-        if cargo:
-            overwrites[cargo] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                attach_files=True,
-                read_message_history=True,
-                create_public_threads=True,
-                send_messages_in_threads=True,
-            )
-
-    # O dono da mesa possui acesso mesmo sendo Estagiário.
+    overwrites = cargos_equipe_permissoes(guild)
     overwrites[interaction.user] = discord.PermissionOverwrite(
         view_channel=True,
         send_messages=True,
         attach_files=True,
         read_message_history=True,
-        create_public_threads=True,
         send_messages_in_threads=True,
     )
-
-    if guild.me:
-        overwrites[guild.me] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            manage_channels=True,
-            attach_files=True,
-            read_message_history=True,
-            create_public_threads=True,
-            send_messages_in_threads=True,
-            manage_threads=True,
-        )
 
     nome_canal = f"🕵️┃{slugify(apelido)}-{slugify(familia)}"
     canal = await guild.create_text_channel(
@@ -6696,99 +6658,6 @@ class OrganizacaoAcoesView(View):
             await interaction.response.send_message("❌ Organização não encontrada.", ephemeral=True)
             return
         await interaction.response.send_modal(EditarOrganizacaoDetalhesModal(organizacao))
-
-    @discord.ui.button(label="Anexar Arquivos", emoji="📎", style=discord.ButtonStyle.secondary)
-    async def anexar_arquivos(self, interaction: discord.Interaction, button: Button):
-        membro = interaction.user if isinstance(interaction.user, discord.Member) else None
-        ids_investigador_mais = {1490200390426165290, *CARGOS_ADMIN_IDS, *CARGOS_AUTORIZADORES}
-        if not membro or not any(role.id in ids_investigador_mais for role in membro.roles):
-            await interaction.response.send_message(
-                "❌ Apenas Investigador ou superior pode anexar arquivos no mapeamento de comunidades.",
-                ephemeral=True,
-            )
-            return
-
-        organizacao = obter_organizacao_por_id(self.numero)
-        if not organizacao:
-            await interaction.response.send_message("❌ Organização não encontrada.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            "📎 Envie agora, neste mesmo canal, uma mensagem contendo as fotos ou arquivos do mapeamento. "
-            "Você pode anexar vários arquivos de uma vez. Digite `cancelar` para interromper.",
-            ephemeral=True,
-        )
-
-        def verificar(msg: discord.Message) -> bool:
-            return (
-                msg.author.id == interaction.user.id
-                and msg.channel.id == interaction.channel.id
-            )
-
-        try:
-            mensagem = await bot.wait_for("message", timeout=300, check=verificar)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("⌛ Tempo encerrado. Nenhum arquivo foi anexado.", ephemeral=True)
-            return
-
-        if str(mensagem.content or "").strip().lower() == "cancelar":
-            try:
-                await mensagem.delete()
-            except Exception:
-                pass
-            await interaction.followup.send("❌ Anexação cancelada.", ephemeral=True)
-            return
-
-        if not mensagem.attachments:
-            await interaction.followup.send("❌ A mensagem não possui fotos ou arquivos anexados.", ephemeral=True)
-            return
-
-        organizacoes = carregar_organizacoes()
-        indice = next((i for i, org in enumerate(organizacoes) if int(org.get("id", 0) or 0) == self.numero), None)
-        if indice is None:
-            await interaction.followup.send("❌ Organização não encontrada no banco.", ephemeral=True)
-            return
-
-        arquivos = list(organizacoes[indice].get("arquivos_mapeamento") or [])
-        existentes = {str(a.get("url")) for a in arquivos if isinstance(a, dict)}
-        adicionados = 0
-        for anexo in mensagem.attachments:
-            if anexo.url in existentes:
-                continue
-            arquivos.append({
-                "nome": anexo.filename,
-                "url": anexo.url,
-                "content_type": anexo.content_type,
-                "tamanho": anexo.size,
-                "anexado_por_id": interaction.user.id,
-                "anexado_por_nome": str(interaction.user),
-                "anexado_em": agora_br(),
-                "mensagem_id": mensagem.id,
-                "canal_id": mensagem.channel.id,
-            })
-            existentes.add(anexo.url)
-            adicionados += 1
-
-        organizacoes[indice]["arquivos_mapeamento"] = arquivos
-        organizacoes[indice]["ultima_edicao"] = agora_br()
-        organizacoes[indice]["editado_por"] = str(interaction.user)
-        organizacoes[indice]["editado_por_id"] = interaction.user.id
-        organizacoes[indice]["versao"] = int(organizacoes[indice].get("versao", 1) or 1) + 1
-        salvar_organizacoes(organizacoes)
-
-        try:
-            await mensagem.delete()
-        except Exception:
-            pass
-
-        await enviar_log(
-            f"📎 {adicionados} arquivo(s) anexado(s) ao mapeamento da organização "
-            f"{self.numero:02d} por {interaction.user.mention}."
-        )
-        await interaction.followup.send(
-            f"✅ {adicionados} arquivo(s) anexado(s) ao mapeamento. Total salvo: {len(arquivos)}.",
-            ephemeral=True,
-        )
 
     @discord.ui.button(label="Atualizar Ficha", emoji="🔄", style=discord.ButtonStyle.gray)
     async def atualizar(self, interaction: discord.Interaction, button: Button):
@@ -17463,17 +17332,7 @@ def formatar_ficha_organizacao(organizacao: Dict[str, Any]) -> str:
         f"👑 **Líder:** {valor_org(organizacao, 'lider')}\n\n"
         f"🔎 **Características:**\n{cortar_campo_org(valor_org(organizacao, 'caracteristicas'), 620)}\n\n"
         f"📂 **Histórico operacional:**\n{cortar_campo_org(valor_org(organizacao, 'historico', 'Sem registros.'), 620)}\n\n"
-        + (
-            "📎 **Arquivos do mapeamento:**\n" +
-            "\n".join(
-                f"• [{cortar_campo_org(str(a.get('nome') or 'Arquivo'), 70)}]({a.get('url')})"
-                for a in list(organizacao.get('arquivos_mapeamento') or [])[-10:]
-                if isinstance(a, dict) and a.get('url')
-            ) + "\n\n"
-            if any(isinstance(a, dict) and a.get('url') for a in list(organizacao.get('arquivos_mapeamento') or []))
-            else ""
-        )
-        + f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✏️ **Última edição:** {ultima}\n"
         f"👤 **Editado por:** {editor}\n"
         f"🔢 **Versão:** {int(organizacao.get('versao', 1) or 1)}"
@@ -36272,421 +36131,935 @@ class BancoImportarPainelModal(Modal, title="Importar painel completo"):
                 await _banco_prof_erro_interacao(interaction, "Não foi possível preparar a importação estruturada.", erro)
 
 
+
+# =====================================================
+# PATCH — TAREFAS: CONTEXTO DE MESA + ESCOLHA DE TÓPICO
+# =====================================================
+
+async def _resolver_mesa_tarefas(canal: Any) -> tuple[Optional[discord.TextChannel], Dict[str, Any]]:
+    """Resolve a mesa mesmo quando o registro JSON antigo está ausente ou desatualizado."""
+    guild = getattr(canal, 'guild', None)
+    if guild is None:
+        return None, {}
+
+    canal_principal = canal.parent if isinstance(canal, discord.Thread) else canal
+    if not isinstance(canal_principal, discord.TextChannel):
+        return None, {}
+
+    mesa = buscar_mesa_por_canal(int(canal_principal.id)) or {}
+    if mesa:
+        return canal_principal, mesa
+
+    # Mesas antigas podem não existir mais no mesas.json após uma migração.
+    categoria_id = int(getattr(canal_principal, 'category_id', 0) or 0)
+    categoria_valida = categoria_id in {
+        int(CATEGORIA_MESAS_ABERTAS_ID or 0),
+        int(CATEGORIA_MESAS_FECHADAS_ID or 0),
+    }
+
+    nomes_topicos = {
+        'chat', 'informante', 'rota de farm', 'rota de produção', 'rota de producao',
+        'ingredientes base e produtos', 'informações gerais', 'informacoes gerais',
+        'fotos líderes', 'fotos lideres', 'fotos dos membros', 'rádio', 'radio',
+        'localização', 'localizacao', 'crimes da comunidade', 'baú de líder',
+        'bau de lider', 'baú de membros', 'bau de membros',
+    }
+    topicos_ativos = list(getattr(canal_principal, 'threads', []) or [])
+    possui_topicos_mesa = any(
+        any(chave in str(getattr(t, 'name', '')).lower() for chave in nomes_topicos)
+        for t in topicos_ativos
+    )
+    nome_canal = str(getattr(canal_principal, 'name', '') or '').lower()
+    parece_mesa = (
+        categoria_valida
+        or possui_topicos_mesa
+        or nome_canal.startswith(('🕵', 'investigacao-', 'investigação-'))
+    )
+    if not parece_mesa:
+        return None, {}
+
+    # Repara automaticamente o registro da mesa para os próximos cliques.
+    familia = nome_canal
+    if '┃' in familia:
+        familia = familia.split('┃', 1)[-1]
+    familia = familia.replace('🕵️', '').replace('🕵', '').strip(' -|') or canal_principal.name
+    mesa = {
+        'canal_id': int(canal_principal.id),
+        'nome_canal': str(canal_principal.name),
+        'apelido': 'Não identificado',
+        'familia': familia,
+        'autor_id': 0,
+        'autor_nome': 'Registro recuperado automaticamente',
+        'status': 'FECHADA' if categoria_id == int(CATEGORIA_MESAS_FECHADAS_ID or 0) else 'ABERTA',
+        'criada_em': agora_br(),
+        'fechada_em': None,
+        'topicos_ids': [int(t.id) for t in topicos_ativos],
+    }
+    try:
+        registrar_mesa(mesa)
+    except Exception:
+        traceback.print_exc()
+    return canal_principal, mesa
+
+
+async def _listar_topicos_tarefa(
+    canal_mesa: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]] = None,
+) -> List[discord.Thread]:
+    """Lista tópicos ativos e arquivados da mesa sem criar nenhum novo."""
+    guild = canal_mesa.guild
+    encontrados: Dict[int, discord.Thread] = {}
+    mesa = mesa or {}
+
+    # IDs persistidos são a fonte mais segura, inclusive para tópicos arquivados.
+    for topico_id in list(mesa.get('topicos_ids') or []):
+        try:
+            tid = int(topico_id)
+        except Exception:
+            continue
+        topico = guild.get_thread(tid) or guild.get_channel(tid)
+        if topico is None:
+            try:
+                topico = await guild.fetch_channel(tid)
+            except Exception:
+                topico = None
+        if isinstance(topico, discord.Thread) and int(getattr(topico, 'parent_id', 0) or 0) == int(canal_mesa.id):
+            encontrados[int(topico.id)] = topico
+
+    for topico in list(getattr(canal_mesa, 'threads', []) or []):
+        if isinstance(topico, discord.Thread):
+            encontrados[int(topico.id)] = topico
+
+    # Recupera também tópicos arquivados de mesas antigas.
+    for privado in (False, True):
+        try:
+            async for topico in canal_mesa.archived_threads(limit=100, private=privado):
+                if isinstance(topico, discord.Thread):
+                    encontrados[int(topico.id)] = topico
+        except (discord.Forbidden, discord.HTTPException, TypeError, AttributeError):
+            pass
+        except Exception:
+            traceback.print_exc()
+
+    # Não oferece tópicos apagados ou pertencentes a outro canal.
+    topicos = [
+        t for t in encontrados.values()
+        if int(getattr(t, 'parent_id', 0) or 0) == int(canal_mesa.id)
+    ]
+
+    def ordem(t: discord.Thread) -> tuple[int, str]:
+        nome = str(getattr(t, 'name', '') or '').lower()
+        # Chat continua aparecendo primeiro, mas não é obrigatório.
+        prioridade = 0 if 'chat' in nome else 1
+        return prioridade, nome
+
+    return sorted(topicos, key=ordem)[:25]
+
+
+def _nome_topico_tarefa(topico: discord.Thread) -> str:
+    nome = str(getattr(topico, 'name', '') or 'Tópico').strip()
+    return nome[:100]
+
+
+class ObjetivoTarefaModal(Modal, title='Criar Tarefa Investigativa'):
+    objetivo = TextInput(
+        label='Objetivo da tarefa',
+        placeholder='Ex.: Fotografar a entrada e registrar os veículos utilizados.',
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+
+    def __init__(self, responsavel_id: int, mesa_canal_id: int, topico_destino_id: int):
+        super().__init__()
+        self.responsavel_id = int(responsavel_id)
+        self.mesa_canal_id = int(mesa_canal_id)
+        self.topico_destino_id = int(topico_destino_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.followup.send('❌ Esta ação precisa ser usada dentro do servidor.', ephemeral=True)
+
+        canal_mesa = guild.get_channel(self.mesa_canal_id)
+        if canal_mesa is None:
+            try:
+                canal_mesa = await guild.fetch_channel(self.mesa_canal_id)
+            except Exception:
+                canal_mesa = None
+        if not isinstance(canal_mesa, discord.TextChannel):
+            return await interaction.followup.send('❌ Não encontrei o canal principal desta mesa.', ephemeral=True)
+
+        topico = guild.get_thread(self.topico_destino_id) or guild.get_channel(self.topico_destino_id)
+        if topico is None:
+            try:
+                topico = await guild.fetch_channel(self.topico_destino_id)
+            except Exception:
+                topico = None
+        if not isinstance(topico, discord.Thread) or int(getattr(topico, 'parent_id', 0) or 0) != self.mesa_canal_id:
+            return await interaction.followup.send('❌ O tópico selecionado não existe mais ou não pertence a esta mesa.', ephemeral=True)
+
+        try:
+            if bool(getattr(topico, 'archived', False)):
+                await topico.edit(archived=False, reason='Nova tarefa investigativa DICOR')
+            if bool(getattr(topico, 'locked', False)):
+                return await interaction.followup.send('❌ O tópico selecionado está bloqueado. Escolha outro tópico.', ephemeral=True)
+        except discord.Forbidden:
+            return await interaction.followup.send('❌ O bot não tem permissão para reabrir este tópico.', ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+        numero = _numero_tarefa_mesa(self.mesa_canal_id)
+        tarefa = {
+            'numero': numero,
+            'mesa_canal_id': self.mesa_canal_id,
+            'canal_id': int(topico.id),
+            'topico_destino_id': int(topico.id),
+            'topico_destino_nome': str(topico.name),
+            'objetivo': str(self.objetivo.value).strip(),
+            'responsavel_id': self.responsavel_id,
+            'criador_id': int(interaction.user.id),
+            'status': 'PENDENTE',
+            'criada_em': agora_br(),
+        }
+        try:
+            msg = await topico.send(_texto_tarefa(tarefa), view=TarefaInvestigativaView())
+        except discord.Forbidden:
+            return await interaction.followup.send('❌ O bot não pode enviar mensagens nesse tópico.', ephemeral=True)
+        except discord.HTTPException as erro:
+            return await interaction.followup.send(f'❌ Falha ao publicar a tarefa: `{erro}`', ephemeral=True)
+
+        tarefa['mensagem_id'] = int(msg.id)
+        tarefas = _carregar_tarefas()
+        tarefas[str(msg.id)] = tarefa
+        _salvar_tarefas(tarefas)
+        await interaction.followup.send(
+            f'✅ Tarefa Nº **{numero:03d}** criada para <@{self.responsavel_id}> em {topico.mention}.',
+            ephemeral=True,
+        )
+
+
+class SelecionarResponsavelTarefa(discord.ui.UserSelect):
+    def __init__(self, mesa_canal_id: int, topico_destino_id: int):
+        super().__init__(
+            placeholder='2/2 • Selecione o agente responsável',
+            min_values=1,
+            max_values=1,
+        )
+        self.mesa_canal_id = int(mesa_canal_id)
+        self.topico_destino_id = int(topico_destino_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+        membro = self.values[0]
+        if getattr(membro, 'bot', False):
+            return await interaction.response.send_message('❌ Selecione uma pessoa, não um bot.', ephemeral=True)
+        await interaction.response.send_modal(
+            ObjetivoTarefaModal(membro.id, self.mesa_canal_id, self.topico_destino_id)
+        )
+
+
+class SelecionarResponsavelTarefaView(View):
+    def __init__(self, mesa_canal_id: int, topico_destino_id: int):
+        super().__init__(timeout=180)
+        self.add_item(SelecionarResponsavelTarefa(mesa_canal_id, topico_destino_id))
+
+
+class SelecionarTopicoTarefa(discord.ui.Select):
+    def __init__(self, mesa_canal_id: int, topicos: List[discord.Thread]):
+        self.mesa_canal_id = int(mesa_canal_id)
+        options: List[discord.SelectOption] = []
+        for topico in topicos[:25]:
+            nome = _nome_topico_tarefa(topico)
+            descricao = 'Tópico selecionado para receber a tarefa'
+            if bool(getattr(topico, 'archived', False)):
+                descricao = 'Arquivado — será reaberto automaticamente'
+            options.append(
+                discord.SelectOption(
+                    label=nome[:100],
+                    value=str(int(topico.id)),
+                    description=descricao[:100],
+                    emoji='💬' if 'chat' in nome.lower() else '📌',
+                )
+            )
+        super().__init__(
+            placeholder='1/2 • Escolha em qual tópico a tarefa será publicada',
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+        try:
+            topico_id = int(self.values[0])
+        except Exception:
+            return await interaction.response.send_message('❌ Tópico inválido.', ephemeral=True)
+        await interaction.response.edit_message(
+            content=(
+                f'📌 Tópico selecionado: <#{topico_id}>\n\n'
+                'Agora selecione o **agente responsável** pela tarefa.'
+            ),
+            view=SelecionarResponsavelTarefaView(self.mesa_canal_id, topico_id),
+        )
+
+
+class SelecionarTopicoTarefaView(View):
+    def __init__(self, mesa_canal_id: int, topicos: List[discord.Thread]):
+        super().__init__(timeout=180)
+        self.add_item(SelecionarTopicoTarefa(mesa_canal_id, topicos))
+
+
+class GerenciamentoTarefasView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Criar Tarefa', emoji='➕', style=discord.ButtonStyle.green,
+        custom_id='dic_mesa_criar_tarefa_v1',
+    )
+    async def criar(self, interaction: discord.Interaction, button: Button):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas.', ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        canal_mesa, mesa = await _resolver_mesa_tarefas(interaction.channel)
+        if canal_mesa is None:
+            return await interaction.followup.send(
+                '❌ Este painel não está vinculado a uma mesa de investigação válida.',
+                ephemeral=True,
+            )
+
+        topicos = await _listar_topicos_tarefa(canal_mesa, mesa)
+        if not topicos:
+            return await interaction.followup.send(
+                '❌ Nenhum tópico da mesa foi encontrado. O bot não criou tópicos novos.',
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            '📌 **CRIAR TAREFA INVESTIGATIVA**\n\n'
+            'Primeiro, escolha em qual tópico da mesa a tarefa será publicada.',
+            view=SelecionarTopicoTarefaView(int(canal_mesa.id), topicos),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label='Ver Tarefas Pendentes', emoji='📋', style=discord.ButtonStyle.blurple,
+        custom_id='dic_mesa_ver_tarefas_v1',
+    )
+    async def ver(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        canal_mesa, _mesa = await _resolver_mesa_tarefas(interaction.channel)
+        if canal_mesa is None:
+            return await interaction.followup.send(
+                '❌ Este painel não está vinculado a uma mesa de investigação válida.',
+                ephemeral=True,
+            )
+
+        tarefas = [
+            t for t in _carregar_tarefas().values()
+            if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id)
+            and t.get('status') != 'CONCLUIDA'
+        ]
+        tarefas.sort(key=lambda t: int(t.get('numero') or 0))
+        if not tarefas:
+            return await interaction.followup.send('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
+
+        linhas: List[str] = []
+        for t in tarefas[:25]:
+            st = '⏳ Pendente' if t.get('status') == 'PENDENTE' else '🟡 Aguardando encerramento'
+            topico_id = int(t.get('topico_destino_id') or t.get('canal_id') or 0)
+            destino = f'<#{topico_id}>' if topico_id else 'Não informado'
+            linhas.append(
+                f"**Nº {int(t.get('numero', 0)):03d}** — {st}\n"
+                f"Responsável: <@{t.get('responsavel_id')}>\n"
+                f"Tópico: {destino}\n"
+                f"Objetivo: {str(t.get('objetivo', ''))[:180]}"
+            )
+        await interaction.followup.send(
+            '📋 **TAREFAS PENDENTES DA MESA**\n\n' + '\n\n'.join(linhas),
+            ephemeral=True,
+        )
+
+
+print(
+    '✅ Tarefas DICOR corrigidas: mesas antigas reconhecidas e tópico de destino selecionável.',
+    flush=True,
+)
+
 print(
     "✅ Central de Fichas V6 ativa: OCR de painel por linhas/colunas; nome, RG, telefone e cargo separados com segurança.",
     flush=True,
 )
 
-if __name__ == '__main__':
-    asyncio.run(main())
+
 
 # =====================================================
-# CENTRAL DE FICHAS V6 — PERMISSÕES FINAIS + ANEXOS DE PERÍCIA
-# Inspetor/Vice-Diretor/Diretor: controle total.
-# Investigador/Estagiário: somente pesquisa e visualização.
-# Sincronização também revisa pendências e vincula TODAS as fotos da perícia.
+# PATCH — FICHAS OCR CONFIRMADAS NÃO VOLTAM PARA REVISÃO
+# - Cria uma identidade estável para cada imagem/perícia, mesmo quando o
+#   proxy/URL do embed muda após um redeploy.
+# - Reconcilia o SQLite com as fichas confirmadas persistentes em /data.
+# - Bloqueia a recriação e republicação de fichas já confirmadas/corrigidas.
+# - Remove cartões antigos já resolvidos e mantém somente pendências reais.
 # =====================================================
 
-_BANCO_V6_CARGOS_ADMIN = {
-    1490200388912156692,  # Inspetor
-    1490200383614615725,  # Vice-Diretor
-    1490200382776021132,  # Diretor
-}
+_BANCO_INIT_ANTES_ANTI_REENVIO = inicializar_banco_dicor
+_BANCO_OCR_CRIAR_ANTES_ANTI_REENVIO = _banco_ocr_criar_pendente
+_BANCO_OCR_RESOLVER_ANTES_ANTI_REENVIO = _banco_ocr_resolver
+_BANCO_OCR_PENDENTES_ANTES_ANTI_REENVIO = _banco_ocr_pendentes
+_BANCO_V4_REPUBLICAR_ANTES_ANTI_REENVIO = _banco_v4_republicar_pendentes
+_BANCO_PUBLICAR_TODOS_ANTES_ANTI_REENVIO = _banco_publicar_todos_ocr_pendentes
+_BANCO_ON_READY_ANTES_ANTI_REENVIO = bot.on_ready
+
+_BANCO_ANTI_REENVIO_LOCK = threading.RLock()
+_BANCO_ANTI_REENVIO_EXECUTANDO = False
+_BANCO_ANTI_REENVIO_INIT_OK = False
 
 
-def _banco_v6_admin_usuario(usuario: Any) -> bool:
-    if not isinstance(usuario, discord.Member):
-        return False
-    if getattr(usuario.guild_permissions, "administrator", False):
-        return True
-    return any(int(getattr(cargo, "id", 0) or 0) in _BANCO_V6_CARGOS_ADMIN for cargo in usuario.roles)
+def _banco_ocr_fonte_estavel(fonte_id: Any) -> str:
+    """Retira o hash variável das URLs de embed, preservando a posição da imagem."""
+    valor = str(fonte_id or '').strip()
+    m = re.match(r'^(embed:(?:image|thumb):\d+)(?::.*)?$', valor, flags=re.I)
+    if m:
+        return m.group(1).lower()
+    return valor.lower()[:300]
 
 
-def _banco_v6_admin_interacao(interaction: discord.Interaction) -> bool:
-    return _banco_v6_admin_usuario(interaction.user)
+def _banco_ocr_hash_arquivo(caminho: Any) -> str:
+    caminho_txt = str(caminho or '').strip()
+    if not caminho_txt:
+        return ''
+    try:
+        arquivo = Path(caminho_txt)
+        if not arquivo.is_file():
+            return ''
+        h = hashlib.sha256()
+        with arquivo.open('rb') as stream:
+            while True:
+                bloco = stream.read(1024 * 1024)
+                if not bloco:
+                    break
+                h.update(bloco)
+        return h.hexdigest()
+    except Exception:
+        return ''
 
 
-async def _banco_v6_negar_escrita(interaction: discord.Interaction) -> None:
-    texto = (
-        "❌ Você possui acesso somente para consulta. Apenas Inspetor, Vice-Diretor e Diretor "
-        "podem criar, editar, excluir, importar ou sincronizar fichas."
-    )
-    if interaction.response.is_done():
-        await interaction.followup.send(texto, ephemeral=True)
-    else:
-        await interaction.response.send_message(texto, ephemeral=True)
+def _banco_ocr_nome_chave(valor: Any) -> str:
+    return re.sub(r'[^a-z0-9]+', '', normalizar_busca(str(valor or '')))[:160]
 
 
-# Ficha consultada: remove controles de alteração para Investigador/Estagiário.
-_BANCO_FICHA_GERAL_VIEW_ANTES_V6 = BancoFichaGeralView
-
-
-class BancoFichaGeralView(_BANCO_FICHA_GERAL_VIEW_ANTES_V6):
-    def __init__(
-        self,
-        usuario_id: int,
-        perfil: Optional[Dict[str, Any]] = None,
-        opcoes: Optional[List[Tuple[str, int, str, str, str]]] = None,
-        somente_leitura: bool = False,
-    ):
-        super().__init__(usuario_id, perfil=perfil, opcoes=opcoes)
-        self.somente_leitura = bool(somente_leitura)
-        if self.somente_leitura:
-            for item in list(self.children):
-                if isinstance(item, discord.ui.Button) and getattr(item, "label", "") in {
-                    "Adicionar arquivos", "Adicionar/editar informações"
-                }:
-                    self.remove_item(item)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if int(interaction.user.id) != self.usuario_id:
-            await interaction.response.send_message(
-                "❌ Esta ficha pertence à consulta de outro agente.", ephemeral=True
-            )
-            return False
-        return True
-
-    async def adicionar_arquivos(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_v6_admin_interacao(interaction):
-            return await _banco_v6_negar_escrita(interaction)
-        return await super().adicionar_arquivos(interaction, button)
-
-    async def editar_informacoes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_v6_admin_interacao(interaction):
-            return await _banco_v6_negar_escrita(interaction)
-        return await super().editar_informacoes(interaction, button)
-
-
-# Consulta final: entrega ficha em modo somente leitura para Estagiário/Investigador.
-_BANCO_ENVIAR_CONSULTA_ANTES_V6 = _banco_prof_enviar_consulta
-
-
-async def _banco_prof_enviar_consulta(
-    interaction: discord.Interaction,
-    consulta: str,
+def _banco_ocr_chaves_dedupe(
     *,
-    editar_original: bool = False,
+    mensagem_id: int = 0,
+    canal_id: int = 0,
+    fonte_id: Any = '',
+    imagem_path: Any = '',
+    placa: Any = '',
+    documento: Any = '',
+    proprietario_nome: Any = '',
+) -> List[str]:
+    msg = int(mensagem_id or 0)
+    canal = int(canal_id or 0)
+    fonte = _banco_ocr_fonte_estavel(fonte_id)
+    placa_n = _banco_normalizar_placa(placa)
+    documento_n = _banco_normalizar_rg(documento)
+    nome_n = _banco_ocr_nome_chave(proprietario_nome)
+    imagem_hash = _banco_ocr_hash_arquivo(imagem_path)
+    chaves: List[str] = []
+
+    if msg and fonte:
+        chaves.append(f'msg:{msg}:fonte:{fonte}')
+    if canal and msg and fonte:
+        chaves.append(f'canal:{canal}:msg:{msg}:fonte:{fonte}')
+    if msg and placa_n:
+        chaves.append(f'msg:{msg}:placa:{placa_n}')
+    if msg and documento_n:
+        chaves.append(f'msg:{msg}:doc:{documento_n}')
+    if msg and nome_n and (documento_n or not placa_n):
+        chaves.append(f'msg:{msg}:nome:{nome_n}')
+    if imagem_hash:
+        chaves.append(f'imagem:{imagem_hash}')
+    # Remove duplicatas mantendo a ordem.
+    return list(dict.fromkeys(x for x in chaves if x))
+
+
+def _banco_ocr_criar_estrutura_anti_reenvio() -> None:
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_resolucoes_dedupe (
+                chave TEXT PRIMARY KEY,
+                pendente_id INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'CONFIRMADO',
+                mensagem_id INTEGER DEFAULT 0,
+                canal_id INTEGER DEFAULT 0,
+                fonte_estavel TEXT DEFAULT '',
+                placa TEXT DEFAULT '',
+                documento TEXT DEFAULT '',
+                proprietario_nome TEXT DEFAULT '',
+                imagem_hash TEXT DEFAULT '',
+                atualizado_em TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ocr_dedupe_pendente
+                ON ocr_resolucoes_dedupe(pendente_id, status);
+            CREATE INDEX IF NOT EXISTS idx_ocr_dedupe_mensagem
+                ON ocr_resolucoes_dedupe(mensagem_id, status);
+            """
+        )
+
+
+def _banco_ocr_registrar_resolucao(
+    pendente: Dict[str, Any],
+    *,
+    status: str = 'CONFIRMADO',
+    placa: Any = '',
+    documento: Any = '',
+    proprietario_nome: Any = '',
 ) -> None:
-    resultados = await asyncio.to_thread(banco_buscar, consulta)
-    opcoes = await asyncio.to_thread(_banco_ficha_geral_opcoes, resultados)
-    if not opcoes:
-        embed = discord.Embed(
-            title="🔍 CONSULTA AO BANCO",
-            description=f"Nenhum registro foi localizado para **{consulta[:100]}**.",
-            color=discord.Color.orange(),
-        )
-        if editar_original:
-            await interaction.edit_original_response(embed=embed, view=None)
-        else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+    if not pendente:
         return
-
-    somente_leitura = not _banco_v6_admin_interacao(interaction)
-    if len(opcoes) == 1:
-        tipo, rid, _, _, _ = opcoes[0]
-        if tipo == "faccao":
-            return await _BANCO_ENVIAR_CONSULTA_ANTES_V6(
-                interaction, consulta, editar_original=editar_original
-            )
-        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, rid)
-        perfil = await asyncio.to_thread(_banco_v4_enriquecer_perfil_organizacao, perfil)
-        embed = _banco_embed_ficha_geral(perfil)
-        view = BancoFichaGeralView(
-            int(interaction.user.id), perfil=perfil, somente_leitura=somente_leitura
-        )
-    else:
-        embed = discord.Embed(
-            title="🔍 RESULTADOS DA PESQUISA",
-            description="Selecione uma ficha abaixo para visualizar os dados completos.",
-            color=discord.Color.blurple(),
-        )
-        view = BancoFichaGeralView(
-            int(interaction.user.id), opcoes=opcoes, somente_leitura=somente_leitura
-        )
-
-    if editar_original:
-        await interaction.edit_original_response(embed=embed, view=view)
-    else:
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-
-class BancoDadosSomentePesquisaView(View):
-    def __init__(self):
-        super().__init__(timeout=600)
-
-    @discord.ui.button(label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.primary)
-    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_prof_equipe(interaction):
-            return await interaction.response.send_message(
-                "❌ Apenas a equipe DICOR pode consultar as fichas.", ephemeral=True
-            )
-        await interaction.response.send_modal(BancoConsultaModal())
-
-
-class BancoDadosView(View):
-    """Painel administrativo. Todas as ações são novamente validadas no backend."""
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not _banco_prof_equipe(interaction):
-            await interaction.response.send_message(
-                "❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True
-            )
-            return False
-        asyncio.create_task(_banco_prof_salvar_contexto_painel(interaction))
-        return True
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
-        await _banco_prof_erro_interacao(interaction, "A Central de Fichas apresentou uma falha.", error)
-
-    @discord.ui.button(
-        label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary,
-        custom_id="dicor_banco_criar_ficha_v6", row=0,
+    status_n = str(status or pendente.get('status') or 'CONFIRMADO').upper()
+    placa_n = _banco_normalizar_placa(placa or pendente.get('placa_final') or pendente.get('placa_sugerida'))
+    documento_n = _banco_normalizar_rg(documento or pendente.get('proprietario_rg'))
+    nome = str(proprietario_nome or pendente.get('proprietario_nome') or '')[:180]
+    fonte_estavel = _banco_ocr_fonte_estavel(pendente.get('fonte_id'))
+    imagem_hash = _banco_ocr_hash_arquivo(pendente.get('imagem_path'))
+    chaves = _banco_ocr_chaves_dedupe(
+        mensagem_id=int(pendente.get('mensagem_id') or 0),
+        canal_id=int(pendente.get('canal_id') or 0),
+        fonte_id=pendente.get('fonte_id'),
+        imagem_path=pendente.get('imagem_path'),
+        placa=placa_n,
+        documento=documento_n,
+        proprietario_nome=nome,
     )
-    async def criar_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_v6_admin_interacao(interaction):
-            return await _banco_v6_negar_escrita(interaction)
-        await interaction.response.defer(ephemeral=True)
-        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
-
-    @discord.ui.button(
-        label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary,
-        custom_id="dicor_banco_consultar_v6", row=0,
-    )
-    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BancoConsultaModal())
-
-    @discord.ui.button(
-        label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary,
-        custom_id="dicor_banco_importar_painel_v6", row=0,
-    )
-    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_v6_admin_interacao(interaction):
-            return await _banco_v6_negar_escrita(interaction)
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="🏴 ESCOLHA O MODO DE ATUALIZAÇÃO",
-                description="Escolha como o painel será aplicado.",
-                color=discord.Color.gold(),
-            ).add_field(
-                name="🔗 MESCLAR • recomendado",
-                value="Adiciona novos membros e atualiza os encontrados, mantendo os demais ativos.",
-                inline=False,
-            ).add_field(
-                name="♻️ SUBSTITUIR LISTA ATUAL",
-                value="Ausentes ficam inativos, mas fichas e histórico são preservados.",
-                inline=False,
-            ),
-            view=BancoEscolherModoPainelView(
-                int(interaction.user.id),
-                int(getattr(interaction.channel, "id", 0) or 0),
-                int(getattr(interaction.message, "id", 0) or 0),
-            ),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success,
-        custom_id="dicor_banco_sync_tudo_v6", row=0,
-    )
-    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _banco_v6_admin_interacao(interaction):
-            return await _banco_v6_negar_escrita(interaction)
-        await interaction.response.defer(ephemeral=True)
-        if _BANCO_PROF_SYNC_LOCK.locked():
-            return await interaction.followup.send(
-                "⏳ Já existe uma sincronização em andamento.", ephemeral=True
+    if not chaves:
+        return
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        for chave in chaves:
+            db.execute(
+                """
+                INSERT INTO ocr_resolucoes_dedupe
+                (chave, pendente_id, status, mensagem_id, canal_id, fonte_estavel,
+                 placa, documento, proprietario_nome, imagem_hash, atualizado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chave) DO UPDATE SET
+                    pendente_id=excluded.pendente_id,
+                    status=excluded.status,
+                    mensagem_id=excluded.mensagem_id,
+                    canal_id=excluded.canal_id,
+                    fonte_estavel=excluded.fonte_estavel,
+                    placa=excluded.placa,
+                    documento=excluded.documento,
+                    proprietario_nome=excluded.proprietario_nome,
+                    imagem_hash=excluded.imagem_hash,
+                    atualizado_em=excluded.atualizado_em
+                """,
+                (
+                    chave, int(pendente.get('id') or 0), status_n,
+                    int(pendente.get('mensagem_id') or 0), int(pendente.get('canal_id') or 0),
+                    fonte_estavel, placa_n, documento_n, nome, imagem_hash, agora,
+                ),
             )
-        await interaction.followup.send(
-            "🔄 Sincronização completa iniciada: mesas, procurados, organizações, Perícia Externa, "
-            "todas as fotos das perícias e revisão das fichas pendentes.",
-            ephemeral=True,
-        )
-        asyncio.create_task(
-            _banco_v4_sync_com_revisao(
-                interaction,
-                int(getattr(interaction.channel, "id", 0) or 0),
-                int(getattr(interaction.message, "id", 0) or 0),
+
+
+def _banco_ocr_dedupe_encontrado(chaves: List[str]) -> Dict[str, Any]:
+    if not chaves:
+        return {}
+    placeholders = ','.join('?' for _ in chaves)
+    with _banco_conexao() as db:
+        row = db.execute(
+            f"SELECT * FROM ocr_resolucoes_dedupe WHERE chave IN ({placeholders}) "
+            "ORDER BY atualizado_em DESC LIMIT 1",
+            tuple(chaves),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def _banco_ocr_marcar_duplicados_resolvidos(pendente: Dict[str, Any], status_origem: str) -> int:
+    """Fecha outras pendências da mesma imagem/perícia para impedir cartões repetidos."""
+    if not pendente:
+        return 0
+    msg = int(pendente.get('mensagem_id') or 0)
+    fonte = _banco_ocr_fonte_estavel(pendente.get('fonte_id'))
+    placa = _banco_normalizar_placa(pendente.get('placa_final') or pendente.get('placa_sugerida'))
+    documento = _banco_normalizar_rg(pendente.get('proprietario_rg'))
+    atual_id = int(pendente.get('id') or 0)
+    agora = _banco_agora_iso()
+    alterados = 0
+    with _banco_conexao() as db:
+        rows = db.execute(
+            "SELECT * FROM placas_ocr_pendentes WHERE status='PENDENTE' AND id<>?",
+            (atual_id,),
+        ).fetchall()
+        for row in rows:
+            outro = dict(row)
+            mesmo = False
+            if msg and int(outro.get('mensagem_id') or 0) == msg:
+                outro_fonte = _banco_ocr_fonte_estavel(outro.get('fonte_id'))
+                outro_placa = _banco_normalizar_placa(outro.get('placa_sugerida'))
+                outro_doc = _banco_normalizar_rg(outro.get('proprietario_rg'))
+                if fonte and outro_fonte == fonte:
+                    mesmo = True
+                elif placa and outro_placa == placa:
+                    mesmo = True
+                elif documento and outro_doc == documento:
+                    mesmo = True
+            if not mesmo:
+                continue
+            db.execute(
+                """
+                UPDATE placas_ocr_pendentes
+                SET status='DUPLICADO_RESOLVIDO', placa_final=?, resolvido_por_id=?,
+                    revisao_canal_id=0, revisao_mensagem_id=0, atualizado_em=?
+                WHERE id=? AND status='PENDENTE'
+                """,
+                (
+                    placa, int(pendente.get('resolvido_por_id') or 0), agora,
+                    int(outro.get('id') or 0),
+                ),
             )
-        )
+            alterados += 1
+    return alterados
 
 
-# Vincula TODAS as imagens da mesma mensagem de Perícia às fichas identificadas nela.
-async def _banco_v6_anexar_todas_fotos_pericias(
-    guild: Optional[discord.Guild], *, limite: Optional[int] = None
-) -> Dict[str, int]:
-    resultado = {"mensagens": 0, "fotos_salvas": 0, "vinculos": 0, "erros": 0}
-    if guild is None:
-        return resultado
-    canal = guild.get_channel(BANCO_PERICIA_CHANNEL_ID)
-    if canal is None:
+def _banco_ocr_reconciliar_confirmadas() -> Dict[str, int]:
+    """Reconcilia pendências com fichas/snapshots já confirmados no volume persistente."""
+    global _BANCO_ANTI_REENVIO_EXECUTANDO
+    if _BANCO_ANTI_REENVIO_EXECUTANDO:
+        return {'confirmadas': 0, 'duplicadas': 0}
+    with _BANCO_ANTI_REENVIO_LOCK:
+        if _BANCO_ANTI_REENVIO_EXECUTANDO:
+            return {'confirmadas': 0, 'duplicadas': 0}
+        _BANCO_ANTI_REENVIO_EXECUTANDO = True
         try:
-            canal = await bot.fetch_channel(BANCO_PERICIA_CHANNEL_ID)
-        except Exception:
-            canal = None
-    if canal is None or not hasattr(canal, "history"):
-        return resultado
+            _banco_ocr_criar_estrutura_anti_reenvio()
+            confirmadas = 0
+            duplicadas = 0
+            # 1) Registros já resolvidos na tabela principal.
+            with _banco_conexao() as db:
+                resolvidas = db.execute(
+                    "SELECT * FROM placas_ocr_pendentes WHERE status IN ('CONFIRMADO','CORRIGIDO','IGNORADO')"
+                ).fetchall()
+            for row in resolvidas:
+                item = dict(row)
+                _banco_ocr_registrar_resolucao(item, status=str(item.get('status') or 'CONFIRMADO'))
 
-    historico_limite = limite
-    if historico_limite is None:
-        historico_limite = None if BANCO_PERICIA_SCAN_LIMIT <= 0 else BANCO_PERICIA_SCAN_LIMIT
-
-    async for msg in canal.history(limit=historico_limite, oldest_first=True):
-        fontes = list(_banco_fontes_imagem_mensagem(msg))
-        if not fontes:
-            continue
-        with _banco_conexao() as db:
-            veiculos = db.execute(
-                "SELECT * FROM veiculos WHERE origem_id=? OR mensagem_url=?",
-                (str(msg.id), str(getattr(msg, "jump_url", "") or "")),
-            ).fetchall()
-        if not veiculos:
-            continue
-        resultado["mensagens"] += 1
-
-        for indice, fonte in enumerate(fontes, start=1):
+            # 2) Snapshots persistentes são a fonte definitiva após redeploys.
             try:
-                caminho = await _banco_salvar_fonte_imagem(
-                    fonte, f"pericia-completa-{msg.id}-{indice}"
-                )
-                if not caminho:
-                    continue
-                resultado["fotos_salvas"] += 1
-                nome = Path(str(caminho)).name
-                url = str(fonte.get("url") or "")[:1000]
-                mime = str(fonte.get("content_type") or fonte.get("mime") or "image/*")[:120]
-                tamanho = int(fonte.get("size") or 0)
-
                 with _banco_conexao() as db:
-                    for row in veiculos:
-                        veiculo = dict(row)
-                        veiculo_id = int(veiculo.get("id") or 0)
-                        individuo = _banco_ficha_geral_individuo_do_veiculo(db, veiculo)
-                        individuo_id = int(individuo["id"] or 0) if individuo else 0
-                        existente = db.execute(
-                            """
-                            SELECT id FROM arquivos_ficha_geral
-                            WHERE individuo_id=? AND veiculo_id=?
-                              AND (url_original=? OR caminho=?)
-                            LIMIT 1
-                            """,
-                            (individuo_id, veiculo_id, url, str(caminho)),
-                        ).fetchone()
-                        if existente:
-                            continue
+                    snapshots = db.execute(
+                        "SELECT * FROM fichas_confirmadas_persistentes ORDER BY id"
+                    ).fetchall()
+            except sqlite3.OperationalError:
+                snapshots = []
+            for row in snapshots:
+                snap = dict(row)
+                pid = int(snap.get('pendente_id') or 0)
+                dados: Dict[str, Any] = {}
+                try:
+                    dados = json.loads(str(snap.get('dados_json') or '{}'))
+                except Exception:
+                    dados = {}
+                evidencia = dict(dados.get('evidencia') or {})
+                with _banco_conexao() as db:
+                    pend_row = db.execute(
+                        "SELECT * FROM placas_ocr_pendentes WHERE id=?", (pid,)
+                    ).fetchone()
+                    if pend_row and str(pend_row['status'] or '').upper() == 'PENDENTE':
                         db.execute(
                             """
-                            INSERT INTO arquivos_ficha_geral
-                            (individuo_id, veiculo_id, nome_arquivo, caminho, url_original,
-                             descricao, mime_type, tamanho_bytes, criado_por_id, criado_em)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            UPDATE placas_ocr_pendentes
+                            SET status=?, placa_final=?, revisao_canal_id=0,
+                                revisao_mensagem_id=0, atualizado_em=? WHERE id=?
                             """,
                             (
-                                individuo_id, veiculo_id, nome, str(caminho), url,
-                                f"Evidência completa anexada automaticamente da Perícia Externa #{msg.id}.",
-                                mime, tamanho, int(getattr(msg.author, "id", 0) or 0), _banco_agora_iso(),
+                                str(snap.get('status') or 'CONFIRMADO').upper(),
+                                _banco_normalizar_placa(snap.get('placa')),
+                                _banco_agora_iso(), pid,
                             ),
                         )
-                        resultado["vinculos"] += 1
-            except BancoImagemIndisponivel:
-                continue
-            except Exception:
-                resultado["erros"] += 1
-                traceback.print_exc()
-    return resultado
+                        confirmadas += 1
+                    pend_row = db.execute(
+                        "SELECT * FROM placas_ocr_pendentes WHERE id=?", (pid,)
+                    ).fetchone()
+                if pend_row:
+                    pend = dict(pend_row)
+                else:
+                    pend = {
+                        'id': pid,
+                        'mensagem_id': int(evidencia.get('mensagem_id') or 0),
+                        'canal_id': int(evidencia.get('canal_id') or 0),
+                        'fonte_id': '',
+                        'imagem_path': str(evidencia.get('imagem_path') or snap.get('imagem_path') or ''),
+                        'placa_sugerida': str(snap.get('placa') or ''),
+                        'placa_final': str(snap.get('placa') or ''),
+                        'proprietario_rg': str(snap.get('documento') or ''),
+                        'proprietario_nome': str(snap.get('proprietario_nome') or ''),
+                    }
+                _banco_ocr_registrar_resolucao(
+                    pend,
+                    status=str(snap.get('status') or 'CONFIRMADO'),
+                    placa=snap.get('placa'),
+                    documento=snap.get('documento'),
+                    proprietario_nome=snap.get('proprietario_nome'),
+                )
+
+            # 3) Qualquer PENDENTE que corresponda a uma resolução vira duplicata resolvida.
+            with _banco_conexao() as db:
+                pendentes = db.execute(
+                    "SELECT * FROM placas_ocr_pendentes WHERE status='PENDENTE' ORDER BY id"
+                ).fetchall()
+            for row in pendentes:
+                item = dict(row)
+                chaves = _banco_ocr_chaves_dedupe(
+                    mensagem_id=int(item.get('mensagem_id') or 0),
+                    canal_id=int(item.get('canal_id') or 0),
+                    fonte_id=item.get('fonte_id'),
+                    imagem_path=item.get('imagem_path'),
+                    placa=item.get('placa_sugerida'),
+                    documento=item.get('proprietario_rg'),
+                    proprietario_nome=item.get('proprietario_nome'),
+                )
+                resolucao = _banco_ocr_dedupe_encontrado(chaves)
+                if not resolucao:
+                    continue
+                with _banco_conexao() as db:
+                    db.execute(
+                        """
+                        UPDATE placas_ocr_pendentes
+                        SET status='DUPLICADO_RESOLVIDO', placa_final=?,
+                            revisao_canal_id=0, revisao_mensagem_id=0, atualizado_em=?
+                        WHERE id=? AND status='PENDENTE'
+                        """,
+                        (
+                            str(resolucao.get('placa') or item.get('placa_sugerida') or ''),
+                            _banco_agora_iso(), int(item.get('id') or 0),
+                        ),
+                    )
+                duplicadas += 1
+            return {'confirmadas': confirmadas, 'duplicadas': duplicadas}
+        finally:
+            _BANCO_ANTI_REENVIO_EXECUTANDO = False
 
 
-_BANCO_SINCRONIZAR_PERICIAS_ANTES_V6 = banco_sincronizar_pericias
+def inicializar_banco_dicor() -> None:
+    global _BANCO_ANTI_REENVIO_INIT_OK
+    _BANCO_INIT_ANTES_ANTI_REENVIO()
+    if not _BANCO_ANTI_REENVIO_INIT_OK:
+        with _BANCO_ANTI_REENVIO_LOCK:
+            if not _BANCO_ANTI_REENVIO_INIT_OK:
+                _banco_ocr_criar_estrutura_anti_reenvio()
+                _BANCO_ANTI_REENVIO_INIT_OK = True
+                resultado = _banco_ocr_reconciliar_confirmadas()
+                if resultado.get('confirmadas') or resultado.get('duplicadas'):
+                    print(
+                        f"✅ Anti-reenvio OCR reconciliado: {resultado.get('confirmadas', 0)} confirmada(s) "
+                        f"e {resultado.get('duplicadas', 0)} duplicata(s) removida(s) da fila.",
+                        flush=True,
+                    )
 
 
-async def banco_sincronizar_pericias(
-    guild: Optional[discord.Guild],
+def _banco_ocr_criar_pendente(
     *,
-    limite: Optional[int] = None,
-    canal_revisao_id: int = 0,
-    forcar_historico: bool = False,
-    max_ocr_override: Optional[int] = None,
-) -> Dict[str, int]:
-    resultado = await _BANCO_SINCRONIZAR_PERICIAS_ANTES_V6(
-        guild,
-        limite=limite,
-        canal_revisao_id=canal_revisao_id,
-        forcar_historico=forcar_historico,
-        max_ocr_override=max_ocr_override,
+    msg: discord.Message,
+    canal_id: int,
+    fonte: Dict[str, Any],
+    imagem_path: str,
+    placa: str,
+    confianca: float,
+    texto_ocr: str,
+    dados: Dict[str, str],
+) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    placa_n = _banco_normalizar_placa(placa)
+    documento = _banco_normalizar_rg((dados or {}).get('proprietario_rg'))
+    nome = str((dados or {}).get('proprietario_nome') or '')
+    chaves = _banco_ocr_chaves_dedupe(
+        mensagem_id=int(getattr(msg, 'id', 0) or 0),
+        canal_id=int(canal_id or 0),
+        fonte_id=(fonte or {}).get('fonte_id'),
+        imagem_path=imagem_path,
+        placa=placa_n,
+        documento=documento,
+        proprietario_nome=nome,
     )
-    anexos = await _banco_v6_anexar_todas_fotos_pericias(guild, limite=limite)
-    resultado["fotos_anexadas"] = int(anexos.get("vinculos", 0))
-    resultado["erros"] = int(resultado.get("erros", 0)) + int(anexos.get("erros", 0))
-    return resultado
+    resolucao = _banco_ocr_dedupe_encontrado(chaves)
+    if resolucao:
+        pid = int(resolucao.get('pendente_id') or 0)
+        existente = _banco_ocr_pendente_por_id(pid) if pid else {}
+        if existente:
+            return existente
+        return {
+            'id': pid,
+            'status': str(resolucao.get('status') or 'CONFIRMADO'),
+            'placa_sugerida': str(resolucao.get('placa') or placa_n),
+            'placa_final': str(resolucao.get('placa') or placa_n),
+            'mensagem_id': int(getattr(msg, 'id', 0) or 0),
+            'canal_id': int(canal_id or 0),
+            'fonte_id': str((fonte or {}).get('fonte_id') or ''),
+        }
+
+    pendente = _BANCO_OCR_CRIAR_ANTES_ANTI_REENVIO(
+        msg=msg,
+        canal_id=canal_id,
+        fonte=fonte,
+        imagem_path=imagem_path,
+        placa=placa,
+        confianca=confianca,
+        texto_ocr=texto_ocr,
+        dados=dados,
+    )
+    # Corrige uma possível corrida entre a análise e uma confirmação simultânea.
+    if pendente and str(pendente.get('status') or '').upper() == 'PENDENTE':
+        chaves_pos = _banco_ocr_chaves_dedupe(
+            mensagem_id=int(pendente.get('mensagem_id') or 0),
+            canal_id=int(pendente.get('canal_id') or 0),
+            fonte_id=pendente.get('fonte_id'),
+            imagem_path=pendente.get('imagem_path'),
+            placa=pendente.get('placa_sugerida'),
+            documento=pendente.get('proprietario_rg'),
+            proprietario_nome=pendente.get('proprietario_nome'),
+        )
+        resolucao_pos = _banco_ocr_dedupe_encontrado(chaves_pos)
+        if resolucao_pos:
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    UPDATE placas_ocr_pendentes
+                    SET status='DUPLICADO_RESOLVIDO', revisao_canal_id=0,
+                        revisao_mensagem_id=0, atualizado_em=? WHERE id=?
+                    """,
+                    (_banco_agora_iso(), int(pendente.get('id') or 0)),
+                )
+            pendente = {**pendente, 'status': 'DUPLICADO_RESOLVIDO'}
+    return pendente
 
 
-# /painelbanco agora é individual: Estagiário/Investigador recebem somente pesquisa;
-# Inspetor+ recebe o painel administrativo completo.
-async def _painelbanco_v6(interaction: discord.Interaction):
-    if not _banco_prof_equipe(interaction):
-        return await interaction.response.send_message(
-            "❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True
+def _banco_ocr_resolver(*args, **kwargs) -> Dict[str, Any]:
+    pendente_id = int(args[0] if args else kwargs.get('pendente_id', 0) or 0)
+    pendente_antes = _banco_ocr_pendente_por_id(pendente_id)
+    status_atual = str(pendente_antes.get('status') or '').upper()
+    if status_atual == 'DUPLICADO_RESOLVIDO':
+        return _banco_v3_item_ocr_ja_resolvido(pendente_antes)
+    item = _BANCO_OCR_RESOLVER_ANTES_ANTI_REENVIO(*args, **kwargs)
+    pendente_depois = _banco_ocr_pendente_por_id(pendente_id) or pendente_antes
+    status_final = str(kwargs.get('status_final') or pendente_depois.get('status') or 'CONFIRMADO').upper()
+    if status_final in {'CONFIRMADO', 'CORRIGIDO', 'IGNORADO'}:
+        placa = str((item or {}).get('placa') or pendente_depois.get('placa_final') or pendente_depois.get('placa_sugerida') or '')
+        documento = str(
+            ((item or {}).get('individuo') or {}).get('rg')
+            or ((item or {}).get('dados_ficha') or {}).get('proprietario_rg')
+            or pendente_depois.get('proprietario_rg') or ''
         )
-    if _banco_v6_admin_interacao(interaction):
-        await interaction.response.send_message(
-            embed=banco_embed_painel(), view=BancoDadosView(), ephemeral=True
+        nome = str(
+            ((item or {}).get('individuo') or {}).get('nome')
+            or ((item or {}).get('dados_ficha') or {}).get('proprietario_nome')
+            or pendente_depois.get('proprietario_nome') or ''
         )
-    else:
-        embed = discord.Embed(
-            title="🔎 CONSULTA DE FICHAS • DICOR",
-            description=(
-                "Acesso em modo **somente leitura**. Você pode pesquisar e visualizar fichas, "
-                "mas não pode criar, editar, importar, sincronizar ou adicionar informações."
-            ),
-            color=discord.Color.blurple(),
+        _banco_ocr_registrar_resolucao(
+            pendente_depois,
+            status=status_final,
+            placa=placa,
+            documento=documento,
+            proprietario_nome=nome,
         )
-        await interaction.response.send_message(
-            embed=embed, view=BancoDadosSomentePesquisaView(), ephemeral=True
-        )
+        _banco_ocr_marcar_duplicados_resolvidos(pendente_depois, status_final)
+        fonte_id = str(pendente_depois.get('fonte_id') or '')
+        if fonte_id:
+            with _banco_conexao() as db:
+                db.execute(
+                    "UPDATE ocr_fontes_processadas SET status=?, processado_em=? WHERE fonte_id=?",
+                    (status_final, _banco_agora_iso(), fonte_id),
+                )
+    return item
 
 
-_cmd_painelbanco_v6 = bot.tree.get_command("painelbanco")
-if _cmd_painelbanco_v6 is not None:
-    _cmd_painelbanco_v6._callback = _painelbanco_v6
+def _banco_ocr_pendentes(limite: int = 30, apenas_sem_mensagem: bool = False) -> List[Dict[str, Any]]:
+    if not _BANCO_ANTI_REENVIO_EXECUTANDO:
+        _banco_ocr_reconciliar_confirmadas()
+    return _BANCO_OCR_PENDENTES_ANTES_ANTI_REENVIO(limite, apenas_sem_mensagem)
+
+
+async def _banco_v4_republicar_pendentes(
+    guild: Optional[discord.Guild], canal_id: int, *, limite: int = 50
+) -> Dict[str, int]:
+    await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
+    return await _BANCO_V4_REPUBLICAR_ANTES_ANTI_REENVIO(
+        guild, canal_id, limite=limite
+    )
+
+
+async def _banco_publicar_todos_ocr_pendentes(
+    guild: Optional[discord.Guild], canal_fallback_id: int
+) -> int:
+    await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
+    return await _BANCO_PUBLICAR_TODOS_ANTES_ANTI_REENVIO(guild, canal_fallback_id)
+
+
+async def _banco_ocr_limpar_cartoes_resolvidos(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT id, revisao_canal_id, revisao_mensagem_id
+            FROM placas_ocr_pendentes
+            WHERE status<>'PENDENTE' AND revisao_canal_id<>0 AND revisao_mensagem_id<>0
+            LIMIT 250
+            """
+        ).fetchall()
+    removidos = 0
+    for row in rows:
+        canal_id = int(row['revisao_canal_id'] or 0)
+        mensagem_id = int(row['revisao_mensagem_id'] or 0)
+        try:
+            canal = guild.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+            mensagem = await canal.fetch_message(mensagem_id)
+            await mensagem.delete()
+            removidos += 1
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with _banco_conexao() as db:
+                db.execute(
+                    "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 WHERE id=?",
+                    (int(row['id']),),
+                )
+    return removidos
+
+
+@bot.event
+async def on_ready():
+    await _BANCO_ON_READY_ANTES_ANTI_REENVIO()
+    try:
+        resultado = await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
+        removidos = await _banco_ocr_limpar_cartoes_resolvidos(bot.get_guild(GUILD_ID))
+        print(
+            f"✅ Anti-reenvio de fichas ativo: {resultado.get('confirmadas', 0)} confirmação(ões) "
+            f"reconciliada(s), {resultado.get('duplicadas', 0)} duplicata(s) fechada(s), "
+            f"{removidos} cartão(ões) antigo(s) removido(s).",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao reconciliar fichas OCR confirmadas: {type(erro).__name__}: {erro}", flush=True)
+
 
 print(
-    "✅ Central de Fichas V6 ativa: Inspetor+ com controle total; Estagiário/Investigador somente leitura; "
-    "sincronização revisa pendências e anexa todas as fotos das perícias.",
+    '✅ Anti-reenvio OCR ativo: fichas confirmadas/corrigidas não voltam para a fila nem são republicadas.',
     flush=True,
 )
 
-# Mantém o modo somente leitura também depois que o usuário escolhe um resultado no menu.
-_BANCO_FICHA_GERAL_SELECT_ANTES_V6 = BancoFichaGeralSelect
-
-
-class BancoFichaGeralSelect(_BANCO_FICHA_GERAL_SELECT_ANTES_V6):
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            tipo, registro_id = self.values[0].split(":", 1)
-            if tipo == "faccao":
-                registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", int(registro_id))
-                if not registro:
-                    return await interaction.followup.send("❌ Organização não encontrada.", ephemeral=True)
-                await interaction.edit_original_response(
-                    embed=_banco_embed_consulta_faccao(registro), view=self.view
-                )
-                return
-            perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, int(registro_id))
-            perfil = await asyncio.to_thread(_banco_v4_enriquecer_perfil_organizacao, perfil)
-            if not perfil:
-                return await interaction.followup.send("❌ Ficha não encontrada.", ephemeral=True)
-            nova_view = BancoFichaGeralView(
-                usuario_id=int(interaction.user.id),
-                perfil=perfil,
-                opcoes=self._opcoes_brutas,
-                somente_leitura=not _banco_v6_admin_interacao(interaction),
-            )
-            await interaction.edit_original_response(
-                embed=_banco_embed_ficha_geral(perfil), view=nova_view
-            )
-        except Exception as erro:
-            await _banco_prof_erro_interacao(
-                interaction, "Não foi possível abrir a ficha geral.", erro
-            )
+if __name__ == '__main__':
+    asyncio.run(main())
