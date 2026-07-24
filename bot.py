@@ -36499,565 +36499,406 @@ print(
 )
 
 
-
 # =====================================================
-# PATCH — FICHAS OCR CONFIRMADAS NÃO VOLTAM PARA REVISÃO
-# - Cria uma identidade estável para cada imagem/perícia, mesmo quando o
-#   proxy/URL do embed muda após um redeploy.
-# - Reconcilia o SQLite com as fichas confirmadas persistentes em /data.
-# - Bloqueia a recriação e republicação de fichas já confirmadas/corrigidas.
-# - Remove cartões antigos já resolvidos e mantém somente pendências reais.
+# PATCH FINAL — FICHAS SEM FOTOS DA PERÍCIA
+# + ALERTA CONFIÁVEL DE BOLETIM PARADO (48H)
 # =====================================================
+# Regras:
+# 1) fichas confirmadas e fichas consultadas mantêm todas as informações,
+#    mas não incorporam imagens da Perícia Externa;
+# 2) a origem continua disponível por link direto para a perícia;
+# 3) o alerta de boletim parado verifica os tópicos reais do Discord,
+#    inclusive tópicos arquivados automaticamente, sem depender apenas do JSON;
+# 4) o primeiro aviso ocorre com 48h e volta a ocorrer a cada novo período
+#    completo de 48h, sempre mencionando o responsável atual quando existir.
 
-_BANCO_INIT_ANTES_ANTI_REENVIO = inicializar_banco_dicor
-_BANCO_OCR_CRIAR_ANTES_ANTI_REENVIO = _banco_ocr_criar_pendente
-_BANCO_OCR_RESOLVER_ANTES_ANTI_REENVIO = _banco_ocr_resolver
-_BANCO_OCR_PENDENTES_ANTES_ANTI_REENVIO = _banco_ocr_pendentes
-_BANCO_V4_REPUBLICAR_ANTES_ANTI_REENVIO = _banco_v4_republicar_pendentes
-_BANCO_PUBLICAR_TODOS_ANTES_ANTI_REENVIO = _banco_publicar_todos_ocr_pendentes
-_BANCO_ON_READY_ANTES_ANTI_REENVIO = bot.on_ready
-
-_BANCO_ANTI_REENVIO_LOCK = threading.RLock()
-_BANCO_ANTI_REENVIO_EXECUTANDO = False
-_BANCO_ANTI_REENVIO_INIT_OK = False
-
-
-def _banco_ocr_fonte_estavel(fonte_id: Any) -> str:
-    """Retira o hash variável das URLs de embed, preservando a posição da imagem."""
-    valor = str(fonte_id or '').strip()
-    m = re.match(r'^(embed:(?:image|thumb):\d+)(?::.*)?$', valor, flags=re.I)
-    if m:
-        return m.group(1).lower()
-    return valor.lower()[:300]
+_BANCO_EMBED_FICHA_GERAL_ANTES_SEM_FOTO_PERICIA = _banco_embed_ficha_geral
+_BANCO_EMBED_FICHA_CONFIRMADA_ANTES_SEM_FOTO_PERICIA = _banco_embed_ficha_confirmada
 
 
-def _banco_ocr_hash_arquivo(caminho: Any) -> str:
-    caminho_txt = str(caminho or '').strip()
-    if not caminho_txt:
-        return ''
+def _dicor_remover_imagem_do_embed(embed: discord.Embed) -> discord.Embed:
+    """Remove apenas a imagem incorporada no cartão; arquivos e dados permanecem salvos."""
     try:
-        arquivo = Path(caminho_txt)
-        if not arquivo.is_file():
-            return ''
-        h = hashlib.sha256()
-        with arquivo.open('rb') as stream:
-            while True:
-                bloco = stream.read(1024 * 1024)
-                if not bloco:
-                    break
-                h.update(bloco)
-        return h.hexdigest()
+        embed.remove_image()
     except Exception:
-        return ''
-
-
-def _banco_ocr_nome_chave(valor: Any) -> str:
-    return re.sub(r'[^a-z0-9]+', '', normalizar_busca(str(valor or '')))[:160]
-
-
-def _banco_ocr_chaves_dedupe(
-    *,
-    mensagem_id: int = 0,
-    canal_id: int = 0,
-    fonte_id: Any = '',
-    imagem_path: Any = '',
-    placa: Any = '',
-    documento: Any = '',
-    proprietario_nome: Any = '',
-) -> List[str]:
-    msg = int(mensagem_id or 0)
-    canal = int(canal_id or 0)
-    fonte = _banco_ocr_fonte_estavel(fonte_id)
-    placa_n = _banco_normalizar_placa(placa)
-    documento_n = _banco_normalizar_rg(documento)
-    nome_n = _banco_ocr_nome_chave(proprietario_nome)
-    imagem_hash = _banco_ocr_hash_arquivo(imagem_path)
-    chaves: List[str] = []
-
-    if msg and fonte:
-        chaves.append(f'msg:{msg}:fonte:{fonte}')
-    if canal and msg and fonte:
-        chaves.append(f'canal:{canal}:msg:{msg}:fonte:{fonte}')
-    if msg and placa_n:
-        chaves.append(f'msg:{msg}:placa:{placa_n}')
-    if msg and documento_n:
-        chaves.append(f'msg:{msg}:doc:{documento_n}')
-    if msg and nome_n and (documento_n or not placa_n):
-        chaves.append(f'msg:{msg}:nome:{nome_n}')
-    if imagem_hash:
-        chaves.append(f'imagem:{imagem_hash}')
-    # Remove duplicatas mantendo a ordem.
-    return list(dict.fromkeys(x for x in chaves if x))
-
-
-def _banco_ocr_criar_estrutura_anti_reenvio() -> None:
-    with _banco_conexao() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS ocr_resolucoes_dedupe (
-                chave TEXT PRIMARY KEY,
-                pendente_id INTEGER DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'CONFIRMADO',
-                mensagem_id INTEGER DEFAULT 0,
-                canal_id INTEGER DEFAULT 0,
-                fonte_estavel TEXT DEFAULT '',
-                placa TEXT DEFAULT '',
-                documento TEXT DEFAULT '',
-                proprietario_nome TEXT DEFAULT '',
-                imagem_hash TEXT DEFAULT '',
-                atualizado_em TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_ocr_dedupe_pendente
-                ON ocr_resolucoes_dedupe(pendente_id, status);
-            CREATE INDEX IF NOT EXISTS idx_ocr_dedupe_mensagem
-                ON ocr_resolucoes_dedupe(mensagem_id, status);
-            """
-        )
-
-
-def _banco_ocr_registrar_resolucao(
-    pendente: Dict[str, Any],
-    *,
-    status: str = 'CONFIRMADO',
-    placa: Any = '',
-    documento: Any = '',
-    proprietario_nome: Any = '',
-) -> None:
-    if not pendente:
-        return
-    status_n = str(status or pendente.get('status') or 'CONFIRMADO').upper()
-    placa_n = _banco_normalizar_placa(placa or pendente.get('placa_final') or pendente.get('placa_sugerida'))
-    documento_n = _banco_normalizar_rg(documento or pendente.get('proprietario_rg'))
-    nome = str(proprietario_nome or pendente.get('proprietario_nome') or '')[:180]
-    fonte_estavel = _banco_ocr_fonte_estavel(pendente.get('fonte_id'))
-    imagem_hash = _banco_ocr_hash_arquivo(pendente.get('imagem_path'))
-    chaves = _banco_ocr_chaves_dedupe(
-        mensagem_id=int(pendente.get('mensagem_id') or 0),
-        canal_id=int(pendente.get('canal_id') or 0),
-        fonte_id=pendente.get('fonte_id'),
-        imagem_path=pendente.get('imagem_path'),
-        placa=placa_n,
-        documento=documento_n,
-        proprietario_nome=nome,
-    )
-    if not chaves:
-        return
-    agora = _banco_agora_iso()
-    with _banco_conexao() as db:
-        for chave in chaves:
-            db.execute(
-                """
-                INSERT INTO ocr_resolucoes_dedupe
-                (chave, pendente_id, status, mensagem_id, canal_id, fonte_estavel,
-                 placa, documento, proprietario_nome, imagem_hash, atualizado_em)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chave) DO UPDATE SET
-                    pendente_id=excluded.pendente_id,
-                    status=excluded.status,
-                    mensagem_id=excluded.mensagem_id,
-                    canal_id=excluded.canal_id,
-                    fonte_estavel=excluded.fonte_estavel,
-                    placa=excluded.placa,
-                    documento=excluded.documento,
-                    proprietario_nome=excluded.proprietario_nome,
-                    imagem_hash=excluded.imagem_hash,
-                    atualizado_em=excluded.atualizado_em
-                """,
-                (
-                    chave, int(pendente.get('id') or 0), status_n,
-                    int(pendente.get('mensagem_id') or 0), int(pendente.get('canal_id') or 0),
-                    fonte_estavel, placa_n, documento_n, nome, imagem_hash, agora,
-                ),
-            )
-
-
-def _banco_ocr_dedupe_encontrado(chaves: List[str]) -> Dict[str, Any]:
-    if not chaves:
-        return {}
-    placeholders = ','.join('?' for _ in chaves)
-    with _banco_conexao() as db:
-        row = db.execute(
-            f"SELECT * FROM ocr_resolucoes_dedupe WHERE chave IN ({placeholders}) "
-            "ORDER BY atualizado_em DESC LIMIT 1",
-            tuple(chaves),
-        ).fetchone()
-    return dict(row) if row else {}
-
-
-def _banco_ocr_marcar_duplicados_resolvidos(pendente: Dict[str, Any], status_origem: str) -> int:
-    """Fecha outras pendências da mesma imagem/perícia para impedir cartões repetidos."""
-    if not pendente:
-        return 0
-    msg = int(pendente.get('mensagem_id') or 0)
-    fonte = _banco_ocr_fonte_estavel(pendente.get('fonte_id'))
-    placa = _banco_normalizar_placa(pendente.get('placa_final') or pendente.get('placa_sugerida'))
-    documento = _banco_normalizar_rg(pendente.get('proprietario_rg'))
-    atual_id = int(pendente.get('id') or 0)
-    agora = _banco_agora_iso()
-    alterados = 0
-    with _banco_conexao() as db:
-        rows = db.execute(
-            "SELECT * FROM placas_ocr_pendentes WHERE status='PENDENTE' AND id<>?",
-            (atual_id,),
-        ).fetchall()
-        for row in rows:
-            outro = dict(row)
-            mesmo = False
-            if msg and int(outro.get('mensagem_id') or 0) == msg:
-                outro_fonte = _banco_ocr_fonte_estavel(outro.get('fonte_id'))
-                outro_placa = _banco_normalizar_placa(outro.get('placa_sugerida'))
-                outro_doc = _banco_normalizar_rg(outro.get('proprietario_rg'))
-                if fonte and outro_fonte == fonte:
-                    mesmo = True
-                elif placa and outro_placa == placa:
-                    mesmo = True
-                elif documento and outro_doc == documento:
-                    mesmo = True
-            if not mesmo:
-                continue
-            db.execute(
-                """
-                UPDATE placas_ocr_pendentes
-                SET status='DUPLICADO_RESOLVIDO', placa_final=?, resolvido_por_id=?,
-                    revisao_canal_id=0, revisao_mensagem_id=0, atualizado_em=?
-                WHERE id=? AND status='PENDENTE'
-                """,
-                (
-                    placa, int(pendente.get('resolvido_por_id') or 0), agora,
-                    int(outro.get('id') or 0),
-                ),
-            )
-            alterados += 1
-    return alterados
-
-
-def _banco_ocr_reconciliar_confirmadas() -> Dict[str, int]:
-    """Reconcilia pendências com fichas/snapshots já confirmados no volume persistente."""
-    global _BANCO_ANTI_REENVIO_EXECUTANDO
-    if _BANCO_ANTI_REENVIO_EXECUTANDO:
-        return {'confirmadas': 0, 'duplicadas': 0}
-    with _BANCO_ANTI_REENVIO_LOCK:
-        if _BANCO_ANTI_REENVIO_EXECUTANDO:
-            return {'confirmadas': 0, 'duplicadas': 0}
-        _BANCO_ANTI_REENVIO_EXECUTANDO = True
         try:
-            _banco_ocr_criar_estrutura_anti_reenvio()
-            confirmadas = 0
-            duplicadas = 0
-            # 1) Registros já resolvidos na tabela principal.
-            with _banco_conexao() as db:
-                resolvidas = db.execute(
-                    "SELECT * FROM placas_ocr_pendentes WHERE status IN ('CONFIRMADO','CORRIGIDO','IGNORADO')"
-                ).fetchall()
-            for row in resolvidas:
-                item = dict(row)
-                _banco_ocr_registrar_resolucao(item, status=str(item.get('status') or 'CONFIRMADO'))
-
-            # 2) Snapshots persistentes são a fonte definitiva após redeploys.
-            try:
-                with _banco_conexao() as db:
-                    snapshots = db.execute(
-                        "SELECT * FROM fichas_confirmadas_persistentes ORDER BY id"
-                    ).fetchall()
-            except sqlite3.OperationalError:
-                snapshots = []
-            for row in snapshots:
-                snap = dict(row)
-                pid = int(snap.get('pendente_id') or 0)
-                dados: Dict[str, Any] = {}
-                try:
-                    dados = json.loads(str(snap.get('dados_json') or '{}'))
-                except Exception:
-                    dados = {}
-                evidencia = dict(dados.get('evidencia') or {})
-                with _banco_conexao() as db:
-                    pend_row = db.execute(
-                        "SELECT * FROM placas_ocr_pendentes WHERE id=?", (pid,)
-                    ).fetchone()
-                    if pend_row and str(pend_row['status'] or '').upper() == 'PENDENTE':
-                        db.execute(
-                            """
-                            UPDATE placas_ocr_pendentes
-                            SET status=?, placa_final=?, revisao_canal_id=0,
-                                revisao_mensagem_id=0, atualizado_em=? WHERE id=?
-                            """,
-                            (
-                                str(snap.get('status') or 'CONFIRMADO').upper(),
-                                _banco_normalizar_placa(snap.get('placa')),
-                                _banco_agora_iso(), pid,
-                            ),
-                        )
-                        confirmadas += 1
-                    pend_row = db.execute(
-                        "SELECT * FROM placas_ocr_pendentes WHERE id=?", (pid,)
-                    ).fetchone()
-                if pend_row:
-                    pend = dict(pend_row)
-                else:
-                    pend = {
-                        'id': pid,
-                        'mensagem_id': int(evidencia.get('mensagem_id') or 0),
-                        'canal_id': int(evidencia.get('canal_id') or 0),
-                        'fonte_id': '',
-                        'imagem_path': str(evidencia.get('imagem_path') or snap.get('imagem_path') or ''),
-                        'placa_sugerida': str(snap.get('placa') or ''),
-                        'placa_final': str(snap.get('placa') or ''),
-                        'proprietario_rg': str(snap.get('documento') or ''),
-                        'proprietario_nome': str(snap.get('proprietario_nome') or ''),
-                    }
-                _banco_ocr_registrar_resolucao(
-                    pend,
-                    status=str(snap.get('status') or 'CONFIRMADO'),
-                    placa=snap.get('placa'),
-                    documento=snap.get('documento'),
-                    proprietario_nome=snap.get('proprietario_nome'),
-                )
-
-            # 3) Qualquer PENDENTE que corresponda a uma resolução vira duplicata resolvida.
-            with _banco_conexao() as db:
-                pendentes = db.execute(
-                    "SELECT * FROM placas_ocr_pendentes WHERE status='PENDENTE' ORDER BY id"
-                ).fetchall()
-            for row in pendentes:
-                item = dict(row)
-                chaves = _banco_ocr_chaves_dedupe(
-                    mensagem_id=int(item.get('mensagem_id') or 0),
-                    canal_id=int(item.get('canal_id') or 0),
-                    fonte_id=item.get('fonte_id'),
-                    imagem_path=item.get('imagem_path'),
-                    placa=item.get('placa_sugerida'),
-                    documento=item.get('proprietario_rg'),
-                    proprietario_nome=item.get('proprietario_nome'),
-                )
-                resolucao = _banco_ocr_dedupe_encontrado(chaves)
-                if not resolucao:
-                    continue
-                with _banco_conexao() as db:
-                    db.execute(
-                        """
-                        UPDATE placas_ocr_pendentes
-                        SET status='DUPLICADO_RESOLVIDO', placa_final=?,
-                            revisao_canal_id=0, revisao_mensagem_id=0, atualizado_em=?
-                        WHERE id=? AND status='PENDENTE'
-                        """,
-                        (
-                            str(resolucao.get('placa') or item.get('placa_sugerida') or ''),
-                            _banco_agora_iso(), int(item.get('id') or 0),
-                        ),
-                    )
-                duplicadas += 1
-            return {'confirmadas': confirmadas, 'duplicadas': duplicadas}
-        finally:
-            _BANCO_ANTI_REENVIO_EXECUTANDO = False
-
-
-def inicializar_banco_dicor() -> None:
-    global _BANCO_ANTI_REENVIO_INIT_OK
-    _BANCO_INIT_ANTES_ANTI_REENVIO()
-    if not _BANCO_ANTI_REENVIO_INIT_OK:
-        with _BANCO_ANTI_REENVIO_LOCK:
-            if not _BANCO_ANTI_REENVIO_INIT_OK:
-                _banco_ocr_criar_estrutura_anti_reenvio()
-                _BANCO_ANTI_REENVIO_INIT_OK = True
-                resultado = _banco_ocr_reconciliar_confirmadas()
-                if resultado.get('confirmadas') or resultado.get('duplicadas'):
-                    print(
-                        f"✅ Anti-reenvio OCR reconciliado: {resultado.get('confirmadas', 0)} confirmada(s) "
-                        f"e {resultado.get('duplicadas', 0)} duplicata(s) removida(s) da fila.",
-                        flush=True,
-                    )
-
-
-def _banco_ocr_criar_pendente(
-    *,
-    msg: discord.Message,
-    canal_id: int,
-    fonte: Dict[str, Any],
-    imagem_path: str,
-    placa: str,
-    confianca: float,
-    texto_ocr: str,
-    dados: Dict[str, str],
-) -> Dict[str, Any]:
-    inicializar_banco_dicor()
-    placa_n = _banco_normalizar_placa(placa)
-    documento = _banco_normalizar_rg((dados or {}).get('proprietario_rg'))
-    nome = str((dados or {}).get('proprietario_nome') or '')
-    chaves = _banco_ocr_chaves_dedupe(
-        mensagem_id=int(getattr(msg, 'id', 0) or 0),
-        canal_id=int(canal_id or 0),
-        fonte_id=(fonte or {}).get('fonte_id'),
-        imagem_path=imagem_path,
-        placa=placa_n,
-        documento=documento,
-        proprietario_nome=nome,
-    )
-    resolucao = _banco_ocr_dedupe_encontrado(chaves)
-    if resolucao:
-        pid = int(resolucao.get('pendente_id') or 0)
-        existente = _banco_ocr_pendente_por_id(pid) if pid else {}
-        if existente:
-            return existente
-        return {
-            'id': pid,
-            'status': str(resolucao.get('status') or 'CONFIRMADO'),
-            'placa_sugerida': str(resolucao.get('placa') or placa_n),
-            'placa_final': str(resolucao.get('placa') or placa_n),
-            'mensagem_id': int(getattr(msg, 'id', 0) or 0),
-            'canal_id': int(canal_id or 0),
-            'fonte_id': str((fonte or {}).get('fonte_id') or ''),
-        }
-
-    pendente = _BANCO_OCR_CRIAR_ANTES_ANTI_REENVIO(
-        msg=msg,
-        canal_id=canal_id,
-        fonte=fonte,
-        imagem_path=imagem_path,
-        placa=placa,
-        confianca=confianca,
-        texto_ocr=texto_ocr,
-        dados=dados,
-    )
-    # Corrige uma possível corrida entre a análise e uma confirmação simultânea.
-    if pendente and str(pendente.get('status') or '').upper() == 'PENDENTE':
-        chaves_pos = _banco_ocr_chaves_dedupe(
-            mensagem_id=int(pendente.get('mensagem_id') or 0),
-            canal_id=int(pendente.get('canal_id') or 0),
-            fonte_id=pendente.get('fonte_id'),
-            imagem_path=pendente.get('imagem_path'),
-            placa=pendente.get('placa_sugerida'),
-            documento=pendente.get('proprietario_rg'),
-            proprietario_nome=pendente.get('proprietario_nome'),
-        )
-        resolucao_pos = _banco_ocr_dedupe_encontrado(chaves_pos)
-        if resolucao_pos:
-            with _banco_conexao() as db:
-                db.execute(
-                    """
-                    UPDATE placas_ocr_pendentes
-                    SET status='DUPLICADO_RESOLVIDO', revisao_canal_id=0,
-                        revisao_mensagem_id=0, atualizado_em=? WHERE id=?
-                    """,
-                    (_banco_agora_iso(), int(pendente.get('id') or 0)),
-                )
-            pendente = {**pendente, 'status': 'DUPLICADO_RESOLVIDO'}
-    return pendente
-
-
-def _banco_ocr_resolver(*args, **kwargs) -> Dict[str, Any]:
-    pendente_id = int(args[0] if args else kwargs.get('pendente_id', 0) or 0)
-    pendente_antes = _banco_ocr_pendente_por_id(pendente_id)
-    status_atual = str(pendente_antes.get('status') or '').upper()
-    if status_atual == 'DUPLICADO_RESOLVIDO':
-        return _banco_v3_item_ocr_ja_resolvido(pendente_antes)
-    item = _BANCO_OCR_RESOLVER_ANTES_ANTI_REENVIO(*args, **kwargs)
-    pendente_depois = _banco_ocr_pendente_por_id(pendente_id) or pendente_antes
-    status_final = str(kwargs.get('status_final') or pendente_depois.get('status') or 'CONFIRMADO').upper()
-    if status_final in {'CONFIRMADO', 'CORRIGIDO', 'IGNORADO'}:
-        placa = str((item or {}).get('placa') or pendente_depois.get('placa_final') or pendente_depois.get('placa_sugerida') or '')
-        documento = str(
-            ((item or {}).get('individuo') or {}).get('rg')
-            or ((item or {}).get('dados_ficha') or {}).get('proprietario_rg')
-            or pendente_depois.get('proprietario_rg') or ''
-        )
-        nome = str(
-            ((item or {}).get('individuo') or {}).get('nome')
-            or ((item or {}).get('dados_ficha') or {}).get('proprietario_nome')
-            or pendente_depois.get('proprietario_nome') or ''
-        )
-        _banco_ocr_registrar_resolucao(
-            pendente_depois,
-            status=status_final,
-            placa=placa,
-            documento=documento,
-            proprietario_nome=nome,
-        )
-        _banco_ocr_marcar_duplicados_resolvidos(pendente_depois, status_final)
-        fonte_id = str(pendente_depois.get('fonte_id') or '')
-        if fonte_id:
-            with _banco_conexao() as db:
-                db.execute(
-                    "UPDATE ocr_fontes_processadas SET status=?, processado_em=? WHERE fonte_id=?",
-                    (status_final, _banco_agora_iso(), fonte_id),
-                )
-    return item
-
-
-def _banco_ocr_pendentes(limite: int = 30, apenas_sem_mensagem: bool = False) -> List[Dict[str, Any]]:
-    if not _BANCO_ANTI_REENVIO_EXECUTANDO:
-        _banco_ocr_reconciliar_confirmadas()
-    return _BANCO_OCR_PENDENTES_ANTES_ANTI_REENVIO(limite, apenas_sem_mensagem)
-
-
-async def _banco_v4_republicar_pendentes(
-    guild: Optional[discord.Guild], canal_id: int, *, limite: int = 50
-) -> Dict[str, int]:
-    await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
-    return await _BANCO_V4_REPUBLICAR_ANTES_ANTI_REENVIO(
-        guild, canal_id, limite=limite
-    )
-
-
-async def _banco_publicar_todos_ocr_pendentes(
-    guild: Optional[discord.Guild], canal_fallback_id: int
-) -> int:
-    await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
-    return await _BANCO_PUBLICAR_TODOS_ANTES_ANTI_REENVIO(guild, canal_fallback_id)
-
-
-async def _banco_ocr_limpar_cartoes_resolvidos(guild: Optional[discord.Guild]) -> int:
-    if guild is None:
-        return 0
-    with _banco_conexao() as db:
-        rows = db.execute(
-            """
-            SELECT id, revisao_canal_id, revisao_mensagem_id
-            FROM placas_ocr_pendentes
-            WHERE status<>'PENDENTE' AND revisao_canal_id<>0 AND revisao_mensagem_id<>0
-            LIMIT 250
-            """
-        ).fetchall()
-    removidos = 0
-    for row in rows:
-        canal_id = int(row['revisao_canal_id'] or 0)
-        mensagem_id = int(row['revisao_mensagem_id'] or 0)
-        try:
-            canal = guild.get_channel(canal_id) or await bot.fetch_channel(canal_id)
-            mensagem = await canal.fetch_message(mensagem_id)
-            await mensagem.delete()
-            removidos += 1
-        except (discord.NotFound, discord.Forbidden):
-            pass
+            embed._image = {}
         except Exception:
-            traceback.print_exc()
-        finally:
-            with _banco_conexao() as db:
-                db.execute(
-                    "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 WHERE id=?",
-                    (int(row['id']),),
+            pass
+    return embed
+
+
+def _banco_embed_ficha_geral(perfil: Dict[str, Any]) -> discord.Embed:
+    embed = _BANCO_EMBED_FICHA_GERAL_ANTES_SEM_FOTO_PERICIA(perfil)
+    _dicor_remover_imagem_do_embed(embed)
+    # O campo de origem já é criado pela ficha original. Este complemento só
+    # deixa explícito que as imagens permanecem na Perícia Externa.
+    nomes_campos = {str(getattr(campo, 'name', '') or '').upper() for campo in embed.fields}
+    if any('ORIGEM' in nome for nome in nomes_campos):
+        embed.add_field(
+            name='🖼️ IMAGENS DA PERÍCIA',
+            value='As fotos originais não são copiadas para esta ficha. Use o link de origem acima para visualizá-las.',
+            inline=False,
+        )
+    return embed
+
+
+def _banco_embed_ficha_confirmada(
+    item: Dict[str, Any],
+    pendente: Dict[str, Any],
+    usuario: discord.abc.User,
+) -> discord.Embed:
+    embed = _BANCO_EMBED_FICHA_CONFIRMADA_ANTES_SEM_FOTO_PERICIA(item, pendente, usuario)
+    _dicor_remover_imagem_do_embed(embed)
+    embed.set_footer(
+        text='DICOR • ficha persistente • imagens disponíveis somente no link da Perícia Externa'
+    )
+    return embed
+
+
+_ALERTA_BOLETIM_V3_INTERVALO_HORAS = max(
+    1,
+    env_int('ALERTA_BOLETIM_PARADO_HORAS', 48),
+)
+_ALERTA_BOLETIM_V3_VERIFICACAO_MINUTOS = max(
+    10,
+    env_int('ALERTA_BOLETIM_VERIFICACAO_MINUTOS', 30),
+)
+_ALERTA_BOLETIM_V3_STATUS_FECHADOS = {
+    'FINALIZADO', 'ARQUIVADO', 'CONCLUÍDO', 'CONCLUIDO', 'ENCERRADO',
+    'FECHADO', 'CANCELADO', 'REMOVIDO',
+}
+
+
+def _dicor_boletim_status_fechado(registro: Dict[str, Any]) -> bool:
+    return str(registro.get('status') or '').strip().upper() in _ALERTA_BOLETIM_V3_STATUS_FECHADOS
+
+
+def _dicor_data_utc(valor: Any) -> Optional[datetime.datetime]:
+    try:
+        data = _data_boletim_alerta_para_utc(valor)
+        if data:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _dicor_numero_boletim_topico(topico: discord.Thread, registros: List[Dict[str, Any]]) -> str:
+    for registro in registros:
+        numero = str(registro.get('numero') or '').strip()
+        if numero:
+            try:
+                return numero_curto_boletim(numero)
+            except Exception:
+                return numero
+    nome = str(getattr(topico, 'name', '') or '')
+    achado = re.search(r'(?:N[º°o]?\s*)?(\d{1,6})', nome, flags=re.I)
+    return achado.group(1).zfill(3) if achado else nome[:80]
+
+
+async def _dicor_coletar_topicos_boletins() -> List[discord.Thread]:
+    """Coleta tópicos ativos e arquivados diretamente do canal de boletins abertos."""
+    parent = bot.get_channel(int(BOLETIM_ATENDIMENTO_CHANNEL_ID))
+    if parent is None:
+        try:
+            parent = await bot.fetch_channel(int(BOLETIM_ATENDIMENTO_CHANNEL_ID))
+        except Exception:
+            parent = None
+    if parent is None:
+        return []
+
+    encontrados: Dict[int, discord.Thread] = {}
+    guild = getattr(parent, 'guild', None)
+    if guild is not None:
+        for topico in list(getattr(guild, 'threads', []) or []):
+            if isinstance(topico, discord.Thread) and int(getattr(topico, 'parent_id', 0) or 0) == int(parent.id):
+                encontrados[int(topico.id)] = topico
+
+    for topico in list(getattr(parent, 'threads', []) or []):
+        if isinstance(topico, discord.Thread):
+            encontrados[int(topico.id)] = topico
+
+    archived = getattr(parent, 'archived_threads', None)
+    if callable(archived):
+        # A assinatura varia entre TextChannel e ForumChannel. Tenta os modos
+        # suportados sem interromper toda a verificação.
+        tentativas = (
+            {'limit': None},
+            {'limit': 100},
+            {'limit': 100, 'private': False},
+            {'limit': 100, 'private': True},
+        )
+        for kwargs in tentativas:
+            try:
+                async for topico in archived(**kwargs):
+                    if isinstance(topico, discord.Thread):
+                        encontrados[int(topico.id)] = topico
+                # Se a primeira forma funcionou, não repete a mesma listagem.
+                if kwargs in ({'limit': None}, {'limit': 100}):
+                    break
+            except TypeError:
+                continue
+            except (discord.Forbidden, discord.HTTPException):
+                break
+            except Exception as erro:
+                print(
+                    f'⚠️ Alerta BO parado: falha ao listar tópicos arquivados: '
+                    f'{type(erro).__name__}: {erro}',
+                    flush=True,
                 )
-    return removidos
+                break
+
+    # Garante também os tópicos registrados no JSON, caso não estejam na cache.
+    for registro in carregar_atendimentos_boletins():
+        if not isinstance(registro, dict) or _dicor_boletim_status_fechado(registro):
+            continue
+        topico_id = _topico_id_atendimento_alerta(registro)
+        if not topico_id or topico_id in encontrados:
+            continue
+        try:
+            topico = await obter_canal_bot(topico_id)
+            if isinstance(topico, discord.Thread):
+                encontrados[int(topico.id)] = topico
+        except Exception:
+            continue
+
+    return sorted(encontrados.values(), key=lambda t: int(t.id))
+
+
+def _dicor_registros_por_topico_boletim() -> Tuple[Dict[int, List[Dict[str, Any]]], set[int]]:
+    abertos: Dict[int, List[Dict[str, Any]]] = {}
+    fechados: set[int] = set()
+    for registro in carregar_atendimentos_boletins():
+        if not isinstance(registro, dict):
+            continue
+        topico_id = _topico_id_atendimento_alerta(registro)
+        if not topico_id:
+            continue
+        if _dicor_boletim_status_fechado(registro):
+            fechados.add(int(topico_id))
+        else:
+            abertos.setdefault(int(topico_id), []).append(registro)
+    return abertos, fechados
+
+
+def _dicor_ultima_atividade_humana(
+    mensagens: List[discord.Message],
+    topico: discord.Thread,
+) -> Tuple[Optional[datetime.datetime], int]:
+    for mensagem in mensagens:
+        autor = getattr(mensagem, 'author', None)
+        if autor is not None and not bool(getattr(autor, 'bot', False)):
+            data = getattr(mensagem, 'created_at', None)
+            if data and data.tzinfo is None:
+                data = data.replace(tzinfo=datetime.timezone.utc)
+            return data.astimezone(datetime.timezone.utc) if data else None, int(mensagem.id)
+    criado = getattr(topico, 'created_at', None)
+    if criado and criado.tzinfo is None:
+        criado = criado.replace(tzinfo=datetime.timezone.utc)
+    return (criado.astimezone(datetime.timezone.utc) if criado else None), int(getattr(topico, 'id', 0) or 0)
+
+
+def _dicor_alerta_bo_parado_ja_publicado_no_periodo(
+    mensagens: List[discord.Message],
+    inicio_periodo: datetime.datetime,
+) -> Optional[discord.Message]:
+    for mensagem in mensagens:
+        criado = getattr(mensagem, 'created_at', None)
+        if criado and criado.tzinfo is None:
+            criado = criado.replace(tzinfo=datetime.timezone.utc)
+        if criado and criado.astimezone(datetime.timezone.utc) < inicio_periodo:
+            continue
+        autor = getattr(mensagem, 'author', None)
+        if autor is None or not bool(getattr(autor, 'bot', False)):
+            continue
+        for embed in list(getattr(mensagem, 'embeds', []) or []):
+            titulo = str(getattr(embed, 'title', '') or '').upper()
+            if 'ALERTA DE BOLETIM PARADO' in titulo:
+                return mensagem
+        if 'ALERTA DE BOLETIM PARADO' in str(getattr(mensagem, 'content', '') or '').upper():
+            return mensagem
+    return None
+
+
+@tasks.loop(minutes=_ALERTA_BOLETIM_V3_VERIFICACAO_MINUTOS)
+async def _dicor_verificar_boletins_parados_v3():
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    enviados = 0
+    elegiveis = 0
+    ignorados = 0
+    erros = 0
+    topicos = await _dicor_coletar_topicos_boletins()
+    registros_abertos, registros_fechados = _dicor_registros_por_topico_boletim()
+
+    for topico in topicos:
+        topico_id = int(topico.id)
+        registros = registros_abertos.get(topico_id, [])
+        if topico_id in registros_fechados and not registros:
+            ignorados += 1
+            continue
+        try:
+            mensagens = [
+                mensagem async for mensagem in topico.history(
+                    limit=200,
+                    oldest_first=False,
+                )
+            ]
+            ultima_atividade, marcador = _dicor_ultima_atividade_humana(mensagens, topico)
+            if ultima_atividade is None:
+                ignorados += 1
+                continue
+
+            horas = (agora - ultima_atividade).total_seconds() / 3600
+            if horas < _ALERTA_BOLETIM_V3_INTERVALO_HORAS:
+                continue
+            elegiveis += 1
+            periodo = max(1, int(horas // _ALERTA_BOLETIM_V3_INTERVALO_HORAS))
+            inicio_periodo = ultima_atividade + datetime.timedelta(
+                hours=periodo * _ALERTA_BOLETIM_V3_INTERVALO_HORAS
+            )
+            chave = (
+                f'alerta-boletim-parado-v3:{topico_id}:'
+                f'atividade-{int(ultima_atividade.timestamp())}:periodo-{periodo}'
+            )
+
+            alerta_existente = _dicor_alerta_bo_parado_ja_publicado_no_periodo(
+                mensagens,
+                inicio_periodo,
+            )
+            if alerta_existente is not None:
+                if not await _alerta_ja_enviado(chave):
+                    await _registrar_alerta_enviado(chave, alerta_existente)
+                continue
+
+            agente_topico_id, agente_topico_nome, data_troca_topico = (
+                await _responsavel_mais_recente_no_topico_alerta(topico, mensagens)
+            )
+            agente_registro_id, agente_registro_nome, data_troca_registro = (
+                _responsavel_por_registros_alerta(registros)
+                if registros else (0, '', None)
+            )
+            if agente_topico_id:
+                agente_id = agente_topico_id
+                agente_nome = agente_topico_nome
+                data_responsavel = data_troca_topico
+            else:
+                agente_id = agente_registro_id
+                agente_nome = agente_registro_nome
+                data_responsavel = data_troca_registro
+
+            if agente_id and registros:
+                membro = getattr(topico, 'guild', None)
+                membro = membro.get_member(agente_id) if membro else None
+                if membro:
+                    agente_nome = str(membro)
+                _sincronizar_responsavel_boletim_alerta(
+                    topico_id=topico_id,
+                    numero=_dicor_numero_boletim_topico(topico, registros),
+                    agente_id=agente_id,
+                    agente_nome=agente_nome,
+                    atribuido_em=data_responsavel,
+                )
+
+            if bool(getattr(topico, 'archived', False)):
+                try:
+                    await topico.edit(archived=False, reason='Alerta automático de boletim parado DICOR')
+                except Exception:
+                    pass
+
+            numero = _dicor_numero_boletim_topico(topico, registros)
+            original = next(
+                (
+                    str(r.get('mensagem_original_url') or r.get('mensagem_url') or '').strip()
+                    for r in registros
+                    if str(r.get('mensagem_original_url') or r.get('mensagem_url') or '').strip().startswith('http')
+                ),
+                '',
+            )
+            links: List[Tuple[str, str]] = []
+            if original:
+                links.append(('Ver boletim original', original))
+            links.append(('Abrir tópico', f'https://discord.com/channels/{topico.guild.id}/{topico.id}'))
+
+            if agente_id:
+                responsavel = f'Responsável atual: <@{agente_id}>'
+                mencao = f'<@{agente_id}>'
+            else:
+                responsavel = 'Sem agente responsável definido'
+                mencao = None
+
+            mensagem = await enviar_alerta_inteligente_no_canal(
+                topico,
+                chave=chave,
+                titulo='⏰ ALERTA DE BOLETIM PARADO',
+                descricao=(
+                    f'O boletim Nº **{numero}** está sem atualização humana há '
+                    f'aproximadamente **{int(horas)} horas**.'
+                ),
+                itens=[
+                    responsavel,
+                    'Atualize, conclua ou transfira o boletim para outro agente.',
+                    'Um novo aviso será enviado apenas após outro período completo de 48 horas.',
+                ],
+                links=links,
+                cor=discord.Color.orange(),
+                mencao=mencao,
+            )
+            if mensagem is not None:
+                enviados += 1
+        except discord.NotFound:
+            ignorados += 1
+        except Exception as erro:
+            erros += 1
+            print(
+                f'⚠️ Alerta BO parado V3 falhou no tópico {topico_id}: '
+                f'{type(erro).__name__}: {erro}',
+                flush=True,
+            )
+
+    print(
+        f'✅ Verificação BO parado V3: {len(topicos)} tópico(s), '
+        f'{elegiveis} elegível(is), {enviados} alerta(s) enviado(s), '
+        f'{ignorados} ignorado(s), {erros} erro(s).',
+        flush=True,
+    )
+
+
+@_dicor_verificar_boletins_parados_v3.before_loop
+async def _dicor_antes_verificar_boletins_parados_v3():
+    await bot.wait_until_ready()
+    await asyncio.sleep(20)
+
+
+# O listener antigo resolve este nome em tempo de execução. Ao apontá-lo para
+# a V3, impede que a rotina antiga seja iniciada e garante apenas um loop ativo.
+verificar_boletins_parados_alerta_inteligente = _dicor_verificar_boletins_parados_v3
+
+_DICOR_ON_READY_ANTES_ALERTA_BO_V3 = bot.on_ready
 
 
 @bot.event
 async def on_ready():
-    await _BANCO_ON_READY_ANTES_ANTI_REENVIO()
+    await _DICOR_ON_READY_ANTES_ALERTA_BO_V3()
     try:
-        resultado = await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
-        removidos = await _banco_ocr_limpar_cartoes_resolvidos(bot.get_guild(GUILD_ID))
+        if not _dicor_verificar_boletins_parados_v3.is_running():
+            _dicor_verificar_boletins_parados_v3.start()
         print(
-            f"✅ Anti-reenvio de fichas ativo: {resultado.get('confirmadas', 0)} confirmação(ões) "
-            f"reconciliada(s), {resultado.get('duplicadas', 0)} duplicata(s) fechada(s), "
-            f"{removidos} cartão(ões) antigo(s) removido(s).",
+            f'✅ Alertas de boletins parados V3 ativos: primeira checagem em 20s; '
+            f'intervalo de aviso {_ALERTA_BOLETIM_V3_INTERVALO_HORAS}h; '
+            f'verificação a cada {_ALERTA_BOLETIM_V3_VERIFICACAO_MINUTOS}min.',
             flush=True,
         )
     except Exception as erro:
-        traceback.print_exc()
-        print(f"⚠️ Falha ao reconciliar fichas OCR confirmadas: {type(erro).__name__}: {erro}", flush=True)
+        print(
+            f'⚠️ Falha ao iniciar alertas de boletins parados V3: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
 
 
 print(
-    '✅ Anti-reenvio OCR ativo: fichas confirmadas/corrigidas não voltam para a fila nem são republicadas.',
+    '✅ Fichas sem cópia de fotos da Perícia Externa + alertas BO parado V3 carregados.',
     flush=True,
 )
 
