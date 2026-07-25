@@ -37661,5 +37661,425 @@ print(
 )
 
 
+
+# =====================================================
+# PATCH — CATÁLOGO COM FOTOS PERSISTENTES E RECUPERAÇÃO AUTOMÁTICA
+# Motivo: /app/public/uploads é apagado a cada deploy do Railway.
+# As fotos passam a ser salvas no volume /data e são recuperadas das
+# mensagens oficiais do Discord quando um cadastro antigo perdeu o arquivo.
+# =====================================================
+
+_CATALOGO_UPLOADS_LEGADO_DIR = Path(UPLOADS_DIR)
+UPLOADS_DIR = Path(DATA_DIR) / 'catalogo_uploads'
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+_CATALOGO_REPARO_TASK: Optional[asyncio.Task] = None
+_registro_tem_valor_util_catalogo_base = registro_tem_valor_util
+_CATALOGO_REPARO_LOCK = asyncio.Lock()
+_GERAR_CATALOGO_HTML_ANTES_FOTOS_PERSISTENTES = gerar_catalogo_html
+_IMPORTAR_MENSAGEM_ANTIGA_ANTES_FOTOS_PERSISTENTES = importar_mensagem_antiga
+_CATALOGO_ON_READY_ANTES_FOTOS_PERSISTENTES = bot.on_ready
+
+
+def _catalogo_extensao_imagem(nome: str, content_type: str = '') -> str:
+    ext = Path(str(nome or '')).suffix.lower()
+    permitidas = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
+    if ext in permitidas:
+        return ext
+    tipo = str(content_type or '').lower()
+    if 'jpeg' in tipo or 'jpg' in tipo:
+        return '.jpg'
+    if 'webp' in tipo:
+        return '.webp'
+    if 'gif' in tipo:
+        return '.gif'
+    return '.png'
+
+
+def _catalogo_nome_arquivo(valor: Any) -> str:
+    texto = str(valor or '').strip().replace('\\', '/')
+    if not texto:
+        return ''
+    if texto.startswith(('http://', 'https://')):
+        try:
+            from urllib.parse import urlparse
+            texto = urlparse(texto).path
+        except Exception:
+            pass
+    return Path(texto).name
+
+
+def _catalogo_caminho_local(valor: Any) -> Optional[Path]:
+    texto = str(valor or '').strip()
+    if not texto or texto.startswith(('http://', 'https://', 'data:')):
+        return None
+    nome = _catalogo_nome_arquivo(texto)
+    if not nome:
+        return None
+    candidatos = [
+        UPLOADS_DIR / nome,
+        _CATALOGO_UPLOADS_LEGADO_DIR / nome,
+        PUBLIC_DIR / 'uploads' / nome,
+        BASE_DIR / texto.lstrip('/'),
+    ]
+    for candidato in candidatos:
+        try:
+            if candidato.exists() and candidato.is_file() and candidato.stat().st_size > 0:
+                return candidato
+        except Exception:
+            continue
+    return None
+
+
+def _catalogo_foto_disponivel(valor: Any) -> bool:
+    texto = str(valor or '').strip()
+    if not texto:
+        return False
+    if texto.startswith(('http://', 'https://', 'data:')):
+        return True
+    return _catalogo_caminho_local(texto) is not None
+
+
+def _catalogo_url_local(valor: Any) -> str:
+    texto = str(valor or '').strip()
+    if not texto:
+        return ''
+    if texto.startswith(('http://', 'https://', 'data:')):
+        return texto
+    caminho = _catalogo_caminho_local(texto)
+    if caminho is None:
+        return ''
+    nome = caminho.name
+    destino = UPLOADS_DIR / nome
+    try:
+        if caminho.resolve() != destino.resolve() and not destino.exists():
+            shutil.copy2(caminho, destino)
+    except Exception:
+        pass
+    return f'/uploads/{nome}'
+
+
+def _catalogo_migrar_uploads_legados() -> int:
+    migrados = 0
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        if _CATALOGO_UPLOADS_LEGADO_DIR.exists() and _CATALOGO_UPLOADS_LEGADO_DIR.resolve() != UPLOADS_DIR.resolve():
+            for origem in _CATALOGO_UPLOADS_LEGADO_DIR.iterdir():
+                if not origem.is_file() or origem.stat().st_size <= 0:
+                    continue
+                destino = UPLOADS_DIR / origem.name
+                if not destino.exists():
+                    shutil.copy2(origem, destino)
+                    migrados += 1
+    except Exception:
+        traceback.print_exc()
+    return migrados
+
+
+def _catalogo_normalizar_fotos_salvas() -> int:
+    lista = carregar_procurados()
+    alterados = 0
+    for registro in lista:
+        for campo in ('foto_individuo', 'foto_rg'):
+            atual = str(registro.get(campo) or '').strip()
+            normalizado = _catalogo_url_local(atual)
+            # URLs externas válidas são mantidas. Caminhos locais ausentes viram
+            # vazio para o HTML mostrar o placeholder, nunca um ícone quebrado.
+            if normalizado != atual:
+                registro[campo] = normalizado
+                alterados += 1
+    if alterados:
+        salvar_procurados(lista)
+    return alterados
+
+
+def gerar_catalogo_html() -> None:
+    _catalogo_migrar_uploads_legados()
+    _catalogo_normalizar_fotos_salvas()
+    _GERAR_CATALOGO_HTML_ANTES_FOTOS_PERSISTENTES()
+
+
+async def salvar_anexo_publico(anexo: discord.Attachment, prefixo: str) -> str:
+    """Salva a imagem do procurado diretamente no volume persistente /data."""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    ext = _catalogo_extensao_imagem(getattr(anexo, 'filename', ''), getattr(anexo, 'content_type', ''))
+    base = slugify(Path(str(getattr(anexo, 'filename', '') or 'imagem')).stem) or 'imagem'
+    nome = f"{data_caso()}-{slugify(prefixo)}-{base}{ext}"
+    caminho = UPLOADS_DIR / nome
+    try:
+        await anexo.save(str(caminho))
+    except Exception:
+        # Fallback por HTTP para anexos cujo save direto falhou.
+        urls = [str(getattr(anexo, 'proxy_url', '') or ''), str(getattr(anexo, 'url', '') or '')]
+        ultimo_erro: Optional[Exception] = None
+        for url in urls:
+            if not url:
+                continue
+            try:
+                timeout = aiohttp.ClientTimeout(total=40)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resposta:
+                        if resposta.status != 200:
+                            continue
+                        dados = await resposta.read()
+                        if dados:
+                            caminho.write_bytes(dados)
+                            ultimo_erro = None
+                            break
+            except Exception as erro:
+                ultimo_erro = erro
+        if not caminho.exists() or caminho.stat().st_size <= 0:
+            if ultimo_erro:
+                raise ultimo_erro
+            raise RuntimeError('Não foi possível salvar a imagem do catálogo.')
+    return f'/uploads/{nome}'
+
+
+def registro_tem_valor_util(valor: Any) -> bool:
+    texto = str(valor or '').strip()
+    if texto.replace('\\', '/').lower().startswith(('/uploads/', 'uploads/', 'public/uploads/')):
+        return _catalogo_foto_disponivel(texto)
+    return _registro_tem_valor_util_catalogo_base(valor)
+
+
+def _catalogo_texto_mensagem(msg: discord.Message) -> str:
+    partes = [str(getattr(msg, 'content', '') or '')]
+    for embed in list(getattr(msg, 'embeds', []) or []):
+        if getattr(embed, 'title', None):
+            partes.append(str(embed.title))
+        if getattr(embed, 'description', None):
+            partes.append(str(embed.description))
+        for field in list(getattr(embed, 'fields', []) or []):
+            partes.append(f'{field.name}: {field.value}')
+    return '\n'.join(partes)
+
+
+def _catalogo_anexos_imagem(msg: discord.Message) -> List[discord.Attachment]:
+    saida: List[discord.Attachment] = []
+    for anexo in list(getattr(msg, 'attachments', []) or []):
+        tipo = str(getattr(anexo, 'content_type', '') or '').lower()
+        ext = Path(str(getattr(anexo, 'filename', '') or '')).suffix.lower()
+        if tipo.startswith('image/') or ext in {'.png', '.jpg', '.jpeg', '.webp', '.gif'}:
+            saida.append(anexo)
+    return saida
+
+
+async def importar_mensagem_antiga(msg: discord.Message) -> Optional[Dict[str, Any]]:
+    """Importa e também recupera fotos quando o caminho antigo sumiu no deploy."""
+    texto_total = _catalogo_texto_mensagem(msg)
+    dados = extrair_por_labels(texto_total)
+    if not dados.get('rg') or not dados.get('nome'):
+        return None
+
+    existente = procurar_por_rg(dados.get('rg', ''))
+    imagens = _catalogo_anexos_imagem(msg)
+    foto_ind = str(existente.get('foto_individuo', '') if existente else '')
+    foto_rg = str(existente.get('foto_rg', '') if existente else '')
+    if not _catalogo_foto_disponivel(foto_ind):
+        foto_ind = ''
+    if not _catalogo_foto_disponivel(foto_rg):
+        foto_rg = ''
+    if not foto_ind and len(imagens) >= 1:
+        foto_ind = await salvar_anexo_publico(imagens[0], f'sync-ind-{dados.get("rg", "")}-{msg.id}')
+    if not foto_rg and len(imagens) >= 2:
+        foto_rg = await salvar_anexo_publico(imagens[1], f'sync-rg-{dados.get("rg", "")}-{msg.id}')
+
+    return {
+        'id': f'SYNC-{msg.id}',
+        'caso': f'SYNC-{msg.id}',
+        'data': msg.created_at.strftime('%d/%m/%Y %H:%M'),
+        'status': str(existente.get('status', 'A PROCURAR') if existente else 'A PROCURAR'),
+        'nome': dados.get('nome', ''),
+        'rg': dados.get('rg', ''),
+        'crimes': dados.get('crimes', 'Não identificado na mensagem antiga'),
+        'ultimo_avistamento': dados.get('ultimo_avistamento', 'Não identificado na mensagem antiga'),
+        'informacoes': dados.get('informacoes', 'Importado automaticamente do histórico do canal.'),
+        'foto_individuo': foto_ind,
+        'foto_rg': foto_rg,
+        'autor_id': None,
+        'autor_nome': 'Sincronização antiga',
+        'mensagem_id': msg.id,
+        'mensagem_url': msg.jump_url,
+    }
+
+
+def _catalogo_ids_jump_url(url: Any) -> Tuple[int, int]:
+    texto = str(url or '')
+    achado = re.search(r'/channels/\d+/(\d+)/(\d+)', texto)
+    if not achado:
+        return 0, 0
+    return int(achado.group(1)), int(achado.group(2))
+
+
+async def _catalogo_fetch_message(canal_id: int, mensagem_id: int) -> Optional[discord.Message]:
+    if not canal_id or not mensagem_id:
+        return None
+    try:
+        canal = bot.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+        if canal is None or not hasattr(canal, 'fetch_message'):
+            return None
+        return await canal.fetch_message(mensagem_id)
+    except (discord.NotFound, discord.Forbidden):
+        return None
+    except Exception:
+        return None
+
+
+async def _catalogo_mapa_mensagens_por_rg() -> Dict[Tuple[str, str], discord.Message]:
+    mapa: Dict[Tuple[str, str], discord.Message] = {}
+    canais = [
+        ('ATIVO', int(PROCURADOS_CHANNEL_ID or 0)),
+        ('RETIRADO', int(HISTORICO_PROCURADOS_ID or 0)),
+    ]
+    for status, canal_id in canais:
+        if not canal_id:
+            continue
+        try:
+            canal = bot.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+        except Exception:
+            continue
+        if canal is None or not hasattr(canal, 'history'):
+            continue
+        try:
+            async for msg in canal.history(limit=1500, oldest_first=False):
+                if len(_catalogo_anexos_imagem(msg)) < 1:
+                    continue
+                dados = extrair_por_labels(_catalogo_texto_mensagem(msg))
+                rg = limpar_rg(dados.get('rg', ''))
+                if rg and (status, rg) not in mapa:
+                    mapa[(status, rg)] = msg
+        except Exception:
+            traceback.print_exc()
+    return mapa
+
+
+async def _catalogo_reparar_fotos_perdidas() -> Dict[str, int]:
+    async with _CATALOGO_REPARO_LOCK:
+        _catalogo_migrar_uploads_legados()
+        lista = carregar_procurados()
+        faltantes = [
+            r for r in lista
+            if not _catalogo_foto_disponivel(r.get('foto_individuo'))
+            or not _catalogo_foto_disponivel(r.get('foto_rg'))
+        ]
+        if not faltantes:
+            gerar_catalogo_html()
+            return {'analisados': 0, 'recuperados': 0, 'sem_origem': 0}
+
+        mapa_rg: Optional[Dict[Tuple[str, str], discord.Message]] = None
+        recuperados = 0
+        sem_origem = 0
+        alterou = False
+
+        for registro in faltantes:
+            msg: Optional[discord.Message] = None
+            for url_key in ('mensagem_url', 'mensagem_arquivada_url'):
+                canal_id, mensagem_id = _catalogo_ids_jump_url(registro.get(url_key))
+                msg = await _catalogo_fetch_message(canal_id, mensagem_id)
+                if msg is not None:
+                    break
+
+            if msg is None:
+                status_retirado = str(registro.get('status') or '').upper() == 'RETIRADO'
+                canal_id = int(HISTORICO_PROCURADOS_ID if status_retirado else PROCURADOS_CHANNEL_ID or 0)
+                mensagem_id = int(
+                    registro.get('mensagem_arquivada_id')
+                    or registro.get('mensagem_id')
+                    or 0
+                )
+                msg = await _catalogo_fetch_message(canal_id, mensagem_id)
+
+            if msg is None:
+                if mapa_rg is None:
+                    mapa_rg = await _catalogo_mapa_mensagens_por_rg()
+                status_chave = 'RETIRADO' if str(registro.get('status') or '').upper() == 'RETIRADO' else 'ATIVO'
+                msg = mapa_rg.get((status_chave, limpar_rg(registro.get('rg', ''))))
+
+            if msg is None:
+                sem_origem += 1
+                continue
+
+            imagens = _catalogo_anexos_imagem(msg)
+            if not imagens:
+                sem_origem += 1
+                continue
+
+            rg = limpar_rg(registro.get('rg', '')) or str(msg.id)
+            if not _catalogo_foto_disponivel(registro.get('foto_individuo')) and len(imagens) >= 1:
+                try:
+                    registro['foto_individuo'] = await salvar_anexo_publico(
+                        imagens[0], f'recuperado-ind-{rg}-{msg.id}'
+                    )
+                    recuperados += 1
+                    alterou = True
+                except Exception:
+                    traceback.print_exc()
+            if not _catalogo_foto_disponivel(registro.get('foto_rg')) and len(imagens) >= 2:
+                try:
+                    registro['foto_rg'] = await salvar_anexo_publico(
+                        imagens[1], f'recuperado-rg-{rg}-{msg.id}'
+                    )
+                    recuperados += 1
+                    alterou = True
+                except Exception:
+                    traceback.print_exc()
+
+            await asyncio.sleep(0.15)
+
+        if alterou:
+            salvar_procurados(lista)
+        gerar_catalogo_html()
+        return {
+            'analisados': len(faltantes),
+            'recuperados': recuperados,
+            'sem_origem': sem_origem,
+        }
+
+
+async def _catalogo_reparo_automatico_inicio() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(12)
+    try:
+        resultado = await _catalogo_reparar_fotos_perdidas()
+        print(
+            '✅ Catálogo com fotos persistentes ativo: '
+            f"{resultado['recuperados']} foto(s) recuperada(s), "
+            f"{resultado['sem_origem']} registro(s) sem imagem recuperável.",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ Falha ao reparar fotos do catálogo: {type(erro).__name__}: {erro}', flush=True)
+
+
+@bot.event
+async def on_ready():
+    global _CATALOGO_REPARO_TASK
+    await _CATALOGO_ON_READY_ANTES_FOTOS_PERSISTENTES()
+    if _CATALOGO_REPARO_TASK is None or _CATALOGO_REPARO_TASK.done():
+        _CATALOGO_REPARO_TASK = asyncio.create_task(
+            _catalogo_reparo_automatico_inicio(),
+            name='catalogo_reparar_fotos_persistentes',
+        )
+
+
+def apagar_arquivos_locais_do_registro(registro: Dict[str, Any]) -> None:
+    for chave in ('foto_individuo', 'foto_rg'):
+        nome = _catalogo_nome_arquivo(registro.get(chave))
+        if not nome:
+            continue
+        for base in (UPLOADS_DIR, _CATALOGO_UPLOADS_LEGADO_DIR):
+            try:
+                caminho = (base / nome).resolve()
+                if base.resolve() in caminho.parents and caminho.exists() and caminho.is_file():
+                    caminho.unlink()
+            except Exception:
+                pass
+
+
+print(
+    f'✅ Catálogo persistente carregado: fotos em {UPLOADS_DIR}; recuperação automática após deploy ativa.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
