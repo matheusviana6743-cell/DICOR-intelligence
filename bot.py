@@ -831,9 +831,11 @@ def gerar_catalogo_html() -> None:
         if not src:
             return f'<div class="placeholder">{vazio}</div>'
         src_e = escape(src)
+        vazio_e = escape(vazio)
         return (
             f'<img class="zoom-img" src="{src_e}" alt="{escape(alt)}" '
-            f'onclick="abrirFoto(this.src, this.alt)">'
+            f'onclick="abrirFoto(this.src, this.alt)" '
+            f'onerror="this.onerror=null;this.outerHTML=\'<div class=&quot;placeholder&quot;>{vazio_e}</div>\';">'
         )
 
     def card_html(registro: Dict[str, Any]) -> str:
@@ -27030,7 +27032,16 @@ def _banco_ocr_obter_engine():
     with _BANCO_OCR_THREAD_LOCK:
         if _BANCO_OCR_ENGINE is None:
             try:
-                _BANCO_OCR_ENGINE = RapidOCR()
+                # RapidOCR 3.x aceita Global.log_level. Usamos critical para
+                # não poluir o Railway com INFO de carregamento e avisos
+                # normais como "The text detection result is empty".
+                try:
+                    _BANCO_OCR_ENGINE = RapidOCR(
+                        params={"Global.log_level": "critical"}
+                    )
+                except TypeError:
+                    # Compatibilidade com versões antigas do pacote.
+                    _BANCO_OCR_ENGINE = RapidOCR()
                 _BANCO_OCR_ENGINE_ERRO = ""
             except Exception as erro:
                 _BANCO_OCR_ENGINE_ERRO = f"{type(erro).__name__}: {erro}"
@@ -36725,6 +36736,7 @@ def _dicor_alerta_bo_parado_ja_publicado_no_periodo(
 async def _dicor_verificar_boletins_parados_v3():
     agora = datetime.datetime.now(datetime.timezone.utc)
     enviados = 0
+    ja_avisados = 0
     elegiveis = 0
     ignorados = 0
     erros = 0
@@ -36767,6 +36779,7 @@ async def _dicor_verificar_boletins_parados_v3():
                 inicio_periodo,
             )
             if alerta_existente is not None:
+                ja_avisados += 1
                 if not await _alerta_ja_enviado(chave):
                     await _registrar_alerta_enviado(chave, alerta_existente)
                 continue
@@ -36859,6 +36872,7 @@ async def _dicor_verificar_boletins_parados_v3():
     print(
         f'✅ Verificação BO parado V3: {len(topicos)} tópico(s), '
         f'{elegiveis} elegível(is), {enviados} alerta(s) enviado(s), '
+        f'{ja_avisados} já avisado(s) no período atual, '
         f'{ignorados} ignorado(s), {erros} erro(s).',
         flush=True,
     )
@@ -37734,8 +37748,12 @@ def _catalogo_foto_disponivel(valor: Any) -> bool:
     texto = str(valor or '').strip()
     if not texto:
         return False
-    if texto.startswith(('http://', 'https://', 'data:')):
+    if texto.startswith('data:'):
         return True
+    if texto.startswith(('http://', 'https://')):
+        # URL de CDN não é persistência: pode expirar após algum tempo.
+        # Considera pendente de recuperação para copiar ao volume /data.
+        return False
     return _catalogo_caminho_local(texto) is not None
 
 
@@ -38080,6 +38098,14 @@ print(
     f'✅ Catálogo persistente carregado: fotos em {UPLOADS_DIR}; recuperação automática após deploy ativa.',
     flush=True,
 )
+
+
+print(
+    '✅ Estabilidade Railway V4 ativa: OCR silencioso, imagens do catálogo persistentes '
+    'e diagnóstico claro dos alertas de boletins.',
+    flush=True,
+)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
