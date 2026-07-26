@@ -39442,5 +39442,400 @@ async def _bo_reconciliar_numero_com_origem() -> Dict[str, int]:
             'sem_origem': sem_origem,
         }
 
+
+# =====================================================
+# PATCH — MANUTENÇÃO SEGURA DO VOLUME RAILWAY V1
+# =====================================================
+# O volume gratuito de 500 MB estava enchendo porque o banco criava um backup
+# SQLite completo após cada confirmação de ficha e conservava até 25 cópias.
+# Esta manutenção preserva o banco principal, snapshots, arquivos manuais,
+# fotos do catálogo e documentos oficiais. Ela remove somente backups excedentes
+# e temporários/arquivos OCR que não são mais necessários.
+
+import shutil as _dicor_volume_shutil
+
+VOLUME_BACKUPS_MANTER = max(2, min(10, env_int("VOLUME_BACKUPS_MANTER", 3)))
+VOLUME_BACKUP_INTERVALO_HORAS = max(1, min(48, env_int("VOLUME_BACKUP_INTERVALO_HORAS", 6)))
+VOLUME_LIMPEZA_INTERVALO_HORAS = max(1, min(24, env_int("VOLUME_LIMPEZA_INTERVALO_HORAS", 6)))
+VOLUME_ALERTA_PERCENTUAL = max(60, min(98, env_int("VOLUME_ALERTA_PERCENTUAL", 80)))
+VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS = max(
+    1, min(168, env_int("VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS", 24))
+)
+
+_VOLUME_MANUTENCAO_THREAD_LOCK = threading.RLock()
+_VOLUME_MANUTENCAO_ASYNC_LOCK = asyncio.Lock()
+_VOLUME_MANUTENCAO_TASK: Optional[asyncio.Task] = None
+_VOLUME_ON_READY_ANTERIOR = on_ready
+_BANCO_BACKUP_ANTES_VOLUME = _banco_criar_backup_duravel
+
+
+def _volume_bytes_arquivo(caminho: Path) -> int:
+    try:
+        return int(caminho.stat().st_size) if caminho.is_file() else 0
+    except Exception:
+        return 0
+
+
+def _volume_formatar_bytes(valor: int) -> str:
+    tamanho = float(max(0, int(valor or 0)))
+    for unidade in ("B", "KB", "MB", "GB", "TB"):
+        if tamanho < 1024.0 or unidade == "TB":
+            return f"{tamanho:.1f} {unidade}"
+        tamanho /= 1024.0
+    return f"{tamanho:.1f} TB"
+
+
+def _volume_tamanho_diretorio(caminho: Path) -> int:
+    total = 0
+    try:
+        if not caminho.exists():
+            return 0
+        for item in caminho.rglob("*"):
+            if item.is_file():
+                total += _volume_bytes_arquivo(item)
+    except Exception:
+        pass
+    return int(total)
+
+
+def _volume_estado_disco() -> Dict[str, Any]:
+    try:
+        uso = _dicor_volume_shutil.disk_usage(str(DATA_DIR))
+        percentual = (float(uso.used) / float(uso.total) * 100.0) if uso.total else 0.0
+        return {
+            "total": int(uso.total),
+            "usado": int(uso.used),
+            "livre": int(uso.free),
+            "percentual": percentual,
+        }
+    except Exception:
+        return {"total": 0, "usado": 0, "livre": 0, "percentual": 0.0}
+
+
+def _volume_backups_ordenados() -> List[Path]:
+    try:
+        return sorted(
+            [
+                item for item in Path(_BANCO_BACKUPS_DURAVEIS_DIR).glob("dicor_banco_*.sqlite3")
+                if item.is_file()
+            ],
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return []
+
+
+def _volume_caminhos_ocr_pendentes() -> set[str]:
+    caminhos: set[str] = set()
+    try:
+        if not Path(BANCO_DADOS_SQLITE).exists():
+            return caminhos
+        conexao = sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=20)
+        try:
+            colunas = {
+                str(row[1]) for row in conexao.execute("PRAGMA table_info(placas_ocr_pendentes)").fetchall()
+            }
+            if not {"imagem_path", "status"}.issubset(colunas):
+                return caminhos
+            rows = conexao.execute(
+                """
+                SELECT imagem_path
+                FROM placas_ocr_pendentes
+                WHERE UPPER(COALESCE(status, 'PENDENTE')) IN
+                      ('PENDENTE', 'AGUARDANDO', 'EM_REVISAO', 'PROCESSANDO')
+                """
+            ).fetchall()
+            for row in rows:
+                bruto = str(row[0] or "").strip()
+                if bruto:
+                    try:
+                        caminhos.add(str(Path(bruto).resolve()))
+                    except Exception:
+                        caminhos.add(bruto)
+        finally:
+            conexao.close()
+    except Exception:
+        pass
+    return caminhos
+
+
+def _volume_apagar_arquivo(caminho: Path) -> int:
+    tamanho = _volume_bytes_arquivo(caminho)
+    try:
+        caminho.unlink(missing_ok=True)
+        return tamanho
+    except Exception:
+        return 0
+
+
+def _volume_limpeza_segura_sync() -> Dict[str, Any]:
+    with _VOLUME_MANUTENCAO_THREAD_LOCK:
+        Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+        estado_antes = _volume_estado_disco()
+        agora = time.time()
+        liberados = 0
+        removidos_backups = 0
+        removidos_temporarios = 0
+        removidos_ocr = 0
+        falhas = 0
+
+        # 1) Backups do SQLite: snapshots individuais já protegem cada ficha.
+        # Conservamos somente as cópias mais recentes para caber no volume de 500 MB.
+        backups = _volume_backups_ordenados()
+        for antigo in backups[VOLUME_BACKUPS_MANTER:]:
+            tamanho = _volume_apagar_arquivo(antigo)
+            if tamanho:
+                liberados += tamanho
+                removidos_backups += 1
+            elif antigo.exists():
+                falhas += 1
+
+        # 2) Temporários deixados por reinício/crash. Não são dados oficiais.
+        for padrao in ("*.tmp", "*.part", "*.download"):
+            try:
+                candidatos = list(Path(DATA_DIR).rglob(padrao))
+            except Exception:
+                candidatos = []
+            for item in candidatos:
+                try:
+                    idade_horas = (agora - item.stat().st_mtime) / 3600.0
+                except Exception:
+                    continue
+                if idade_horas < 1.0:
+                    continue
+                tamanho = _volume_apagar_arquivo(item)
+                if tamanho:
+                    liberados += tamanho
+                    removidos_temporarios += 1
+                elif item.exists():
+                    falhas += 1
+
+        # 3) Bancos corrompidos antigos já substituídos por backup íntegro.
+        try:
+            corrompidos = list(Path(DATA_DIR).rglob("*.corrompido-*"))
+        except Exception:
+            corrompidos = []
+        for item in corrompidos:
+            try:
+                idade_dias = (agora - item.stat().st_mtime) / 86400.0
+            except Exception:
+                continue
+            if idade_dias < 7.0:
+                continue
+            tamanho = _volume_apagar_arquivo(item)
+            if tamanho:
+                liberados += tamanho
+                removidos_temporarios += 1
+            elif item.exists():
+                falhas += 1
+
+        # 4) Variações temporárias de OCR. Normalmente são apagadas no finally,
+        # mas podem sobrar quando o Railway encerra o processo no meio da leitura.
+        arquivos_dir = Path(globals().get("BANCO_ARQUIVOS_DIR", Path(DATA_DIR) / "banco_dados_arquivos"))
+        pendentes = _volume_caminhos_ocr_pendentes()
+        prefixos_temporarios = (
+            "ocr-enh-", "ocr-crop-", "ocr-safe-", "ocr-safe-crop-"
+        )
+        prefixos_origem_ocr = ("ocr-pericia-", "ocr-historico-")
+        if arquivos_dir.exists():
+            try:
+                itens_ocr = list(arquivos_dir.iterdir())
+            except Exception:
+                itens_ocr = []
+            for item in itens_ocr:
+                if not item.is_file():
+                    continue
+                nome = item.name.lower()
+                try:
+                    idade_horas = (agora - item.stat().st_mtime) / 3600.0
+                    resolvido = str(item.resolve()) not in pendentes
+                except Exception:
+                    continue
+                apagar = False
+                if nome.startswith(prefixos_temporarios) and idade_horas >= 1.0:
+                    apagar = True
+                elif (
+                    nome.startswith(prefixos_origem_ocr)
+                    and resolvido
+                    and idade_horas >= float(VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS)
+                ):
+                    # A ficha guarda as informações e o link da Perícia Externa;
+                    # a cópia local da imagem não é necessária depois da resolução.
+                    apagar = True
+                if not apagar:
+                    continue
+                tamanho = _volume_apagar_arquivo(item)
+                if tamanho:
+                    liberados += tamanho
+                    removidos_ocr += 1
+                elif item.exists():
+                    falhas += 1
+
+        estado_depois = _volume_estado_disco()
+        return {
+            "liberados": int(liberados),
+            "backups_removidos": int(removidos_backups),
+            "temporarios_removidos": int(removidos_temporarios),
+            "ocr_removidos": int(removidos_ocr),
+            "falhas": int(falhas),
+            "antes": estado_antes,
+            "depois": estado_depois,
+            "backups_mantidos": len(_volume_backups_ordenados()),
+            "tamanho_backups": _volume_tamanho_diretorio(Path(_BANCO_BACKUPS_DURAVEIS_DIR)),
+            "tamanho_snapshots": _volume_tamanho_diretorio(Path(_BANCO_FICHAS_DURAVEIS_DIR)),
+            "tamanho_catalogo": _volume_tamanho_diretorio(Path(DATA_DIR) / "catalogo_uploads"),
+            "tamanho_arquivos_banco": _volume_tamanho_diretorio(arquivos_dir),
+        }
+
+
+def _banco_criar_backup_duravel(motivo: str = "manual") -> Optional[str]:
+    """Backup persistente com retenção e intervalo seguros para volume pequeno."""
+    try:
+        _volume_limpeza_segura_sync()
+    except Exception:
+        pass
+
+    backups = _volume_backups_ordenados()
+    motivo_norm = str(motivo or "manual").strip().lower()
+    forcar = motivo_norm in {"manual", "inicial", "restauracao", "restauração", "pre-migracao", "pré-migração"}
+    if backups and not forcar:
+        try:
+            idade_horas = (time.time() - backups[0].stat().st_mtime) / 3600.0
+            if idade_horas < float(VOLUME_BACKUP_INTERVALO_HORAS):
+                return str(backups[0])
+        except Exception:
+            pass
+
+    resultado = _BANCO_BACKUP_ANTES_VOLUME(motivo)
+    try:
+        _volume_limpeza_segura_sync()
+    except Exception:
+        pass
+    return resultado
+
+
+async def _volume_manutencao_periodica() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
+                resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
+            depois = dict(resumo.get("depois") or {})
+            if resumo.get("liberados") or float(depois.get("percentual") or 0.0) >= VOLUME_ALERTA_PERCENTUAL:
+                print(
+                    "🧹 Manutenção do volume DICOR: "
+                    f"liberados {_volume_formatar_bytes(resumo.get('liberados', 0))}; "
+                    f"uso {float(depois.get('percentual') or 0.0):.1f}%; "
+                    f"backups mantidos {resumo.get('backups_mantidos', 0)}.",
+                    flush=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as erro:
+            print(
+                f"⚠️ Manutenção do volume falhou: {type(erro).__name__}: {erro}",
+                flush=True,
+            )
+        await asyncio.sleep(float(VOLUME_LIMPEZA_INTERVALO_HORAS) * 3600.0)
+
+
+@bot.tree.command(
+    name="manutencaovolume",
+    description="Verifica e limpa backups/temporários do volume persistente do bot.",
+)
+async def manutencaovolume(interaction: discord.Interaction):
+    if not _membro_inspetor_mais(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode executar a manutenção do volume.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
+            resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
+        antes = dict(resumo.get("antes") or {})
+        depois = dict(resumo.get("depois") or {})
+        embed = discord.Embed(
+            title="🧹 MANUTENÇÃO DO VOLUME • DICOR",
+            description="Limpeza concluída sem apagar fichas, banco principal, arquivos manuais ou fotos do catálogo.",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(
+            name="💾 Uso do volume",
+            value=(
+                f"**Antes:** {float(antes.get('percentual') or 0.0):.1f}% "
+                f"({_volume_formatar_bytes(antes.get('usado', 0))})\n"
+                f"**Depois:** {float(depois.get('percentual') or 0.0):.1f}% "
+                f"({_volume_formatar_bytes(depois.get('usado', 0))})\n"
+                f"**Livre:** {_volume_formatar_bytes(depois.get('livre', 0))}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🗑️ Limpeza realizada",
+            value=(
+                f"**Espaço liberado:** {_volume_formatar_bytes(resumo.get('liberados', 0))}\n"
+                f"**Backups antigos:** {resumo.get('backups_removidos', 0)}\n"
+                f"**Temporários:** {resumo.get('temporarios_removidos', 0)}\n"
+                f"**Arquivos OCR resolvidos:** {resumo.get('ocr_removidos', 0)}\n"
+                f"**Falhas:** {resumo.get('falhas', 0)}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🛡️ Dados preservados",
+            value=(
+                f"**Backups mantidos:** {resumo.get('backups_mantidos', 0)} "
+                f"({_volume_formatar_bytes(resumo.get('tamanho_backups', 0))})\n"
+                f"**Snapshots das fichas:** {_volume_formatar_bytes(resumo.get('tamanho_snapshots', 0))}\n"
+                f"**Fotos do catálogo:** {_volume_formatar_bytes(resumo.get('tamanho_catalogo', 0))}\n"
+                f"**Arquivos do banco:** {_volume_formatar_bytes(resumo.get('tamanho_arquivos_banco', 0))}"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="POLÍCIA FEDERAL • DICOR • volume persistente /data")
+        await interaction.edit_original_response(embed=embed)
+    except Exception as erro:
+        traceback.print_exc()
+        await interaction.edit_original_response(
+            content=f"❌ Não foi possível realizar a manutenção: {type(erro).__name__}: {erro}"
+        )
+
+
+@bot.event
+async def on_ready():
+    global _VOLUME_MANUTENCAO_TASK
+    await _VOLUME_ON_READY_ANTERIOR()
+    try:
+        async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
+            resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
+        depois = dict(resumo.get("depois") or {})
+        print(
+            "✅ Manutenção segura do volume V1 ativa: "
+            f"{_volume_formatar_bytes(resumo.get('liberados', 0))} liberados; "
+            f"uso atual {float(depois.get('percentual') or 0.0):.1f}%; "
+            f"{resumo.get('backups_mantidos', 0)} backup(s) mantido(s).",
+            flush=True,
+        )
+    except Exception as erro:
+        print(
+            f"⚠️ Limpeza inicial do volume falhou: {type(erro).__name__}: {erro}",
+            flush=True,
+        )
+    if _VOLUME_MANUTENCAO_TASK is None or _VOLUME_MANUTENCAO_TASK.done():
+        _VOLUME_MANUTENCAO_TASK = asyncio.create_task(
+            _volume_manutencao_periodica(),
+            name="dicor-volume-maintenance",
+        )
+
+
+print(
+    "✅ Manutenção do volume V1 carregada: retenção de backups, limpeza de temporários e comando /manutencaovolume.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
