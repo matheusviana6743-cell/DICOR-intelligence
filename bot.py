@@ -11043,9 +11043,10 @@ async def atendimento_boletim_automatico(message: discord.Message):
             return
         if buscar_atendimento_por_mensagem(message.id):
             return
-        numero_lock = numero_boletim_de_texto(coletar_texto_embed(message) or message.content or "")
-        if buscar_atendimento_por_numero(numero_lock):
-            return
+        # A trava usa o ID único da mensagem, e não o número do BO. A versão
+        # antiga gerava/reservava um número apenas para montar a trava e podia
+        # repetir ou pular numerações quando dois boletins chegavam juntos.
+        numero_lock = f"MSG-{message.id}"
         if numero_lock in boletins_processando:
             return
         boletins_processando.add(message.id)
@@ -38106,6 +38107,1340 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# PATCH FINAL — NUMERAÇÃO ÚNICA E REPARO DOS BOLETINS
+# Corrige duplicidade causada por criação simultânea, reserva o número antes
+# de liberar o lock e renumera tópicos/mensagens já criados com número repetido.
+# =====================================================
+
+import contextvars as _bo_num_contextvars
+import hashlib as _bo_num_hashlib
+
+_BO_NUMERO_CONTEXTO = _bo_num_contextvars.ContextVar(
+    'dicor_bo_numero_contexto', default={'preferido': '', 'mensagem_id': 0}
+)
+_BO_NUMEROS_RESERVADOS: set[int] = set()
+_BO_NUM_RECONCILIACAO_LOCK = asyncio.Lock()
+_BO_NUM_RECONCILIACAO_CONCLUIDA = False
+_BO_NUM_CRIAR_AREA_ANTERIOR = criar_area_atendimento_boletim
+
+
+def numero_boletim_de_texto(texto: str) -> str:
+    """Retorna somente um identificador de trava; nunca consome o contador.
+
+    A criação real reserva a numeração dentro de `_proximo_numero_topico_boletim`.
+    Isso impede que o listener avance o contador antes de o tópico existir.
+    """
+    numero = extrair_numero_boletim_seguro(str(texto or ''))
+    if numero:
+        return f'ORIGEM-{numero}'
+    digest = _bo_num_hashlib.sha1(str(texto or '').encode('utf-8', 'ignore')).hexdigest()[:16]
+    return f'SEM-NUMERO-{digest}'
+
+
+async def criar_area_atendimento_boletim(
+    message: discord.Message,
+) -> Optional[Dict[str, Any]]:
+    texto = coletar_texto_embed(message) or message.content or ''
+    contexto = {
+        'preferido': extrair_numero_boletim_seguro(texto),
+        'mensagem_id': int(getattr(message, 'id', 0) or 0),
+    }
+    token = _BO_NUMERO_CONTEXTO.set(contexto)
+    try:
+        return await _BO_NUM_CRIAR_AREA_ANTERIOR(message)
+    finally:
+        _BO_NUMERO_CONTEXTO.reset(token)
+
+
+def _bo_numero_formatado(valor: int) -> str:
+    return f'BO-DICOR-{int(valor):03d}'
+
+
+def _bo_numero_contexto_inteiro() -> int:
+    try:
+        contexto = _BO_NUMERO_CONTEXTO.get() or {}
+        return _extrair_inteiro_numero_boletim(contexto.get('preferido'))
+    except Exception:
+        return 0
+
+
+def _bo_numero_origem_contexto() -> int:
+    try:
+        contexto = _BO_NUMERO_CONTEXTO.get() or {}
+        return int(contexto.get('mensagem_id') or 0)
+    except Exception:
+        return 0
+
+
+async def _bo_num_listar_threads(canal_pai: discord.TextChannel) -> List[discord.Thread]:
+    encontrados: Dict[int, discord.Thread] = {}
+    for topico in list(getattr(canal_pai, 'threads', []) or []):
+        encontrados[int(topico.id)] = topico
+
+    tentativas = [
+        {'limit': 500, 'private': False},
+        {'limit': 500, 'private': True, 'joined': True},
+        {'limit': 500, 'private': True},
+    ]
+    for kwargs in tentativas:
+        try:
+            iterator = canal_pai.archived_threads(**kwargs)
+            async for topico in iterator:
+                encontrados[int(topico.id)] = topico
+        except TypeError:
+            continue
+        except (discord.Forbidden, discord.NotFound, AttributeError):
+            continue
+        except Exception as erro:
+            print(
+                f'⚠️ Numeração BO: falha ao listar tópicos arquivados '
+                f'{kwargs}: {type(erro).__name__}: {erro}',
+                flush=True,
+            )
+    return list(encontrados.values())
+
+
+async def _bo_num_coletar_usados(canal_pai: discord.TextChannel) -> set[int]:
+    usados: set[int] = set(_BO_NUMEROS_RESERVADOS)
+    try:
+        for atendimento in carregar_atendimentos_boletins():
+            numero = _extrair_inteiro_numero_boletim(atendimento.get('numero'))
+            if numero > 0:
+                usados.add(numero)
+    except Exception:
+        traceback.print_exc()
+
+    # Os boletins oficiais publicados não entram como conflito aqui, porque o
+    # atendimento deve poder usar exatamente o número do seu próprio boletim.
+    # Eles são considerados apenas para calcular o maior número na reserva.
+    try:
+        for topico in await _bo_num_listar_threads(canal_pai):
+            numero = _extrair_inteiro_numero_boletim(getattr(topico, 'name', ''))
+            if numero > 0:
+                usados.add(numero)
+    except Exception:
+        traceback.print_exc()
+    return usados
+
+
+async def _proximo_numero_topico_boletim(canal_pai) -> str:
+    """Reserva atomicamente uma numeração única para o próximo atendimento."""
+    async with _BOLETIM_NUMERO_TOPICO_LOCK:
+        usados = await _bo_num_coletar_usados(canal_pai)
+        preferido = _bo_numero_contexto_inteiro()
+        origem_id = _bo_numero_origem_contexto()
+
+        numeros_publicados: set[int] = set()
+        try:
+            for boletim in carregar_boletins():
+                n_publicado = _extrair_inteiro_numero_boletim(boletim.get('numero'))
+                if n_publicado > 0:
+                    numeros_publicados.add(n_publicado)
+        except Exception:
+            traceback.print_exc()
+
+        # Aceita o número do boletim original quando ele ainda não pertence a
+        # outro atendimento/tópico. A presença no catálogo de boletins oficiais
+        # não é conflito: normalmente é justamente o registro desta mensagem.
+        escolhido = 0
+        if preferido > 0 and preferido not in usados:
+            escolhido = preferido
+        if escolhido <= 0:
+            base = usados | numeros_publicados
+            escolhido = (max(base) if base else 0) + 1
+
+        _BO_NUMEROS_RESERVADOS.add(escolhido)
+        contador = {
+            'ultimo': escolhido,
+            'modelo': 'reserva_atomica_bo_v4',
+            'mensagem_origem_id': origem_id or None,
+            'atualizado_em': agora_br(),
+        }
+        salvar_json(BOLETINS_CONTADOR_JSON, contador)
+        return _bo_numero_formatado(escolhido)
+
+
+def _bo_num_data_ordenacao(registro: Dict[str, Any], topico: Optional[discord.Thread]) -> float:
+    for chave in ('mensagem_original_id', 'thread_id', 'area_id', 'id'):
+        valor = registro.get(chave)
+        try:
+            inteiro = int(str(valor).replace('ATD-', '').split('-')[-1])
+            if inteiro > 10**15:
+                return discord.utils.snowflake_time(inteiro).timestamp()
+        except Exception:
+            continue
+    if topico is not None:
+        try:
+            return topico.created_at.timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def _bo_num_substituir_contextual(texto: str, antigo: int, novo: int) -> str:
+    original = str(texto or '')
+    if not original:
+        return original
+    a = f'{antigo:03d}'
+    n = f'{novo:03d}'
+    saida = re.sub(
+        rf'(?i)(BO[-\s]?DICOR[-\s]?)0*{antigo}(?!\d)',
+        lambda m: f'{m.group(1)}{n}',
+        original,
+    )
+    saida = re.sub(
+        rf'(?i)((?:BOLETIM(?:\s+DE\s+OCORR[ÊE]NCIA)?|CONTROLE\s+DO\s+BOLETIM|ATENDIMENTO(?:\s+PRIVADO)?\s+CRIADO\s+PARA\s+BOLETIM)'
+        rf'[^\d]{{0,25}})0*{antigo}(?!\d)',
+        lambda m: f'{m.group(1)}{n}',
+        saida,
+    )
+    return saida
+
+
+async def _bo_num_editar_mensagem(
+    mensagem: discord.Message,
+    antigo: int,
+    novo: int,
+    atendimento: Dict[str, Any],
+) -> bool:
+    mudou = False
+    novo_conteudo = _bo_num_substituir_contextual(mensagem.content or '', antigo, novo)
+    if novo_conteudo != (mensagem.content or ''):
+        mudou = True
+
+    novos_embeds: List[discord.Embed] = []
+    embeds_mudaram = False
+    for embed in list(getattr(mensagem, 'embeds', []) or []):
+        dados = embed.to_dict()
+        for chave in ('title', 'description'):
+            if dados.get(chave):
+                alterado = _bo_num_substituir_contextual(dados[chave], antigo, novo)
+                if alterado != dados[chave]:
+                    dados[chave] = alterado
+                    embeds_mudaram = True
+        for campo in dados.get('fields', []) or []:
+            for chave in ('name', 'value'):
+                if campo.get(chave):
+                    alterado = _bo_num_substituir_contextual(campo[chave], antigo, novo)
+                    if alterado != campo[chave]:
+                        campo[chave] = alterado
+                        embeds_mudaram = True
+        novos_embeds.append(discord.Embed.from_dict(dados))
+
+    kwargs: Dict[str, Any] = {}
+    if mudou:
+        kwargs['content'] = novo_conteudo
+    if embeds_mudaram:
+        kwargs['embeds'] = novos_embeds
+    if str(mensagem.id) == str(atendimento.get('painel_msg_id') or ''):
+        kwargs['content'] = texto_painel_boletim(atendimento)
+        kwargs['view'] = BoletimAtendimentoView()
+    if not kwargs:
+        return False
+    try:
+        await mensagem.edit(**kwargs)
+        return True
+    except (discord.NotFound, discord.Forbidden):
+        return False
+    except Exception as erro:
+        print(
+            f'⚠️ Numeração BO: não foi possível editar mensagem {mensagem.id}: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+        return False
+
+
+async def _bo_num_corrigir_topico_e_mensagens(
+    canal_pai: discord.TextChannel,
+    topico: discord.Thread,
+    atendimento: Dict[str, Any],
+    antigo: int,
+    novo: int,
+) -> Dict[str, int]:
+    resultado = {'topico': 0, 'abertura': 0, 'internas': 0}
+    titulo = f'📋 BOLETIM DE OCORRÊNCIA — Nº {novo:03d}'
+    try:
+        kwargs: Dict[str, Any] = {'name': titulo[:100], 'reason': 'Correção automática da numeração duplicada do BO'}
+        if bool(getattr(topico, 'archived', False)):
+            kwargs['archived'] = False
+        if bool(getattr(topico, 'locked', False)):
+            kwargs['locked'] = False
+        await topico.edit(**kwargs)
+        resultado['topico'] = 1
+    except Exception as erro:
+        print(f'⚠️ Numeração BO: falha ao renomear tópico {topico.id}: {erro}', flush=True)
+
+    abertura = None
+    abertura_id = int(atendimento.get('mensagem_abertura_id') or 0)
+    if abertura_id:
+        try:
+            abertura = await canal_pai.fetch_message(abertura_id)
+        except Exception:
+            abertura = None
+    if abertura is None:
+        try:
+            async for msg in canal_pai.history(limit=500, oldest_first=False):
+                if f'<#{topico.id}>' in str(msg.content or ''):
+                    abertura = msg
+                    atendimento['mensagem_abertura_id'] = msg.id
+                    break
+        except Exception:
+            pass
+    if abertura is not None:
+        novo_texto = (
+            f'📋 Atendimento privado criado para **Boletim Nº {novo:03d}**: '
+            f'{topico.mention}'
+        )
+        try:
+            await abertura.edit(
+                content=novo_texto,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            resultado['abertura'] = 1
+        except Exception as erro:
+            print(f'⚠️ Numeração BO: falha ao editar abertura {abertura.id}: {erro}', flush=True)
+
+    try:
+        async for msg in topico.history(limit=100, oldest_first=True):
+            if getattr(msg.author, 'id', 0) != getattr(bot.user, 'id', -1):
+                continue
+            if await _bo_num_editar_mensagem(msg, antigo, novo, atendimento):
+                resultado['internas'] += 1
+    except Exception as erro:
+        print(f'⚠️ Numeração BO: falha ao revisar mensagens do tópico {topico.id}: {erro}', flush=True)
+    return resultado
+
+
+def _bo_num_mesclar_registros_duplicados(lista: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unicos: List[Dict[str, Any]] = []
+    indices: Dict[str, int] = {}
+    for item in lista:
+        chaves = []
+        for campo in ('id', 'thread_id', 'area_id', 'mensagem_original_id'):
+            valor = str(item.get(campo) or '').strip()
+            if valor and valor != '0':
+                chaves.append(f'{campo}:{valor}')
+        existente = next((indices[c] for c in chaves if c in indices), None)
+        if existente is None:
+            indice = len(unicos)
+            unicos.append(dict(item))
+            for chave in chaves:
+                indices[chave] = indice
+        else:
+            alvo = unicos[existente]
+            for chave, valor in item.items():
+                if valor not in (None, '', [], {}):
+                    alvo[chave] = valor
+            for chave in chaves:
+                indices[chave] = existente
+    return unicos
+
+
+async def _bo_num_reconciliar_existentes() -> Dict[str, int]:
+    global _BO_NUM_RECONCILIACAO_CONCLUIDA
+    async with _BO_NUM_RECONCILIACAO_LOCK:
+        resumo = {
+            'topicos_analisados': 0,
+            'duplicados_corrigidos': 0,
+            'registros_recuperados': 0,
+            'mensagens_editadas': 0,
+            'maior_numero': 0,
+        }
+        guild = bot.guilds[0] if bot.guilds else None
+        if guild is None:
+            return resumo
+        canal_pai = await _resolver_canal_boletins_abertos(guild)
+        if not isinstance(canal_pai, discord.TextChannel):
+            return resumo
+
+        topicos = await _bo_num_listar_threads(canal_pai)
+        topicos_por_id = {int(t.id): t for t in topicos}
+        registros = _bo_num_mesclar_registros_duplicados(carregar_atendimentos_boletins())
+        por_topico: Dict[int, Dict[str, Any]] = {}
+        for registro in registros:
+            tid = int(registro.get('thread_id') or registro.get('area_id') or 0)
+            if tid:
+                por_topico[tid] = registro
+
+        # Recupera tópicos que existem no Discord, mas ficaram fora do JSON por
+        # duas criações simultâneas salvando o arquivo ao mesmo tempo.
+        for topico in topicos:
+            if int(topico.id) in por_topico:
+                continue
+            numero = _extrair_inteiro_numero_boletim(getattr(topico, 'name', ''))
+            if numero <= 0:
+                continue
+            registro = {
+                'id': f'ATD-REC-NUM-{topico.id}',
+                'numero': _bo_numero_formatado(numero),
+                'area_id': topico.id,
+                'thread_id': topico.id,
+                'canal_atendimento_id': canal_pai.id,
+                'status': 'EM ATENDIMENTO',
+                'data_criacao': agora_br(),
+                'historico': [{
+                    'acao': 'Registro recuperado durante correção de numeração',
+                    'usuario': 'Sistema',
+                    'data': agora_br(),
+                }],
+            }
+            registros.append(registro)
+            por_topico[int(topico.id)] = registro
+            resumo['registros_recuperados'] += 1
+
+        entidades = []
+        for tid, registro in por_topico.items():
+            topico = topicos_por_id.get(tid)
+            if topico is None:
+                try:
+                    canal = bot.get_channel(tid) or await bot.fetch_channel(tid)
+                    if isinstance(canal, discord.Thread):
+                        topico = canal
+                        topicos_por_id[tid] = canal
+                except Exception:
+                    topico = None
+            if topico is None:
+                continue
+            numero = _extrair_inteiro_numero_boletim(
+                registro.get('numero') or getattr(topico, 'name', '')
+            )
+            entidades.append((
+                _bo_num_data_ordenacao(registro, topico),
+                int(tid),
+                numero,
+                registro,
+                topico,
+            ))
+        entidades.sort(key=lambda x: (x[0], x[1]))
+        resumo['topicos_analisados'] = len(entidades)
+
+        numeros_existentes = {e[2] for e in entidades if e[2] > 0}
+        # Inclui boletins oficiais publicados, mas ainda sem tópico.
+        for boletim in carregar_boletins():
+            n = _extrair_inteiro_numero_boletim(boletim.get('numero'))
+            if n > 0:
+                numeros_existentes.add(n)
+        proximo = (max(numeros_existentes) if numeros_existentes else 0) + 1
+        vistos: set[int] = set()
+        alteracoes: List[Tuple[Dict[str, Any], discord.Thread, int, int]] = []
+
+        for _, _, numero, registro, topico in entidades:
+            if numero > 0 and numero not in vistos:
+                vistos.add(numero)
+                registro['numero'] = _bo_numero_formatado(numero)
+                continue
+            antigo = numero
+            preferido_original = _extrair_inteiro_numero_boletim(
+                registro.get('numero_original_texto')
+            )
+            if preferido_original > 0 and preferido_original not in vistos:
+                novo = preferido_original
+            else:
+                while proximo in vistos:
+                    proximo += 1
+                novo = proximo
+                proximo += 1
+            vistos.add(novo)
+            registro['numero_anterior_corrigido'] = _bo_numero_formatado(antigo) if antigo > 0 else 'NÃO INFORMADO'
+            registro['numero'] = _bo_numero_formatado(novo)
+            registro['numero_corrigido_em'] = agora_br()
+            historico = registro.setdefault('historico', [])
+            historico.append({
+                'acao': 'Numeração duplicada corrigida automaticamente',
+                'numero_anterior': registro['numero_anterior_corrigido'],
+                'numero_novo': registro['numero'],
+                'usuario': 'Sistema',
+                'data': agora_br(),
+            })
+            alteracoes.append((registro, topico, antigo, novo))
+
+        # Salva primeiro: se o Discord reiniciar no meio da edição, a numeração
+        # correta já permanece no volume /data.
+        salvar_atendimentos_boletins(registros)
+
+        boletins = carregar_boletins()
+        boletins_alterados = False
+        for registro, _, _, novo in alteracoes:
+            origem = str(registro.get('mensagem_original_id') or '')
+            rid = str(registro.get('id') or '')
+            for boletim in boletins:
+                if (
+                    origem and origem in {
+                        str(boletim.get('mensagem_id') or ''),
+                        str(boletim.get('mensagem_original_id') or ''),
+                    }
+                ) or (rid and rid == str(boletim.get('atendimento_id') or '')):
+                    boletim['numero'] = _bo_numero_formatado(novo)
+                    boletins_alterados = True
+        if boletins_alterados:
+            salvar_boletins(boletins)
+
+        for registro, topico, antigo, novo in alteracoes:
+            resultado = await _bo_num_corrigir_topico_e_mensagens(
+                canal_pai, topico, registro, antigo, novo
+            )
+            resumo['duplicados_corrigidos'] += 1
+            resumo['mensagens_editadas'] += resultado['abertura'] + resultado['internas']
+            await asyncio.sleep(0.25)
+
+        maior_final = 0
+        for registro in registros:
+            maior_final = max(
+                maior_final,
+                _extrair_inteiro_numero_boletim(registro.get('numero')),
+            )
+        for boletim in boletins:
+            maior_final = max(
+                maior_final,
+                _extrair_inteiro_numero_boletim(boletim.get('numero')),
+            )
+        salvar_json(BOLETINS_CONTADOR_JSON, {
+            'ultimo': maior_final,
+            'modelo': 'reserva_atomica_bo_v4',
+            'reconciliado_em': agora_br(),
+        })
+        resumo['maior_numero'] = maior_final
+        _BO_NUMEROS_RESERVADOS.clear()
+        _BO_NUM_RECONCILIACAO_CONCLUIDA = True
+        return resumo
+
+
+_BO_NUM_ON_READY_ANTERIOR = on_ready
+
+
+@bot.event
+async def on_ready():
+    await _BO_NUM_ON_READY_ANTERIOR()
+    try:
+        resumo = await _bo_num_reconciliar_existentes()
+        print(
+            '✅ Numeração única dos BOs V4 ativa: '
+            f"{resumo['topicos_analisados']} tópico(s) analisado(s), "
+            f"{resumo['duplicados_corrigidos']} duplicado(s) corrigido(s), "
+            f"próximo após {resumo['maior_numero']:03d}.",
+            flush=True,
+        )
+        if resumo['duplicados_corrigidos'] or resumo['registros_recuperados']:
+            await enviar_log(
+                '🔢 **NUMERAÇÃO DOS BOLETINS CORRIGIDA**\n'
+                f"Tópicos analisados: `{resumo['topicos_analisados']}`\n"
+                f"Números repetidos corrigidos: `{resumo['duplicados_corrigidos']}`\n"
+                f"Registros recuperados: `{resumo['registros_recuperados']}`\n"
+                f"Mensagens atualizadas: `{resumo['mensagens_editadas']}`\n"
+                f"Maior número atual: `{resumo['maior_numero']:03d}`\n"
+                'Os próximos boletins usarão reserva atômica e não repetirão número.'
+            )
+    except Exception as erro:
+        traceback.print_exc()
+        print(
+            f'❌ Falha na reconciliação da numeração dos BOs: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+
+
+print(
+    '✅ Correção de numeração BO V4 carregada: reserva atômica, reparo de duplicados '
+    'e atualização automática dos tópicos antigos.',
+    flush=True,
+)
+
+
+# =====================================================
+# PATCH FINAL — ARQUIVAMENTO DE BO EM TÓPICO COM O MESMO NÚMERO
+# Ao finalizar, cria/reutiliza um tópico no canal de arquivados, copia o
+# boletim completo para dentro dele e preserva exatamente o número oficial
+# recebido na mensagem de origem. Também reconcilia tópicos antigos usando
+# o número do BO original quando essa mensagem ainda está acessível.
+# =====================================================
+
+_BO_ARQUIVO_FINALIZAR_ANTERIOR = finalizar_boletim_atendimento
+_BO_ARQUIVO_CRIAR_AREA_ANTERIOR = criar_area_atendimento_boletim
+_BO_ARQUIVO_ON_READY_ANTERIOR = on_ready
+_BO_ARQUIVO_LOCKS: Dict[str, asyncio.Lock] = {}
+_BO_ARQUIVO_RECONCILIACAO_LOCK = asyncio.Lock()
+_BO_ARQUIVO_RECONCILIADO = False
+
+
+def _bo_arquivo_lock(chave: Any) -> asyncio.Lock:
+    chave_txt = str(chave or 'global')
+    trava = _BO_ARQUIVO_LOCKS.get(chave_txt)
+    if trava is None:
+        trava = asyncio.Lock()
+        _BO_ARQUIVO_LOCKS[chave_txt] = trava
+    return trava
+
+
+def _bo_numero_oficial_texto(message: discord.Message) -> str:
+    partes: List[str] = []
+    try:
+        partes.append(str(getattr(message, 'content', '') or ''))
+        for embed in list(getattr(message, 'embeds', []) or []):
+            partes.append(str(getattr(embed, 'title', '') or ''))
+            partes.append(str(getattr(embed, 'description', '') or ''))
+            for campo in list(getattr(embed, 'fields', []) or []):
+                partes.append(f'{getattr(campo, "name", "")}: {getattr(campo, "value", "")}')
+    except Exception:
+        traceback.print_exc()
+    return extrair_numero_boletim_seguro('\n'.join(partes))
+
+
+async def criar_area_atendimento_boletim(
+    message: discord.Message,
+) -> Optional[Dict[str, Any]]:
+    """Mantém o número oficial que veio no BO e grava a origem no registro."""
+    numero_oficial = _bo_numero_oficial_texto(message)
+    atendimento = await _BO_ARQUIVO_CRIAR_AREA_ANTERIOR(message)
+    if not atendimento:
+        return atendimento
+    try:
+        atendimento['numero_original_texto'] = numero_oficial or atendimento.get('numero')
+        atendimento['numero_origem_oficial'] = numero_oficial or atendimento.get('numero')
+        atendimento['numero_origem_confirmado'] = bool(numero_oficial)
+        atendimento['numero_origem_confirmado_em'] = agora_br()
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    except Exception:
+        traceback.print_exc()
+    return atendimento
+
+
+async def _bo_resolver_canal_arquivados(guild: discord.Guild):
+    canal = guild.get_channel(int(BOLETINS_ARQUIVADOS_CHANNEL_ID or 0))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(BOLETINS_ARQUIVADOS_CHANNEL_ID or 0))
+        except Exception:
+            canal = None
+    if isinstance(canal, (discord.TextChannel, discord.ForumChannel)):
+        return canal
+
+    nomes = {
+        'boletins arquivados',
+        'boletim arquivado',
+        'boletins finalizados',
+        'boletins encerrados',
+    }
+    for candidato in list(getattr(guild, 'text_channels', []) or []):
+        nome = normalizar_busca(getattr(candidato, 'name', '')).replace('-', ' ')
+        nome = re.sub(r'\s+', ' ', nome).strip()
+        if any(alvo in nome for alvo in nomes):
+            return candidato
+    for candidato in list(getattr(guild, 'forums', []) or []):
+        nome = normalizar_busca(getattr(candidato, 'name', '')).replace('-', ' ')
+        nome = re.sub(r'\s+', ' ', nome).strip()
+        if any(alvo in nome for alvo in nomes):
+            return candidato
+    return None
+
+
+async def _bo_listar_topicos_do_canal(canal) -> List[discord.Thread]:
+    encontrados: Dict[int, discord.Thread] = {}
+    for topico in list(getattr(canal, 'threads', []) or []):
+        if isinstance(topico, discord.Thread):
+            encontrados[int(topico.id)] = topico
+
+    tentativas = [
+        {'limit': 500, 'private': False},
+        {'limit': 500, 'private': True, 'joined': True},
+        {'limit': 500, 'private': True},
+        {'limit': 500},
+    ]
+    for kwargs in tentativas:
+        try:
+            iterator = canal.archived_threads(**kwargs)
+            async for topico in iterator:
+                if isinstance(topico, discord.Thread):
+                    encontrados[int(topico.id)] = topico
+        except TypeError:
+            continue
+        except (discord.Forbidden, discord.NotFound, AttributeError):
+            continue
+        except Exception:
+            traceback.print_exc()
+    return list(encontrados.values())
+
+
+def _bo_titulo_arquivo(numero: Any) -> str:
+    n = _extrair_inteiro_numero_boletim(numero)
+    if n > 0:
+        return f'📁 BOLETIM ARQUIVADO — Nº {n:03d}'
+    return f'📁 BOLETIM ARQUIVADO — Nº {numero_curto_boletim(numero)}'
+
+
+def _bo_thread_url(topico: discord.Thread) -> str:
+    try:
+        guild_id = int(getattr(getattr(topico, 'guild', None), 'id', 0) or 0)
+        topico_id = int(getattr(topico, 'id', 0) or 0)
+        if guild_id and topico_id:
+            return f'https://discord.com/channels/{guild_id}/{topico_id}'
+    except Exception:
+        pass
+    return str(getattr(topico, 'jump_url', '') or '')
+
+
+async def _bo_localizar_topico_arquivo(canal, atendimento: Dict[str, Any]) -> Optional[discord.Thread]:
+    for chave in ('arquivamento_topico_id', 'arquivo_thread_id', 'thread_arquivado_id'):
+        try:
+            tid = int(atendimento.get(chave) or 0)
+        except Exception:
+            tid = 0
+        if tid:
+            try:
+                achado = bot.get_channel(tid) or await bot.fetch_channel(tid)
+                if isinstance(achado, discord.Thread):
+                    return achado
+            except Exception:
+                pass
+
+    numero = _extrair_inteiro_numero_boletim(atendimento.get('numero'))
+    origem_id = int(atendimento.get('mensagem_original_id') or 0)
+    for topico in await _bo_listar_topicos_do_canal(canal):
+        numero_topico = _extrair_inteiro_numero_boletim(getattr(topico, 'name', ''))
+        if numero > 0 and numero_topico == numero:
+            return topico
+        # Em caso de título legado, procura uma marca persistente dentro do tópico.
+        try:
+            async for msg in topico.history(limit=8, oldest_first=True):
+                conteudo = str(msg.content or '')
+                if origem_id and f'ORIGEM-BO:{origem_id}' in conteudo:
+                    return topico
+        except Exception:
+            continue
+    return None
+
+
+async def _bo_criar_ou_reutilizar_topico_arquivo(
+    canal,
+    atendimento: Dict[str, Any],
+    finalizador: discord.abc.User,
+) -> Tuple[discord.Thread, Optional[discord.Message], bool]:
+    existente = await _bo_localizar_topico_arquivo(canal, atendimento)
+    if existente is not None:
+        try:
+            kwargs: Dict[str, Any] = {}
+            if bool(getattr(existente, 'archived', False)):
+                kwargs['archived'] = False
+            if bool(getattr(existente, 'locked', False)):
+                kwargs['locked'] = False
+            if kwargs:
+                await existente.edit(**kwargs)
+        except Exception:
+            pass
+        return existente, None, False
+
+    titulo = _bo_titulo_arquivo(atendimento.get('numero'))[:100]
+    numero_curto = numero_curto_boletim(atendimento.get('numero'))
+    abertura = None
+    topico = None
+
+    if isinstance(canal, discord.TextChannel):
+        abertura = await canal.send(
+            f'📁 Boletim Nº **{numero_curto}** finalizado e arquivado. '
+            'O conteúdo completo está no tópico vinculado.',
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            topico = await abertura.create_thread(
+                name=titulo,
+                auto_archive_duration=10080,
+                reason=f'Arquivamento do boletim Nº {numero_curto}',
+            )
+        except discord.HTTPException:
+            topico = await abertura.create_thread(
+                name=titulo,
+                auto_archive_duration=1440,
+                reason=f'Arquivamento do boletim Nº {numero_curto}',
+            )
+    elif isinstance(canal, discord.ForumChannel):
+        conteudo = (
+            f'📁 **BOLETIM ARQUIVADO — Nº {numero_curto}**\n'
+            f'Finalizado por: {getattr(finalizador, "mention", str(finalizador))}\n'
+            f'ORIGEM-BO:{int(atendimento.get("mensagem_original_id") or 0)}'
+        )
+        try:
+            criado = await canal.create_thread(
+                name=titulo,
+                content=conteudo,
+                auto_archive_duration=10080,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except (TypeError, discord.HTTPException):
+            criado = await canal.create_thread(
+                name=titulo,
+                content=conteudo,
+                auto_archive_duration=1440,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        topico = getattr(criado, 'thread', criado)
+        abertura = getattr(criado, 'message', None)
+
+    if not isinstance(topico, discord.Thread):
+        raise RuntimeError('O Discord não retornou um tópico válido para o arquivamento do BO.')
+    return topico, abertura, True
+
+
+def _bo_texto_mensagem_historico(msg: discord.Message) -> str:
+    conteudo = coletar_texto_embed(msg) if 'coletar_texto_embed' in globals() else (msg.content or '')
+    conteudo = str(conteudo or '').strip()
+    if not conteudo:
+        return ''
+    autor = getattr(msg.author, 'display_name', None) or str(msg.author)
+    return f'[{formatar_data_discord(msg.created_at)}] {autor}:\n{conteudo[:1600]}'
+
+
+async def finalizar_boletim_atendimento(
+    interaction: discord.Interaction,
+    resultado: str,
+) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    atendimento = await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        return await interaction.followup.send('❌ Atendimento não encontrado.', ephemeral=True)
+    if atendimento.get('status') == 'FINALIZADO':
+        url = atendimento.get('arquivamento_topico_url') or atendimento.get('arquivamento_url')
+        extra = f'\n📁 Arquivo: {url}' if url else ''
+        return await interaction.followup.send(f'⚠️ Este boletim já foi finalizado.{extra}', ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+        await enviar_log(
+            f'🚫 Tentativa sem permissão de finalizar boletim `{atendimento.get("numero")}` '
+            f'por {interaction.user.mention} (`{interaction.user.id}`).'
+        )
+        return await interaction.followup.send(
+            '❌ Você não possui permissão para finalizar este boletim.',
+            ephemeral=True,
+        )
+
+    chave_lock = atendimento.get('id') or atendimento.get('thread_id') or interaction.channel_id
+    async with _bo_arquivo_lock(chave_lock):
+        # Recarrega após adquirir a trava para impedir finalização dupla simultânea.
+        atualizado = None
+        try:
+            for item in carregar_atendimentos_boletins():
+                if str(item.get('id') or '') == str(atendimento.get('id') or ''):
+                    atualizado = item
+                    break
+        except Exception:
+            atualizado = None
+        if atualizado:
+            atendimento = atualizado
+        if atendimento.get('status') == 'FINALIZADO':
+            return await interaction.followup.send('⚠️ Este boletim já foi finalizado.', ephemeral=True)
+
+        numero = atendimento.get('numero')
+        numero_curto = numero_curto_boletim(numero)
+        finalizado_em = agora_br()
+        canal_atual = interaction.channel
+
+        try:
+            await canal_atual.send(
+                '✅ **BOLETIM FINALIZADO**\n\n'
+                f'**Boletim:** Nº {numero_curto}\n'
+                f'**Agente responsável:** <@{atendimento.get("agente_id")}>\n'
+                f'**Finalizado por:** {interaction.user.mention}\n'
+                f'**Data e horário:** {finalizado_em}\n'
+                f'**Resultado final:**\n{resultado}'
+            )
+        except Exception:
+            traceback.print_exc()
+
+        mensagens: List[discord.Message] = []
+        try:
+            async for msg in canal_atual.history(limit=None, oldest_first=True):
+                mensagens.append(msg)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Erro coletando mensagens do atendimento `{numero}`: {erro}'
+            )
+
+        pasta = (
+            BOLETIM_ARQUIVOS_DIR
+            / str(numero or 'boletim').replace('/', '-')
+            / 'arquivamento'
+        )
+        anexos = await arquivos_para_reenvio_de_mensagens(
+            mensagens,
+            pasta,
+            str(numero or 'boletim'),
+        )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                '❌ Servidor não encontrado. Nada foi apagado.', ephemeral=True
+            )
+        canal_arq = await _bo_resolver_canal_arquivados(interaction.guild)
+        if canal_arq is None:
+            return await interaction.followup.send(
+                '❌ Canal de boletins arquivados não encontrado. Nada foi apagado.',
+                ephemeral=True,
+            )
+
+        atendimento.update({
+            'arquivamento_status': 'em_andamento',
+            'arquivamento_iniciado_em': finalizado_em,
+        })
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+        try:
+            topico_arq, mensagem_abertura, criado_agora = await _bo_criar_ou_reutilizar_topico_arquivo(
+                canal_arq,
+                atendimento,
+                interaction.user,
+            )
+            atendimento.update({
+                'arquivamento_topico_id': topico_arq.id,
+                'arquivo_thread_id': topico_arq.id,
+                'arquivamento_topico_url': _bo_thread_url(topico_arq),
+                'arquivamento_mensagem_abertura_id': getattr(mensagem_abertura, 'id', None),
+                'arquivamento_topico_criado_em': atendimento.get('arquivamento_topico_criado_em') or agora_br(),
+            })
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+            conteudo_ja_enviado = bool(atendimento.get('arquivamento_conteudo_enviado'))
+            if not conteudo_ja_enviado:
+                embed = discord.Embed(
+                    title=f'📁 BOLETIM DE OCORRÊNCIA ARQUIVADO — Nº {numero_curto}',
+                    description=(
+                        'Registro final do atendimento, preservado em tópico próprio. '
+                        'O número é o mesmo do boletim recebido.'
+                    ),
+                    color=discord.Color.dark_blue(),
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                )
+                embed.add_field(
+                    name='📌 Identificação',
+                    value=(
+                        f'**Número:** `{numero}`\n'
+                        f'**Autor do BO:** {atendimento.get("autor_nome") or "Não identificado"}\n'
+                        f'**Agente responsável:** <@{atendimento.get("agente_id")}>\n'
+                        f'**Finalizado por:** {interaction.user.mention}'
+                    ),
+                    inline=False,
+                )
+                embed.add_field(
+                    name='🕒 Datas',
+                    value=(
+                        f'**Recebimento:** {atendimento.get("data_criacao") or "Não informado"}\n'
+                        f'**Finalização:** {finalizado_em}'
+                    ),
+                    inline=False,
+                )
+                embed.add_field(
+                    name='✅ Resultado final',
+                    value=cortar_discord(str(resultado or 'Não informado'), 1000),
+                    inline=False,
+                )
+                links = []
+                if atendimento.get('mensagem_original_url'):
+                    links.append(f'[Abrir boletim original]({atendimento.get("mensagem_original_url")})')
+                if links:
+                    embed.add_field(name='🔗 Origem', value=' • '.join(links), inline=False)
+                embed.set_footer(
+                    text=(
+                        f'ORIGEM-BO:{int(atendimento.get("mensagem_original_id") or 0)} '
+                        f'• atendimento {atendimento.get("id")}'
+                    )
+                )
+                await topico_arq.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+
+                # Copia o BO original em bloco separado, mantendo a leitura clara.
+                texto_original = ''
+                try:
+                    canal_origem = interaction.guild.get_channel(int(atendimento.get('canal_origem_id') or 0))
+                    if canal_origem is None and atendimento.get('canal_origem_id'):
+                        canal_origem = await bot.fetch_channel(int(atendimento.get('canal_origem_id')))
+                    if canal_origem is not None and atendimento.get('mensagem_original_id'):
+                        msg_original = await canal_origem.fetch_message(int(atendimento.get('mensagem_original_id')))
+                        texto_original = coletar_texto_embed(msg_original) or msg_original.content or ''
+                except Exception:
+                    texto_original = ''
+                if texto_original.strip():
+                    cabecalho_original = (
+                        f'📄 **BOLETIM ORIGINAL — Nº {numero_curto}**\n'
+                        '━━━━━━━━━━━━━━━━━━━━━━━\n'
+                    )
+                    partes_original = [
+                        texto_original[i:i + 1800]
+                        for i in range(0, len(texto_original), 1800)
+                    ] or ['Sem texto.']
+                    for idx, parte in enumerate(partes_original):
+                        await topico_arq.send(
+                            (cabecalho_original if idx == 0 else '📄 **CONTINUAÇÃO DO BO ORIGINAL**\n')
+                            + parte,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+
+                linhas_historico = [
+                    linha for linha in (_bo_texto_mensagem_historico(msg) for msg in mensagens)
+                    if linha
+                ]
+                historico_completo = '\n\n'.join(linhas_historico)
+                if historico_completo:
+                    partes_hist = [
+                        historico_completo[i:i + 1800]
+                        for i in range(0, len(historico_completo), 1800)
+                    ]
+                    for idx, parte in enumerate(partes_hist):
+                        titulo_hist = (
+                            '🧾 **HISTÓRICO COMPLETO DO ATENDIMENTO**\n'
+                            if idx == 0 else
+                            '🧾 **CONTINUAÇÃO DO HISTÓRICO**\n'
+                        )
+                        await topico_arq.send(
+                            titulo_hist + parte,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+
+                enviados = await enviar_arquivos_em_lotes(
+                    topico_arq,
+                    anexos,
+                    f'📎 Arquivos do boletim Nº {numero_curto}',
+                )
+                atendimento['anexos_arquivados'] = enviados
+                atendimento['arquivamento_conteudo_enviado'] = True
+                atendimento['arquivamento_conteudo_enviado_em'] = agora_br()
+            else:
+                enviados = int(atendimento.get('anexos_arquivados') or 0)
+
+            atendimento.update({
+                'status': 'FINALIZADO',
+                'resultado_final': resultado,
+                'finalizado_por_id': interaction.user.id,
+                'finalizado_por_nome': str(interaction.user),
+                'data_finalizacao': finalizado_em,
+                'arquivamento_status': 'concluido',
+                'arquivamento_url': _bo_thread_url(topico_arq),
+                'arquivamento_topico_novo': criado_agora,
+            })
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+
+            await enviar_log(
+                '✅ **BOLETIM FINALIZADO EM TÓPICO DE ARQUIVO**\n'
+                f'Boletim: `{numero}`\n'
+                f'Tópico: {topico_arq.mention} (`{topico_arq.id}`)\n'
+                f'Finalizado por: {interaction.user.mention} (`{interaction.user.id}`)\n'
+                f'Mensagens coletadas: `{len(mensagens)}`\n'
+                f'Anexos arquivados: `{enviados}`\n'
+                'Número preservado do boletim original.'
+            )
+            await interaction.followup.send(
+                f'✅ Boletim Nº **{numero_curto}** finalizado e arquivado no tópico {topico_arq.mention}.',
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            atendimento['arquivamento_status'] = 'falhou'
+            atendimento['arquivamento_erro'] = f'{type(erro).__name__}: {erro}'[:500]
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+            await enviar_log(
+                f'❌ Falha ao arquivar o boletim `{numero}` em tópico: '
+                f'`{type(erro).__name__}: {erro}`'
+            )
+            return await interaction.followup.send(
+                '❌ Falha no arquivamento. O tópico em aberto foi mantido para não perder dados.',
+                ephemeral=True,
+            )
+
+        # Só apaga o tópico em aberto depois que o arquivo estiver confirmado no /data.
+        try:
+            await canal_atual.delete(
+                reason=f'Boletim Nº {numero_curto} finalizado e arquivado em tópico próprio'
+            )
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Boletim Nº `{numero_curto}` arquivado, mas não consegui apagar '
+                f'a área `{getattr(canal_atual, "id", 0)}`: {erro}'
+            )
+
+
+async def _bo_reconciliar_numero_com_origem() -> Dict[str, int]:
+    """Corrige tópicos antigos usando o número escrito no BO recebido."""
+    global _BO_ARQUIVO_RECONCILIADO
+    async with _BO_ARQUIVO_RECONCILIACAO_LOCK:
+        if _BO_ARQUIVO_RECONCILIADO:
+            return {'analisados': 0, 'corrigidos': 0, 'sem_origem': 0}
+        guild = bot.guilds[0] if bot.guilds else None
+        if guild is None:
+            return {'analisados': 0, 'corrigidos': 0, 'sem_origem': 0}
+        canal_abertos = await _resolver_canal_boletins_abertos(guild)
+        registros = carregar_atendimentos_boletins()
+        usados: Dict[int, str] = {}
+        for registro in registros:
+            numero = _extrair_inteiro_numero_boletim(registro.get('numero'))
+            if numero > 0:
+                usados.setdefault(numero, str(registro.get('id') or ''))
+
+        analisados = 0
+        corrigidos = 0
+        sem_origem = 0
+        alterou = False
+        for registro in registros:
+            if str(registro.get('status') or '').upper() == 'FINALIZADO':
+                continue
+            analisados += 1
+            oficial = str(registro.get('numero_origem_oficial') or registro.get('numero_original_texto') or '')
+            if not oficial:
+                try:
+                    canal_origem = guild.get_channel(int(registro.get('canal_origem_id') or 0))
+                    if canal_origem is None and registro.get('canal_origem_id'):
+                        canal_origem = await bot.fetch_channel(int(registro.get('canal_origem_id')))
+                    if canal_origem is not None and registro.get('mensagem_original_id'):
+                        msg = await canal_origem.fetch_message(int(registro.get('mensagem_original_id')))
+                        oficial = _bo_numero_oficial_texto(msg)
+                except Exception:
+                    oficial = ''
+            oficial_int = _extrair_inteiro_numero_boletim(oficial)
+            atual_int = _extrair_inteiro_numero_boletim(registro.get('numero'))
+            if oficial_int <= 0:
+                sem_origem += 1
+                continue
+            dono = usados.get(oficial_int)
+            if dono and dono != str(registro.get('id') or ''):
+                # Não cria nova duplicidade: a reconciliação geral V4 atribui um
+                # número livre ao registro conflitante.
+                continue
+            registro['numero_origem_oficial'] = _bo_numero_formatado(oficial_int)
+            registro['numero_original_texto'] = _bo_numero_formatado(oficial_int)
+            if atual_int == oficial_int:
+                continue
+            topico = None
+            tid = int(registro.get('thread_id') or registro.get('area_id') or 0)
+            if tid:
+                try:
+                    achado = bot.get_channel(tid) or await bot.fetch_channel(tid)
+                    if isinstance(achado, discord.Thread):
+                        topico = achado
+                except Exception:
+                    topico = None
+            if topico is None or not isinstance(canal_abertos, discord.TextChannel):
+                continue
+            usados.pop(atual_int, None)
+            usados[oficial_int] = str(registro.get('id') or '')
+            registro['numero'] = _bo_numero_formatado(oficial_int)
+            registro['numero_corrigido_pela_origem_em'] = agora_br()
+            alterou = True
+            await _bo_num_corrigir_topico_e_mensagens(
+                canal_abertos,
+                topico,
+                registro,
+                atual_int,
+                oficial_int,
+            )
+            corrigidos += 1
+        if alterou:
+            salvar_atendimentos_boletins(registros)
+        _BO_ARQUIVO_RECONCILIADO = True
+        return {'analisados': analisados, 'corrigidos': corrigidos, 'sem_origem': sem_origem}
+
+
+@bot.event
+async def on_ready():
+    await _BO_ARQUIVO_ON_READY_ANTERIOR()
+    try:
+        resumo = await _bo_reconciliar_numero_com_origem()
+        print(
+            '✅ Arquivamento de BO em tópico V5 ativo: '
+            f"{resumo['corrigidos']} numeração(ões) ajustada(s) pela origem; "
+            'fechamento preserva o mesmo número no canal de arquivados.',
+            flush=True,
+        )
+        if resumo['corrigidos']:
+            await enviar_log(
+                '🔢 **BOLETINS AJUSTADOS PELO NÚMERO ORIGINAL**\n'
+                f"Registros analisados: `{resumo['analisados']}`\n"
+                f"Tópicos corrigidos: `{resumo['corrigidos']}`\n"
+                f"Sem mensagem de origem acessível: `{resumo['sem_origem']}`\n"
+                'Ao finalizar, cada BO agora ganha um tópico próprio em Arquivados com o mesmo número.'
+            )
+    except Exception as erro:
+        traceback.print_exc()
+        print(
+            f'❌ Falha ao reconciliar o número original dos BOs: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+
+
+print(
+    '✅ Arquivamento BO V5 carregado: tópico próprio no canal de arquivados, '
+    'mesmo número da origem e cópia completa do atendimento.',
+    flush=True,
+)
+
+
+# V5.1 — reconciliação por lote. Permite trocar números entre tópicos quando
+# a sequência antiga ficou deslocada, sem bloquear a correção por conflito
+# temporário. O número escrito no BO original é a fonte principal.
+async def _bo_reconciliar_numero_com_origem() -> Dict[str, int]:
+    global _BO_ARQUIVO_RECONCILIADO
+    async with _BO_ARQUIVO_RECONCILIACAO_LOCK:
+        if _BO_ARQUIVO_RECONCILIADO:
+            return {'analisados': 0, 'corrigidos': 0, 'sem_origem': 0}
+        guild = bot.guilds[0] if bot.guilds else None
+        if guild is None:
+            return {'analisados': 0, 'corrigidos': 0, 'sem_origem': 0}
+        canal_abertos = await _resolver_canal_boletins_abertos(guild)
+        registros = carregar_atendimentos_boletins()
+        entidades: List[Dict[str, Any]] = []
+        sem_origem = 0
+
+        for indice, registro in enumerate(registros):
+            if str(registro.get('status') or '').upper() == 'FINALIZADO':
+                continue
+            topico = None
+            tid = int(registro.get('thread_id') or registro.get('area_id') or 0)
+            if tid:
+                try:
+                    achado = bot.get_channel(tid) or await bot.fetch_channel(tid)
+                    if isinstance(achado, discord.Thread):
+                        topico = achado
+                except Exception:
+                    topico = None
+            if topico is None:
+                continue
+
+            oficial = str(registro.get('numero_origem_oficial') or registro.get('numero_original_texto') or '')
+            if not oficial:
+                try:
+                    canal_origem = guild.get_channel(int(registro.get('canal_origem_id') or 0))
+                    if canal_origem is None and registro.get('canal_origem_id'):
+                        canal_origem = await bot.fetch_channel(int(registro.get('canal_origem_id')))
+                    if canal_origem is not None and registro.get('mensagem_original_id'):
+                        msg_origem = await canal_origem.fetch_message(int(registro.get('mensagem_original_id')))
+                        oficial = _bo_numero_oficial_texto(msg_origem)
+                except Exception:
+                    oficial = ''
+            oficial_int = _extrair_inteiro_numero_boletim(oficial)
+            if oficial_int <= 0:
+                sem_origem += 1
+            entidades.append({
+                'indice': indice,
+                'registro': registro,
+                'topico': topico,
+                'atual': _extrair_inteiro_numero_boletim(registro.get('numero')),
+                'oficial': oficial_int,
+                'ordem': _bo_num_data_ordenacao(registro, topico),
+            })
+
+        entidades.sort(key=lambda e: (e['ordem'], int(e['topico'].id)))
+        contagem_oficial: Dict[int, int] = {}
+        for e in entidades:
+            if e['oficial'] > 0:
+                contagem_oficial[e['oficial']] = contagem_oficial.get(e['oficial'], 0) + 1
+
+        atribuicoes: Dict[int, int] = {}
+        usados: set[int] = set()
+        # Primeiro, números oficiais únicos. Assim trocas 17↔18 são permitidas.
+        for e in entidades:
+            oficial = e['oficial']
+            if oficial > 0 and contagem_oficial.get(oficial) == 1:
+                atribuicoes[e['indice']] = oficial
+                usados.add(oficial)
+
+        base_numeros = {
+            _extrair_inteiro_numero_boletim(r.get('numero'))
+            for r in registros
+            if str(r.get('status') or '').upper() == 'FINALIZADO'
+        }
+        base_numeros.discard(0)
+        usados |= base_numeros
+        maior = max(
+            [0]
+            + list(usados)
+            + [e['atual'] for e in entidades if e['atual'] > 0]
+            + [e['oficial'] for e in entidades if e['oficial'] > 0]
+        )
+        proximo = maior + 1
+
+        # Depois mantém o atual quando livre; conflitos recebem próximo número.
+        for e in entidades:
+            if e['indice'] in atribuicoes:
+                continue
+            atual = e['atual']
+            if atual > 0 and atual not in usados:
+                novo = atual
+            else:
+                while proximo in usados:
+                    proximo += 1
+                novo = proximo
+                proximo += 1
+            atribuicoes[e['indice']] = novo
+            usados.add(novo)
+
+        corrigidos = 0
+        alterou = False
+        boletins = carregar_boletins()
+        boletins_alterados = False
+        for e in entidades:
+            registro = e['registro']
+            novo = atribuicoes[e['indice']]
+            antigo = e['atual']
+            oficial = e['oficial']
+            if oficial > 0:
+                registro['numero_origem_oficial'] = _bo_numero_formatado(oficial)
+                registro['numero_original_texto'] = _bo_numero_formatado(oficial)
+                registro['numero_origem_confirmado'] = True
+            if novo == antigo:
+                continue
+            registro['numero'] = _bo_numero_formatado(novo)
+            registro['numero_anterior_corrigido'] = _bo_numero_formatado(antigo) if antigo > 0 else 'NÃO INFORMADO'
+            registro['numero_corrigido_pela_origem_em'] = agora_br()
+            registro.setdefault('historico', []).append({
+                'acao': 'Número ajustado para seguir o boletim original',
+                'numero_anterior': registro['numero_anterior_corrigido'],
+                'numero_novo': registro['numero'],
+                'usuario': 'Sistema',
+                'data': agora_br(),
+            })
+            alterou = True
+            await _bo_num_corrigir_topico_e_mensagens(
+                canal_abertos,
+                e['topico'],
+                registro,
+                antigo,
+                novo,
+            )
+            origem_id = str(registro.get('mensagem_original_id') or '')
+            for boletim in boletins:
+                if origem_id and origem_id in {
+                    str(boletim.get('mensagem_id') or ''),
+                    str(boletim.get('mensagem_original_id') or ''),
+                }:
+                    boletim['numero'] = _bo_numero_formatado(novo)
+                    boletins_alterados = True
+            corrigidos += 1
+            await asyncio.sleep(0.15)
+
+        if alterou:
+            salvar_atendimentos_boletins(registros)
+        if boletins_alterados:
+            salvar_boletins(boletins)
+        maior_final = max([0] + [
+            _extrair_inteiro_numero_boletim(r.get('numero')) for r in registros
+        ])
+        contador = carregar_json(BOLETINS_CONTADOR_JSON, {})
+        if not isinstance(contador, dict):
+            contador = {}
+        contador.update({
+            'ultimo': max(int(contador.get('ultimo', 0) or 0), maior_final),
+            'modelo': 'numero_oficial_origem_v5_1',
+            'atualizado_em': agora_br(),
+        })
+        salvar_json(BOLETINS_CONTADOR_JSON, contador)
+        _BO_ARQUIVO_RECONCILIADO = True
+        return {
+            'analisados': len(entidades),
+            'corrigidos': corrigidos,
+            'sem_origem': sem_origem,
+        }
 
 if __name__ == '__main__':
     asyncio.run(main())
