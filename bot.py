@@ -39444,27 +39444,31 @@ async def _bo_reconciliar_numero_com_origem() -> Dict[str, int]:
 
 
 # =====================================================
-# PATCH — MANUTENÇÃO SEGURA DO VOLUME RAILWAY V1
+# PATCH — MANUTENÇÃO REAL DO VOLUME RAILWAY V2
 # =====================================================
-# O volume gratuito de 500 MB estava enchendo porque o banco criava um backup
-# SQLite completo após cada confirmação de ficha e conservava até 25 cópias.
-# Esta manutenção preserva o banco principal, snapshots, arquivos manuais,
-# fotos do catálogo e documentos oficiais. Ela remove somente backups excedentes
-# e temporários/arquivos OCR que não são mais necessários.
+# Esta versão não presume que apenas os backups ocupam espaço. Ela mede o
+# conteúdo real de /data, compacta o SQLite, elimina temporários e OCR resolvido,
+# remove backups antigos em qualquer pasta legada, deduplica arquivos idênticos
+# usando hard links e informa exatamente quais diretórios continuam grandes.
+# Dados oficiais e caminhos existentes permanecem disponíveis.
 
+import hashlib as _dicor_volume_hashlib
 import shutil as _dicor_volume_shutil
 
-VOLUME_BACKUPS_MANTER = max(2, min(10, env_int("VOLUME_BACKUPS_MANTER", 3)))
-VOLUME_BACKUP_INTERVALO_HORAS = max(1, min(48, env_int("VOLUME_BACKUP_INTERVALO_HORAS", 6)))
+VOLUME_BACKUPS_MANTER = max(1, min(3, env_int("VOLUME_BACKUPS_MANTER", 1)))
+VOLUME_BACKUP_INTERVALO_HORAS = max(1, min(48, env_int("VOLUME_BACKUP_INTERVALO_HORAS", 12)))
 VOLUME_LIMPEZA_INTERVALO_HORAS = max(1, min(24, env_int("VOLUME_LIMPEZA_INTERVALO_HORAS", 6)))
 VOLUME_ALERTA_PERCENTUAL = max(60, min(98, env_int("VOLUME_ALERTA_PERCENTUAL", 80)))
 VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS = max(
-    1, min(168, env_int("VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS", 24))
+    0, min(168, env_int("VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS", 1))
 )
+VOLUME_ORFAOS_RETENCAO_DIAS = max(1, min(90, env_int("VOLUME_ORFAOS_RETENCAO_DIAS", 7)))
+VOLUME_DEDUP_MIN_KB = max(8, min(10240, env_int("VOLUME_DEDUP_MIN_KB", 64)))
 
 _VOLUME_MANUTENCAO_THREAD_LOCK = threading.RLock()
 _VOLUME_MANUTENCAO_ASYNC_LOCK = asyncio.Lock()
 _VOLUME_MANUTENCAO_TASK: Optional[asyncio.Task] = None
+_VOLUME_LIMPEZA_INICIAL_FEITA = False
 _VOLUME_ON_READY_ANTERIOR = on_ready
 _BANCO_BACKUP_ANTES_VOLUME = _banco_criar_backup_duravel
 
@@ -39490,12 +39494,18 @@ def _volume_tamanho_diretorio(caminho: Path) -> int:
     try:
         if not caminho.exists():
             return 0
+        if caminho.is_file():
+            return _volume_bytes_arquivo(caminho)
         for item in caminho.rglob("*"):
             if item.is_file():
                 total += _volume_bytes_arquivo(item)
     except Exception:
         pass
     return int(total)
+
+
+def _volume_total_arquivos() -> int:
+    return _volume_tamanho_diretorio(Path(DATA_DIR))
 
 
 def _volume_estado_disco() -> Dict[str, Any]:
@@ -39512,18 +39522,57 @@ def _volume_estado_disco() -> Dict[str, Any]:
         return {"total": 0, "usado": 0, "livre": 0, "percentual": 0.0}
 
 
+def _volume_top_diretorios(limite: int = 10) -> List[Tuple[str, int]]:
+    itens: List[Tuple[str, int]] = []
+    raiz = Path(DATA_DIR)
+    try:
+        for item in raiz.iterdir():
+            if item.is_dir():
+                itens.append((item.name, _volume_tamanho_diretorio(item)))
+            elif item.is_file():
+                itens.append((item.name, _volume_bytes_arquivo(item)))
+    except Exception:
+        return []
+    itens.sort(key=lambda par: par[1], reverse=True)
+    return itens[:max(1, int(limite))]
+
+
+def _volume_top_arquivos(limite: int = 12) -> List[Tuple[str, int]]:
+    itens: List[Tuple[str, int]] = []
+    raiz = Path(DATA_DIR)
+    try:
+        for item in raiz.rglob("*"):
+            if item.is_file():
+                try:
+                    nome = str(item.relative_to(raiz))
+                except Exception:
+                    nome = str(item)
+                itens.append((nome, _volume_bytes_arquivo(item)))
+    except Exception:
+        return []
+    itens.sort(key=lambda par: par[1], reverse=True)
+    return itens[:max(1, int(limite))]
+
+
 def _volume_backups_ordenados() -> List[Path]:
+    encontrados: Dict[str, Path] = {}
+    raiz = Path(DATA_DIR)
+    padroes = ("dicor_banco_*.sqlite3", "dicor_banco_*.db")
+    for padrao in padroes:
+        try:
+            for item in raiz.rglob(padrao):
+                if item.is_file() and item.resolve() != Path(BANCO_DADOS_SQLITE).resolve():
+                    encontrados[str(item.resolve())] = item
+        except Exception:
+            continue
     try:
         return sorted(
-            [
-                item for item in Path(_BANCO_BACKUPS_DURAVEIS_DIR).glob("dicor_banco_*.sqlite3")
-                if item.is_file()
-            ],
+            encontrados.values(),
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         )
     except Exception:
-        return []
+        return list(encontrados.values())
 
 
 def _volume_caminhos_ocr_pendentes() -> set[str]:
@@ -39569,10 +39618,214 @@ def _volume_apagar_arquivo(caminho: Path) -> int:
         return 0
 
 
-def _volume_limpeza_segura_sync() -> Dict[str, Any]:
+def _volume_remover_arvore_temporaria(caminho: Path, idade_minima_horas: float = 1.0) -> Tuple[int, int]:
+    liberados = 0
+    removidos = 0
+    if not caminho.exists():
+        return liberados, removidos
+    agora = time.time()
+    try:
+        arquivos = list(caminho.rglob("*"))
+    except Exception:
+        arquivos = []
+    for item in arquivos:
+        if not item.is_file():
+            continue
+        try:
+            idade = (agora - item.stat().st_mtime) / 3600.0
+        except Exception:
+            continue
+        if idade < idade_minima_horas:
+            continue
+        tamanho = _volume_apagar_arquivo(item)
+        if tamanho:
+            liberados += tamanho
+            removidos += 1
+    try:
+        for pasta in sorted([p for p in caminho.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+            try:
+                pasta.rmdir()
+            except Exception:
+                pass
+        caminho.rmdir()
+    except Exception:
+        pass
+    return liberados, removidos
+
+
+def _volume_vacuum_sqlite() -> Dict[str, Any]:
+    resultado = {"antes": 0, "depois": 0, "liberados": 0, "ok": False, "erro": ""}
+    caminho = Path(BANCO_DADOS_SQLITE)
+    if not caminho.exists():
+        return resultado
+    resultado["antes"] = _volume_bytes_arquivo(caminho)
+    conexao = None
+    try:
+        conexao = sqlite3.connect(str(caminho), timeout=120)
+        try:
+            conexao.execute("PRAGMA busy_timeout=120000")
+            conexao.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        conexao.execute("VACUUM")
+        conexao.execute("PRAGMA optimize")
+        conexao.commit()
+        resultado["ok"] = True
+    except Exception as erro:
+        resultado["erro"] = f"{type(erro).__name__}: {erro}"
+    finally:
+        try:
+            if conexao is not None:
+                conexao.close()
+        except Exception:
+            pass
+    resultado["depois"] = _volume_bytes_arquivo(caminho)
+    resultado["liberados"] = max(0, int(resultado["antes"]) - int(resultado["depois"]))
+    return resultado
+
+
+def _volume_hash_arquivo(caminho: Path) -> str:
+    digest = _dicor_volume_hashlib.sha256()
+    with caminho.open("rb") as arquivo:
+        while True:
+            bloco = arquivo.read(1024 * 1024)
+            if not bloco:
+                break
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def _volume_deduplicar_arquivos() -> Dict[str, int]:
+    """Substitui anexos idênticos por hard links, preservando todos os caminhos.
+
+    A busca fica restrita a pastas de anexos imutáveis. Assinaturas, bancos,
+    dossiês e documentos editáveis não entram para evitar que uma futura
+    sobrescrita em um caminho altere outro arquivo ligado ao mesmo inode.
+    """
+    extensoes = {
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+        ".pdf", ".zip", ".mp4", ".mov", ".webm",
+    }
+    minimo = int(VOLUME_DEDUP_MIN_KB) * 1024
+    por_tamanho: Dict[int, List[Path]] = {}
+    raiz = Path(DATA_DIR)
+    raizes_permitidas = [
+        raiz / "catalogo_uploads",
+        raiz / "banco_dados_arquivos",
+        raiz / "mensagens_protegidas_arquivos",
+        raiz / "boletins_arquivos",
+        raiz / "relatorios_arquivos",
+        raiz / "paineis_originais",
+    ]
+    candidatos: List[Path] = []
+    for pasta in raizes_permitidas:
+        if not pasta.exists():
+            continue
+        try:
+            candidatos.extend(list(pasta.rglob("*")))
+        except Exception:
+            continue
+    for item in candidatos:
+        if not item.is_file() or item.suffix.lower() not in extensoes:
+            continue
+        tamanho = _volume_bytes_arquivo(item)
+        if tamanho < minimo:
+            continue
+        por_tamanho.setdefault(tamanho, []).append(item)
+
+    liberados = 0
+    deduplicados = 0
+    falhas = 0
+    for tamanho, grupo in por_tamanho.items():
+        if len(grupo) < 2:
+            continue
+        por_hash: Dict[str, Path] = {}
+        for item in grupo:
+            try:
+                chave = _volume_hash_arquivo(item)
+            except Exception:
+                falhas += 1
+                continue
+            original = por_hash.get(chave)
+            if original is None:
+                por_hash[chave] = item
+                continue
+            try:
+                stat_original = original.stat()
+                stat_item = item.stat()
+                if stat_original.st_dev == stat_item.st_dev and stat_original.st_ino == stat_item.st_ino:
+                    continue
+                temporario = item.with_name(item.name + f".dedup-{os.getpid()}.tmp")
+                temporario.unlink(missing_ok=True)
+                os.link(str(original), str(temporario))
+                os.replace(str(temporario), str(item))
+                liberados += tamanho
+                deduplicados += 1
+            except Exception:
+                falhas += 1
+                try:
+                    temporario.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    return {"liberados": liberados, "arquivos": deduplicados, "falhas": falhas}
+
+
+def _volume_texto_referencias_json() -> str:
+    partes: List[str] = []
+    raiz = Path(DATA_DIR)
+    try:
+        arquivos = list(raiz.glob("*.json")) + list(raiz.glob("*/*.json"))
+    except Exception:
+        arquivos = []
+    for arquivo in arquivos:
+        try:
+            if arquivo.stat().st_size > 30 * 1024 * 1024:
+                continue
+            partes.append(arquivo.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+    return "\n".join(partes)
+
+
+def _volume_limpar_catalogo_orfao() -> Dict[str, int]:
+    pasta = Path(DATA_DIR) / "catalogo_uploads"
+    if not pasta.exists():
+        return {"liberados": 0, "arquivos": 0, "falhas": 0}
+    referencias = _volume_texto_referencias_json()
+    agora = time.time()
+    retencao = float(VOLUME_ORFAOS_RETENCAO_DIAS) * 86400.0
+    liberados = 0
+    removidos = 0
+    falhas = 0
+    try:
+        itens = list(pasta.rglob("*"))
+    except Exception:
+        itens = []
+    for item in itens:
+        if not item.is_file():
+            continue
+        try:
+            if (agora - item.stat().st_mtime) < retencao:
+                continue
+            # Mantém qualquer arquivo citado por nome ou caminho nos bancos JSON.
+            if item.name in referencias or str(item) in referencias:
+                continue
+            tamanho = _volume_apagar_arquivo(item)
+            if tamanho:
+                liberados += tamanho
+                removidos += 1
+            elif item.exists():
+                falhas += 1
+        except Exception:
+            falhas += 1
+    return {"liberados": liberados, "arquivos": removidos, "falhas": falhas}
+
+
+def _volume_limpeza_real_sync() -> Dict[str, Any]:
     with _VOLUME_MANUTENCAO_THREAD_LOCK:
         Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
         estado_antes = _volume_estado_disco()
+        arquivos_antes = _volume_total_arquivos()
         agora = time.time()
         liberados = 0
         removidos_backups = 0
@@ -39580,8 +39833,7 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
         removidos_ocr = 0
         falhas = 0
 
-        # 1) Backups do SQLite: snapshots individuais já protegem cada ficha.
-        # Conservamos somente as cópias mais recentes para caber no volume de 500 MB.
+        # 1) Remove backups antigos inclusive de pastas legadas.
         backups = _volume_backups_ordenados()
         for antigo in backups[VOLUME_BACKUPS_MANTER:]:
             tamanho = _volume_apagar_arquivo(antigo)
@@ -39591,8 +39843,8 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
             elif antigo.exists():
                 falhas += 1
 
-        # 2) Temporários deixados por reinício/crash. Não são dados oficiais.
-        for padrao in ("*.tmp", "*.part", "*.download"):
+        # 2) Temporários gerais e pastas de importação interrompida.
+        for padrao in ("*.tmp", "*.part", "*.download", "*.cache"):
             try:
                 candidatos = list(Path(DATA_DIR).rglob(padrao))
             except Exception:
@@ -39611,7 +39863,16 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
                 elif item.exists():
                     falhas += 1
 
-        # 3) Bancos corrompidos antigos já substituídos por backup íntegro.
+        for pasta_tmp in (
+            Path(DATA_DIR) / "tmp_importacao_paineis",
+            Path(DATA_DIR) / "tmp",
+            Path(DATA_DIR) / "temporarios",
+        ):
+            livres, quantidade = _volume_remover_arvore_temporaria(pasta_tmp, 1.0)
+            liberados += livres
+            removidos_temporarios += quantidade
+
+        # 3) Bancos corrompidos antigos já substituídos por cópia íntegra.
         try:
             corrompidos = list(Path(DATA_DIR).rglob("*.corrompido-*"))
         except Exception:
@@ -39621,7 +39882,7 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
                 idade_dias = (agora - item.stat().st_mtime) / 86400.0
             except Exception:
                 continue
-            if idade_dias < 7.0:
+            if idade_dias < 2.0:
                 continue
             tamanho = _volume_apagar_arquivo(item)
             if tamanho:
@@ -39630,40 +39891,27 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
             elif item.exists():
                 falhas += 1
 
-        # 4) Variações temporárias de OCR. Normalmente são apagadas no finally,
-        # mas podem sobrar quando o Railway encerra o processo no meio da leitura.
+        # 4) OCR: mantém somente imagens ainda pendentes.
         arquivos_dir = Path(globals().get("BANCO_ARQUIVOS_DIR", Path(DATA_DIR) / "banco_dados_arquivos"))
         pendentes = _volume_caminhos_ocr_pendentes()
-        prefixos_temporarios = (
-            "ocr-enh-", "ocr-crop-", "ocr-safe-", "ocr-safe-crop-"
+        prefixos_ocr = (
+            "ocr-enh-", "ocr-crop-", "ocr-safe-", "ocr-safe-crop-",
+            "ocr-pericia-", "ocr-historico-", "ocr-ficha-",
         )
-        prefixos_origem_ocr = ("ocr-pericia-", "ocr-historico-")
         if arquivos_dir.exists():
             try:
-                itens_ocr = list(arquivos_dir.iterdir())
+                itens_ocr = list(arquivos_dir.rglob("*"))
             except Exception:
                 itens_ocr = []
             for item in itens_ocr:
-                if not item.is_file():
+                if not item.is_file() or not item.name.lower().startswith(prefixos_ocr):
                     continue
-                nome = item.name.lower()
                 try:
                     idade_horas = (agora - item.stat().st_mtime) / 3600.0
                     resolvido = str(item.resolve()) not in pendentes
                 except Exception:
                     continue
-                apagar = False
-                if nome.startswith(prefixos_temporarios) and idade_horas >= 1.0:
-                    apagar = True
-                elif (
-                    nome.startswith(prefixos_origem_ocr)
-                    and resolvido
-                    and idade_horas >= float(VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS)
-                ):
-                    # A ficha guarda as informações e o link da Perícia Externa;
-                    # a cópia local da imagem não é necessária depois da resolução.
-                    apagar = True
-                if not apagar:
+                if not resolvido or idade_horas < float(VOLUME_OCR_RESOLVIDO_RETENCAO_HORAS):
                     continue
                 tamanho = _volume_apagar_arquivo(item)
                 if tamanho:
@@ -39672,30 +39920,57 @@ def _volume_limpeza_segura_sync() -> Dict[str, Any]:
                 elif item.exists():
                     falhas += 1
 
+        # 5) Remove fotos órfãs do catálogo, nunca as que ainda são referenciadas.
+        catalogo_orfao = _volume_limpar_catalogo_orfao()
+        liberados += int(catalogo_orfao.get("liberados", 0))
+        falhas += int(catalogo_orfao.get("falhas", 0))
+
+        # 6) Compacta o SQLite e trunca WAL.
+        vacuum = _volume_vacuum_sqlite()
+        liberados += int(vacuum.get("liberados", 0))
+
+        # 7) Arquivos idênticos passam a compartilhar o mesmo conteúdo físico.
+        dedup = _volume_deduplicar_arquivos()
+        liberados += int(dedup.get("liberados", 0))
+        falhas += int(dedup.get("falhas", 0))
+
         estado_depois = _volume_estado_disco()
+        arquivos_depois = _volume_total_arquivos()
         return {
             "liberados": int(liberados),
             "backups_removidos": int(removidos_backups),
             "temporarios_removidos": int(removidos_temporarios),
             "ocr_removidos": int(removidos_ocr),
+            "catalogo_orfaos": int(catalogo_orfao.get("arquivos", 0)),
+            "deduplicados": int(dedup.get("arquivos", 0)),
+            "vacuum": vacuum,
             "falhas": int(falhas),
             "antes": estado_antes,
             "depois": estado_depois,
+            "arquivos_antes": int(arquivos_antes),
+            "arquivos_depois": int(arquivos_depois),
             "backups_mantidos": len(_volume_backups_ordenados()),
             "tamanho_backups": _volume_tamanho_diretorio(Path(_BANCO_BACKUPS_DURAVEIS_DIR)),
             "tamanho_snapshots": _volume_tamanho_diretorio(Path(_BANCO_FICHAS_DURAVEIS_DIR)),
             "tamanho_catalogo": _volume_tamanho_diretorio(Path(DATA_DIR) / "catalogo_uploads"),
             "tamanho_arquivos_banco": _volume_tamanho_diretorio(arquivos_dir),
+            "top_diretorios": _volume_top_diretorios(10),
+            "top_arquivos": _volume_top_arquivos(12),
         }
 
 
-def _banco_criar_backup_duravel(motivo: str = "manual") -> Optional[str]:
-    """Backup persistente com retenção e intervalo seguros para volume pequeno."""
-    try:
-        _volume_limpeza_segura_sync()
-    except Exception:
-        pass
+# Compatibilidade com chamadas da V1 e de outros patches.
+def _volume_limpeza_segura_sync() -> Dict[str, Any]:
+    return _volume_limpeza_real_sync()
 
+
+def _banco_criar_backup_duravel(motivo: str = "manual") -> Optional[str]:
+    """Backup persistente com uma única cópia recente para volume de 500 MB.
+
+    A varredura completa não é executada aqui, porque esta função é chamada
+    depois de várias ações do banco. A limpeza pesada fica no início, no comando
+    e na tarefa periódica.
+    """
     backups = _volume_backups_ordenados()
     motivo_norm = str(motivo or "manual").strip().lower()
     forcar = motivo_norm in {"manual", "inicial", "restauracao", "restauração", "pre-migracao", "pré-migração"}
@@ -39709,10 +39984,24 @@ def _banco_criar_backup_duravel(motivo: str = "manual") -> Optional[str]:
 
     resultado = _BANCO_BACKUP_ANTES_VOLUME(motivo)
     try:
-        _volume_limpeza_segura_sync()
+        atuais = _volume_backups_ordenados()
+        for antigo in atuais[VOLUME_BACKUPS_MANTER:]:
+            _volume_apagar_arquivo(antigo)
     except Exception:
         pass
     return resultado
+
+
+def _volume_linhas_top(itens: List[Tuple[str, int]], limite: int = 8) -> str:
+    if not itens:
+        return "Nenhum arquivo encontrado."
+    linhas = []
+    for nome, tamanho in itens[:limite]:
+        nome_curto = str(nome)
+        if len(nome_curto) > 52:
+            nome_curto = "…" + nome_curto[-51:]
+        linhas.append(f"• `{nome_curto}` — **{_volume_formatar_bytes(tamanho)}**")
+    return "\n".join(linhas)
 
 
 async def _volume_manutencao_periodica() -> None:
@@ -39720,29 +40009,25 @@ async def _volume_manutencao_periodica() -> None:
     while not bot.is_closed():
         try:
             async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
-                resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
+                resumo = await asyncio.to_thread(_volume_limpeza_real_sync)
             depois = dict(resumo.get("depois") or {})
-            if resumo.get("liberados") or float(depois.get("percentual") or 0.0) >= VOLUME_ALERTA_PERCENTUAL:
-                print(
-                    "🧹 Manutenção do volume DICOR: "
-                    f"liberados {_volume_formatar_bytes(resumo.get('liberados', 0))}; "
-                    f"uso {float(depois.get('percentual') or 0.0):.1f}%; "
-                    f"backups mantidos {resumo.get('backups_mantidos', 0)}.",
-                    flush=True,
-                )
+            print(
+                "🧹 Volume DICOR V2: "
+                f"liberados {_volume_formatar_bytes(resumo.get('liberados', 0))}; "
+                f"arquivos em /data {_volume_formatar_bytes(resumo.get('arquivos_depois', 0))}; "
+                f"disco {float(depois.get('percentual') or 0.0):.1f}%.",
+                flush=True,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as erro:
-            print(
-                f"⚠️ Manutenção do volume falhou: {type(erro).__name__}: {erro}",
-                flush=True,
-            )
+            print(f"⚠️ Manutenção do volume V2 falhou: {type(erro).__name__}: {erro}", flush=True)
         await asyncio.sleep(float(VOLUME_LIMPEZA_INTERVALO_HORAS) * 3600.0)
 
 
 @bot.tree.command(
     name="manutencaovolume",
-    description="Verifica e limpa backups/temporários do volume persistente do bot.",
+    description="Analisa e limpa de verdade o volume persistente do bot.",
 )
 async def manutencaovolume(interaction: discord.Interaction):
     if not _membro_inspetor_mais(interaction.user):
@@ -39754,49 +40039,56 @@ async def manutencaovolume(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
-            resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
+            resumo = await asyncio.to_thread(_volume_limpeza_real_sync)
         antes = dict(resumo.get("antes") or {})
         depois = dict(resumo.get("depois") or {})
+        vacuum = dict(resumo.get("vacuum") or {})
         embed = discord.Embed(
-            title="🧹 MANUTENÇÃO DO VOLUME • DICOR",
-            description="Limpeza concluída sem apagar fichas, banco principal, arquivos manuais ou fotos do catálogo.",
+            title="🧹 MANUTENÇÃO REAL DO VOLUME • DICOR",
+            description=(
+                "A limpeza foi executada diretamente em `/data`. "
+                "Nenhuma ficha, registro, assinatura ou documento oficial referenciado foi apagado."
+            ),
             color=discord.Color.green(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
         embed.add_field(
-            name="💾 Uso do volume",
+            name="💾 Resultado",
             value=(
-                f"**Antes:** {float(antes.get('percentual') or 0.0):.1f}% "
+                f"**Uso do disco antes:** {float(antes.get('percentual') or 0.0):.1f}% "
                 f"({_volume_formatar_bytes(antes.get('usado', 0))})\n"
-                f"**Depois:** {float(depois.get('percentual') or 0.0):.1f}% "
+                f"**Uso do disco depois:** {float(depois.get('percentual') or 0.0):.1f}% "
                 f"({_volume_formatar_bytes(depois.get('usado', 0))})\n"
+                f"**Arquivos reais em /data:** {_volume_formatar_bytes(resumo.get('arquivos_depois', 0))}\n"
+                f"**Espaço calculado como liberado:** {_volume_formatar_bytes(resumo.get('liberados', 0))}\n"
                 f"**Livre:** {_volume_formatar_bytes(depois.get('livre', 0))}"
             ),
             inline=False,
         )
         embed.add_field(
-            name="🗑️ Limpeza realizada",
+            name="🗑️ Ações realizadas",
             value=(
-                f"**Espaço liberado:** {_volume_formatar_bytes(resumo.get('liberados', 0))}\n"
                 f"**Backups antigos:** {resumo.get('backups_removidos', 0)}\n"
                 f"**Temporários:** {resumo.get('temporarios_removidos', 0)}\n"
-                f"**Arquivos OCR resolvidos:** {resumo.get('ocr_removidos', 0)}\n"
+                f"**OCR resolvido:** {resumo.get('ocr_removidos', 0)}\n"
+                f"**Fotos órfãs do catálogo:** {resumo.get('catalogo_orfaos', 0)}\n"
+                f"**Arquivos idênticos deduplicados:** {resumo.get('deduplicados', 0)}\n"
+                f"**SQLite compactado:** {'Sim' if vacuum.get('ok') else 'Não'}\n"
                 f"**Falhas:** {resumo.get('falhas', 0)}"
             ),
             inline=False,
         )
         embed.add_field(
-            name="🛡️ Dados preservados",
-            value=(
-                f"**Backups mantidos:** {resumo.get('backups_mantidos', 0)} "
-                f"({_volume_formatar_bytes(resumo.get('tamanho_backups', 0))})\n"
-                f"**Snapshots das fichas:** {_volume_formatar_bytes(resumo.get('tamanho_snapshots', 0))}\n"
-                f"**Fotos do catálogo:** {_volume_formatar_bytes(resumo.get('tamanho_catalogo', 0))}\n"
-                f"**Arquivos do banco:** {_volume_formatar_bytes(resumo.get('tamanho_arquivos_banco', 0))}"
-            ),
+            name="📂 Maiores áreas do volume",
+            value=_volume_linhas_top(list(resumo.get("top_diretorios") or []), 8)[:1024],
             inline=False,
         )
-        embed.set_footer(text="POLÍCIA FEDERAL • DICOR • volume persistente /data")
+        embed.add_field(
+            name="📄 Maiores arquivos",
+            value=_volume_linhas_top(list(resumo.get("top_arquivos") or []), 7)[:1024],
+            inline=False,
+        )
+        embed.set_footer(text="POLÍCIA FEDERAL • DICOR • análise real do volume /data")
         await interaction.edit_original_response(embed=embed)
     except Exception as erro:
         traceback.print_exc()
@@ -39807,33 +40099,1012 @@ async def manutencaovolume(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    global _VOLUME_MANUTENCAO_TASK
+    global _VOLUME_MANUTENCAO_TASK, _VOLUME_LIMPEZA_INICIAL_FEITA
     await _VOLUME_ON_READY_ANTERIOR()
-    try:
-        async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
-            resumo = await asyncio.to_thread(_volume_limpeza_segura_sync)
-        depois = dict(resumo.get("depois") or {})
-        print(
-            "✅ Manutenção segura do volume V1 ativa: "
-            f"{_volume_formatar_bytes(resumo.get('liberados', 0))} liberados; "
-            f"uso atual {float(depois.get('percentual') or 0.0):.1f}%; "
-            f"{resumo.get('backups_mantidos', 0)} backup(s) mantido(s).",
-            flush=True,
-        )
-    except Exception as erro:
-        print(
-            f"⚠️ Limpeza inicial do volume falhou: {type(erro).__name__}: {erro}",
-            flush=True,
-        )
+    if not _VOLUME_LIMPEZA_INICIAL_FEITA:
+        _VOLUME_LIMPEZA_INICIAL_FEITA = True
+        try:
+            async with _VOLUME_MANUTENCAO_ASYNC_LOCK:
+                resumo = await asyncio.to_thread(_volume_limpeza_real_sync)
+            depois = dict(resumo.get("depois") or {})
+            print(
+                "✅ Manutenção real do volume V2 ativa: "
+                f"{_volume_formatar_bytes(resumo.get('liberados', 0))} liberados; "
+                f"arquivos em /data {_volume_formatar_bytes(resumo.get('arquivos_depois', 0))}; "
+                f"uso do disco {float(depois.get('percentual') or 0.0):.1f}%; "
+                f"{resumo.get('backups_mantidos', 0)} backup(s) mantido(s).",
+                flush=True,
+            )
+            for nome, tamanho in list(resumo.get("top_diretorios") or [])[:8]:
+                print(f"   📂 /data/{nome}: {_volume_formatar_bytes(tamanho)}", flush=True)
+        except Exception as erro:
+            print(f"⚠️ Limpeza inicial do volume V2 falhou: {type(erro).__name__}: {erro}", flush=True)
     if _VOLUME_MANUTENCAO_TASK is None or _VOLUME_MANUTENCAO_TASK.done():
         _VOLUME_MANUTENCAO_TASK = asyncio.create_task(
             _volume_manutencao_periodica(),
-            name="dicor-volume-maintenance",
+            name="dicor-volume-maintenance-v2",
         )
 
 
 print(
-    "✅ Manutenção do volume V1 carregada: retenção de backups, limpeza de temporários e comando /manutencaovolume.",
+    "✅ Manutenção do volume V2 carregada: inventário real, VACUUM, deduplicação e limpeza segura.",
+    flush=True,
+)
+
+# =====================================================
+# PATCH FINAL — FLUXO CONTROLADO DA PERÍCIA EXTERNA
+# - Usa exatamente o número recebido na mensagem oficial;
+# - Cria tópico privado com painel e escolha de responsável por Inspetor+;
+# - Obriga resultado "Indivíduo pego" ou "Não pego";
+# - Em "Não pego", somente conclui depois de informar o número do BO;
+# - Copia todas as fotos/anexos da perícia para o tópico;
+# - Garante que anexos complementares do BO também entrem no atendimento.
+# =====================================================
+
+import io as _pericia_io
+import tempfile as _pericia_tempfile
+
+PERICIA_FLUXO_CHANNEL_ID = int(
+    os.getenv(
+        "PERICIA_FLUXO_CHANNEL_ID",
+        str(int((globals().get("CANAIS_RELATORIOS", {}) or {}).get("pericia_externa", 1490200524367200297))),
+    )
+)
+PERICIA_ATENDIMENTOS_JSON = Path(DATA_DIR) / "pericias_atendimentos.json"
+_PERICIA_PROCESSANDO: set[int] = set()
+_PERICIA_LOCK = asyncio.Lock()
+_PERICIA_ON_READY_ANTERIOR = on_ready
+_PERICIA_BO_CRIAR_AREA_ANTERIOR = criar_area_atendimento_boletim
+
+_PERICIA_STATUS_FINAIS = {
+    "CONCLUIDA_PEGO",
+    "CONCLUIDA_COM_BO",
+    "CONCLUIDA",
+    "FINALIZADA",
+}
+
+
+def _pericia_carregar() -> List[Dict[str, Any]]:
+    dados = carregar_json(PERICIA_ATENDIMENTOS_JSON, [])
+    return dados if isinstance(dados, list) else []
+
+
+def _pericia_salvar(lista: List[Dict[str, Any]]) -> None:
+    PERICIA_ATENDIMENTOS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    salvar_json(PERICIA_ATENDIMENTOS_JSON, lista[-5000:])
+
+
+def _pericia_atualizar(registro: Dict[str, Any]) -> Dict[str, Any]:
+    lista = _pericia_carregar()
+    localizado = False
+    for indice, atual in enumerate(lista):
+        if str(atual.get("id") or "") == str(registro.get("id") or ""):
+            lista[indice] = dict(registro)
+            localizado = True
+            break
+    if not localizado:
+        lista.append(dict(registro))
+    _pericia_salvar(lista)
+    return registro
+
+
+def _pericia_por_mensagem(message_id: Any) -> Optional[Dict[str, Any]]:
+    alvo = str(message_id or "")
+    for item in _pericia_carregar():
+        ids = {str(item.get("mensagem_original_id") or "")}
+        ids.update(str(x) for x in (item.get("mensagens_origem_ids") or []))
+        if alvo and alvo in ids:
+            return item
+    return None
+
+
+def _pericia_por_topico(topico_id: Any) -> Optional[Dict[str, Any]]:
+    alvo = str(topico_id or "")
+    for item in _pericia_carregar():
+        if alvo and alvo in {
+            str(item.get("topico_id") or ""),
+            str(item.get("thread_id") or ""),
+        }:
+            return item
+    return None
+
+
+def _pericia_numero_chave(numero: Any) -> str:
+    texto = unicodedata.normalize("NFKD", str(numero or "")).encode("ascii", "ignore").decode("ascii")
+    texto = re.sub(r"[^A-Za-z0-9]+", "", texto).upper()
+    return texto
+
+
+def _pericia_por_numero(numero: Any) -> Optional[Dict[str, Any]]:
+    alvo = _pericia_numero_chave(numero)
+    if not alvo:
+        return None
+    for item in _pericia_carregar():
+        if _pericia_numero_chave(item.get("numero")) == alvo:
+            return item
+    return None
+
+
+def _pericia_texto_mensagem(message: discord.Message) -> str:
+    partes: List[str] = []
+    try:
+        partes.append(str(message.content or ""))
+        for embed in list(message.embeds or []):
+            partes.append(str(getattr(embed, "title", "") or ""))
+            partes.append(str(getattr(embed, "description", "") or ""))
+            for campo in list(getattr(embed, "fields", []) or []):
+                partes.append(f"{getattr(campo, 'name', '')}: {getattr(campo, 'value', '')}")
+            rodape = getattr(getattr(embed, "footer", None), "text", None)
+            if rodape:
+                partes.append(str(rodape))
+    except Exception:
+        traceback.print_exc()
+    return "\n".join(x for x in partes if str(x).strip()).strip()
+
+
+def _pericia_extrair_numero(texto: str) -> str:
+    bruto = str(texto or "")
+    padroes = [
+        r"(?is)(?:RELAT[ÓO]RIO\s+DE\s+)?PER[ÍI]CIA\s+EXTERNA\s*(?:N[º°O.]|NÚMERO|NUMERO)?\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
+        r"(?is)N[º°O.]?\s*(?:DA\s+)?PER[ÍI]CIA\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
+        r"(?is)PER[ÍI]CIA\s*(?:N[º°O.]|NÚMERO|NUMERO)\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
+    ]
+    for padrao in padroes:
+        achado = re.search(padrao, bruto)
+        if achado:
+            numero = re.sub(r"\s+", "", achado.group(1)).strip("-/: ")
+            if numero:
+                return numero
+    return ""
+
+
+def _pericia_mensagem_principal(message: discord.Message) -> Tuple[bool, str, str]:
+    if not message or not getattr(message, "channel", None):
+        return False, "", ""
+    if int(getattr(message.channel, "id", 0) or 0) != int(PERICIA_FLUXO_CHANNEL_ID):
+        return False, "", ""
+    if isinstance(message.channel, discord.Thread):
+        return False, "", ""
+    if getattr(message, "type", None) != discord.MessageType.default:
+        return False, "", ""
+    texto = _pericia_texto_mensagem(message)
+    norm = normalizar_busca(texto) if "normalizar_busca" in globals() else texto.lower()
+    if "pericia externa" not in norm:
+        return False, "", texto
+    numero = _pericia_extrair_numero(texto)
+    if not numero:
+        return False, "", texto
+    # Não abre outro tópico para mensagens de continuação de anexos.
+    if "continuacao dos anexos" in norm or "continuação dos anexos" in texto.lower():
+        return False, numero, texto
+    return True, numero, texto
+
+
+def _pericia_nome_seguro(numero: Any) -> str:
+    texto = str(numero or "SEM-NUMERO").strip()
+    texto = re.sub(r"[^0-9A-Za-zÀ-ÿ._/-]+", "-", texto)
+    texto = texto.replace("/", "-")
+    return texto[:42] or "SEM-NUMERO"
+
+
+def _pericia_status_label(status: Any) -> str:
+    mapa = {
+        "AGUARDANDO_AGENTE": "🟡 Aguardando agente responsável",
+        "PENDENTE": "🟠 Tarefa pendente",
+        "AGUARDANDO_BO": "🔴 Aguardando criação e número do BO",
+        "CONCLUIDA_PEGO": "🟢 Concluída — indivíduo pego",
+        "CONCLUIDA_COM_BO": "🟢 Concluída — BO registrado",
+    }
+    return mapa.get(str(status or "").upper(), str(status or "Não informado"))
+
+
+def _pericia_titulo_topico(registro: Dict[str, Any]) -> str:
+    numero = _pericia_nome_seguro(registro.get("numero"))
+    status = str(registro.get("status") or "AGUARDANDO_AGENTE").upper()
+    if status == "AGUARDANDO_AGENTE":
+        return f"🔬 PERÍCIA Nº {numero} • AGUARDANDO AGENTE"[:100]
+    if status == "PENDENTE":
+        return f"🟠 PERÍCIA Nº {numero} • TAREFA PENDENTE"[:100]
+    if status == "AGUARDANDO_BO":
+        return f"🔴 PERÍCIA Nº {numero} • AGUARDANDO BO"[:100]
+    if status == "CONCLUIDA_PEGO":
+        return f"✅ PERÍCIA Nº {numero} • INDIVÍDUO PEGO"[:100]
+    if status == "CONCLUIDA_COM_BO":
+        bo = _pericia_nome_seguro(registro.get("bo_numero") or "INFORMADO")
+        return f"✅ PERÍCIA Nº {numero} • BO Nº {bo}"[:100]
+    return f"🔬 PERÍCIA Nº {numero}"[:100]
+
+
+def _pericia_embed_painel(registro: Dict[str, Any]) -> discord.Embed:
+    status = str(registro.get("status") or "AGUARDANDO_AGENTE").upper()
+    cores = {
+        "AGUARDANDO_AGENTE": discord.Color.gold(),
+        "PENDENTE": discord.Color.orange(),
+        "AGUARDANDO_BO": discord.Color.red(),
+        "CONCLUIDA_PEGO": discord.Color.green(),
+        "CONCLUIDA_COM_BO": discord.Color.green(),
+    }
+    responsavel_id = int(registro.get("agente_id") or 0)
+    responsavel = f"<@{responsavel_id}>" if responsavel_id else "Ainda não selecionado"
+    embed = discord.Embed(
+        title=f"🔬 CONTROLE DA PERÍCIA EXTERNA — Nº {registro.get('numero')}",
+        description=(
+            "Fluxo controlado da DICOR. O número é o mesmo que chegou na Perícia Externa e "
+            "não será reiniciado nem substituído pelo bot."
+        ),
+        color=cores.get(status, discord.Color.blurple()),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="📌 Status", value=_pericia_status_label(status), inline=False)
+    embed.add_field(name="👤 Agente responsável", value=responsavel, inline=True)
+    embed.add_field(
+        name="📎 Evidências copiadas",
+        value=str(int(registro.get("anexos_copiados") or 0)),
+        inline=True,
+    )
+    origem = str(registro.get("mensagem_original_url") or "")
+    if origem:
+        embed.add_field(name="🔗 Origem", value=f"[Abrir Perícia Externa]({origem})", inline=False)
+    if status == "AGUARDANDO_AGENTE":
+        instrucao = "Um **Inspetor+** deve selecionar abaixo o agente que ficará responsável pela resposta."
+    elif status == "PENDENTE":
+        instrucao = (
+            "O responsável deve registrar o resultado usando **Indivíduo pego** ou "
+            "**Indivíduo não pego**."
+        )
+    elif status == "AGUARDANDO_BO":
+        instrucao = (
+            "O responsável deve acessar o **e-mail da Polícia Federal**, abrir um Boletim de Ocorrência "
+            "e depois clicar em **Informar nº do BO**. A perícia não será concluída sem esse número."
+        )
+    elif status == "CONCLUIDA_PEGO":
+        instrucao = (
+            f"Indivíduo registrado como pego por <@{int(registro.get('resultado_por_id') or 0)}> "
+            f"em **{registro.get('concluida_em') or agora_br()}**."
+        )
+    else:
+        bo = registro.get("bo_numero") or "Não informado"
+        instrucao = (
+            f"Indivíduo não localizado. Boletim vinculado: **{bo}**. "
+            f"Conclusão registrada em **{registro.get('concluida_em') or agora_br()}**."
+        )
+    embed.add_field(name="🧭 Procedimento", value=instrucao, inline=False)
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Capital Morada do Valley")
+    return embed
+
+
+def _pericia_usuario_pode_responder(interaction: discord.Interaction, registro: Dict[str, Any]) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    if _membro_inspetor_mais(interaction.user):
+        return True
+    return int(registro.get("agente_id") or 0) == int(interaction.user.id)
+
+
+async def _pericia_obter_topico(registro: Dict[str, Any]) -> Optional[discord.Thread]:
+    tid = int(registro.get("topico_id") or registro.get("thread_id") or 0)
+    if not tid:
+        return None
+    canal = bot.get_channel(tid)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(tid)
+        except Exception:
+            canal = None
+    return canal if isinstance(canal, discord.Thread) else None
+
+
+async def _pericia_editar_mensagem_tarefa(registro: Dict[str, Any]) -> None:
+    try:
+        guild = bot.get_guild(int(registro.get("guild_id") or 0))
+        if guild is None:
+            return
+        canal = guild.get_channel(int(registro.get("canal_pai_id") or 0))
+        if canal is None:
+            canal = await bot.fetch_channel(int(registro.get("canal_pai_id") or 0))
+        mensagem_id = int(registro.get("mensagem_tarefa_id") or 0)
+        if not mensagem_id or not hasattr(canal, "fetch_message"):
+            return
+        msg = await canal.fetch_message(mensagem_id)
+        status = str(registro.get("status") or "").upper()
+        agente_id = int(registro.get("agente_id") or 0)
+        topico_id = int(registro.get("topico_id") or 0)
+        if status == "PENDENTE":
+            texto = (
+                f"📌 **TAREFA PENDENTE — PERÍCIA Nº {registro.get('numero')}**\n"
+                f"Responsável: <@{agente_id}>\n"
+                f"Atendimento: <#{topico_id}>\n"
+                "Registre no painel se o indivíduo foi pego ou não."
+            )
+        elif status == "AGUARDANDO_BO":
+            texto = (
+                f"📧 **TAREFA PENDENTE — CRIAR BO • PERÍCIA Nº {registro.get('numero')}**\n"
+                f"Responsável: <@{agente_id}>\n"
+                f"Atendimento: <#{topico_id}>\n"
+                "Acesse o e-mail da Polícia Federal, abra o boletim e informe o número no painel."
+            )
+        elif status in _PERICIA_STATUS_FINAIS:
+            complemento = (
+                "Indivíduo pego."
+                if status == "CONCLUIDA_PEGO"
+                else f"BO vinculado: **{registro.get('bo_numero') or 'informado'}**."
+            )
+            texto = (
+                f"✅ **TAREFA CONCLUÍDA — PERÍCIA Nº {registro.get('numero')}**\n"
+                f"Responsável: <@{agente_id}>\n"
+                f"Atendimento: <#{topico_id}>\n{complemento}"
+            )
+        else:
+            return
+        await msg.edit(
+            content=texto,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+async def _pericia_atualizar_painel(registro: Dict[str, Any]) -> None:
+    topico = await _pericia_obter_topico(registro)
+    if topico is None:
+        return
+    try:
+        if bool(getattr(topico, "archived", False)):
+            await topico.edit(archived=False)
+    except Exception:
+        pass
+    try:
+        await topico.edit(name=_pericia_titulo_topico(registro), reason="Atualização do fluxo da Perícia Externa")
+    except Exception:
+        traceback.print_exc()
+    painel_id = int(registro.get("painel_msg_id") or 0)
+    if painel_id:
+        try:
+            painel = await topico.fetch_message(painel_id)
+            await painel.edit(
+                embed=_pericia_embed_painel(registro),
+                view=PericiaAtendimentoView(registro),
+            )
+        except Exception:
+            traceback.print_exc()
+    await _pericia_editar_mensagem_tarefa(registro)
+
+
+class PericiaNumeroBoModal(Modal, title="Vincular Boletim de Ocorrência"):
+    numero_bo = TextInput(
+        label="Número do boletim",
+        placeholder="Ex.: 017 ou BO-DICOR-017",
+        required=True,
+        min_length=1,
+        max_length=40,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode informar o BO.", ephemeral=True
+            )
+        if str(registro.get("status") or "").upper() != "AGUARDANDO_BO":
+            return await interaction.response.send_message(
+                "⚠️ Esta perícia não está aguardando número de boletim.", ephemeral=True
+            )
+        bruto = str(self.numero_bo.value or "").strip()
+        digitos = re.sub(r"\D+", "", bruto)
+        if not digitos:
+            return await interaction.response.send_message(
+                "❌ Informe um número válido de boletim.", ephemeral=True
+            )
+        numero_bo = f"BO-DICOR-{int(digitos):03d}"
+        registro.update({
+            "status": "CONCLUIDA_COM_BO",
+            "bo_numero": numero_bo,
+            "bo_informado_por_id": interaction.user.id,
+            "bo_informado_por_nome": str(interaction.user),
+            "resultado_por_id": interaction.user.id,
+            "resultado_por_nome": str(interaction.user),
+            "concluida_em": agora_br(),
+        })
+        _pericia_atualizar(registro)
+        await interaction.response.send_message(
+            f"✅ Perícia Nº **{registro.get('numero')}** concluída com o boletim **{numero_bo}**.",
+            ephemeral=True,
+        )
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            await topico.send(
+                "✅ **PERÍCIA CONCLUÍDA COM BOLETIM**\n"
+                f"**Perícia:** Nº {registro.get('numero')}\n"
+                f"**Boletim vinculado:** {numero_bo}\n"
+                f"**Responsável:** <@{int(registro.get('agente_id') or 0)}>\n"
+                f"**Registrado por:** {interaction.user.mention}\n"
+                f"**Data:** {registro.get('concluida_em')}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        await _pericia_atualizar_painel(registro)
+        if topico:
+            await asyncio.sleep(3)
+            try:
+                await topico.edit(archived=True, locked=True, reason="Perícia concluída com número de BO")
+            except Exception:
+                traceback.print_exc()
+        await enviar_log(
+            f"✅ Perícia `{registro.get('numero')}` concluída com `{numero_bo}` por "
+            f"{interaction.user.mention} (`{interaction.user.id}`)."
+        )
+
+
+class PericiaSelecionarAgente(discord.ui.UserSelect):
+    def __init__(self, desabilitado: bool = False):
+        super().__init__(
+            placeholder="Inspetor+: selecione o agente responsável",
+            min_values=1,
+            max_values=1,
+            custom_id="dicor_pericia_selecionar_agente_v1",
+            row=0,
+            disabled=desabilitado,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas Inspetor+ pode escolher o responsável pela perícia.", ephemeral=True
+            )
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if str(registro.get("status") or "").upper() in _PERICIA_STATUS_FINAIS:
+            return await interaction.response.send_message("⚠️ Esta perícia já foi concluída.", ephemeral=True)
+        escolhido = self.values[0] if self.values else None
+        if interaction.guild and not isinstance(escolhido, discord.Member):
+            try:
+                escolhido = interaction.guild.get_member(int(escolhido.id)) or await interaction.guild.fetch_member(int(escolhido.id))
+            except Exception:
+                escolhido = None
+        if not isinstance(escolhido, discord.Member) or escolhido.bot:
+            return await interaction.response.send_message("❌ Selecione um agente válido.", ephemeral=True)
+        if not usuario_tem_equipe(escolhido) and not _membro_inspetor_mais(escolhido):
+            return await interaction.response.send_message(
+                "❌ O membro selecionado não possui cargo da equipe DICOR.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        registro.update({
+            "agente_id": escolhido.id,
+            "agente_nome": str(escolhido),
+            "agente_escolhido_por_id": interaction.user.id,
+            "agente_escolhido_por_nome": str(interaction.user),
+            "agente_escolhido_em": agora_br(),
+            "status": "AGUARDANDO_BO" if str(registro.get("status") or "").upper() == "AGUARDANDO_BO" else "PENDENTE",
+        })
+        _pericia_atualizar(registro)
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            try:
+                await topico.add_user(escolhido)
+            except Exception:
+                traceback.print_exc()
+            await topico.send(
+                f"{escolhido.mention}\n"
+                f"📌 **TAREFA PENDENTE — PERÍCIA Nº {registro.get('numero')}**\n"
+                "Você foi definido como responsável. Analise a perícia e responda pelo painel abaixo.",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        try:
+            canal_pai = interaction.guild.get_channel(int(registro.get("canal_pai_id") or 0))
+            if canal_pai is None:
+                canal_pai = await bot.fetch_channel(int(registro.get("canal_pai_id") or 0))
+            mensagem_tarefa = None
+            mid = int(registro.get("mensagem_tarefa_id") or 0)
+            if mid and hasattr(canal_pai, "fetch_message"):
+                try:
+                    mensagem_tarefa = await canal_pai.fetch_message(mid)
+                except Exception:
+                    mensagem_tarefa = None
+            if mensagem_tarefa is None:
+                mensagem_tarefa = await canal_pai.send(
+                    f"📌 **TAREFA PENDENTE — PERÍCIA Nº {registro.get('numero')}**\n"
+                    f"Responsável: {escolhido.mention}\n"
+                    f"Atendimento: <#{int(registro.get('topico_id') or 0)}>",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+                registro["mensagem_tarefa_id"] = mensagem_tarefa.id
+                _pericia_atualizar(registro)
+        except Exception:
+            traceback.print_exc()
+        await _pericia_atualizar_painel(registro)
+        await interaction.followup.send(
+            f"✅ {escolhido.mention} foi definido como responsável pela Perícia Nº **{registro.get('numero')}**.",
+            ephemeral=True,
+        )
+        await enviar_log(
+            f"👤 Responsável da Perícia `{registro.get('numero')}` definido: "
+            f"{escolhido.mention} (`{escolhido.id}`) por {interaction.user.mention}."
+        )
+
+
+class PericiaAtendimentoView(View):
+    def __init__(self, registro: Optional[Dict[str, Any]] = None):
+        super().__init__(timeout=None)
+        registro = registro or {}
+        status = str(registro.get("status") or "PENDENTE").upper()
+        final = status in _PERICIA_STATUS_FINAIS
+        agente_definido = bool(int(registro.get("agente_id") or 0))
+        self.add_item(PericiaSelecionarAgente(desabilitado=final))
+        self.pego.disabled = final or not agente_definido or status == "AGUARDANDO_BO"
+        self.nao_pego.disabled = final or not agente_definido or status == "AGUARDANDO_BO"
+        self.informar_bo.disabled = final or status != "AGUARDANDO_BO"
+
+    @discord.ui.button(
+        label="Indivíduo pego",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="dicor_pericia_individuo_pego_v1",
+        row=1,
+    )
+    async def pego(self, interaction: discord.Interaction, button: Button):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode responder esta perícia.", ephemeral=True
+            )
+        if not registro.get("agente_id"):
+            return await interaction.response.send_message("⚠️ Escolha primeiro o agente responsável.", ephemeral=True)
+        if str(registro.get("status") or "").upper() in _PERICIA_STATUS_FINAIS:
+            return await interaction.response.send_message("⚠️ Esta perícia já foi concluída.", ephemeral=True)
+        registro.update({
+            "status": "CONCLUIDA_PEGO",
+            "resultado": "INDIVIDUO_PEGO",
+            "resultado_por_id": interaction.user.id,
+            "resultado_por_nome": str(interaction.user),
+            "concluida_em": agora_br(),
+        })
+        _pericia_atualizar(registro)
+        await interaction.response.send_message(
+            f"✅ Perícia Nº **{registro.get('numero')}** concluída como **indivíduo pego**.",
+            ephemeral=True,
+        )
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            await topico.send(
+                "✅ **PERÍCIA CONCLUÍDA — INDIVÍDUO PEGO**\n"
+                f"**Perícia:** Nº {registro.get('numero')}\n"
+                f"**Responsável:** <@{int(registro.get('agente_id') or 0)}>\n"
+                f"**Resposta registrada por:** {interaction.user.mention}\n"
+                f"**Data:** {registro.get('concluida_em')}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        await _pericia_atualizar_painel(registro)
+        if topico:
+            await asyncio.sleep(3)
+            try:
+                await topico.edit(archived=True, locked=True, reason="Perícia concluída: indivíduo pego")
+            except Exception:
+                traceback.print_exc()
+        await enviar_log(
+            f"✅ Perícia `{registro.get('numero')}` concluída como indivíduo pego por "
+            f"{interaction.user.mention} (`{interaction.user.id}`)."
+        )
+
+    @discord.ui.button(
+        label="Indivíduo não pego",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        custom_id="dicor_pericia_individuo_nao_pego_v1",
+        row=1,
+    )
+    async def nao_pego(self, interaction: discord.Interaction, button: Button):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode responder esta perícia.", ephemeral=True
+            )
+        if not registro.get("agente_id"):
+            return await interaction.response.send_message("⚠️ Escolha primeiro o agente responsável.", ephemeral=True)
+        if str(registro.get("status") or "").upper() in _PERICIA_STATUS_FINAIS:
+            return await interaction.response.send_message("⚠️ Esta perícia já foi concluída.", ephemeral=True)
+        registro.update({
+            "status": "AGUARDANDO_BO",
+            "resultado": "INDIVIDUO_NAO_PEGO",
+            "nao_pego_registrado_por_id": interaction.user.id,
+            "nao_pego_registrado_por_nome": str(interaction.user),
+            "nao_pego_registrado_em": agora_br(),
+        })
+        _pericia_atualizar(registro)
+        await interaction.response.send_message(
+            "📧 Resultado registrado. Agora abra um boletim no **e-mail da Polícia Federal** e informe o número no painel.",
+            ephemeral=True,
+        )
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            await topico.send(
+                f"<@{int(registro.get('agente_id') or 0)}>\n"
+                f"📧 **NOVA TAREFA — CRIAR BO PARA A PERÍCIA Nº {registro.get('numero')}**\n"
+                "O indivíduo não foi localizado. Acesse o **e-mail da Polícia Federal**, abra o Boletim de Ocorrência "
+                "e depois clique em **Informar nº do BO**.\n"
+                "⚠️ Esta perícia **não será finalizada** enquanto o número do boletim não for registrado.",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        await _pericia_atualizar_painel(registro)
+        await enviar_log(
+            f"📧 Perícia `{registro.get('numero')}` aguardando BO; responsável "
+            f"`{registro.get('agente_id')}`; resultado informado por `{interaction.user.id}`."
+        )
+
+    @discord.ui.button(
+        label="Informar nº do BO",
+        emoji="📝",
+        style=discord.ButtonStyle.primary,
+        custom_id="dicor_pericia_informar_bo_v1",
+        row=1,
+    )
+    async def informar_bo(self, interaction: discord.Interaction, button: Button):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode informar o BO.", ephemeral=True
+            )
+        if str(registro.get("status") or "").upper() != "AGUARDANDO_BO":
+            return await interaction.response.send_message(
+                "⚠️ Primeiro registre que o indivíduo não foi pego.", ephemeral=True
+            )
+        await interaction.response.send_modal(PericiaNumeroBoModal())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ Ocorreu um erro ao processar a perícia.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Ocorreu um erro ao processar a perícia.", ephemeral=True)
+        except Exception:
+            pass
+
+
+async def _pericia_membros_inspetor_mais(guild: discord.Guild) -> List[discord.Member]:
+    membros: Dict[int, discord.Member] = {}
+    for membro in list(getattr(guild, "members", []) or []):
+        if membro.bot:
+            continue
+        try:
+            if _membro_inspetor_mais(membro):
+                membros[membro.id] = membro
+        except Exception:
+            continue
+    return list(membros.values())
+
+
+async def _pericia_criar_topico(message: discord.Message, numero: str) -> Tuple[discord.Thread, bool]:
+    canal = message.channel
+    if not isinstance(canal, discord.TextChannel):
+        raise RuntimeError("O canal de Perícia Externa precisa ser um canal de texto.")
+    titulo = f"🔬 PERÍCIA Nº {_pericia_nome_seguro(numero)} • AGUARDANDO AGENTE"[:100]
+    privado = True
+    try:
+        if "_configurar_canal_pai_para_topicos_privados" in globals():
+            await _configurar_canal_pai_para_topicos_privados(canal, None)
+        try:
+            topico = await canal.create_thread(
+                name=titulo,
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=10080,
+                reason=f"Atendimento controlado da Perícia Externa Nº {numero}",
+            )
+        except discord.HTTPException:
+            topico = await canal.create_thread(
+                name=titulo,
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=1440,
+                reason=f"Atendimento controlado da Perícia Externa Nº {numero}",
+            )
+    except Exception:
+        privado = False
+        try:
+            topico = await message.create_thread(
+                name=titulo,
+                auto_archive_duration=10080,
+                reason=f"Atendimento da Perícia Externa Nº {numero}",
+            )
+        except discord.HTTPException:
+            topico = await message.create_thread(
+                name=titulo,
+                auto_archive_duration=1440,
+                reason=f"Atendimento da Perícia Externa Nº {numero}",
+            )
+    if privado:
+        for admin in await _pericia_membros_inspetor_mais(message.guild):
+            try:
+                await topico.add_user(admin)
+            except Exception:
+                pass
+    return topico, privado
+
+
+async def _pericia_mensagens_publicacao(message: discord.Message, numero: str) -> List[discord.Message]:
+    await asyncio.sleep(2.5)
+    encontrados: Dict[int, discord.Message] = {int(message.id): message}
+    # A publicação dos relatórios novos registra todos os IDs dos lotes.
+    try:
+        for registro in carregar_relatorios_operacionais():
+            if str(registro.get("tipo") or "") != "pericia_externa":
+                continue
+            ids = [int(x) for x in (registro.get("mensagens_ids") or []) if str(x).isdigit()]
+            mesmo_id = int(message.id) == int(registro.get("id") or 0) or int(message.id) in ids
+            mesmo_numero = _pericia_numero_chave(registro.get("numero")) == _pericia_numero_chave(numero)
+            if not (mesmo_id or mesmo_numero):
+                continue
+            for mid in ids:
+                try:
+                    msg = await message.channel.fetch_message(mid)
+                    encontrados[int(msg.id)] = msg
+                except Exception:
+                    pass
+            break
+    except Exception:
+        traceback.print_exc()
+    # Fallback para anexos enviados em mensagens de continuação logo após o relatório.
+    try:
+        async for msg in message.channel.history(limit=30, after=message.created_at, oldest_first=True):
+            if int(msg.id) == int(message.id):
+                continue
+            principal, outro_numero, texto = _pericia_mensagem_principal(msg)
+            if principal and _pericia_numero_chave(outro_numero) != _pericia_numero_chave(numero):
+                break
+            if not msg.attachments:
+                continue
+            norm = normalizar_busca(texto) if "normalizar_busca" in globals() else texto.lower()
+            relacionado = (
+                _pericia_numero_chave(numero) in _pericia_numero_chave(texto)
+                or "continuacao dos anexos" in norm
+                or "anexos do relatorio" in norm
+            )
+            if relacionado:
+                encontrados[int(msg.id)] = msg
+    except Exception:
+        traceback.print_exc()
+    return [encontrados[k] for k in sorted(encontrados)]
+
+
+async def _pericia_copiar_anexos_para_topico(
+    mensagens: List[discord.Message],
+    topico: discord.Thread,
+    numero: str,
+    ignorar_mensagem_id: int = 0,
+) -> Tuple[int, List[int]]:
+    mensagens_filtradas = [m for m in mensagens if int(m.id) != int(ignorar_mensagem_id or 0)]
+    if not mensagens_filtradas:
+        return 0, []
+    ids_origem = [int(m.id) for m in mensagens_filtradas]
+    enviados = 0
+    with _pericia_tempfile.TemporaryDirectory(prefix="dicor-pericia-") as tmp:
+        pasta = Path(tmp)
+        caminhos = await arquivos_para_reenvio_de_mensagens(
+            mensagens_filtradas,
+            pasta,
+            f"pericia-{_pericia_nome_seguro(numero)}",
+        )
+        if caminhos:
+            enviados += await enviar_arquivos_em_lotes(
+                topico,
+                caminhos,
+                legenda=f"📎 Evidências da Perícia Nº {numero}",
+            )
+    return enviados, ids_origem
+
+
+async def _pericia_criar_atendimento(message: discord.Message, numero: str, texto: str) -> Optional[Dict[str, Any]]:
+    async with _PERICIA_LOCK:
+        existente_msg = _pericia_por_mensagem(message.id)
+        if existente_msg:
+            return existente_msg
+        existente_num = _pericia_por_numero(numero)
+        if existente_num:
+            topico_existente = await _pericia_obter_topico(existente_num)
+            if topico_existente:
+                mensagens = await _pericia_mensagens_publicacao(message, numero)
+                existentes_ids = {int(x) for x in (existente_num.get("mensagens_origem_ids") or []) if str(x).isdigit()}
+                mensagens_novas = [m for m in mensagens if int(m.id) not in existentes_ids]
+                enviados, ids = await _pericia_copiar_anexos_para_topico(mensagens_novas, topico_existente, numero)
+                existentes_ids.update(ids)
+                existente_num["mensagens_origem_ids"] = sorted(existentes_ids)
+                existente_num["anexos_copiados"] = int(existente_num.get("anexos_copiados") or 0) + enviados
+                _pericia_atualizar(existente_num)
+                await _pericia_atualizar_painel(existente_num)
+            return existente_num
+
+        topico, privado = await _pericia_criar_topico(message, numero)
+        registro: Dict[str, Any] = {
+            "id": f"PERICIA-{message.id}",
+            "numero": numero,
+            "numero_chave": _pericia_numero_chave(numero),
+            "mensagem_original_id": message.id,
+            "mensagem_original_url": message.jump_url,
+            "mensagens_origem_ids": [message.id],
+            "canal_pai_id": message.channel.id,
+            "guild_id": message.guild.id if message.guild else 0,
+            "topico_id": topico.id,
+            "thread_id": topico.id,
+            "topico_privado": privado,
+            "status": "AGUARDANDO_AGENTE",
+            "agente_id": None,
+            "painel_msg_id": None,
+            "mensagem_tarefa_id": None,
+            "anexos_copiados": 0,
+            "criada_em": agora_br(),
+        }
+        _pericia_atualizar(registro)
+
+        mencoes_admin = mencoes_inspetor_mais(message.guild) if message.guild else ""
+        abertura = discord.Embed(
+            title=f"🔬 PERÍCIA EXTERNA RECEBIDA — Nº {numero}",
+            description=(
+                "A perícia foi encaminhada para controle operacional da DICOR. "
+                "Todo o material original foi copiado abaixo."
+            ),
+            color=discord.Color.dark_blue(),
+        )
+        abertura.add_field(name="📄 Número oficial", value=str(numero), inline=True)
+        abertura.add_field(name="🔒 Atendimento", value="Privado" if privado else "Público", inline=True)
+        abertura.add_field(name="🔗 Mensagem original", value=f"[Abrir Perícia Externa]({message.jump_url})", inline=False)
+        await topico.send(
+            content=mencoes_admin or None,
+            embed=abertura,
+            allowed_mentions=discord.AllowedMentions(roles=True, users=True, everyone=False),
+        )
+
+        texto_limpo = str(texto or "").strip()
+        if texto_limpo:
+            partes = [texto_limpo[i:i + 1850] for i in range(0, len(texto_limpo), 1850)]
+            for indice, parte in enumerate(partes):
+                titulo = "📄 Conteúdo da perícia" if indice == 0 else "📄 Continuação da perícia"
+                await topico.send(f"**{titulo}**\n{parte}")
+
+        mensagens = await _pericia_mensagens_publicacao(message, numero)
+        enviados, ids = await _pericia_copiar_anexos_para_topico(mensagens, topico, numero)
+        registro["mensagens_origem_ids"] = sorted(set(ids + [message.id]))
+        registro["anexos_copiados"] = enviados
+
+        painel = await topico.send(
+            embed=_pericia_embed_painel(registro),
+            view=PericiaAtendimentoView(registro),
+        )
+        registro["painel_msg_id"] = painel.id
+        _pericia_atualizar(registro)
+
+        try:
+            aviso = await message.channel.send(
+                f"🔬 Atendimento criado para **Perícia Nº {numero}**: {topico.mention}\n"
+                "Aguardando um **Inspetor+** selecionar o agente responsável.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            registro["mensagem_abertura_id"] = aviso.id
+            _pericia_atualizar(registro)
+        except Exception:
+            traceback.print_exc()
+
+        await enviar_log(
+            f"🔬 Atendimento da Perícia Externa `{numero}` criado no tópico `{topico.id}` | "
+            f"mensagem original `{message.id}` | anexos `{enviados}`."
+        )
+        return registro
+
+
+@bot.listen("on_message")
+async def pericia_externa_fluxo_automatico(message: discord.Message):
+    try:
+        principal, numero, texto = _pericia_mensagem_principal(message)
+        if not principal:
+            return
+        if int(message.id) in _PERICIA_PROCESSANDO:
+            return
+        _PERICIA_PROCESSANDO.add(int(message.id))
+        await _pericia_criar_atendimento(message, numero, texto)
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f"❌ Falha ao criar atendimento da Perícia Externa na mensagem "
+            f"`{getattr(message, 'id', 0)}`: {type(erro).__name__}: {erro}"
+        )
+    finally:
+        _PERICIA_PROCESSANDO.discard(int(getattr(message, "id", 0) or 0))
+
+
+async def _bo_mensagens_anexos_complementares(message: discord.Message) -> List[discord.Message]:
+    relacionados: List[discord.Message] = []
+    numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(message))
+    try:
+        async for msg in message.channel.history(limit=30, after=message.created_at, oldest_first=True):
+            if eh_boletim_valido_para_atendimento(msg):
+                break
+            if not msg.attachments:
+                continue
+            texto = _pericia_texto_mensagem(msg)
+            norm = normalizar_busca(texto) if "normalizar_busca" in globals() else texto.lower()
+            referenciado = bool(
+                getattr(getattr(msg, "reference", None), "message_id", None) == message.id
+            )
+            mesmo_numero = bool(numero and _pericia_numero_chave(numero) in _pericia_numero_chave(texto))
+            prova_generica = any(x in norm for x in ("provas", "anexos do boletim", "fotos do boletim"))
+            if referenciado or mesmo_numero or prova_generica:
+                relacionados.append(msg)
+    except Exception:
+        traceback.print_exc()
+    return relacionados
+
+
+async def _bo_copiar_anexos_complementares(
+    message: discord.Message,
+    atendimento: Dict[str, Any],
+) -> None:
+    await asyncio.sleep(2.0)
+    extras = await _bo_mensagens_anexos_complementares(message)
+    if not extras:
+        return
+    topico_id = int(atendimento.get("thread_id") or atendimento.get("area_id") or 0)
+    topico = bot.get_channel(topico_id)
+    if topico is None:
+        try:
+            topico = await bot.fetch_channel(topico_id)
+        except Exception:
+            topico = None
+    if not isinstance(topico, discord.Thread):
+        return
+    with _pericia_tempfile.TemporaryDirectory(prefix="dicor-bo-extra-") as tmp:
+        caminhos = await arquivos_para_reenvio_de_mensagens(
+            extras,
+            Path(tmp),
+            f"bo-{numero_curto_boletim(atendimento.get('numero'))}",
+        )
+        if not caminhos:
+            return
+        enviados = await enviar_arquivos_em_lotes(
+            topico,
+            caminhos,
+            legenda=f"📎 Fotos e anexos complementares do BO Nº {numero_curto_boletim(atendimento.get('numero'))}",
+        )
+    atendimento["anexos_complementares_copiados"] = int(atendimento.get("anexos_complementares_copiados") or 0) + enviados
+    ids = {int(x) for x in (atendimento.get("mensagens_anexos_complementares_ids") or []) if str(x).isdigit()}
+    ids.update(int(m.id) for m in extras)
+    atendimento["mensagens_anexos_complementares_ids"] = sorted(ids)
+    atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+
+
+async def criar_area_atendimento_boletim(message: discord.Message) -> Optional[Dict[str, Any]]:
+    atendimento = await _PERICIA_BO_CRIAR_AREA_ANTERIOR(message)
+    if atendimento:
+        asyncio.create_task(
+            _bo_copiar_anexos_complementares(message, atendimento),
+            name=f"bo-anexos-complementares-{message.id}",
+        )
+    return atendimento
+
+
+@bot.event
+async def on_ready():
+    await _PERICIA_ON_READY_ANTERIOR()
+    try:
+        bot.add_view(PericiaAtendimentoView())
+        print(
+            f"✅ Fluxo controlado da Perícia Externa ativo no canal {PERICIA_FLUXO_CHANNEL_ID}: "
+            "número original, escolha por Inspetor+, tarefa, resultado e BO obrigatório.",
+            flush=True,
+        )
+    except Exception as erro:
+        print(f"⚠️ Falha ao registrar o painel persistente da Perícia: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ Perícia Externa controlada carregada: tópico privado, responsável por Inspetor+, "
+    "Indivíduo pego/não pego, BO obrigatório e cópia completa de anexos.",
     flush=True,
 )
 
