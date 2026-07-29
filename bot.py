@@ -44180,5 +44180,539 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# PATCH FINAL — RECONHECIMENTO AUTOMÁTICO DE RG + PERFIL CRIMINAL
+# - Sem painel administrativo, comando ou lista manual.
+# - Reconhece automaticamente RGs de fichas em texto, embeds e encaminhamentos.
+# - Mostra a ficha completa no local da mensagem.
+# - Usa exclusivamente o catálogo CRIMES_RP já existente no bot.
+# - Consolida reincidência por registros de prisão, BO e procurados vinculados ao RG.
+# =====================================================
+
+from collections import Counter as _rg_auto_Counter
+from typing import Iterable
+
+_RG_AUTO_DELETE_AFTER = 90
+_RG_AUTO_MAX_POR_MENSAGEM = 4
+_RG_AUTO_SNAPSHOT_FLAG = 1 << 14
+_RG_AUTO_PROCESSANDO: set[int] = set()
+_RG_AUTO_INDEX_CACHE: Dict[str, Any] = {"em": 0.0, "dados": {}}
+_RG_AUTO_PERFIL_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_RG_AUTO_CARREGAR_FICHA_ANTES = _banco_ficha_geral_carregar
+_RG_AUTO_EMBED_FICHA_ANTES = _banco_embed_ficha_geral
+
+
+def _rg_auto_inicializar() -> None:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS rg_aparicoes_automaticas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                individuo_id INTEGER NOT NULL,
+                rg TEXT NOT NULL,
+                mensagem_id INTEGER NOT NULL,
+                canal_id INTEGER NOT NULL,
+                guild_id INTEGER DEFAULT 0,
+                mensagem_url TEXT DEFAULT '',
+                resposta_id INTEGER DEFAULT 0,
+                detectado_em TEXT NOT NULL,
+                UNIQUE(mensagem_id, rg),
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_rg_aparicoes_individuo
+                ON rg_aparicoes_automaticas(individuo_id, detectado_em DESC);
+            """
+        )
+
+
+def _rg_auto_indice_sync(forcar: bool = False) -> Dict[str, Dict[str, Any]]:
+    agora = time.monotonic()
+    cache = dict(_RG_AUTO_INDEX_CACHE.get("dados") or {})
+    if cache and not forcar and (agora - float(_RG_AUTO_INDEX_CACHE.get("em") or 0.0)) < 30:
+        return cache
+    _rg_auto_inicializar()
+    indice: Dict[str, Dict[str, Any]] = {}
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM individuos
+            WHERE UPPER(COALESCE(status,'')) <> 'ARQUIVADO'
+            ORDER BY atualizado_em DESC
+            """
+        ).fetchall()
+        for row in rows:
+            dados = dict(row)
+            rg_n = _banco_normalizar_rg(dados.get("rg"))
+            if rg_n:
+                indice[rg_n] = dados
+        try:
+            aliases = db.execute(
+                """
+                SELECT a.valor, i.*
+                FROM identificadores_ficha a
+                JOIN individuos i ON i.id=a.individuo_id
+                WHERE UPPER(COALESCE(i.status,'')) <> 'ARQUIVADO'
+                """
+            ).fetchall()
+            for row in aliases:
+                dados = dict(row)
+                alias_n = _banco_normalizar_rg(dados.get("valor"))
+                if alias_n:
+                    indice.setdefault(alias_n, dados)
+        except sqlite3.OperationalError:
+            pass
+    _RG_AUTO_INDEX_CACHE["em"] = agora
+    _RG_AUTO_INDEX_CACHE["dados"] = indice
+    return indice
+
+
+def _rg_auto_normalizar_texto(valor: Any) -> str:
+    texto = unicodedata.normalize("NFKD", str(valor or "").lower())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _rg_auto_crime_catalogo() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    por_artigo: Dict[str, Dict[str, Any]] = {}
+    por_nome: Dict[str, str] = {}
+    for crime in list(globals().get("CRIMES_RP") or []):
+        artigo = str(crime.get("artigo") or "").strip()
+        nome = str(crime.get("nome") or "").strip()
+        if not artigo or not nome:
+            continue
+        por_artigo[artigo] = dict(crime)
+        por_nome[_rg_auto_normalizar_texto(nome)] = artigo
+    return por_artigo, por_nome
+
+
+def _rg_auto_crimes_no_texto(texto: Any, artigos_diretos: Optional[Iterable[Any]] = None) -> set[str]:
+    bruto = str(texto or "")
+    normal = _rg_auto_normalizar_texto(bruto)
+    por_artigo, por_nome = _rg_auto_crime_catalogo()
+    encontrados: set[str] = set()
+
+    for artigo in list(artigos_diretos or []):
+        artigo_n = str(artigo or "").strip().replace("Art.", "").replace("art.", "").strip()
+        if artigo_n in por_artigo:
+            encontrados.add(artigo_n)
+
+    for artigo, crime in por_artigo.items():
+        if re.search(rf"(?<![0-9.])(?:art\.?\s*)?{re.escape(artigo)}(?![0-9.])", bruto, re.IGNORECASE):
+            encontrados.add(artigo)
+            continue
+        nome_n = _rg_auto_normalizar_texto(crime.get("nome"))
+        if len(nome_n) >= 5 and re.search(rf"(?<!\w){re.escape(nome_n)}(?!\w)", normal):
+            encontrados.add(artigo)
+
+    # Sinônimos mínimos e seguros para nomes já existentes em CRIMES_RP.
+    aliases = {
+        "11.1": (r"\btentativa de fuga\b", r"\bfuga policial\b", r"\bfuga de abordagem\b", r"\bfuga\b"),
+        "6.4": (r"\btrafico de drogas\b",),
+        "8.3": (r"\bformacao de quadrilha\b",),
+        "8.4": (r"\bassociacao criminosa\b",),
+        "14.2": (r"\bresistencia a prisao\b",),
+    }
+    for artigo, padroes in aliases.items():
+        if artigo in por_artigo and any(re.search(p, normal) for p in padroes):
+            encontrados.add(artigo)
+    return encontrados
+
+
+def _rg_auto_dict_rg_corresponde(registro: Dict[str, Any], rg: str) -> bool:
+    alvo = _banco_normalizar_rg(rg)
+    if not alvo:
+        return False
+    chaves = {
+        "rg", "rg_texto", "registro", "registro_geral", "passaporte", "documento",
+        "documento_numero", "proprietario_rg", "individuo_rg", "suspeito_rg",
+    }
+    for chave, valor in registro.items():
+        chave_n = _rg_auto_normalizar_texto(chave).replace(" ", "_")
+        if chave_n in chaves and _banco_normalizar_rg(valor) == alvo:
+            return True
+    return False
+
+
+def _rg_auto_textos_criminais_dict(registro: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    textos: List[str] = []
+    artigos: List[str] = []
+    for chave, valor in registro.items():
+        chave_n = _rg_auto_normalizar_texto(chave)
+        if chave_n in {"crimes artigos", "crimes_artigos", "artigos", "artigos crimes"}:
+            if isinstance(valor, (list, tuple, set)):
+                artigos.extend(str(x) for x in valor)
+            elif valor:
+                artigos.extend(re.findall(r"\d+(?:\.\d+)+", str(valor)))
+        if any(token in chave_n for token in ("crime", "infracao", "infracoes", "motivo da prisao", "motivo_prisao")):
+            if isinstance(valor, (str, int, float)):
+                textos.append(str(valor))
+            elif isinstance(valor, (list, tuple, set)):
+                textos.extend(str(x) for x in valor)
+    return textos, artigos
+
+
+def _rg_auto_eventos_json(no: Any, rg: str, prefixo: str = "raiz") -> Iterable[Tuple[str, set[str]]]:
+    if isinstance(no, dict):
+        if _rg_auto_dict_rg_corresponde(no, rg):
+            textos, artigos = _rg_auto_textos_criminais_dict(no)
+            crimes = _rg_auto_crimes_no_texto("\n".join(textos), artigos)
+            if crimes:
+                chave = str(
+                    no.get("mensagem_id") or no.get("message_id") or no.get("id") or
+                    no.get("caso") or no.get("numero") or no.get("numero_boletim") or prefixo
+                )
+                yield chave, crimes
+        for chave, valor in no.items():
+            if isinstance(valor, (dict, list, tuple)):
+                yield from _rg_auto_eventos_json(valor, rg, f"{prefixo}.{chave}")
+    elif isinstance(no, (list, tuple)):
+        for indice, valor in enumerate(no):
+            yield from _rg_auto_eventos_json(valor, rg, f"{prefixo}[{indice}]")
+
+
+def _rg_auto_perfil_criminal_sync(individuo: Dict[str, Any]) -> Dict[str, Any]:
+    individuo_id = int(individuo.get("id") or 0)
+    rg = _banco_normalizar_rg(individuo.get("rg"))
+    if not individuo_id or not rg:
+        return {"contagens": [], "fontes": 0}
+    agora_m = time.monotonic()
+    cache = _RG_AUTO_PERFIL_CACHE.get(individuo_id)
+    if cache and (agora_m - cache[0]) < 15:
+        return dict(cache[1])
+
+    contagem: _rg_auto_Counter[str] = _rg_auto_Counter()
+    eventos_vistos: set[Tuple[str, str]] = set()
+
+    def adicionar(fonte: str, chave: str, crimes: Iterable[str]) -> None:
+        for artigo in set(str(x) for x in crimes if x):
+            evento = (f"{fonte}:{chave}", artigo)
+            if evento in eventos_vistos:
+                continue
+            eventos_vistos.add(evento)
+            contagem[artigo] += 1
+
+    _rg_auto_inicializar()
+    with _banco_conexao() as db:
+        try:
+            prisoes = db.execute(
+                "SELECT mensagem_id, texto_original FROM historico_prisoes WHERE individuo_id=?",
+                (individuo_id,),
+            ).fetchall()
+            for prisao in prisoes:
+                adicionar("prisao", str(prisao["mensagem_id"]), _rg_auto_crimes_no_texto(prisao["texto_original"]))
+        except sqlite3.OperationalError:
+            pass
+
+    arquivos_json = [
+        ("procurado", globals().get("CATALOGO_JSON")),
+        ("boletim", globals().get("BOLETIM_ATENDIMENTOS_JSON")),
+        ("boletim", globals().get("BOLETINS_JSON")),
+        ("procurado_pendente", globals().get("PROCURADOS_PENDENTES_JSON")),
+    ]
+    for fonte, caminho in arquivos_json:
+        if not caminho:
+            continue
+        try:
+            dados = carregar_json(Path(caminho), [] if fonte != "procurado_pendente" else {})
+            for chave, crimes in _rg_auto_eventos_json(dados, rg, fonte):
+                adicionar(fonte, chave, crimes)
+        except Exception:
+            continue
+
+    # Observações antigas são usadas apenas como fallback, evitando contar duas vezes
+    # um crime que já existe em prisão, boletim ou procurado estruturado.
+    if not eventos_vistos:
+        crimes_observacao = _rg_auto_crimes_no_texto(individuo.get("observacoes"))
+        if crimes_observacao:
+            adicionar("ficha", str(individuo_id), crimes_observacao)
+
+    por_artigo, _ = _rg_auto_crime_catalogo()
+    linhas: List[Dict[str, Any]] = []
+    for artigo, quantidade in sorted(
+        contagem.items(),
+        key=lambda item: (-int(item[1]), str(por_artigo.get(item[0], {}).get("nome") or item[0])),
+    ):
+        crime = por_artigo.get(artigo)
+        if not crime:
+            continue
+        linhas.append({
+            "artigo": artigo,
+            "nome": str(crime.get("nome") or artigo),
+            "quantidade": int(quantidade),
+        })
+    resultado = {"contagens": linhas[:12], "fontes": len({x[0] for x in eventos_vistos})}
+    _RG_AUTO_PERFIL_CACHE[individuo_id] = (agora_m, resultado)
+    return dict(resultado)
+
+
+def _rg_auto_nome_resumido_crime(artigo: str, nome: str) -> str:
+    if artigo == "11.1":
+        return "fuga"
+    return str(nome or "crime").strip().lower()
+
+
+def _rg_auto_frase_crime(item: Dict[str, Any]) -> str:
+    quantidade = int(item.get("quantidade") or 0)
+    nome = _rg_auto_nome_resumido_crime(str(item.get("artigo") or ""), str(item.get("nome") or ""))
+    if quantidade >= 5:
+        frase = f"Apresenta alta recorrência em {nome}"
+    elif quantidade >= 3:
+        frase = f"Comete bastante {nome}"
+    elif quantidade == 2:
+        frase = f"Comete {nome} de forma recorrente"
+    else:
+        frase = f"Possui registro de {nome}"
+    sufixo = "registro confirmado" if quantidade == 1 else "registros confirmados"
+    return f"• {frase} — **{quantidade} {sufixo}**"
+
+
+def _rg_auto_texto_perfil_criminal(perfil_criminal: Dict[str, Any]) -> str:
+    contagens = list(perfil_criminal.get("contagens") or [])
+    if not contagens:
+        return "Nenhuma recorrência criminal foi identificada nos registros vinculados a este RG."
+    linhas = [_rg_auto_frase_crime(item) for item in contagens[:6]]
+    if len(contagens) > 6:
+        linhas.append(f"• +{len(contagens) - 6} crime(s) registrado(s) no histórico")
+    return "\n".join(linhas)[:1024]
+
+
+def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
+    perfil = dict(_RG_AUTO_CARREGAR_FICHA_ANTES(tipo, registro_id) or {})
+    individuo = dict(perfil.get("individuo") or {})
+    if individuo:
+        perfil["perfil_criminal_automatico"] = _rg_auto_perfil_criminal_sync(individuo)
+        try:
+            _rg_auto_inicializar()
+            with _banco_conexao() as db:
+                total_aparicoes = int(db.execute(
+                    "SELECT COUNT(*) FROM rg_aparicoes_automaticas WHERE individuo_id=?",
+                    (int(individuo.get("id") or 0),),
+                ).fetchone()[0])
+            perfil["aparicoes_automaticas"] = total_aparicoes
+        except Exception:
+            perfil["aparicoes_automaticas"] = 0
+    return perfil
+
+
+def _banco_embed_ficha_geral(perfil: Dict[str, Any]) -> discord.Embed:
+    embed = _RG_AUTO_EMBED_FICHA_ANTES(perfil)
+    individuo = dict(perfil.get("individuo") or {})
+    if not individuo:
+        return embed
+    criminal = dict(perfil.get("perfil_criminal_automatico") or _rg_auto_perfil_criminal_sync(individuo))
+    valor = _rg_auto_texto_perfil_criminal(criminal)
+    if len(embed.fields) < 25:
+        embed.add_field(name="📊 PADRÃO CRIMINAL AUTOMÁTICO", value=valor, inline=False)
+    aparicoes = int(perfil.get("aparicoes_automaticas") or 0)
+    rodape_atual = str(getattr(getattr(embed, "footer", None), "text", "") or "")
+    complemento = f"Reconhecimento automático de RG • {aparicoes} aparição(ões) registrada(s)"
+    embed.set_footer(text=(f"{rodape_atual} • {complemento}" if rodape_atual else complemento)[:2048])
+    return embed
+
+
+def _rg_auto_texto_payload(payload: Any) -> str:
+    partes: List[str] = []
+    conteudo = _prisao_obj_get(payload, "content", "") if "_prisao_obj_get" in globals() else getattr(payload, "content", "")
+    if conteudo:
+        partes.append(str(conteudo))
+    embeds = list((_prisao_obj_get(payload, "embeds", []) if "_prisao_obj_get" in globals() else getattr(payload, "embeds", [])) or [])
+    for embed in embeds:
+        if "_prisao_embed_texto" in globals():
+            texto_embed = _prisao_embed_texto(embed)
+        else:
+            texto_embed = "\n".join(filter(None, [str(getattr(embed, "title", "") or ""), str(getattr(embed, "description", "") or "")]))
+        if texto_embed:
+            partes.append(texto_embed)
+    anexos = list((_prisao_obj_get(payload, "attachments", []) if "_prisao_obj_get" in globals() else getattr(payload, "attachments", [])) or [])
+    for anexo in anexos:
+        nome = _prisao_obj_get(anexo, "filename", "") if "_prisao_obj_get" in globals() else getattr(anexo, "filename", "")
+        if nome:
+            partes.append(str(nome))
+    return "\n".join(partes)
+
+
+async def _rg_auto_texto_mensagem(message: discord.Message) -> str:
+    payloads: List[Any] = [message]
+    flags = int(getattr(getattr(message, "flags", None), "value", 0) or 0)
+    possui_snapshot = bool(flags & _RG_AUTO_SNAPSHOT_FLAG) or bool(
+        getattr(message, "message_snapshots", None) or getattr(message, "snapshots", None) or getattr(message, "message_snapshot", None)
+    )
+    if possui_snapshot and "_prisao_payloads_mensagem" in globals():
+        try:
+            payloads = await _prisao_payloads_mensagem(message)
+        except Exception:
+            payloads = [message]
+    partes: List[str] = []
+    vistos: set[str] = set()
+    for payload in payloads:
+        texto = _rg_auto_texto_payload(payload).strip()
+        if texto and texto not in vistos:
+            vistos.add(texto)
+            partes.append(texto)
+    return "\n\n".join(partes)
+
+
+def _rg_auto_detectar(texto: str, indice: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    if not texto or not indice:
+        return []
+    sem_urls = re.sub(r"https?://\S+", " ", texto)
+    sem_urls = re.sub(r"<[@#&!]?[0-9]{10,25}>", " ", sem_urls)
+    encontrados: List[str] = []
+
+    padrao_explicito = re.compile(
+        r"(?i)\b(?:rg|registro(?:\s+geral)?|passaporte|documento)\s*(?:n[º°o]\.?|numero)?\s*[:#\-]?\s*([A-Za-z0-9.\-/]{2,20})"
+    )
+    for valor in padrao_explicito.findall(sem_urls):
+        rg_n = _banco_normalizar_rg(valor)
+        if rg_n in indice and rg_n not in encontrados:
+            encontrados.append(rg_n)
+
+    # Também reconhece o número sozinho, desde que ele corresponda exatamente a uma ficha existente.
+    for valor in re.findall(r"(?<![0-9])([0-9]{3,9})(?![0-9])", sem_urls):
+        rg_n = _banco_normalizar_rg(valor)
+        if rg_n in indice and rg_n not in encontrados:
+            encontrados.append(rg_n)
+
+    return [(rg, indice[rg]) for rg in encontrados[:_RG_AUTO_MAX_POR_MENSAGEM]]
+
+
+def _rg_auto_reservar_aparicao_sync(message: discord.Message, individuo: Dict[str, Any], rg_detectado: str) -> bool:
+    _rg_auto_inicializar()
+    try:
+        with _banco_conexao() as db:
+            db.execute(
+                """
+                INSERT INTO rg_aparicoes_automaticas
+                (individuo_id, rg, mensagem_id, canal_id, guild_id, mensagem_url, detectado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(individuo.get("id") or 0), _banco_normalizar_rg(rg_detectado),
+                    int(message.id), int(message.channel.id), int(getattr(message.guild, "id", 0) or 0),
+                    str(getattr(message, "jump_url", "") or ""), _banco_agora_iso(),
+                ),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def _rg_auto_atualizar_resposta_sync(message_id: int, rg: str, resposta_id: int) -> None:
+    try:
+        with _banco_conexao() as db:
+            db.execute(
+                "UPDATE rg_aparicoes_automaticas SET resposta_id=? WHERE mensagem_id=? AND rg=?",
+                (int(resposta_id or 0), int(message_id), _banco_normalizar_rg(rg)),
+            )
+    except Exception:
+        pass
+
+
+def _rg_auto_cancelar_reserva_sync(message_id: int, rg: str) -> None:
+    try:
+        with _banco_conexao() as db:
+            db.execute(
+                "DELETE FROM rg_aparicoes_automaticas WHERE mensagem_id=? AND rg=? AND resposta_id=0",
+                (int(message_id), _banco_normalizar_rg(rg)),
+            )
+    except Exception:
+        pass
+
+
+async def _rg_auto_enviar_ficha(message: discord.Message, rg: str, individuo: Dict[str, Any]) -> None:
+    if not await asyncio.to_thread(_rg_auto_reservar_aparicao_sync, message, individuo, rg):
+        return
+    try:
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, "individuo", int(individuo.get("id") or 0))
+        if not perfil:
+            raise RuntimeError("Ficha não localizada após a identificação do RG.")
+        embed = _banco_embed_ficha_geral(perfil)
+        nome = str(individuo.get("nome") or "INDIVÍDUO")
+        embed.title = f"🔎 RG IDENTIFICADO • {nome}"[:256]
+        embed.description = (
+            f"O RG **{_banco_normalizar_rg(rg)}** apareceu nesta mensagem e corresponde a uma ficha cadastrada.\n\n"
+            + str(embed.description or "")
+        )[:4096]
+        try:
+            resposta = await message.reply(
+                embed=embed,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+                delete_after=_RG_AUTO_DELETE_AFTER,
+            )
+        except Exception:
+            resposta = await message.channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+                delete_after=_RG_AUTO_DELETE_AFTER,
+            )
+        await asyncio.to_thread(_rg_auto_atualizar_resposta_sync, int(message.id), rg, int(resposta.id))
+    except Exception as erro:
+        await asyncio.to_thread(_rg_auto_cancelar_reserva_sync, int(message.id), rg)
+        print(
+            f"⚠️ Reconhecimento automático de RG falhou na mensagem {int(message.id)} | RG {rg}: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+async def _rg_auto_processar_mensagem(message: discord.Message) -> None:
+    if message.guild is None:
+        return
+    if bot.user is not None and int(getattr(message.author, "id", 0) or 0) == int(bot.user.id):
+        return
+    mensagem_id = int(getattr(message, "id", 0) or 0)
+    if not mensagem_id or mensagem_id in _RG_AUTO_PROCESSANDO:
+        return
+    _RG_AUTO_PROCESSANDO.add(mensagem_id)
+    try:
+        # Dá tempo para sistemas como Histórico de Prisão terminarem de salvar uma ficha nova.
+        await asyncio.sleep(1.2)
+        texto = await _rg_auto_texto_mensagem(message)
+        indice = await asyncio.to_thread(_rg_auto_indice_sync)
+        encontrados = _rg_auto_detectar(texto, indice)
+        # Uma ficha pode ter sido criada segundos antes por outro fluxo (prisão/OCR).
+        # Se houver um RG explícito e o cache ainda não o conhecer, atualiza o índice imediatamente.
+        if not encontrados and re.search(r"(?i)\b(?:rg|registro|passaporte|documento)\b", texto or ""):
+            indice = await asyncio.to_thread(_rg_auto_indice_sync, True)
+            encontrados = _rg_auto_detectar(texto, indice)
+        for rg, individuo in encontrados:
+            await _rg_auto_enviar_ficha(message, rg, individuo)
+    finally:
+        _RG_AUTO_PROCESSANDO.discard(mensagem_id)
+
+
+@bot.listen("on_message")
+async def reconhecimento_automatico_rg(message: discord.Message):
+    await _rg_auto_processar_mensagem(message)
+
+
+@bot.listen("on_message_edit")
+async def reconhecimento_automatico_rg_editado(before: discord.Message, after: discord.Message):
+    await _rg_auto_processar_mensagem(after)
+
+
+@bot.listen("on_ready")
+async def iniciar_reconhecimento_automatico_rg() -> None:
+    try:
+        await asyncio.to_thread(_rg_auto_inicializar)
+        indice = await asyncio.to_thread(_rg_auto_indice_sync, True)
+        print(
+            f"✅ Reconhecimento automático de RG ativo: {len(indice)} identificador(es) carregado(s), "
+            f"ficha automática em todo o servidor e análise criminal baseada no CRIMES_RP.",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao iniciar reconhecimento automático de RG: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ Reconhecimento Automático de RG V1 carregado: sem painel, ficha automática e análise de reincidência usando os crimes já existentes no bot.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
