@@ -42388,6 +42388,8 @@ from urllib.parse import quote as _prisao_quote, urlsplit as _prisao_urlsplit
 
 HISTORICO_PRISAO_CHANNEL_ID = int(os.getenv("HISTORICO_PRISAO_CHANNEL_ID", "1532097197292654622"))
 HISTORICO_PRISAO_SCAN_LIMIT = max(20, min(1000, int(os.getenv("HISTORICO_PRISAO_SCAN_LIMIT", "300"))))
+HISTORICO_PRISAO_MIGRAR_ANTIGOS = os.getenv("HISTORICO_PRISAO_MIGRAR_ANTIGOS", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+HISTORICO_PRISAO_MIGRATION_LIMIT = max(0, int(os.getenv("HISTORICO_PRISAO_MIGRATION_LIMIT", "0")))  # 0 = todo o histórico
 _HISTORICO_PRISAO_DIR = Path(DATA_DIR) / "historico_prisao"
 _HISTORICO_PRISAO_DIR.mkdir(parents=True, exist_ok=True)
 _PRISAO_PROCESSANDO: set[int] = set()
@@ -42429,6 +42431,8 @@ def inicializar_banco_dicor() -> None:
                 foto_individuo_path TEXT DEFAULT '',
                 foto_rg_path TEXT DEFAULT '',
                 foto_mochila_url TEXT DEFAULT '',
+                itens_ilegais_json TEXT DEFAULT '[]',
+                mochila_analisada INTEGER DEFAULT 0,
                 criado_por_id INTEGER DEFAULT 0,
                 criado_em TEXT NOT NULL,
                 atualizado_em TEXT NOT NULL,
@@ -42455,6 +42459,11 @@ def inicializar_banco_dicor() -> None:
                 ON fontes_ficha_individuo(individuo_id, tipo, criado_em DESC);
             """
         )
+        colunas_prisao = {str(x[1]) for x in db.execute("PRAGMA table_info(historico_prisoes)").fetchall()}
+        if "itens_ilegais_json" not in colunas_prisao:
+            db.execute("ALTER TABLE historico_prisoes ADD COLUMN itens_ilegais_json TEXT DEFAULT '[]'")
+        if "mochila_analisada" not in colunas_prisao:
+            db.execute("ALTER TABLE historico_prisoes ADD COLUMN mochila_analisada INTEGER DEFAULT 0")
 
 
 def _prisao_lock(mensagem_id: int) -> asyncio.Lock:
@@ -42878,6 +42887,134 @@ def _prisao_referencia_origem(message: discord.Message) -> Tuple[int, int, int]:
     )
 
 
+
+# =====================================================
+# LEITURA DE ITENS ILEGAIS NA FOTO DA MOCHILA
+# =====================================================
+_ITENS_ILEGAIS_MOCHILA: Dict[str, Dict[str, Any]] = {
+    # Drogas
+    "farinha": {"nome": "Farinha", "grupo": "DROGAS ILÍCITAS", "aliases": ["farinha"]},
+    "balinha": {"nome": "Balinha", "grupo": "DROGAS ILÍCITAS", "aliases": ["balinha"]},
+    "erva": {"nome": "Erva", "grupo": "DROGAS ILÍCITAS", "aliases": ["erva"]},
+    "skunk": {"nome": "Skunk", "grupo": "DROGAS ILÍCITAS", "aliases": ["skunk"]},
+    "lanca": {"nome": "Lança", "grupo": "DROGAS ILÍCITAS", "aliases": ["lanca", "lança"]},
+    "rape": {"nome": "Rapé", "grupo": "DROGAS ILÍCITAS", "aliases": ["rape", "rapé"]},
+    "meta": {"nome": "Meta", "grupo": "DROGAS ILÍCITAS", "aliases": ["meta"]},
+    "oxxy": {"nome": "Oxxy", "grupo": "DROGAS ILÍCITAS", "aliases": ["oxxy", "oxy"]},
+    "viagra": {"nome": "Viagra", "grupo": "DROGAS ILÍCITAS", "aliases": ["viagra"]},
+    "carpofol": {"nome": "Carpofol", "grupo": "DROGAS ILÍCITAS", "aliases": ["carpofol"]},
+    "heroina": {"nome": "H. (Heroína)", "grupo": "DROGAS ILÍCITAS", "aliases": ["heroina", "heroína", "h."]},
+    # Armamento
+    "hk_g36": {"nome": "HK G36", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["hk g36", "g36"]},
+    "tec9": {"nome": "Tec9", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["tec9", "tec 9"]},
+    "five_seven": {"nome": "Five Seven", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["five seven", "fiveseven"]},
+    "colt_45": {"nome": "Colt 45", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["colt 45", "colt45"]},
+    "mtar": {"nome": "MTAR", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["mtar"]},
+    "ak103": {"nome": "AK-103", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["ak-103", "ak 103", "ak103"]},
+    "compact_rifle": {"nome": "Compact Rifle", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["compact rifle"]},
+    "carabina_mk2": {"nome": "Carabina-MK2", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["carabina-mk2", "carabina mk2"]},
+    "carabina": {"nome": "Carabina", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["carabina"]},
+    "scar_l": {"nome": "SCAR-L", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["scar-l", "scar l", "scarl"]},
+    "m4a1s": {"nome": "M4A1-S", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["m4a1-s", "m4a1 s", "m4a1s"]},
+    "mp5": {"nome": "MP5", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["mp5"]},
+    "mini_uzi": {"nome": "Mini Uzi", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["mini uzi", "miniuzi"]},
+    "thompson": {"nome": "Thompson", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["thompson"]},
+    "minigun": {"nome": "Minigun", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["minigun"]},
+    "sniper": {"nome": "Sniper", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["sniper"]},
+    "rpg": {"nome": "RPG", "grupo": "ARMAMENTO ILÍCITO", "aliases": ["rpg"]},
+    # Bombas
+    "molotov": {"nome": "Molotov", "grupo": "BOMBAS", "aliases": ["molotov"]},
+    "gas_lacrimogenio": {"nome": "Gás Lacrimogênio", "grupo": "BOMBAS", "aliases": ["gas lacrimogenio", "gás lacrimogênio"]},
+    "bomba_arremesso": {"nome": "Bomba Arremesso", "grupo": "BOMBAS", "aliases": ["bomba arremesso"]},
+    "bomba_fumaca": {"nome": "Bomba de Fumaça", "grupo": "BOMBAS", "aliases": ["bomba de fumaca", "bomba de fumaça"]},
+    "granada": {"nome": "Granada", "grupo": "BOMBAS", "aliases": ["granada"]},
+    # Brancas
+    "machete": {"nome": "Machete", "grupo": "ARMAS BRANCAS", "aliases": ["machete"]},
+    "machado": {"nome": "Machado", "grupo": "ARMAS BRANCAS", "aliases": ["machado"]},
+    "soco_ingles": {"nome": "Soco inglês", "grupo": "ARMAS BRANCAS", "aliases": ["soco ingles", "soco inglês"]},
+    "taco_beisebol": {"nome": "Taco de beisebol", "grupo": "ARMAS BRANCAS", "aliases": ["taco de beisebol"]},
+    "taco_sinuca": {"nome": "Taco de sinuca", "grupo": "ARMAS BRANCAS", "aliases": ["taco de sinuca"]},
+    "canivete": {"nome": "Canivete", "grupo": "ARMAS BRANCAS", "aliases": ["canivete"]},
+    "pao": {"nome": "Pão", "grupo": "ARMAS BRANCAS", "aliases": ["pao", "pão"]},
+    "faca": {"nome": "Faca", "grupo": "ARMAS BRANCAS", "aliases": ["faca"]},
+    "placa_arma": {"nome": "Placa", "grupo": "ARMAS BRANCAS", "aliases": ["placa"]},
+    "katana": {"nome": "Katana", "grupo": "ARMAS BRANCAS", "aliases": ["katana"]},
+    # Materiais
+    "dinheiro_sujo": {"nome": "Dinheiro sujo", "grupo": "MATERIAIS ILEGAIS", "aliases": ["dinheiro sujo"]},
+    "masterpick_embalagem": {"nome": "Embalagem de Masterpick", "grupo": "MATERIAIS ILEGAIS", "aliases": ["embalagem de masterpick", "embalagem masterpick"]},
+    "masterpick": {"nome": "Masterpick", "grupo": "MATERIAIS ILEGAIS", "aliases": ["masterpick"]},
+    "pager": {"nome": "Pager", "grupo": "MATERIAIS ILEGAIS", "aliases": ["pager"]},
+    "camisa_forca": {"nome": "Camisa de força", "grupo": "MATERIAIS ILEGAIS", "aliases": ["camisa de forca", "camisa de força"]},
+    "algema": {"nome": "Algema", "grupo": "MATERIAIS ILEGAIS", "aliases": ["algema", "algemas"]},
+    "adrenalina": {"nome": "Adrenalina", "grupo": "MATERIAIS ILEGAIS", "aliases": ["adrenalina"]},
+    "colete_embalagem": {"nome": "Embalagem Colete", "grupo": "MATERIAIS ILEGAIS", "aliases": ["embalagem colete", "embalagem de colete"]},
+    "colete_ilegal": {"nome": "Colete ilegal", "grupo": "MATERIAIS ILEGAIS", "aliases": ["colete ilegal", "colete militar"]},
+    "municao": {"nome": "Munição", "grupo": "MATERIAIS ILEGAIS", "aliases": ["municao", "munição"]},
+    "capuz": {"nome": "Capuz", "grupo": "MATERIAIS ILEGAIS", "aliases": ["capuz", "mascara", "máscara"]},
+    "lockpick": {"nome": "Lockpick usada", "grupo": "MATERIAIS ILEGAIS", "aliases": ["lockpick usada", "lockpick usado"]},
+    "bloqueador_rastreio": {"nome": "Bloqueador de rastreio", "grupo": "MATERIAIS ILEGAIS", "aliases": ["bloqueador de rastreio"]},
+    "kit_desmanche": {"nome": "Kit Desmanche", "grupo": "MATERIAIS ILEGAIS", "aliases": ["kit desmanche"]},
+    "vaselina": {"nome": "Vaselina", "grupo": "MATERIAIS ILEGAIS", "aliases": ["vaselina"]},
+}
+
+
+def _mochila_norm(texto: str) -> str:
+    base = unicodedata.normalize("NFKD", str(texto or ""))
+    base = "".join(ch for ch in base if not unicodedata.combining(ch)).lower()
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def _mochila_quantidade_linha(linha: str) -> int:
+    texto = str(linha or "")
+    candidatos = []
+    for padrao in (r"\b(\d{1,5})\s*[xX]\b", r"\b[xX]\s*(\d{1,5})\b", r"\bQTD\s*[:\-]?\s*(\d{1,5})\b"):
+        for m in re.finditer(padrao, texto, flags=re.I):
+            try: candidatos.append(int(m.group(1)))
+            except Exception: pass
+    return max(candidatos) if candidatos else 1
+
+
+def _prisao_analisar_itens_ilegais_mochila(item: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not item:
+        return []
+    linhas_originais = [str(x[0] if isinstance(x, (list, tuple)) and x else x) for x in list(item.get("ocr_linhas") or [])]
+    if not linhas_originais:
+        linhas_originais = [x.strip() for x in str(item.get("ocr_texto") or "").splitlines() if x.strip()]
+    linhas_norm = [_mochila_norm(x) for x in linhas_originais]
+    achados: Dict[str, Dict[str, Any]] = {}
+    # Itens mais específicos primeiro, evitando que "carabina" duplique "carabina mk2".
+    ordenados = sorted(_ITENS_ILEGAIS_MOCHILA.items(), key=lambda kv: -max(len(_mochila_norm(a)) for a in kv[1]["aliases"]))
+    ocupadas: set[tuple[int, str]] = set()
+    for chave, regra in ordenados:
+        aliases = [_mochila_norm(a) for a in regra.get("aliases", [])]
+        for idx, linha in enumerate(linhas_norm):
+            alias_ok = next((a for a in aliases if a and re.search(rf"(?<![a-z0-9]){re.escape(a)}(?![a-z0-9])", linha)), None)
+            if not alias_ok:
+                continue
+            # Lockpick comum só entra quando a própria imagem indicar que está usada.
+            if chave == "lockpick" and "usad" not in linha:
+                continue
+            # Não duplica a categoria genérica quando um nome específico ocupa a mesma linha.
+            if chave in {"carabina", "masterpick", "colete_ilegal"} and any(pos == idx for pos, _ in ocupadas):
+                continue
+            janela = " ".join(linhas_originais[max(0, idx-2):min(len(linhas_originais), idx+3)])
+            qtd = _mochila_quantidade_linha(janela)
+            atual = achados.setdefault(chave, {
+                "chave": chave, "nome": regra["nome"], "grupo": regra["grupo"], "quantidade": 0
+            })
+            atual["quantidade"] += max(1, int(qtd))
+            ocupadas.add((idx, chave))
+            break
+    return sorted(achados.values(), key=lambda x: (str(x.get("grupo")), str(x.get("nome"))))
+
+
+def _prisao_itens_json_seguro(valor: Any) -> List[Dict[str, Any]]:
+    try:
+        dados = json.loads(str(valor or "[]")) if not isinstance(valor, list) else valor
+        return [dict(x) for x in dados if isinstance(x, dict)]
+    except Exception:
+        return []
+
 def _prisao_salvar_registro_sync(
     *,
     message: discord.Message,
@@ -42891,6 +43028,7 @@ def _prisao_salvar_registro_sync(
     foto_individuo_url: str,
     foto_rg_url: str,
     foto_mochila_url: str,
+    itens_ilegais: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     inicializar_banco_dicor()
     individuo = banco_upsert_individuo(
@@ -42914,8 +43052,8 @@ def _prisao_salvar_registro_sync(
              individuo_id, nome_texto, rg_texto, nome_ocr, rg_ocr, conferencia_status,
              conferencia_detalhes, data_prisao, pena_total, multa_total, fianca,
              infracoes_quantidade, texto_original, foto_individuo_path, foto_rg_path,
-             foto_mochila_url, criado_por_id, criado_em, atualizado_em)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             foto_mochila_url, itens_ilegais_json, mochila_analisada, criado_por_id, criado_em, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mensagem_id) DO UPDATE SET
                 individuo_id=excluded.individuo_id,
                 nome_texto=excluded.nome_texto,
@@ -42933,6 +43071,8 @@ def _prisao_salvar_registro_sync(
                 foto_individuo_path=excluded.foto_individuo_path,
                 foto_rg_path=excluded.foto_rg_path,
                 foto_mochila_url=excluded.foto_mochila_url,
+                itens_ilegais_json=excluded.itens_ilegais_json,
+                mochila_analisada=excluded.mochila_analisada,
                 atualizado_em=excluded.atualizado_em
             """,
             (
@@ -42944,7 +43084,8 @@ def _prisao_salvar_registro_sync(
                 str(detalhes.get("pena_total") or ""), str(detalhes.get("multa_total") or ""),
                 str(detalhes.get("fianca") or ""), int(detalhes.get("infracoes_quantidade") or 0),
                 str(texto or "")[:12000], foto_individuo_path, foto_rg_path,
-                foto_mochila_url[:1000], int(getattr(message.author, "id", 0) or 0), agora, agora,
+                foto_mochila_url[:1000], json.dumps(list(itens_ilegais or []), ensure_ascii=False), 1,
+                int(getattr(message.author, "id", 0) or 0), agora, agora,
             ),
         )
         db.execute(
@@ -43029,7 +43170,7 @@ async def _prisao_enviar_retorno_temporario(
         return None
 
 
-async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False) -> Optional[Dict[str, Any]]:
+async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False, force_reprocess: bool = False) -> Optional[Dict[str, Any]]:
     if int(message.channel.id) != HISTORICO_PRISAO_CHANNEL_ID:
         return None
     if message.author.bot:
@@ -43042,7 +43183,7 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 membro = await message.guild.fetch_member(int(getattr(message.author, "id", 0) or 0))
             except Exception:
                 membro = None
-    if membro is None or not _membro_inspetor_mais(membro):
+    if not force_reprocess and (membro is None or not _membro_inspetor_mais(membro)):
         try:
             await _prisao_enviar_retorno_temporario(
                 message,
@@ -43052,7 +43193,7 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
             pass
         return None
     async with _prisao_lock(message.id):
-        if await asyncio.to_thread(_prisao_ja_processada, message.id):
+        if not force_reprocess and await asyncio.to_thread(_prisao_ja_processada, message.id):
             return None
         texto = await _prisao_texto_completo(message)
         payloads_debug = await _prisao_payloads_mensagem(message)
@@ -43114,7 +43255,18 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                     _prisao_comprimir_para_upload, Path(rg_item["path"]), rg, "rg"
                 )
                 foto_rg_path, foto_rg_url = str(destino), (url or str(rg_item.get("url") or ""))
+            foto_mochila_url = str((mochila_item or {}).get("url") or "")
+            if mochila_item and mochila_item.get("path"):
+                try:
+                    _, mochila_url_persistente = await asyncio.to_thread(
+                        _prisao_comprimir_para_upload, Path(mochila_item["path"]), rg, "mochila"
+                    )
+                    if mochila_url_persistente:
+                        foto_mochila_url = str(mochila_url_persistente)
+                except Exception as erro:
+                    print(f"⚠️ Não foi possível persistir a foto da mochila: {type(erro).__name__}: {erro}", flush=True)
             detalhes = _prisao_extrair_detalhes(texto)
+            itens_ilegais = _prisao_analisar_itens_ilegais_mochila(mochila_item)
             salvo = await asyncio.to_thread(
                 _prisao_salvar_registro_sync,
                 message=message,
@@ -43127,7 +43279,8 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 foto_rg_path=foto_rg_path,
                 foto_individuo_url=foto_ind_url,
                 foto_rg_url=foto_rg_url,
-                foto_mochila_url=str((mochila_item or {}).get("url") or ""),
+                foto_mochila_url=foto_mochila_url,
+                itens_ilegais=itens_ilegais,
             )
         if not historico:
             cor = discord.Color.blue()
@@ -43147,6 +43300,16 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 f"RG: **{'salva' if foto_rg_path else 'não identificado'}**\n"
                 f"Mochila: **{'vinculada pela mensagem' if mochila_item else 'não identificada'}**"
             ), inline=False)
+            if itens_ilegais:
+                por_grupo_retorno: Dict[str, List[str]] = defaultdict(list)
+                for item_il in itens_ilegais:
+                    por_grupo_retorno[str(item_il.get("grupo") or "OUTROS")].append(
+                        f"• {item_il.get('nome')} × **{int(item_il.get('quantidade') or 1)}**"
+                    )
+                resumo_il = []
+                for grupo_il, linhas_il in por_grupo_retorno.items():
+                    resumo_il.append(f"**{grupo_il}**\n" + "\n".join(linhas_il))
+                embed.add_field(name="🚨 ILEGAIS LIDOS NA MOCHILA", value="\n\n".join(resumo_il)[:1024], inline=False)
             if foto_ind_url.startswith("http"):
                 embed.set_image(url=foto_ind_url)
             if foto_rg_url.startswith("http"):
@@ -43229,6 +43392,69 @@ async def _prisao_importar_historico(guild: Optional[discord.Guild]) -> int:
     if importados:
         print(f"✅ Histórico de Prisão V2: {importados} encaminhamento(s) pendente(s) importado(s).", flush=True)
     return importados
+
+
+def _prisao_precisa_migrar_mochila(mensagem_id: int) -> bool:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        row = db.execute(
+            "SELECT mochila_analisada FROM historico_prisoes WHERE mensagem_id=?",
+            (int(mensagem_id),),
+        ).fetchone()
+    return bool(row is not None and int(row[0] or 0) == 0)
+
+
+async def _prisao_migrar_mochilas_antigas(guild: Optional[discord.Guild]) -> Dict[str, int]:
+    """Relê prisionais já cadastrados e preenche itens ilegais sem republicar fichas."""
+    stats = {"verificados": 0, "migrados": 0, "falhas": 0}
+    if not HISTORICO_PRISAO_MIGRAR_ANTIGOS or guild is None:
+        return stats
+    canal = guild.get_channel(HISTORICO_PRISAO_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(HISTORICO_PRISAO_CHANNEL_ID)
+        except Exception:
+            return stats
+    if not isinstance(canal, discord.TextChannel):
+        return stats
+    limite = HISTORICO_PRISAO_MIGRATION_LIMIT or None
+    try:
+        async for msg in canal.history(limit=limite, oldest_first=True):
+            if msg.author.bot:
+                continue
+            precisa = await asyncio.to_thread(_prisao_precisa_migrar_mochila, msg.id)
+            if not precisa:
+                continue
+            stats["verificados"] += 1
+            try:
+                resultado = await _prisao_processar_mensagem(
+                    msg, historico=True, force_reprocess=True
+                )
+                if resultado:
+                    stats["migrados"] += 1
+                else:
+                    stats["falhas"] += 1
+            except Exception as erro:
+                stats["falhas"] += 1
+                print(
+                    f"⚠️ Migração da mochila da prisão {msg.id} falhou: "
+                    f"{type(erro).__name__}: {erro}", flush=True
+                )
+            await asyncio.sleep(0.35)
+    except Exception:
+        traceback.print_exc()
+    if stats["verificados"]:
+        await enviar_log(
+            "🎒 Migração de mochilas antigas concluída | "
+            f"verificadas `{stats['verificados']}` | "
+            f"migradas `{stats['migrados']}` | falhas `{stats['falhas']}`."
+        )
+        print(
+            "✅ Migração de mochilas antigas: "
+            f"{stats['migrados']}/{stats['verificados']} concluídas; "
+            f"{stats['falhas']} falha(s).", flush=True
+        )
+    return stats
 
 
 def _prisao_url_discord(guild_id: int, canal_id: int, mensagem_id: int) -> str:
@@ -43321,6 +43547,26 @@ def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
             (int(ind.get("id") or 0),),
         ).fetchall()
     perfil["historico_prisoes"] = [dict(x) for x in prisoes]
+    acumulado: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    evidencias_mochila: List[Dict[str, Any]] = []
+    for prisao in perfil["historico_prisoes"]:
+        foto = str(prisao.get("foto_mochila_url") or "").strip()
+        itens = _prisao_itens_json_seguro(prisao.get("itens_ilegais_json"))
+        if foto and itens:
+            evidencias_mochila.append({
+                "foto": foto, "mensagem_url": str(prisao.get("mensagem_url") or ""),
+                "data": str(prisao.get("data_prisao") or prisao.get("criado_em") or "Data não informada"),
+            })
+        for item in itens:
+            grupo = str(item.get("grupo") or "OUTROS")
+            nome_item = str(item.get("nome") or "Item")
+            chave = (grupo, nome_item)
+            alvo = acumulado.setdefault(chave, {"grupo": grupo, "nome": nome_item, "quantidade": 0, "fotos": []})
+            alvo["quantidade"] += max(1, int(item.get("quantidade") or 1))
+            if foto and foto not in alvo["fotos"]:
+                alvo["fotos"].append(foto)
+    perfil["itens_ilegais_acumulados"] = list(acumulado.values())
+    perfil["evidencias_mochila"] = evidencias_mochila
     perfil["fontes_documentais"] = _prisao_fontes_dinamicas(perfil)
     return perfil
 
@@ -43354,6 +43600,35 @@ def _banco_embed_ficha_geral(perfil: Dict[str, Any]) -> discord.Embed:
         if len(prisoes) > 6:
             linhas.append(f"• +{len(prisoes) - 6} registro(s) de prisão")
         embed.add_field(name=f"🚔 HISTÓRICO DE PRISÕES ({len(prisoes)})", value="\n".join(linhas)[:1024], inline=False)
+    itens_acumulados = list(perfil.get("itens_ilegais_acumulados") or [])
+    if itens_acumulados:
+        por_grupo: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for item in itens_acumulados:
+            por_grupo[str(item.get("grupo") or "OUTROS")].append(item)
+        icones_grupo = {
+            "DROGAS ILÍCITAS": "💊", "ARMAMENTO ILÍCITO": "🔫", "BOMBAS": "🧨",
+            "ARMAS BRANCAS": "⚔️", "MATERIAIS ILEGAIS": "🚫",
+        }
+        for grupo, itens_grupo in por_grupo.items():
+            linhas_grupo = []
+            for item in sorted(itens_grupo, key=lambda x: str(x.get("nome") or "")):
+                qtd = int(item.get("quantidade") or 1)
+                fotos_item = list(item.get("fotos") or [])
+                fontes_item = " ".join(f"[foto {i+1}]({url})" for i, url in enumerate(fotos_item[:5]) if str(url).startswith("http"))
+                linhas_grupo.append(f"• **{qtd}× {item.get('nome')}**" + (f" — {fontes_item}" if fontes_item else ""))
+            if len(embed.fields) < 25:
+                embed.add_field(
+                    name=f"{icones_grupo.get(grupo, '📦')} {grupo}",
+                    value="\n".join(linhas_grupo)[:1024], inline=False,
+                )
+    evidencias = list(perfil.get("evidencias_mochila") or [])
+    if evidencias and len(embed.fields) < 25:
+        linhas_ev = []
+        for indice, ev in enumerate(evidencias[:8], 1):
+            foto = str(ev.get("foto") or "")
+            data_ev = str(ev.get("data") or "Data não informada")[:30]
+            linhas_ev.append(f"• [Mochila {indice} — {data_ev}]({foto})" if foto.startswith("http") else f"• Mochila {indice} — {data_ev}")
+        embed.add_field(name="📸 FOTOS-FONTE DAS APREENSÕES", value="\n".join(linhas_ev)[:1024], inline=False)
     if fontes:
         icones = {"PERICIA": "🔬", "BOLETIM": "📄", "PRISAO": "🚔", "REGISTRO": "🔗"}
         linhas = []
@@ -43464,6 +43739,7 @@ async def on_ready():
         await _prisao_configurar_permissoes_canal(guild)
         removidos = await _prisao_limpar_confirmacoes_antigas(guild)
         asyncio.create_task(_prisao_importar_historico(guild), name="historico-prisao-importacao")
+        asyncio.create_task(_prisao_migrar_mochilas_antigas(guild), name="historico-prisao-mochilas-antigas")
         print(
             f"✅ Histórico de Prisão ativo no canal {HISTORICO_PRISAO_CHANNEL_ID}: "
             f"encaminhamentos, conferência Nome/RG, fotos persistentes e histórico na ficha geral; "
@@ -43492,6 +43768,10 @@ print(
 print(
     "✅ Histórico de Prisão V2.2 carregado: tempfile importado, criação de ficha restaurada e reprocessamento automático ativo.",
     flush=True,
+)
+print(
+    "✅ Histórico de Prisão V2.4 carregado: mochilas de prisionais antigos são relidas uma única vez, "
+    "com itens ilegais acumulados por grupo e foto-fonte preservada."
 )
 print(
     "✅ Histórico de Prisão V2.3 carregado: confirmação temporária com fallback sem referência; "
@@ -45069,7 +45349,7 @@ async def _banco_prof_enviar_consulta(
 # Reações visuais no processamento das fichas prisionais.
 _PRISAO_PROCESSAR_SEM_REACOES = _prisao_processar_mensagem
 
-async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False) -> Optional[Dict[str, Any]]:
+async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False, force_reprocess: bool = False) -> Optional[Dict[str, Any]]:
     adicionou_processando = False
     try:
         if not message.author.bot:
@@ -45078,7 +45358,7 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 adicionou_processando = True
             except Exception:
                 pass
-        resultado = await _PRISAO_PROCESSAR_SEM_REACOES(message, historico=historico)
+        resultado = await _PRISAO_PROCESSAR_SEM_REACOES(message, historico=historico, force_reprocess=force_reprocess)
         if adicionou_processando:
             try:
                 await message.remove_reaction("⏳", message.guild.me if message.guild else bot.user)
