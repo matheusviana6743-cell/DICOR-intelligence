@@ -886,7 +886,7 @@ def gerar_catalogo_html() -> None:
                     <div class="box destaque"><b>Último Avistamento</b><p>{escape(registro.get('ultimo_avistamento'))}</p></div>
                     <div class="box"><b>Número do Boletim</b><p>{escape(registro.get('numero_boletim') or registro.get('informacoes') or 'Não informado')}</p></div>
                     {f'<a class="msg" href="{escape(link_msg)}" target="_blank" rel="noopener noreferrer">Abrir mensagem no Discord</a>' if link_msg else ''}
-                    {f'<div class="motivo"><b>Motivo da retirada:</b> {escape(registro.get("motivo_retirada"))}</div>' if registro.get('motivo_retirada') else ''}
+                    {f'<div class="motivo"><b>Prisional:</b> {escape(registro.get("motivo_retirada"))}</div>' if registro.get('motivo_retirada') else ''}
                     <button class="apagar-registro" type="button" onclick='abrirExclusao({registro_id_js}, {nome_js})'>
                         🗑️ Apagar permanentemente
                     </button>
@@ -1804,7 +1804,7 @@ async def arquivar_procurado_discord(
         f"**Características:** {registro.get('caracteristicas', 'Não informado')}\n"
         f"**Crimes:**\n{valor_crimes_registro(registro)}\n\n"
         f"**Outras informações:** {registro.get('informacoes') or registro.get('ultimo_avistamento') or 'Não informado'}\n"
-        f"**Motivo da retirada:** {motivo}\n"
+        f"**Prisional:** {motivo}\n"
         f"**Retirado por:** {retirado_por}\n"
         f"**Data da retirada:** {agora_br()}\n"
         f"**Autor original:** {registro.get('autor_nome', 'Não informado')}\n"
@@ -2048,12 +2048,21 @@ class FinalizarProcuradoView(View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
         await registrar_erro_interacao("FinalizarProcuradoView", interaction, error)
 
-class RetirarProcuradoModal(Modal, title="Retirar Procurado"):
+class RetirarProcuradoModal(Modal, title="Registrar captura do procurado"):
     rg = TextInput(label="RG", placeholder="RG do procurado", max_length=50)
-    motivo = TextInput(label="Motivo", placeholder="Motivo da retirada", style=discord.TextStyle.paragraph, max_length=800, required=False)
+    motivo = TextInput(
+        label="Prisional",
+        placeholder="Cole o link do prisional ou escreva a referência/registro prisional",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
-        await retirar_procurado(interaction, str(self.rg.value), str(self.motivo.value or "Não informado"))
+        prisional = str(self.motivo.value or "").strip()
+        if not prisional:
+            return await interaction.response.send_message("❌ Informe o prisional para concluir a captura.", ephemeral=True)
+        await retirar_procurado(interaction, str(self.rg.value), prisional)
 
 
 class BuscarModificarProcuradoModal(Modal, title="Modificar Procurado"):
@@ -7107,7 +7116,7 @@ async def catalogo(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="retirarprocurado", description="Retira um procurado pelo RG.")
-@app_commands.describe(rg="RG do procurado", motivo="Motivo da retirada")
+@app_commands.describe(rg="RG do procurado", motivo="Link ou referência textual do prisional")
 async def retirarprocurado(interaction: discord.Interaction, rg: str, motivo: str = "Não informado"):
     await retirar_procurado(interaction, rg, motivo)
 
@@ -12046,7 +12055,7 @@ def resumo_dados_autorizacao(tipo: str, dados: Dict[str, Any]) -> str:
         return (
             f"**Nome:** {dados.get('nome', 'Não informado')}\n"
             f"**RG:** `{dados.get('rg', 'Não informado')}`\n"
-            f"**Motivo da retirada:** {dados.get('motivo', 'Não informado')}"
+            f"**Prisional:** {dados.get('motivo', 'Não informado')}"
         )
     if tipo == "comparecimento":
         return (
@@ -40721,6 +40730,70 @@ class PericiaNumeroBoModal(Modal, title="Vincular Boletim de Ocorrência"):
         )
 
 
+class PericiaPrisionalModal(Modal, title="Vincular Prisional"):
+    prisional = TextInput(
+        label="Prisional",
+        placeholder="Cole o link do prisional ou escreva a referência/registro prisional",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=1,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode vincular o prisional.", ephemeral=True
+            )
+        if not registro.get("agente_id"):
+            return await interaction.response.send_message("⚠️ Escolha primeiro o agente responsável.", ephemeral=True)
+        if str(registro.get("status") or "").upper() in _PERICIA_STATUS_FINAIS:
+            return await interaction.response.send_message("⚠️ Esta perícia já foi concluída.", ephemeral=True)
+        referencia = str(self.prisional.value or "").strip()
+        if not referencia:
+            return await interaction.response.send_message("❌ O prisional é obrigatório.", ephemeral=True)
+        registro.update({
+            "status": "CONCLUIDA_PEGO",
+            "resultado": "INDIVIDUO_PEGO",
+            "prisional": referencia,
+            "prisional_informado_por_id": interaction.user.id,
+            "prisional_informado_por_nome": str(interaction.user),
+            "resultado_por_id": interaction.user.id,
+            "resultado_por_nome": str(interaction.user),
+            "concluida_em": agora_br(),
+        })
+        _pericia_atualizar(registro)
+        await interaction.response.send_message(
+            f"✅ Perícia Nº **{registro.get('numero')}** concluída e vinculada ao prisional informado.",
+            ephemeral=True,
+        )
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            await topico.send(
+                "✅ **PERÍCIA CONCLUÍDA — INDIVÍDUO PEGO**\n"
+                f"**Perícia:** Nº {registro.get('numero')}\n"
+                f"**Prisional:** {referencia[:900]}\n"
+                f"**Responsável:** <@{int(registro.get('agente_id') or 0)}>\n"
+                f"**Registrado por:** {interaction.user.mention}\n"
+                f"**Data:** {registro.get('concluida_em')}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        await _pericia_atualizar_painel(registro)
+        if topico:
+            await asyncio.sleep(3)
+            try:
+                await topico.edit(archived=True, locked=True, reason="Perícia concluída com prisional")
+            except Exception:
+                traceback.print_exc()
+        await enviar_log(
+            f"✅ Perícia `{registro.get('numero')}` concluída com prisional por "
+            f"{interaction.user.mention} (`{interaction.user.id}`)."
+        )
+
+
 class PericiaSelecionarAgente(discord.ui.UserSelect):
     def __init__(self, desabilitado: bool = False):
         super().__init__(
@@ -40840,39 +40913,7 @@ class PericiaAtendimentoView(View):
             return await interaction.response.send_message("⚠️ Escolha primeiro o agente responsável.", ephemeral=True)
         if str(registro.get("status") or "").upper() in _PERICIA_STATUS_FINAIS:
             return await interaction.response.send_message("⚠️ Esta perícia já foi concluída.", ephemeral=True)
-        registro.update({
-            "status": "CONCLUIDA_PEGO",
-            "resultado": "INDIVIDUO_PEGO",
-            "resultado_por_id": interaction.user.id,
-            "resultado_por_nome": str(interaction.user),
-            "concluida_em": agora_br(),
-        })
-        _pericia_atualizar(registro)
-        await interaction.response.send_message(
-            f"✅ Perícia Nº **{registro.get('numero')}** concluída como **indivíduo pego**.",
-            ephemeral=True,
-        )
-        topico = await _pericia_obter_topico(registro)
-        if topico:
-            await topico.send(
-                "✅ **PERÍCIA CONCLUÍDA — INDIVÍDUO PEGO**\n"
-                f"**Perícia:** Nº {registro.get('numero')}\n"
-                f"**Responsável:** <@{int(registro.get('agente_id') or 0)}>\n"
-                f"**Resposta registrada por:** {interaction.user.mention}\n"
-                f"**Data:** {registro.get('concluida_em')}",
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            )
-        await _pericia_atualizar_painel(registro)
-        if topico:
-            await asyncio.sleep(3)
-            try:
-                await topico.edit(archived=True, locked=True, reason="Perícia concluída: indivíduo pego")
-            except Exception:
-                traceback.print_exc()
-        await enviar_log(
-            f"✅ Perícia `{registro.get('numero')}` concluída como indivíduo pego por "
-            f"{interaction.user.mention} (`{interaction.user.id}`)."
-        )
+        await interaction.response.send_modal(PericiaPrisionalModal())
 
     @discord.ui.button(
         label="Indivíduo não pego",
@@ -44973,6 +45014,220 @@ async def _banco_compacto_recarregar_view() -> None:
         print("✅ Consulta Compacta V2 ativa: modal direto, respostas azuis e botão Abrir Ficha.", flush=True)
     except Exception as erro:
         print(f"⚠️ Falha ao carregar Consulta Compacta V2: {erro}", flush=True)
+
+
+# =====================================================
+# PATCH FINAL V3 — PESQUISA COMPLETA, REAÇÕES E SINCRONIZAÇÃO AUTOMÁTICA
+# =====================================================
+
+# A pesquisa manual volta a abrir a ficha completa com todas as ações anteriores.
+async def _banco_prof_enviar_consulta(
+    interaction: discord.Interaction,
+    consulta: str,
+    *,
+    editar_original: bool = False,
+) -> None:
+    resultados = await asyncio.to_thread(banco_buscar, consulta)
+    opcoes = await asyncio.to_thread(_banco_ficha_geral_opcoes, resultados)
+    if not opcoes:
+        embed = discord.Embed(
+            title="🔎 CONSULTA AO BANCO",
+            description=f"Nenhum registro foi localizado para **{str(consulta)[:100]}**.",
+            color=discord.Color.from_rgb(30, 105, 190),
+        )
+        if editar_original:
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if len(opcoes) == 1:
+        tipo, rid, _, _, _ = opcoes[0]
+        if tipo == "faccao":
+            registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", rid)
+            embed = _banco_embed_consulta_faccao(registro)
+            embed.color = discord.Color.from_rgb(30, 105, 190)
+            view = None
+        else:
+            perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, rid)
+            if not perfil:
+                return await interaction.followup.send("❌ Ficha não encontrada.", ephemeral=True)
+            embed = _banco_embed_ficha_geral(perfil)
+            embed.color = discord.Color.from_rgb(30, 105, 190)
+            view = BancoFichaGeralView(int(interaction.user.id), perfil)
+    else:
+        embed = _banco_ficha_geral_resultados_embed(str(consulta), opcoes)
+        embed.color = discord.Color.from_rgb(30, 105, 190)
+        view = BancoFichaGeralView(int(interaction.user.id), None, opcoes)
+
+    if editar_original:
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# Reações visuais no processamento das fichas prisionais.
+_PRISAO_PROCESSAR_SEM_REACOES = _prisao_processar_mensagem
+
+async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False) -> Optional[Dict[str, Any]]:
+    adicionou_processando = False
+    try:
+        if not message.author.bot:
+            try:
+                await message.add_reaction("⏳")
+                adicionou_processando = True
+            except Exception:
+                pass
+        resultado = await _PRISAO_PROCESSAR_SEM_REACOES(message, historico=historico)
+        if adicionou_processando:
+            try:
+                await message.remove_reaction("⏳", message.guild.me if message.guild else bot.user)
+            except Exception:
+                pass
+        if resultado:
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+        elif not historico:
+            try:
+                await message.add_reaction("⚠️")
+            except Exception:
+                pass
+        return resultado
+    except Exception:
+        if adicionou_processando:
+            try:
+                await message.remove_reaction("⏳", message.guild.me if message.guild else bot.user)
+            except Exception:
+                pass
+        try:
+            await message.add_reaction("❌")
+        except Exception:
+            pass
+        raise
+
+
+async def _sincronizar_catalogo_procurados_silencioso() -> Dict[str, int]:
+    """Atualiza somente o JSON/HTML do catálogo; nunca publica ou remanda procurados."""
+    canal_ativos = bot.get_channel(PROCURADOS_CHANNEL_ID)
+    canal_arquivados = bot.get_channel(HISTORICO_PROCURADOS_ID)
+    if not isinstance(canal_ativos, discord.TextChannel):
+        return {"analisados": 0, "importados": 0, "atualizados": 0}
+    lista = carregar_procurados()
+    importados = atualizados = analisados = 0
+
+    async def processar(canal: discord.TextChannel, status: str) -> None:
+        nonlocal lista, importados, atualizados, analisados
+        async for msg in canal.history(limit=1000, oldest_first=True):
+            analisados += 1
+            registro = await importar_mensagem_antiga(msg)
+            if not registro:
+                continue
+            registro["status"] = status
+            alvo = limpar_rg(registro.get("rg", ""))
+            existente = next((p for p in lista if limpar_rg(p.get("rg", "")) == alvo), None)
+            if existente is None:
+                lista.append(registro)
+                importados += 1
+                continue
+            mudou = False
+            if str(existente.get("status") or "") != status:
+                existente["status"] = status
+                mudou = True
+            for campo in ("nome", "crimes", "ultimo_avistamento", "informacoes", "foto_individuo", "foto_rg", "mensagem_id", "mensagem_url"):
+                novo = registro.get(campo)
+                atual = existente.get(campo)
+                if novo and (not atual or campo in {"mensagem_id", "mensagem_url"}):
+                    if atual != novo:
+                        existente[campo] = novo
+                        mudou = True
+            if status == "RETIRADO":
+                existente["mensagem_arquivada_id"] = msg.id
+                existente["mensagem_url"] = msg.jump_url
+            if mudou:
+                atualizados += 1
+
+    await processar(canal_ativos, "A PROCURAR")
+    if isinstance(canal_arquivados, discord.TextChannel):
+        await processar(canal_arquivados, "RETIRADO")
+    if "remover_duplicados" in globals():
+        lista = remover_duplicados(lista)
+    salvar_procurados(lista)
+    gerar_catalogo_html()
+    return {"analisados": analisados, "importados": importados, "atualizados": atualizados}
+
+
+async def _catalogo_sync_periodico() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await _sincronizar_catalogo_procurados_silencioso()
+        except Exception as erro:
+            print(f"⚠️ Sincronização automática do catálogo falhou: {type(erro).__name__}: {erro}", flush=True)
+        await asyncio.sleep(600)
+
+
+_CATALOGO_SYNC_TASK: Optional[asyncio.Task] = None
+
+@bot.listen("on_ready")
+async def _catalogo_iniciar_sync_automatico() -> None:
+    global _CATALOGO_SYNC_TASK
+    if _CATALOGO_SYNC_TASK is None or _CATALOGO_SYNC_TASK.done():
+        _CATALOGO_SYNC_TASK = asyncio.create_task(_catalogo_sync_periodico(), name="catalogo-procurados-sync")
+    try:
+        bot.add_view(PainelProcuradosView())
+    except Exception:
+        pass
+
+
+@bot.listen("on_message")
+async def _catalogo_sync_ao_alterar_canais(message: discord.Message) -> None:
+    if int(getattr(message.channel, "id", 0) or 0) not in {int(PROCURADOS_CHANNEL_ID), int(HISTORICO_PROCURADOS_ID)}:
+        return
+    await asyncio.sleep(2)
+    try:
+        await _sincronizar_catalogo_procurados_silencioso()
+    except Exception as erro:
+        print(f"⚠️ Sync do catálogo após mensagem falhou: {type(erro).__name__}: {erro}", flush=True)
+
+
+# Painel de procurados sem botão manual de sincronização.
+class PainelProcuradosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Novo Procurado", emoji="➕", style=discord.ButtonStyle.danger, custom_id="dic_novo_procurado")
+    async def novo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(NovoProcuradoModal())
+
+    @discord.ui.button(label="Lista de Procurados", emoji="📋", style=discord.ButtonStyle.blurple, custom_id="dic_lista_procurados")
+    async def lista(self, interaction: discord.Interaction, button: Button):
+        procurados = carregar_procurados()
+        ativos = [p for p in procurados if p.get("status", "A PROCURAR") == "A PROCURAR"]
+        texto = "Nenhum procurado ativo cadastrado." if not ativos else "\n".join(
+            f"• **{p.get('nome','Sem nome')}** — RG: `{p.get('rg','')}`\n  📍 **Último avistamento:** {p.get('ultimo_avistamento') or 'Não informado'}"
+            for p in ativos[:20]
+        )
+        await interaction.response.send_message(f"📋 **Procurados ativos:**\n{texto}\n\n🔗 {CATALOG_PUBLIC_URL}", ephemeral=True)
+
+    @discord.ui.button(label="Registrar captura", emoji="🚔", style=discord.ButtonStyle.gray, custom_id="dic_retirar_procurado")
+    async def retirar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(RetirarProcuradoModal())
+
+    @discord.ui.button(label="Modificar Procurado", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="dic_modificar_procurado", row=1)
+    async def modificar(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            return await interaction.response.send_message("❌ Apenas a equipe DICOR pode modificar procurados.", ephemeral=True)
+        await interaction.response.send_modal(BuscarModificarProcuradoModal())
+
+    @discord.ui.button(label="Abrir Catálogo", emoji="📄", style=discord.ButtonStyle.green, custom_id="dic_abrir_catalogo")
+    async def abrir_catalogo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(f"📄 **Catálogo de Procurados:**\n{CATALOG_PUBLIC_URL}", ephemeral=True)
+
+
+print("✅ Patch V3 ativo: pesquisa completa, prisional obrigatório, reações e catálogo automático sem repostagem.", flush=True)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
