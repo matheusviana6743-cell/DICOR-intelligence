@@ -36694,6 +36694,50 @@ def _dicor_registros_por_topico_boletim() -> Tuple[Dict[int, List[Dict[str, Any]
     return abertos, fechados
 
 
+def _dicor_normalizar_data_alerta_bo(
+    valor: Any,
+    snowflake_id: int = 0,
+) -> Optional[datetime.datetime]:
+    """Normaliza datas do Discord e rejeita anos inválidos que causam OverflowError."""
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    minimo = datetime.datetime(2015, 1, 1, tzinfo=datetime.timezone.utc)
+    maximo = agora + datetime.timedelta(minutes=10)
+
+    data: Optional[datetime.datetime] = None
+    if isinstance(valor, datetime.datetime):
+        data = valor
+    elif valor:
+        try:
+            data = _dicor_data_utc(valor)
+        except Exception:
+            data = None
+
+    if data is not None:
+        try:
+            if data.tzinfo is None:
+                data = data.replace(tzinfo=datetime.timezone.utc)
+            data = data.astimezone(datetime.timezone.utc)
+            if minimo <= data <= maximo:
+                return data
+        except (OverflowError, OSError, ValueError):
+            data = None
+
+    # O ID de mensagem/tópico do Discord contém a data de criação. É a
+    # recuperação mais confiável quando created_at ou um valor salvo está
+    # corrompido, fora da faixa ou sem timezone.
+    if snowflake_id:
+        try:
+            data = discord.utils.snowflake_time(int(snowflake_id))
+            if data.tzinfo is None:
+                data = data.replace(tzinfo=datetime.timezone.utc)
+            data = data.astimezone(datetime.timezone.utc)
+            if minimo <= data <= maximo:
+                return data
+        except (OverflowError, OSError, ValueError, TypeError):
+            pass
+    return None
+
+
 def _dicor_ultima_atividade_humana(
     mensagens: List[discord.Message],
     topico: discord.Thread,
@@ -36701,14 +36745,20 @@ def _dicor_ultima_atividade_humana(
     for mensagem in mensagens:
         autor = getattr(mensagem, 'author', None)
         if autor is not None and not bool(getattr(autor, 'bot', False)):
-            data = getattr(mensagem, 'created_at', None)
-            if data and data.tzinfo is None:
-                data = data.replace(tzinfo=datetime.timezone.utc)
-            return data.astimezone(datetime.timezone.utc) if data else None, int(mensagem.id)
-    criado = getattr(topico, 'created_at', None)
-    if criado and criado.tzinfo is None:
-        criado = criado.replace(tzinfo=datetime.timezone.utc)
-    return (criado.astimezone(datetime.timezone.utc) if criado else None), int(getattr(topico, 'id', 0) or 0)
+            mensagem_id = int(getattr(mensagem, 'id', 0) or 0)
+            data = _dicor_normalizar_data_alerta_bo(
+                getattr(mensagem, 'created_at', None),
+                mensagem_id,
+            )
+            if data is not None:
+                return data, mensagem_id
+
+    topico_id = int(getattr(topico, 'id', 0) or 0)
+    criado = _dicor_normalizar_data_alerta_bo(
+        getattr(topico, 'created_at', None),
+        topico_id,
+    )
+    return criado, topico_id
 
 
 def _dicor_alerta_bo_parado_ja_publicado_no_periodo(
@@ -36762,17 +36812,37 @@ async def _dicor_verificar_boletins_parados_v3():
                 ignorados += 1
                 continue
 
-            horas = (agora - ultima_atividade).total_seconds() / 3600
-            if horas < _ALERTA_BOLETIM_V3_INTERVALO_HORAS:
+            try:
+                segundos = (agora - ultima_atividade).total_seconds()
+            except (OverflowError, OSError, ValueError):
+                # Última barreira para dados antigos/corrompidos. Recalcula a
+                # data pelo snowflake do tópico em vez de derrubar a rotina.
+                ultima_atividade = _dicor_normalizar_data_alerta_bo(None, marcador or topico_id)
+                if ultima_atividade is None:
+                    ignorados += 1
+                    continue
+                segundos = (agora - ultima_atividade).total_seconds()
+
+            horas = max(0.0, segundos / 3600.0)
+            if not math.isfinite(horas) or horas < _ALERTA_BOLETIM_V3_INTERVALO_HORAS:
                 continue
             elegiveis += 1
+
+            # Nunca soma milhares de períodos à data original. O código antigo
+            # podia ultrapassar o limite do datetime quando havia uma data
+            # corrompida. O início do período atual é calculado a partir de
+            # "agora", usando apenas um resto inferior a 48 horas.
             periodo = max(1, int(horas // _ALERTA_BOLETIM_V3_INTERVALO_HORAS))
-            inicio_periodo = ultima_atividade + datetime.timedelta(
-                hours=periodo * _ALERTA_BOLETIM_V3_INTERVALO_HORAS
-            )
+            resto_periodo = horas % float(_ALERTA_BOLETIM_V3_INTERVALO_HORAS)
+            inicio_periodo = agora - datetime.timedelta(hours=resto_periodo)
+
+            try:
+                marcador_data = int(ultima_atividade.timestamp())
+            except (OverflowError, OSError, ValueError):
+                marcador_data = int(marcador or topico_id)
             chave = (
                 f'alerta-boletim-parado-v3:{topico_id}:'
-                f'atividade-{int(ultima_atividade.timestamp())}:periodo-{periodo}'
+                f'atividade-{marcador_data}:periodo-{periodo}'
             )
 
             alerta_existente = _dicor_alerta_bo_parado_ja_publicado_no_periodo(
@@ -36913,7 +36983,7 @@ async def on_ready():
 
 
 print(
-    '✅ Fichas sem cópia de fotos da Perícia Externa + alertas BO parado V3 carregados.',
+    '✅ Alertas BO parado V3.1 carregados: datas inválidas protegidas e OverflowError corrigido.',
     flush=True,
 )
 
