@@ -42948,6 +42948,46 @@ def _prisao_ja_processada(mensagem_id: int) -> bool:
     return bool(row)
 
 
+async def _prisao_enviar_retorno_temporario(
+    message: discord.Message,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    delete_after: float = 30.0,
+) -> Optional[discord.Message]:
+    """Envia um retorno temporário sem depender de referência válida.
+
+    Encaminhamentos e snapshots podem não aceitar ``reply`` depois do OCR ou
+    durante reprocessamentos. Nesse caso, o bot envia diretamente no canal.
+    A ficha já salva nunca é tratada como falha por causa da notificação.
+    """
+    kwargs: Dict[str, Any] = {
+        "content": content,
+        "embed": embed,
+        "allowed_mentions": discord.AllowedMentions.none(),
+        "delete_after": delete_after,
+    }
+    try:
+        return await message.reply(mention_author=False, **kwargs)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+    except Exception:
+        pass
+
+    canal = getattr(message, "channel", None)
+    if canal is None or not hasattr(canal, "send"):
+        return None
+    try:
+        return await canal.send(**kwargs)
+    except Exception as erro:
+        print(
+            f"⚠️ Ficha prisional salva, mas o retorno temporário não pôde ser enviado: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return None
+
+
 async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False) -> Optional[Dict[str, Any]]:
     if int(message.channel.id) != HISTORICO_PRISAO_CHANNEL_ID:
         return None
@@ -42963,10 +43003,9 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 membro = None
     if membro is None or not _membro_inspetor_mais(membro):
         try:
-            await message.reply(
-                "⚠️ Não foi possível validar seu cargo de **Inspetor+** para importar esta prisão.",
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+            await _prisao_enviar_retorno_temporario(
+                message,
+                content="⚠️ Não foi possível validar seu cargo de **Inspetor+** para importar esta prisão.",
             )
         except Exception:
             pass
@@ -42984,21 +43023,22 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
         )
         if not nome or not rg:
             if not historico:
-                await message.reply(
-                    "⚠️ **HISTÓRICO DE PRISÃO NÃO IMPORTADO**\n"
-                    "Não foi possível identificar os campos **Nome** e **RG** na mensagem encaminhada. "
-                    "Mantenha o modelo `Nome: ...` e `RG: ...`.",
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                await _prisao_enviar_retorno_temporario(
+                    message,
+                    content=(
+                        "⚠️ **HISTÓRICO DE PRISÃO NÃO IMPORTADO**\n"
+                        "Não foi possível identificar os campos **Nome** e **RG** na mensagem encaminhada. "
+                        "Mantenha o modelo `Nome: ...` e `RG: ...`."
+                    ),
                 )
             return None
         descritores = await _prisao_coletar_descritores_midia(message)
         print(f"📷 Prisão V2 mensagem {message.id}: {len(descritores)} mídia(s) encontrada(s) no encaminhamento.", flush=True)
         if not descritores:
             if not historico:
-                await message.reply(
-                    f"⚠️ A prisão de **{nome}** (`{rg}`) possui texto, mas nenhuma imagem foi encontrada no encaminhamento.",
-                    mention_author=False,
+                await _prisao_enviar_retorno_temporario(
+                    message,
+                    content=f"⚠️ A prisão de **{nome}** (`{rg}`) possui texto, mas nenhuma imagem foi encontrada no encaminhamento.",
                 )
             return None
         with tempfile.TemporaryDirectory(prefix="dicor-prisao-") as tmp:
@@ -43049,7 +43089,7 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 foto_mochila_url=str((mochila_item or {}).get("url") or ""),
             )
         if not historico:
-            cor = discord.Color.green() if conferencia["status"] in {"VALIDADO", "VALIDADO_RG"} else discord.Color.orange()
+            cor = discord.Color.blue()
             embed = discord.Embed(
                 title="✅ FICHA PRISIONAL SINCRONIZADA" if conferencia["status"] != "DIVERGENTE" else "⚠️ FICHA SALVA — CONFERÊNCIA NECESSÁRIA",
                 description=(
@@ -43070,11 +43110,10 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 embed.set_image(url=foto_ind_url)
             if foto_rg_url.startswith("http"):
                 embed.set_thumbnail(url=foto_rg_url)
-            await message.reply(
+            await _prisao_enviar_retorno_temporario(
+                message,
                 embed=embed,
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-                delete_after=60,
+                delete_after=30,
             )
             await enviar_log(
                 f"🚔 Histórico de prisão sincronizado | {nome} | RG `{rg}` | "
@@ -43414,7 +43453,730 @@ print(
     flush=True,
 )
 print(
+    "✅ Histórico de Prisão V2.3 carregado: confirmação temporária com fallback sem referência; "
+    "HTTP 50035 Unknown message não interrompe mais a criação da ficha.",
+    flush=True,
+)
+print(
     "✅ Alertas BO parado V3.2 carregados: datas mínimas inválidas e conversão UTC-3 protegidas.",
+    flush=True,
+)
+
+
+# =====================================================
+# SISTEMA PROFISSIONAL DE ENTRADA / SET DICOR
+# - Painel público com formulário: Nome IC, Passaporte, Codinome e Recrutador;
+# - Solicitação encaminhada para autorização de Inspetor+;
+# - Aprovação concede Estagiário e aplica [E.DICOR] Codinome | Passaporte;
+# - Persistência em /data, prevenção de duplicatas e histórico de decisões.
+# =====================================================
+
+SET_CARGO_ESTAGIARIO_ID = env_int("SET_CARGO_ESTAGIARIO_ID", 1490200391239864352)
+SET_APROVACAO_CHANNEL_ID = env_int(
+    "SET_APROVACAO_CHANNEL_ID",
+    AUTORIZACOES_CHANNEL_ID or LOGS_CHANNEL_ID,
+)
+SET_BANNER_URL = os.getenv("SET_BANNER_URL", "").strip()
+SET_SOLICITACOES_JSON = DATA_DIR / "solicitacoes_set_dicor.json"
+_SET_SOLICITACOES_LOCK = asyncio.Lock()
+_SET_VIEWS_REGISTRADAS = False
+
+
+def _set_agora() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
+
+
+def _set_iso_agora() -> str:
+    return _set_agora().isoformat()
+
+
+def _set_limpar_texto(valor: Any, limite: int = 80) -> str:
+    texto = re.sub(r"[\r\n\t]+", " ", str(valor or ""))
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto[:limite].strip()
+
+
+def _set_carregar_dados() -> Dict[str, Any]:
+    dados = carregar_json(SET_SOLICITACOES_JSON, {})
+    if not isinstance(dados, dict):
+        dados = {}
+    dados.setdefault("contador", 0)
+    dados.setdefault("solicitacoes", {})
+    if not isinstance(dados.get("solicitacoes"), dict):
+        dados["solicitacoes"] = {}
+    return dados
+
+
+def _set_salvar_dados(dados: Dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    salvar_json(SET_SOLICITACOES_JSON, dados)
+
+
+def _set_novo_protocolo(dados: Dict[str, Any]) -> str:
+    contador = int(dados.get("contador") or 0) + 1
+    dados["contador"] = contador
+    return f"SET-{contador:04d}/{_set_agora().year}"
+
+
+def _set_formatar_apelido(codinome: str, passaporte: str) -> str:
+    prefixo = "[E.DICOR] "
+    sufixo = f" | {passaporte}"
+    espaco = max(1, 32 - len(prefixo) - len(sufixo))
+    nome = _set_limpar_texto(codinome, espaco) or "Estagiário"
+    return f"{prefixo}{nome[:espaco]}{sufixo}"[:32]
+
+
+def _set_usuario_inspetor_mais(usuario: Any) -> bool:
+    return isinstance(usuario, discord.Member) and _membro_inspetor_mais(usuario)
+
+
+def _set_buscar_por_mensagem(dados: Dict[str, Any], mensagem_id: int) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    for protocolo, solicitacao in dict(dados.get("solicitacoes") or {}).items():
+        if int(solicitacao.get("mensagem_aprovacao_id") or 0) == int(mensagem_id or 0):
+            return str(protocolo), solicitacao
+    return None, None
+
+
+def _set_embed_painel(guild: Optional[discord.Guild]) -> discord.Embed:
+    embed = discord.Embed(
+        title="🛡️ CENTRAL DE RECRUTAMENTO — DICOR",
+        description=(
+            "Bem-vindo ao sistema oficial de ingresso do **Departamento de Inteligência "
+            "e Combate ao Crime Organizado**.\n\n"
+            "Para solicitar seu **SET de Estagiário**, clique no botão abaixo e preencha "
+            "o formulário com informações corretas do personagem."
+        ),
+        color=discord.Color.dark_blue(),
+        timestamp=_set_agora(),
+    )
+    embed.add_field(
+        name="📋 Dados solicitados",
+        value=(
+            "• Nome completo (IC)\n"
+            "• Passaporte (ID)\n"
+            "• Codinome operacional\n"
+            "• Nome de quem realizou o recrutamento"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔐 Processo de autorização",
+        value=(
+            "A solicitação será encaminhada à administração da DICOR. "
+            "Somente **Inspetor, Vice-Diretor ou Diretor** poderá autorizar o ingresso."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ Após a aprovação",
+        value=(
+            f"Cargo concedido: <@&{SET_CARGO_ESTAGIARIO_ID}>\n"
+            "Apelido aplicado: `[E.DICOR] Codinome | Passaporte`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ Atenção",
+        value="Utilize somente informações verdadeiras do RP. Solicitações duplicadas ou incorretas poderão ser recusadas.",
+        inline=False,
+    )
+    if SET_BANNER_URL.startswith("http"):
+        embed.set_image(url=SET_BANNER_URL)
+    elif guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Sistema de Ingresso")
+    return embed
+
+
+def _set_embed_aprovacao(solicitacao: Dict[str, Any]) -> discord.Embed:
+    usuario_id = int(solicitacao.get("usuario_id") or 0)
+    embed = discord.Embed(
+        title="📨 SOLICITAÇÃO DE SET — AGUARDANDO AUTORIZAÇÃO",
+        description=(
+            "Uma nova solicitação de ingresso foi recebida. Confira os dados antes de autorizar.\n\n"
+            "🔒 **Somente Inspetor+ pode decidir esta solicitação.**"
+        ),
+        color=discord.Color.orange(),
+        timestamp=_set_agora(),
+    )
+    embed.add_field(name="👤 Solicitante", value=f"<@{usuario_id}>\n`{usuario_id}`", inline=True)
+    embed.add_field(name="📛 Nome completo (IC)", value=str(solicitacao.get("nome_ic") or "Não informado"), inline=True)
+    embed.add_field(name="🪪 Passaporte", value=f"`{solicitacao.get('passaporte') or 'N/I'}`", inline=True)
+    embed.add_field(name="🎭 Codinome", value=str(solicitacao.get("codinome") or "Não informado"), inline=True)
+    embed.add_field(name="🤝 Quem recrutou", value=str(solicitacao.get("recrutador") or "Não informado"), inline=True)
+    embed.add_field(
+        name="🏷️ Apelido previsto",
+        value=f"`{_set_formatar_apelido(str(solicitacao.get('codinome') or ''), str(solicitacao.get('passaporte') or ''))}`",
+        inline=False,
+    )
+    embed.add_field(
+        name="📅 Enviado em",
+        value=f"<t:{int(solicitacao.get('criado_timestamp') or int(time.time()))}:F>",
+        inline=False,
+    )
+    embed.set_footer(text=f"Protocolo {solicitacao.get('protocolo') or 'N/I'}")
+    return embed
+
+
+def _set_embed_resultado(solicitacao: Dict[str, Any], aprovado: bool, responsavel: discord.Member, motivo: str = "") -> discord.Embed:
+    protocolo = str(solicitacao.get("protocolo") or "N/I")
+    if aprovado:
+        embed = discord.Embed(
+            title="✅ SET AUTORIZADO — DICOR",
+            description="O ingresso foi aprovado e o usuário recebeu o cargo e o apelido operacional.",
+            color=discord.Color.green(),
+            timestamp=_set_agora(),
+        )
+        embed.add_field(name="👤 Integrante", value=f"<@{int(solicitacao.get('usuario_id') or 0)}>", inline=True)
+        embed.add_field(name="🏷️ Novo apelido", value=f"`{solicitacao.get('apelido_aplicado') or 'N/I'}`", inline=True)
+        embed.add_field(name="🛡️ Autorizado por", value=responsavel.mention, inline=True)
+    else:
+        embed = discord.Embed(
+            title="❌ SOLICITAÇÃO DE SET RECUSADA",
+            description="A solicitação foi analisada e não foi autorizada.",
+            color=discord.Color.red(),
+            timestamp=_set_agora(),
+        )
+        embed.add_field(name="👤 Solicitante", value=f"<@{int(solicitacao.get('usuario_id') or 0)}>", inline=True)
+        embed.add_field(name="🛡️ Analisado por", value=responsavel.mention, inline=True)
+        embed.add_field(name="📝 Motivo", value=_set_limpar_texto(motivo, 1000) or "Não informado", inline=False)
+    embed.set_footer(text=f"Protocolo {protocolo} • Esta mensagem será removida em 30 segundos")
+    return embed
+
+
+async def _set_obter_canal(guild: discord.Guild, fallback: Any = None) -> Any:
+    canal = guild.get_channel(int(SET_APROVACAO_CHANNEL_ID or 0)) if SET_APROVACAO_CHANNEL_ID else None
+    if canal is None and SET_APROVACAO_CHANNEL_ID:
+        try:
+            canal = await bot.fetch_channel(int(SET_APROVACAO_CHANNEL_ID))
+        except Exception:
+            canal = None
+    if canal is not None and hasattr(canal, "send"):
+        return canal
+    if fallback is not None and hasattr(fallback, "send"):
+        return fallback
+    return None
+
+
+async def _set_apagar_depois(mensagem: Optional[discord.Message], segundos: int = 30) -> None:
+    if mensagem is None:
+        return
+    await asyncio.sleep(max(1, int(segundos)))
+    try:
+        await mensagem.delete(reason="Solicitação de SET já decidida")
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    except Exception:
+        pass
+
+
+async def _set_atualizar_reacao_status(
+    mensagem: Optional[discord.Message],
+    emoji_status: str,
+) -> None:
+    """Mantém uma única reação do bot indicando o estado da ficha de SET."""
+    if mensagem is None:
+        return
+    emoji_status = str(emoji_status or "").strip()
+    if emoji_status not in {"⏳", "✅", "❌"}:
+        return
+
+    membro_bot = None
+    try:
+        guild = getattr(mensagem, "guild", None)
+        membro_bot = getattr(guild, "me", None) if guild is not None else None
+    except Exception:
+        membro_bot = None
+    if membro_bot is None:
+        membro_bot = getattr(bot, "user", None)
+
+    if membro_bot is not None:
+        for emoji_antigo in ("⏳", "✅", "❌"):
+            if emoji_antigo == emoji_status:
+                continue
+            try:
+                await mensagem.remove_reaction(emoji_antigo, membro_bot)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except Exception:
+                pass
+
+    try:
+        await mensagem.add_reaction(emoji_status)
+    except (discord.NotFound, discord.Forbidden):
+        pass
+    except Exception:
+        pass
+
+
+async def _set_reconciliar_reacoes_pendentes(guild: Optional[discord.Guild]) -> int:
+    """Restaura o ⏳ em solicitações pendentes após reinícios/deploys."""
+    if guild is None:
+        return 0
+    restauradas = 0
+    dados = _set_carregar_dados()
+    for solicitacao in dict(dados.get("solicitacoes") or {}).values():
+        if str(solicitacao.get("status") or "").upper() != "PENDENTE":
+            continue
+        canal_id = int(solicitacao.get("canal_aprovacao_id") or 0)
+        mensagem_id = int(solicitacao.get("mensagem_aprovacao_id") or 0)
+        if not canal_id or not mensagem_id:
+            continue
+        canal = guild.get_channel(canal_id)
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(canal_id)
+            except Exception:
+                canal = None
+        if canal is None or not hasattr(canal, "fetch_message"):
+            continue
+        try:
+            mensagem = await canal.fetch_message(mensagem_id)
+            await _set_atualizar_reacao_status(mensagem, "⏳")
+            restauradas += 1
+        except Exception:
+            continue
+    return restauradas
+
+
+async def _set_notificar_usuario(
+    guild: discord.Guild,
+    solicitacao: Dict[str, Any],
+    embed: discord.Embed,
+) -> None:
+    membro = guild.get_member(int(solicitacao.get("usuario_id") or 0))
+    enviado_dm = False
+    if membro is not None:
+        try:
+            await membro.send(embed=embed)
+            enviado_dm = True
+        except Exception:
+            enviado_dm = False
+    if enviado_dm:
+        return
+    canal_id = int(solicitacao.get("canal_origem_id") or 0)
+    canal = guild.get_channel(canal_id)
+    if canal is None and canal_id:
+        try:
+            canal = await bot.fetch_channel(canal_id)
+        except Exception:
+            canal = None
+    if canal is not None and hasattr(canal, "send"):
+        try:
+            await canal.send(
+                content=f"<@{int(solicitacao.get('usuario_id') or 0)}>",
+                embed=embed,
+                delete_after=60,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except Exception:
+            pass
+
+
+class SetSolicitacaoModal(discord.ui.Modal):
+    def __init__(self, canal_origem_id: int):
+        super().__init__(title="Formulário de Entrada — DICOR", timeout=300)
+        self.canal_origem_id = int(canal_origem_id or 0)
+        self.nome_ic = discord.ui.TextInput(
+            label="Nome completo (IC)",
+            placeholder="Ex.: Matheus Cooper",
+            min_length=3,
+            max_length=50,
+            required=True,
+        )
+        self.passaporte = discord.ui.TextInput(
+            label="Passaporte (ID)",
+            placeholder="Ex.: 34620",
+            min_length=1,
+            max_length=10,
+            required=True,
+        )
+        self.codinome = discord.ui.TextInput(
+            label="Codinome",
+            placeholder="Ex.: Baiano",
+            min_length=2,
+            max_length=30,
+            required=True,
+        )
+        self.recrutador = discord.ui.TextInput(
+            label="Quem te recrutou?",
+            placeholder="Nome ou codinome do recrutador",
+            min_length=2,
+            max_length=50,
+            required=True,
+        )
+        self.add_item(self.nome_ic)
+        self.add_item(self.passaporte)
+        self.add_item(self.codinome)
+        self.add_item(self.recrutador)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("❌ Este formulário só pode ser usado dentro do servidor.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        nome_ic = _set_limpar_texto(self.nome_ic.value, 50)
+        passaporte = _set_limpar_texto(self.passaporte.value, 10)
+        codinome = _set_limpar_texto(self.codinome.value, 30)
+        recrutador = _set_limpar_texto(self.recrutador.value, 50)
+
+        if not re.fullmatch(r"\d{1,10}", passaporte):
+            return await interaction.followup.send("❌ O passaporte deve conter somente números.", ephemeral=True)
+        if len(nome_ic) < 3 or len(codinome) < 2 or len(recrutador) < 2:
+            return await interaction.followup.send("❌ Preencha todos os campos corretamente.", ephemeral=True)
+
+        cargo_estagiario = interaction.guild.get_role(int(SET_CARGO_ESTAGIARIO_ID))
+        if cargo_estagiario and cargo_estagiario in interaction.user.roles:
+            return await interaction.followup.send("⚠️ Você já possui o cargo de Estagiário DICOR.", ephemeral=True)
+
+        protocolo = ""
+        solicitacao: Dict[str, Any] = {}
+        async with _SET_SOLICITACOES_LOCK:
+            dados = _set_carregar_dados()
+            for existente in dict(dados.get("solicitacoes") or {}).values():
+                status = str(existente.get("status") or "").upper()
+                mesmo_usuario = int(existente.get("usuario_id") or 0) == int(interaction.user.id)
+                mesmo_passaporte = str(existente.get("passaporte") or "") == passaporte
+                if status in {"PENDENTE", "PROCESSANDO"} and (mesmo_usuario or mesmo_passaporte):
+                    return await interaction.followup.send(
+                        f"⚠️ Já existe uma solicitação pendente: `{existente.get('protocolo') or 'sem protocolo'}`.",
+                        ephemeral=True,
+                    )
+                if status == "APROVADO" and mesmo_passaporte and not mesmo_usuario:
+                    return await interaction.followup.send("❌ Este passaporte já está vinculado a outro integrante aprovado.", ephemeral=True)
+
+            protocolo = _set_novo_protocolo(dados)
+            solicitacao = {
+                "protocolo": protocolo,
+                "status": "PENDENTE",
+                "usuario_id": int(interaction.user.id),
+                "usuario_nome": str(interaction.user),
+                "nome_ic": nome_ic,
+                "passaporte": passaporte,
+                "codinome": codinome,
+                "recrutador": recrutador,
+                "canal_origem_id": int(self.canal_origem_id or getattr(interaction.channel, "id", 0) or 0),
+                "guild_id": int(interaction.guild.id),
+                "criado_em": _set_iso_agora(),
+                "criado_timestamp": int(time.time()),
+                "mensagem_aprovacao_id": 0,
+                "canal_aprovacao_id": 0,
+            }
+            dados["solicitacoes"][protocolo] = solicitacao
+            _set_salvar_dados(dados)
+
+        canal_aprovacao = await _set_obter_canal(interaction.guild, interaction.channel)
+        if canal_aprovacao is None:
+            async with _SET_SOLICITACOES_LOCK:
+                dados = _set_carregar_dados()
+                dados.get("solicitacoes", {}).pop(protocolo, None)
+                _set_salvar_dados(dados)
+            return await interaction.followup.send(
+                "❌ Não encontrei um canal para encaminhar a autorização. Configure `SET_APROVACAO_CHANNEL_ID`.",
+                ephemeral=True,
+            )
+
+        try:
+            mensagem = await canal_aprovacao.send(
+                content=mencoes_inspetor_mais(interaction.guild),
+                embed=_set_embed_aprovacao(solicitacao),
+                view=SetAprovacaoView(),
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
+            await _set_atualizar_reacao_status(mensagem, "⏳")
+        except Exception as erro:
+            async with _SET_SOLICITACOES_LOCK:
+                dados = _set_carregar_dados()
+                dados.get("solicitacoes", {}).pop(protocolo, None)
+                _set_salvar_dados(dados)
+            await enviar_log(f"❌ Falha ao encaminhar solicitação de SET {protocolo}: {type(erro).__name__}: {erro}")
+            return await interaction.followup.send("❌ Não foi possível encaminhar sua solicitação. Tente novamente mais tarde.", ephemeral=True)
+
+        async with _SET_SOLICITACOES_LOCK:
+            dados = _set_carregar_dados()
+            registro = dados.get("solicitacoes", {}).get(protocolo)
+            if isinstance(registro, dict):
+                registro["mensagem_aprovacao_id"] = int(mensagem.id)
+                registro["canal_aprovacao_id"] = int(mensagem.channel.id)
+                _set_salvar_dados(dados)
+
+        await enviar_log(
+            f"📨 Solicitação de SET recebida | {protocolo} | {interaction.user} (`{interaction.user.id}`) | "
+            f"IC `{nome_ic}` | passaporte `{passaporte}` | codinome `{codinome}` | recrutador `{recrutador}`."
+        )
+        await interaction.followup.send(
+            f"✅ Sua solicitação foi encaminhada para análise.\nProtocolo: **{protocolo}**",
+            ephemeral=True,
+        )
+
+
+class SetSolicitarView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Solicitar SET",
+        emoji="📝",
+        style=discord.ButtonStyle.primary,
+        custom_id="dicor:set:solicitar:v1",
+    )
+    async def solicitar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetSolicitacaoModal(int(getattr(interaction.channel, "id", 0) or 0)))
+
+
+async def _set_obter_solicitacao_por_interacao(interaction: discord.Interaction) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    mensagem_id = int(getattr(getattr(interaction, "message", None), "id", 0) or 0)
+    async with _SET_SOLICITACOES_LOCK:
+        dados = _set_carregar_dados()
+        protocolo, solicitacao = _set_buscar_por_mensagem(dados, mensagem_id)
+        return protocolo, dict(solicitacao) if isinstance(solicitacao, dict) else None
+
+
+async def _set_aprovar(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _set_usuario_inspetor_mais(interaction.user):
+        return await interaction.response.send_message("❌ Somente Inspetor+ pode autorizar o SET.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    mensagem_id = int(getattr(getattr(interaction, "message", None), "id", 0) or 0)
+
+    async with _SET_SOLICITACOES_LOCK:
+        dados = _set_carregar_dados()
+        protocolo, solicitacao = _set_buscar_por_mensagem(dados, mensagem_id)
+        if not protocolo or not isinstance(solicitacao, dict):
+            return await interaction.followup.send("❌ Esta solicitação não foi encontrada no banco.", ephemeral=True)
+        status = str(solicitacao.get("status") or "").upper()
+        if status != "PENDENTE":
+            return await interaction.followup.send(f"⚠️ Esta solicitação já está em estado **{status or 'desconhecido'}**.", ephemeral=True)
+        solicitacao["status"] = "PROCESSANDO"
+        dados["solicitacoes"][protocolo] = solicitacao
+        _set_salvar_dados(dados)
+
+    membro = interaction.guild.get_member(int(solicitacao.get("usuario_id") or 0))
+    if membro is None:
+        try:
+            membro = await interaction.guild.fetch_member(int(solicitacao.get("usuario_id") or 0))
+        except Exception:
+            membro = None
+    cargo = interaction.guild.get_role(int(SET_CARGO_ESTAGIARIO_ID))
+    if membro is None or cargo is None:
+        async with _SET_SOLICITACOES_LOCK:
+            dados = _set_carregar_dados()
+            if protocolo in dados.get("solicitacoes", {}):
+                dados["solicitacoes"][protocolo]["status"] = "PENDENTE"
+                _set_salvar_dados(dados)
+        detalhe = "usuário não está mais no servidor" if membro is None else f"cargo `{SET_CARGO_ESTAGIARIO_ID}` não encontrado"
+        return await interaction.followup.send(f"❌ Não foi possível aprovar: {detalhe}.", ephemeral=True)
+
+    apelido = _set_formatar_apelido(str(solicitacao.get("codinome") or ""), str(solicitacao.get("passaporte") or ""))
+    ja_tinha_cargo = cargo in membro.roles
+    try:
+        if not ja_tinha_cargo:
+            await membro.add_roles(cargo, reason=f"SET DICOR autorizado por {interaction.user} • {protocolo}")
+        await membro.edit(nick=apelido, reason=f"Padronização de ingresso DICOR • {protocolo}")
+    except Exception as erro:
+        if not ja_tinha_cargo:
+            try:
+                await membro.remove_roles(cargo, reason=f"Rollback por falha no apelido • {protocolo}")
+            except Exception:
+                pass
+        async with _SET_SOLICITACOES_LOCK:
+            dados = _set_carregar_dados()
+            if protocolo in dados.get("solicitacoes", {}):
+                dados["solicitacoes"][protocolo]["status"] = "PENDENTE"
+                _set_salvar_dados(dados)
+        await enviar_log(f"❌ Falha ao aplicar SET {protocolo}: {type(erro).__name__}: {erro}")
+        return await interaction.followup.send(
+            "❌ Não consegui aplicar o cargo/apelido. Verifique se o bot possui **Gerenciar Cargos**, "
+            "**Gerenciar Apelidos** e se o cargo do bot está acima do Estagiário.",
+            ephemeral=True,
+        )
+
+    async with _SET_SOLICITACOES_LOCK:
+        dados = _set_carregar_dados()
+        registro = dados.get("solicitacoes", {}).get(protocolo, {})
+        registro.update({
+            "status": "APROVADO",
+            "apelido_aplicado": apelido,
+            "decidido_em": _set_iso_agora(),
+            "decidido_por_id": int(interaction.user.id),
+            "decidido_por_nome": str(interaction.user),
+        })
+        dados["solicitacoes"][protocolo] = registro
+        _set_salvar_dados(dados)
+        solicitacao = dict(registro)
+
+    resultado = _set_embed_resultado(solicitacao, True, interaction.user)
+    try:
+        await _set_atualizar_reacao_status(interaction.message, "✅")
+        await interaction.message.edit(content=None, embed=resultado, view=None)
+        asyncio.create_task(_set_apagar_depois(interaction.message, 30), name=f"apagar-set-{mensagem_id}")
+    except Exception:
+        pass
+    await _set_notificar_usuario(interaction.guild, solicitacao, resultado)
+    await enviar_log(
+        f"✅ SET autorizado | {protocolo} | usuário <@{membro.id}> | cargo <@&{cargo.id}> | "
+        f"apelido `{apelido}` | autorizado por {interaction.user} (`{interaction.user.id}`)."
+    )
+    await interaction.followup.send(f"✅ SET autorizado. Novo apelido: `{apelido}`", ephemeral=True)
+
+
+class SetRecusarModal(discord.ui.Modal):
+    def __init__(self, mensagem_id: int, canal_id: int):
+        super().__init__(title="Recusar solicitação de SET", timeout=300)
+        self.mensagem_id = int(mensagem_id or 0)
+        self.canal_id = int(canal_id or 0)
+        self.motivo = discord.ui.TextInput(
+            label="Motivo da recusa",
+            placeholder="Informe de forma objetiva o motivo da decisão.",
+            style=discord.TextStyle.paragraph,
+            min_length=3,
+            max_length=500,
+            required=True,
+        )
+        self.add_item(self.motivo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not _set_usuario_inspetor_mais(interaction.user):
+            return await interaction.response.send_message("❌ Somente Inspetor+ pode recusar solicitações.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        motivo = _set_limpar_texto(self.motivo.value, 500)
+
+        async with _SET_SOLICITACOES_LOCK:
+            dados = _set_carregar_dados()
+            protocolo, solicitacao = _set_buscar_por_mensagem(dados, self.mensagem_id)
+            if not protocolo or not isinstance(solicitacao, dict):
+                return await interaction.followup.send("❌ Esta solicitação não foi encontrada.", ephemeral=True)
+            status = str(solicitacao.get("status") or "").upper()
+            if status != "PENDENTE":
+                return await interaction.followup.send(f"⚠️ Esta solicitação já está em estado **{status}**.", ephemeral=True)
+            solicitacao.update({
+                "status": "RECUSADO",
+                "motivo_recusa": motivo,
+                "decidido_em": _set_iso_agora(),
+                "decidido_por_id": int(interaction.user.id),
+                "decidido_por_nome": str(interaction.user),
+            })
+            dados["solicitacoes"][protocolo] = solicitacao
+            _set_salvar_dados(dados)
+
+        mensagem = None
+        canal = interaction.guild.get_channel(self.canal_id)
+        if canal is None and self.canal_id:
+            try:
+                canal = await bot.fetch_channel(self.canal_id)
+            except Exception:
+                canal = None
+        if canal is not None and hasattr(canal, "fetch_message"):
+            try:
+                mensagem = await canal.fetch_message(self.mensagem_id)
+            except Exception:
+                mensagem = None
+
+        resultado = _set_embed_resultado(solicitacao, False, interaction.user, motivo)
+        if mensagem is not None:
+            try:
+                await _set_atualizar_reacao_status(mensagem, "❌")
+                await mensagem.edit(content=None, embed=resultado, view=None)
+                asyncio.create_task(_set_apagar_depois(mensagem, 30), name=f"apagar-set-{self.mensagem_id}")
+            except Exception:
+                pass
+        await _set_notificar_usuario(interaction.guild, solicitacao, resultado)
+        await enviar_log(
+            f"❌ SET recusado | {protocolo} | usuário <@{int(solicitacao.get('usuario_id') or 0)}> | "
+            f"por {interaction.user} (`{interaction.user.id}`) | motivo: {motivo}"
+        )
+        await interaction.followup.send("✅ Solicitação recusada e usuário notificado.", ephemeral=True)
+
+
+class SetAprovacaoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Autorizar SET",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="dicor:set:aprovar:v1",
+    )
+    async def aprovar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _set_aprovar(interaction)
+
+    @discord.ui.button(
+        label="Recusar",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        custom_id="dicor:set:recusar:v1",
+    )
+    async def recusar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not _set_usuario_inspetor_mais(interaction.user):
+            return await interaction.response.send_message("❌ Somente Inspetor+ pode recusar solicitações.", ephemeral=True)
+        await interaction.response.send_modal(
+            SetRecusarModal(
+                int(getattr(getattr(interaction, "message", None), "id", 0) or 0),
+                int(getattr(interaction.channel, "id", 0) or 0),
+            )
+        )
+
+
+@bot.tree.command(name="painelentrada", description="Publica o painel profissional de entrada e solicitação de SET da DICOR.")
+@app_commands.describe(canal="Canal onde o painel de entrada será publicado.")
+async def painelentrada(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+    if interaction.guild is None or not _set_usuario_inspetor_mais(interaction.user):
+        return await interaction.response.send_message("❌ Somente Inspetor+ pode publicar o painel de entrada.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    destino = canal or interaction.channel
+    if destino is None or not hasattr(destino, "send"):
+        return await interaction.followup.send("❌ Não foi possível identificar o canal de destino.", ephemeral=True)
+    try:
+        mensagem = await destino.send(embed=_set_embed_painel(interaction.guild), view=SetSolicitarView())
+    except Exception as erro:
+        await enviar_log(f"❌ Falha ao publicar painel de entrada: {type(erro).__name__}: {erro}")
+        return await interaction.followup.send(
+            "❌ Não consegui publicar o painel. Verifique as permissões do bot no canal.",
+            ephemeral=True,
+        )
+    await enviar_log(
+        f"🛡️ Painel de entrada DICOR publicado por {interaction.user} (`{interaction.user.id}`) "
+        f"no canal <#{int(mensagem.channel.id)}> (`{mensagem.id}`)."
+    )
+    await interaction.followup.send(f"✅ Painel de entrada publicado em {mensagem.channel.mention}.", ephemeral=True)
+
+
+_SET_ON_READY_ANTERIOR = on_ready
+
+
+@bot.event
+async def on_ready():
+    global _SET_VIEWS_REGISTRADAS
+    if not _SET_VIEWS_REGISTRADAS:
+        try:
+            bot.add_view(SetSolicitarView())
+            bot.add_view(SetAprovacaoView())
+            _SET_VIEWS_REGISTRADAS = True
+        except Exception as erro:
+            print(f"⚠️ Falha ao registrar views persistentes do SET: {type(erro).__name__}: {erro}", flush=True)
+    await _SET_ON_READY_ANTERIOR()
+    try:
+        SET_SOLICITACOES_JSON.parent.mkdir(parents=True, exist_ok=True)
+        dados = _set_carregar_dados()
+        pendentes = sum(
+            1 for item in dict(dados.get("solicitacoes") or {}).values()
+            if str(item.get("status") or "").upper() == "PENDENTE"
+        )
+        reacoes_restauradas = await _set_reconciliar_reacoes_pendentes(bot.get_guild(GUILD_ID))
+        print(
+            f"✅ Sistema de Entrada DICOR ativo: painel /painelentrada, autorização Inspetor+, "
+            f"cargo Estagiário {SET_CARGO_ESTAGIARIO_ID}, {pendentes} solicitação(ões) pendente(s), "
+            f"{reacoes_restauradas} status ⏳ restaurado(s).",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao iniciar Sistema de Entrada DICOR: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ Sistema de Entrada/SET DICOR V1.1 carregado: formulário profissional, autorização exclusiva de Inspetor+, "
+    "cargo Estagiário, apelido [E.DICOR] Codinome | Passaporte e status por reação ⏳/✅/❌.",
     flush=True,
 )
 
