@@ -44714,5 +44714,265 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# PATCH FINAL — CONSULTA COMPACTA E PROFISSIONAL V2
+# - "Pesquisar fichas" abre a lupa/modal imediatamente.
+# - Toda consulta por interação usa mensagem azul efêmera.
+# - Resultados mostram apenas Nome + RG e botão "Abrir Ficha".
+# - Reconhecimento automático por RG ou nome usa cartão azul temporário.
+# =====================================================
+
+
+def _banco_preview_nome_rg(tipo: str, registro: Dict[str, Any]) -> Tuple[str, str]:
+    if tipo == "individuo":
+        return (
+            str(registro.get("nome") or "Indivíduo não identificado"),
+            str(registro.get("rg") or "Não informado"),
+        )
+    if tipo == "veiculo":
+        return (
+            str(registro.get("proprietario_nome") or "Proprietário não identificado"),
+            str(registro.get("proprietario_rg") or "Não informado"),
+        )
+    return (str(registro.get("nome") or "Organização"), "Não se aplica")
+
+
+def _banco_preview_embed(consulta: str, itens: List[Tuple[str, Dict[str, Any]]]) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔎 RESULTADO DA PESQUISA",
+        description=(
+            f"Consulta: **{str(consulta)[:100]}**\n"
+            "As informações completas permanecem protegidas. Use **Abrir Ficha** para visualizar."
+        ),
+        color=discord.Color.from_rgb(30, 105, 190),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    linhas = []
+    for indice, (tipo, item) in enumerate(itens[:10], start=1):
+        nome, rg = _banco_preview_nome_rg(tipo, item)
+        linhas.append(f"**{indice}. {nome[:90]}**\n> RG: `{rg[:40]}`")
+    embed.add_field(name=f"📁 Fichas localizadas ({len(itens)})", value="\n\n".join(linhas)[:1024], inline=False)
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Consulta restrita ao solicitante")
+    return embed
+
+
+class BancoAbrirFichaButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, indice: int = 0):
+        rotulo = "Abrir Ficha" if indice == 0 else f"Abrir Ficha {indice + 1}"
+        super().__init__(
+            label=rotulo[:80], emoji="📂", style=discord.ButtonStyle.primary,
+            custom_id=f"dicor_abrir_ficha_compacta:{tipo}:{int(registro_id)}:{secrets.token_hex(3)}",
+        )
+        self.tipo = str(tipo)
+        self.registro_id = int(registro_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if self.tipo == "faccao":
+                registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", self.registro_id)
+                if not registro:
+                    return await interaction.edit_original_response(content="❌ A organização não existe mais.", embed=None, view=None)
+                embed = _banco_embed_consulta_faccao(registro)
+            else:
+                perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, self.tipo, self.registro_id)
+                if not perfil:
+                    return await interaction.edit_original_response(content="❌ A ficha não existe mais.", embed=None, view=None)
+                embed = _banco_embed_ficha_geral(perfil)
+            embed.color = discord.Color.from_rgb(30, 105, 190)
+            await interaction.edit_original_response(embed=embed, view=None)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível abrir a ficha.", erro)
+
+
+class BancoAbrirFichaView(View):
+    def __init__(self, itens: List[Tuple[str, Dict[str, Any]]], usuario_id: int = 0, *, timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.usuario_id = int(usuario_id or 0)
+        for indice, (tipo, item) in enumerate(itens[:5]):
+            registro_id = int(item.get("id") or 0)
+            if registro_id:
+                self.add_item(BancoAbrirFichaButton(tipo, registro_id, indice))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.usuario_id and int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message("❌ Esta consulta pertence a outro agente.", ephemeral=True)
+            return False
+        return True
+
+
+async def _banco_prof_enviar_consulta(
+    interaction: discord.Interaction,
+    consulta: str,
+    *,
+    editar_original: bool = False,
+) -> None:
+    resultados = await asyncio.to_thread(banco_buscar, consulta)
+    itens: List[Tuple[str, Dict[str, Any]]] = []
+    vistos: set[Tuple[str, int]] = set()
+    for tipo, grupo in (
+        ("individuo", resultados.get("individuos", [])),
+        ("veiculo", resultados.get("veiculos", [])),
+        ("faccao", resultados.get("faccoes", [])),
+    ):
+        for item in grupo:
+            chave = (tipo, int(item.get("id") or 0))
+            if chave[1] and chave not in vistos:
+                vistos.add(chave)
+                itens.append((tipo, item))
+
+    if not itens:
+        embed = discord.Embed(
+            title="🔎 RESULTADO DA PESQUISA",
+            description=f"Nenhuma ficha foi localizada para **{str(consulta)[:100]}**.",
+            color=discord.Color.from_rgb(30, 105, 190),
+        )
+        if editar_original:
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    embed = _banco_preview_embed(consulta, itens)
+    view = BancoAbrirFichaView(itens, int(interaction.user.id))
+    if editar_original:
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# Painel final: a lupa abre imediatamente, sem menu intermediário.
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True)
+            return False
+        asyncio.create_task(_banco_prof_salvar_contexto_painel(interaction))
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "A Central de Fichas apresentou uma falha.", error)
+
+    @discord.ui.button(label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary,
+                       custom_id="dicor_banco_criar_ficha_v3", row=0)
+    async def criar_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+
+    @discord.ui.button(label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary,
+                       custom_id="dicor_banco_consultar", row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaModal())
+
+    @discord.ui.button(label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary,
+                       custom_id="dicor_banco_importar_painel", row=0)
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🏴 ESCOLHA O MODO DE ATUALIZAÇÃO",
+            description="Selecione como o painel deverá atualizar os registros.",
+            color=discord.Color.from_rgb(30, 105, 190),
+        )
+        embed.add_field(name="🔗 MESCLAR • recomendado", value="Adiciona e atualiza registros sem desativar ausentes.", inline=False)
+        embed.add_field(name="♻️ SUBSTITUIR LISTA ATUAL", value="A lista enviada vira a formação atual; o histórico é preservado.", inline=False)
+        await interaction.response.send_message(
+            embed=embed,
+            view=BancoEscolherModoPainelView(
+                int(interaction.user.id), int(getattr(interaction.channel, "id", 0) or 0),
+                int(getattr(interaction.message, "id", 0) or 0),
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success,
+                       custom_id="dicor_banco_sync_tudo", row=0)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send("⏳ Já existe uma sincronização em andamento.", ephemeral=True)
+        await interaction.followup.send("🔄 Sincronização iniciada.", ephemeral=True)
+        asyncio.create_task(_banco_v4_sync_com_revisao(
+            interaction, int(getattr(interaction.channel, "id", 0) or 0),
+            int(getattr(interaction.message, "id", 0) or 0),
+        ))
+
+
+# Detecção automática por RG ou nome completo cadastrado.
+def _rg_auto_detectar(texto: str, indice: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    if not texto or not indice:
+        return []
+    sem_urls = re.sub(r"https?://\S+", " ", texto)
+    sem_urls = re.sub(r"<[@#&!]?[0-9]{10,25}>", " ", sem_urls)
+    encontrados: List[str] = []
+
+    padrao_explicito = re.compile(
+        r"(?i)\b(?:rg|registro(?:\s+geral)?|passaporte|documento)\s*(?:n[º°o]\.?|numero)?\s*[:#\-]?\s*([A-Za-z0-9.\-/]{2,20})"
+    )
+    for valor in padrao_explicito.findall(sem_urls):
+        rg_n = _banco_normalizar_rg(valor)
+        if rg_n in indice and rg_n not in encontrados:
+            encontrados.append(rg_n)
+    for valor in re.findall(r"(?<![0-9])([0-9]{3,9})(?![0-9])", sem_urls):
+        rg_n = _banco_normalizar_rg(valor)
+        if rg_n in indice and rg_n not in encontrados:
+            encontrados.append(rg_n)
+
+    texto_n = _rg_auto_normalizar_texto(sem_urls)
+    for rg_n, individuo in indice.items():
+        if rg_n in encontrados:
+            continue
+        nome_n = _rg_auto_normalizar_texto(individuo.get("nome"))
+        if len(nome_n) < 5 or len(nome_n.split()) < 2:
+            continue
+        if re.search(rf"(?<!\w){re.escape(nome_n)}(?!\w)", texto_n):
+            encontrados.append(rg_n)
+        if len(encontrados) >= _RG_AUTO_MAX_POR_MENSAGEM:
+            break
+    return [(rg, indice[rg]) for rg in encontrados[:_RG_AUTO_MAX_POR_MENSAGEM]]
+
+
+async def _rg_auto_enviar_ficha(message: discord.Message, rg: str, individuo: Dict[str, Any]) -> None:
+    if not await asyncio.to_thread(_rg_auto_reservar_aparicao_sync, message, individuo, rg):
+        return
+    try:
+        nome = str(individuo.get("nome") or "Indivíduo não identificado")
+        rg_n = _banco_normalizar_rg(rg)
+        embed = discord.Embed(
+            title="🔎 FICHA LOCALIZADA",
+            description="Uma referência corresponde a um registro existente no banco da DICOR.",
+            color=discord.Color.from_rgb(30, 105, 190),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.add_field(name="👤 Nome", value=nome[:1024], inline=False)
+        embed.add_field(name="🪪 RG", value=f"`{rg_n}`", inline=True)
+        embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Abra a ficha somente quando necessário")
+        view = BancoAbrirFichaView([("individuo", individuo)], usuario_id=0, timeout=float(_RG_AUTO_DELETE_AFTER))
+        try:
+            resposta = await message.reply(
+                embed=embed, view=view, mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(), delete_after=_RG_AUTO_DELETE_AFTER,
+            )
+        except Exception:
+            resposta = await message.channel.send(
+                embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none(),
+                delete_after=_RG_AUTO_DELETE_AFTER,
+            )
+        await asyncio.to_thread(_rg_auto_atualizar_resposta_sync, int(message.id), rg, int(resposta.id))
+    except Exception as erro:
+        await asyncio.to_thread(_rg_auto_cancelar_reserva_sync, int(message.id), rg)
+        print(f"⚠️ Consulta automática compacta falhou: {type(erro).__name__}: {erro}", flush=True)
+
+
+@bot.listen("on_ready")
+async def _banco_compacto_recarregar_view() -> None:
+    try:
+        bot.add_view(BancoDadosView())
+        print("✅ Consulta Compacta V2 ativa: modal direto, respostas azuis e botão Abrir Ficha.", flush=True)
+    except Exception as erro:
+        print(f"⚠️ Falha ao carregar Consulta Compacta V2: {erro}", flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
