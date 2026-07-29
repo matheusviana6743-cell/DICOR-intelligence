@@ -42240,5 +42240,973 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# PATCH FINAL — HISTÓRICO DE PRISÃO INTEGRADO À FICHA GERAL
+# - Canal exclusivo: 1532097197292654622;
+# - Lê mensagens encaminhadas, inclusive message_snapshots da API;
+# - Processa texto + todas as imagens da mesma mensagem em um único lote;
+# - Confere Nome/RG digitados com o documento fotografado via OCR;
+# - Cria/atualiza a ficha e mantém todas as prisões como links históricos;
+# - Salva foto do indivíduo e foto do RG de forma persistente e compactada;
+# - Exibe as duas imagens e os links de Perícia, BO e Prisão na ficha geral.
+# =====================================================
+
+from difflib import SequenceMatcher as _prisao_sequence_matcher
+from urllib.parse import quote as _prisao_quote, urlsplit as _prisao_urlsplit
+
+HISTORICO_PRISAO_CHANNEL_ID = int(os.getenv("HISTORICO_PRISAO_CHANNEL_ID", "1532097197292654622"))
+HISTORICO_PRISAO_SCAN_LIMIT = max(20, min(1000, int(os.getenv("HISTORICO_PRISAO_SCAN_LIMIT", "300"))))
+_HISTORICO_PRISAO_DIR = Path(DATA_DIR) / "historico_prisao"
+_HISTORICO_PRISAO_DIR.mkdir(parents=True, exist_ok=True)
+_PRISAO_PROCESSANDO: set[int] = set()
+_PRISAO_LOCKS: Dict[int, asyncio.Lock] = {}
+_PRISAO_INIT_ANTES = inicializar_banco_dicor
+_PRISAO_ON_READY_ANTERIOR = on_ready
+_BANCO_FICHA_GERAL_CARREGAR_ANTES_PRISAO = _banco_ficha_geral_carregar
+_BANCO_EMBED_FICHA_GERAL_ANTES_PRISAO = _banco_embed_ficha_geral
+_BANCO_FICHA_GERAL_VIEW_ANTES_PRISAO = BancoFichaGeralView
+
+
+def inicializar_banco_dicor() -> None:
+    _PRISAO_INIT_ANTES()
+    _HISTORICO_PRISAO_DIR.mkdir(parents=True, exist_ok=True)
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS historico_prisoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mensagem_id INTEGER NOT NULL UNIQUE,
+                canal_id INTEGER NOT NULL,
+                mensagem_url TEXT NOT NULL,
+                mensagem_origem_id INTEGER DEFAULT 0,
+                canal_origem_id INTEGER DEFAULT 0,
+                guild_origem_id INTEGER DEFAULT 0,
+                individuo_id INTEGER DEFAULT 0,
+                nome_texto TEXT NOT NULL,
+                rg_texto TEXT NOT NULL,
+                nome_ocr TEXT DEFAULT '',
+                rg_ocr TEXT DEFAULT '',
+                conferencia_status TEXT DEFAULT 'NAO_CONFERIDO',
+                conferencia_detalhes TEXT DEFAULT '',
+                data_prisao TEXT DEFAULT '',
+                pena_total TEXT DEFAULT '',
+                multa_total TEXT DEFAULT '',
+                fianca TEXT DEFAULT '',
+                infracoes_quantidade INTEGER DEFAULT 0,
+                texto_original TEXT DEFAULT '',
+                foto_individuo_path TEXT DEFAULT '',
+                foto_rg_path TEXT DEFAULT '',
+                foto_mochila_url TEXT DEFAULT '',
+                criado_por_id INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fontes_ficha_individuo (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                individuo_id INTEGER NOT NULL,
+                tipo TEXT NOT NULL,
+                mensagem_id INTEGER DEFAULT 0,
+                canal_id INTEGER DEFAULT 0,
+                mensagem_url TEXT NOT NULL,
+                numero_referencia TEXT DEFAULT '',
+                descricao TEXT DEFAULT '',
+                criado_em TEXT NOT NULL,
+                UNIQUE(tipo, mensagem_id),
+                FOREIGN KEY(individuo_id) REFERENCES individuos(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prisoes_individuo
+                ON historico_prisoes(individuo_id, criado_em DESC);
+            CREATE INDEX IF NOT EXISTS idx_fontes_ficha_individuo
+                ON fontes_ficha_individuo(individuo_id, tipo, criado_em DESC);
+            """
+        )
+
+
+def _prisao_lock(mensagem_id: int) -> asyncio.Lock:
+    chave = int(mensagem_id or 0)
+    lock = _PRISAO_LOCKS.get(chave)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PRISAO_LOCKS[chave] = lock
+    return lock
+
+
+def _prisao_obj_get(obj: Any, nome: str, padrao: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(nome, padrao)
+    return getattr(obj, nome, padrao)
+
+
+def _prisao_embed_texto(embed: Any) -> str:
+    partes: List[str] = []
+    for chave in ("title", "description"):
+        valor = _prisao_obj_get(embed, chave, "")
+        if valor:
+            partes.append(str(valor))
+    for campo in list(_prisao_obj_get(embed, "fields", []) or []):
+        nome = _prisao_obj_get(campo, "name", "")
+        valor = _prisao_obj_get(campo, "value", "")
+        if nome:
+            partes.append(str(nome))
+        if valor:
+            partes.append(str(valor))
+    return "\n".join(partes)
+
+
+async def _prisao_raw_message_json(message: discord.Message) -> Dict[str, Any]:
+    """Fallback para versões do discord.py que ainda não expõem message_snapshots."""
+    if not DISCORD_TOKEN:
+        return {}
+    url = f"https://discord.com/api/v10/channels/{int(message.channel.id)}/messages/{int(message.id)}"
+    try:
+        timeout = ClientTimeout(total=30)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={"Authorization": f"Bot {DISCORD_TOKEN}"}) as resposta:
+                if resposta.status != 200:
+                    return {}
+                dados = await resposta.json(content_type=None)
+                return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _prisao_payloads_mensagem(message: discord.Message) -> List[Any]:
+    payloads: List[Any] = [message]
+    snapshots = list(getattr(message, "message_snapshots", []) or [])
+    for snapshot in snapshots:
+        payload = getattr(snapshot, "message", None) or snapshot
+        payloads.append(payload)
+    if len(payloads) == 1:
+        bruto = await _prisao_raw_message_json(message)
+        for snapshot in list(bruto.get("message_snapshots") or []):
+            payload = snapshot.get("message") if isinstance(snapshot, dict) else None
+            if payload:
+                payloads.append(payload)
+    return payloads
+
+
+async def _prisao_texto_completo(message: discord.Message) -> str:
+    partes: List[str] = []
+    for payload in await _prisao_payloads_mensagem(message):
+        conteudo = _prisao_obj_get(payload, "content", "")
+        if conteudo:
+            partes.append(str(conteudo))
+        for embed in list(_prisao_obj_get(payload, "embeds", []) or []):
+            texto_embed = _prisao_embed_texto(embed)
+            if texto_embed:
+                partes.append(texto_embed)
+    saida: List[str] = []
+    vistos: set[str] = set()
+    for parte in partes:
+        limpa = str(parte or "").strip()
+        if limpa and limpa not in vistos:
+            vistos.add(limpa)
+            saida.append(limpa)
+    return "\n\n".join(saida)
+
+
+def _prisao_extrair_identidade(texto: str) -> Tuple[str, str]:
+    bruto = str(texto or "").replace("**", "").replace("`", "")
+    nome = ""
+    rg = ""
+    padroes_nome = [
+        r"(?im)^\s*[#>*•\-]*\s*(?:nome(?:\s+do\s+preso)?|preso)\s*[:\-]\s*([^\n\r]+)",
+        r"(?im)^\s*[#>*•\-]*\s*indiv[ií]duo\s*[:\-]\s*([^\n\r]+)",
+    ]
+    padroes_rg = [
+        r"(?im)^\s*[#>*•\-]*\s*(?:rg|passaporte)(?:\s+do\s+preso)?\s*[:\-]\s*([A-Za-z0-9.\-/]+)",
+        r"(?im)\bRG\s*#?\s*([0-9A-Za-z.\-/]{2,20})\b",
+    ]
+    for padrao in padroes_nome:
+        m = re.search(padrao, bruto)
+        if m:
+            nome = _banco_limpar_texto(m.group(1), 120).strip(" *#>-•")
+            break
+    for padrao in padroes_rg:
+        m = re.search(padrao, bruto)
+        if m:
+            rg = _banco_normalizar_rg(m.group(1))
+            break
+    return nome, rg
+
+
+def _prisao_extrair_detalhes(texto: str) -> Dict[str, Any]:
+    bruto = str(texto or "").replace("**", "").replace("`", "")
+    def campo(padroes: List[str], limite: int = 120) -> str:
+        for padrao in padroes:
+            m = re.search(padrao, bruto, flags=re.I | re.M)
+            if m:
+                return _banco_limpar_texto(m.group(1), limite)
+        return ""
+    qtd = 0
+    m_qtd = re.search(r"Infra[cç][oõ]es\s+Cometidas\s*[:\-]?\s*(\d+)", bruto, flags=re.I)
+    if m_qtd:
+        qtd = int(m_qtd.group(1))
+    if not qtd:
+        qtd = len(re.findall(r"(?m)^\s*[-•]\s*\d+(?:\.\d+)+\s*[-–—]", bruto))
+    return {
+        "data_prisao": campo([r"Data\s+da\s+Pris[aã]o\s*[:\-]\s*([^\n\r]+)"], 40),
+        "pena_total": campo([r"Pena\s+Total\s*[:\-]\s*([^\n\r]+)"], 80),
+        "multa_total": campo([r"Multa\s+Total\s*[:\-]\s*([^\n\r]+)"], 80),
+        "fianca": campo([r"Fian[cç]a\s*[:\-]\s*([^\n\r]+)"], 80),
+        "infracoes_quantidade": int(qtd),
+    }
+
+
+def _prisao_midia_url(obj: Any) -> str:
+    for chave in ("proxy_url", "url"):
+        valor = _prisao_obj_get(obj, chave, "")
+        if valor:
+            return str(valor)
+    return ""
+
+
+def _prisao_midia_nome(obj: Any, indice: int) -> str:
+    nome = _prisao_obj_get(obj, "filename", "") or _prisao_obj_get(obj, "name", "")
+    nome = Path(str(nome or f"imagem-{indice}.png")).name
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", nome)[:150] or f"imagem-{indice}.png"
+
+
+async def _prisao_coletar_descritores_midia(message: discord.Message) -> List[Dict[str, Any]]:
+    descritores: List[Dict[str, Any]] = []
+    vistos: set[str] = set()
+    indice = 0
+    for payload in await _prisao_payloads_mensagem(message):
+        for anexo in list(_prisao_obj_get(payload, "attachments", []) or []):
+            indice += 1
+            url = _prisao_midia_url(anexo)
+            aid = str(_prisao_obj_get(anexo, "id", "") or "")
+            chave = f"att:{aid}:{url}:{_prisao_midia_nome(anexo, indice)}"
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            descritores.append({
+                "obj": anexo,
+                "url": url,
+                "nome": _prisao_midia_nome(anexo, indice),
+                "content_type": str(_prisao_obj_get(anexo, "content_type", "") or ""),
+                "ordem": indice,
+                "origem": "attachment",
+            })
+        for embed in list(_prisao_obj_get(payload, "embeds", []) or []):
+            for rotulo in ("image", "thumbnail"):
+                media = _prisao_obj_get(embed, rotulo, None)
+                if not media:
+                    continue
+                indice += 1
+                url = _prisao_midia_url(media)
+                if not url:
+                    continue
+                chave = f"embed:{url}"
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                descritores.append({
+                    "obj": media,
+                    "url": url,
+                    "nome": f"{rotulo}-{indice}.png",
+                    "content_type": "image/png",
+                    "ordem": indice,
+                    "origem": "embed",
+                })
+    return descritores
+
+
+async def _prisao_baixar_descritor(descritor: Dict[str, Any], pasta: Path) -> Optional[Path]:
+    pasta.mkdir(parents=True, exist_ok=True)
+    nome = Path(str(descritor.get("nome") or "imagem.png")).name
+    destino = pasta / f"{int(descritor.get('ordem') or 0):02d}-{nome}"
+    obj = descritor.get("obj")
+    try:
+        if hasattr(obj, "save"):
+            await obj.save(str(destino), use_cached=True)
+            if destino.exists() and destino.stat().st_size > 0:
+                return destino
+    except Exception:
+        pass
+    url = str(descritor.get("url") or "")
+    if not url:
+        return None
+    try:
+        timeout = ClientTimeout(total=60)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resposta:
+                if resposta.status != 200:
+                    return None
+                dados = await resposta.read()
+                if not dados:
+                    return None
+                destino.write_bytes(dados)
+                return destino
+    except Exception:
+        return None
+
+
+def _prisao_eh_imagem(caminho: Path) -> bool:
+    if PILImage is None:
+        return False
+    try:
+        with PILImage.open(caminho) as imagem:
+            imagem.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _prisao_ocr_texto(caminho: Path) -> Tuple[str, List[Tuple[str, float]]]:
+    if not BANCO_OCR_ATIVO or RapidOCR is None:
+        return "", []
+    try:
+        linhas = _banco_ocr_ler_imagem_sync(str(caminho))
+    except Exception:
+        return "", []
+    texto = "\n".join(str(x[0]) for x in linhas if x and str(x[0]).strip())
+    return texto, linhas
+
+
+def _prisao_nome_tokens(nome: str) -> set[str]:
+    norm = normalizar_busca(nome) if "normalizar_busca" in globals() else str(nome or "").lower()
+    return {x for x in re.findall(r"[a-z0-9]+", norm) if len(x) >= 3}
+
+
+def _prisao_classificar_midias(midias: List[Dict[str, Any]], nome: str, rg: str) -> Dict[str, Optional[Dict[str, Any]]]:
+    rg_n = _banco_normalizar_rg(rg)
+    nome_norm = normalizar_busca(nome) if "normalizar_busca" in globals() else nome.lower()
+    tokens_nome = _prisao_nome_tokens(nome)
+    for item in midias:
+        texto_ocr = str(item.get("ocr_texto") or "")
+        norm = normalizar_busca(texto_ocr) if "normalizar_busca" in globals() else texto_ocr.lower()
+        alnum = re.sub(r"[^0-9A-Za-z]", "", texto_ocr).upper()
+        rg_score = 0.0
+        if rg_n and rg_n in alnum:
+            rg_score += 20.0
+        if tokens_nome:
+            encontrados = sum(1 for t in tokens_nome if t in norm)
+            rg_score += encontrados * 3.0
+        for palavra in ("estado civil", "habilitacao", "fator sanguineo", "telefone", "carteira", "banco", "desempregado"):
+            if palavra in norm:
+                rg_score += 1.5
+        mochila_score = 0.0
+        for palavra in ("mochila", "inventario", "inventário", "capacidade", "peso", "slot", "itens apreendidos", "apreensao", "apreensão"):
+            if palavra in norm:
+                mochila_score += 4.0
+        item["rg_score"] = rg_score
+        item["mochila_score"] = mochila_score
+        item["nome_similarity"] = _prisao_sequence_matcher(None, nome_norm, norm).ratio() if nome_norm and norm else 0.0
+
+    rg_item = max(midias, key=lambda x: (float(x.get("rg_score") or 0), len(str(x.get("ocr_texto") or ""))), default=None)
+    if rg_item and float(rg_item.get("rg_score") or 0) <= 0 and len(midias) >= 2:
+        # O segundo anexo é o documento no padrão operacional informado.
+        rg_item = sorted(midias, key=lambda x: int(x.get("ordem") or 0))[1]
+    restantes = [x for x in midias if x is not rg_item]
+    mochila_item = max(restantes, key=lambda x: float(x.get("mochila_score") or 0), default=None)
+    if mochila_item and float(mochila_item.get("mochila_score") or 0) <= 0:
+        mochila_item = sorted(restantes, key=lambda x: int(x.get("ordem") or 0))[-1] if len(restantes) >= 2 else None
+    individuo_restantes = [x for x in restantes if x is not mochila_item]
+    individuo_item = sorted(individuo_restantes, key=lambda x: int(x.get("ordem") or 0))[0] if individuo_restantes else None
+    if individuo_item is None and restantes:
+        individuo_item = sorted(restantes, key=lambda x: int(x.get("ordem") or 0))[0]
+    return {"individuo": individuo_item, "rg": rg_item, "mochila": mochila_item}
+
+
+def _prisao_comprimir_para_upload(caminho: Path, rg: str, tipo: str) -> Tuple[Path, str]:
+    if PILImage is None:
+        raise RuntimeError("Pillow indisponível para compactar as fotos da ficha.")
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    with PILImage.open(caminho) as origem:
+        imagem = origem.convert("RGB")
+        limite = (1600, 1600) if tipo == "rg" else (1400, 1400)
+        imagem.thumbnail(limite, PILImage.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        imagem.save(buffer, format="JPEG", quality=84, optimize=True)
+        dados = buffer.getvalue()
+    digest = hashlib.sha256(dados).hexdigest()[:16]
+    nome = f"ficha-prisao-{slugify(rg)}-{tipo}-{digest}.jpg"
+    destino = Path(UPLOADS_DIR) / nome
+    if not destino.exists() or destino.stat().st_size != len(dados):
+        destino.write_bytes(dados)
+    return destino, _prisao_url_publica(destino)
+
+
+def _prisao_url_publica(caminho: Path) -> str:
+    relativo = f"/uploads/{_prisao_quote(caminho.name)}"
+    dominio = str(os.getenv("RAILWAY_PUBLIC_DOMAIN", "") or "").strip()
+    if dominio:
+        return f"https://{dominio}{relativo}"
+    base = str(CATALOG_PUBLIC_URL or "").strip()
+    try:
+        partes = _prisao_urlsplit(base)
+        if partes.scheme in {"http", "https"} and partes.netloc and partes.hostname not in {"127.0.0.1", "localhost"}:
+            return f"{partes.scheme}://{partes.netloc}{relativo}"
+    except Exception:
+        pass
+    return ""
+
+
+def _prisao_conferir_identidade(nome: str, rg: str, rg_item: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    ocr = str((rg_item or {}).get("ocr_texto") or "")
+    ocr_norm = normalizar_busca(ocr) if "normalizar_busca" in globals() else ocr.lower()
+    ocr_alnum = re.sub(r"[^0-9A-Za-z]", "", ocr).upper()
+    rg_n = _banco_normalizar_rg(rg)
+    rg_confere = bool(rg_n and rg_n in ocr_alnum)
+    tokens = _prisao_nome_tokens(nome)
+    tokens_encontrados = sum(1 for token in tokens if token in ocr_norm)
+    nome_confere = bool(tokens and tokens_encontrados >= max(1, min(2, len(tokens))))
+    nome_ocr = ""
+    for linha in str(ocr or "").splitlines():
+        linha_limpa = _banco_limpar_texto(linha, 120)
+        if len(_prisao_nome_tokens(linha_limpa) & tokens) >= 1:
+            nome_ocr = linha_limpa
+            break
+    rg_ocr = rg_n if rg_confere else ""
+    if rg_confere and nome_confere:
+        status = "VALIDADO"
+        detalhes = "Nome e RG conferem com a foto do documento."
+    elif rg_confere:
+        status = "VALIDADO_RG"
+        detalhes = "RG confirmado no documento; nome não ficou totalmente legível no OCR."
+    elif not ocr:
+        status = "OCR_INDISPONIVEL"
+        detalhes = "Documento salvo, mas o OCR não conseguiu produzir texto legível."
+    else:
+        status = "DIVERGENTE"
+        detalhes = "O texto digitado foi registrado, porém o RG da foto não conferiu automaticamente."
+    return {
+        "status": status,
+        "detalhes": detalhes,
+        "nome_ocr": nome_ocr,
+        "rg_ocr": rg_ocr,
+        "rg_confere": rg_confere,
+        "nome_confere": nome_confere,
+    }
+
+
+def _prisao_referencia_origem(message: discord.Message) -> Tuple[int, int, int]:
+    ref = getattr(message, "reference", None)
+    return (
+        int(getattr(ref, "message_id", 0) or 0),
+        int(getattr(ref, "channel_id", 0) or 0),
+        int(getattr(ref, "guild_id", 0) or 0),
+    )
+
+
+def _prisao_salvar_registro_sync(
+    *,
+    message: discord.Message,
+    nome: str,
+    rg: str,
+    texto: str,
+    detalhes: Dict[str, Any],
+    conferencia: Dict[str, Any],
+    foto_individuo_path: str,
+    foto_rg_path: str,
+    foto_individuo_url: str,
+    foto_rg_url: str,
+    foto_mochila_url: str,
+) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    individuo = banco_upsert_individuo(
+        nome=nome,
+        rg=rg,
+        origem="historico_prisao",
+        criado_por_id=int(getattr(message.author, "id", 0) or 0),
+        foto_individuo_path=foto_individuo_path,
+        foto_rg_path=foto_rg_path,
+        foto_individuo_url=foto_individuo_url,
+        foto_rg_url=foto_rg_url,
+    )
+    individuo_id = int(individuo.get("id") or 0)
+    origem_msg, origem_canal, origem_guild = _prisao_referencia_origem(message)
+    agora = _banco_agora_iso()
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            INSERT INTO historico_prisoes
+            (mensagem_id, canal_id, mensagem_url, mensagem_origem_id, canal_origem_id, guild_origem_id,
+             individuo_id, nome_texto, rg_texto, nome_ocr, rg_ocr, conferencia_status,
+             conferencia_detalhes, data_prisao, pena_total, multa_total, fianca,
+             infracoes_quantidade, texto_original, foto_individuo_path, foto_rg_path,
+             foto_mochila_url, criado_por_id, criado_em, atualizado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mensagem_id) DO UPDATE SET
+                individuo_id=excluded.individuo_id,
+                nome_texto=excluded.nome_texto,
+                rg_texto=excluded.rg_texto,
+                nome_ocr=excluded.nome_ocr,
+                rg_ocr=excluded.rg_ocr,
+                conferencia_status=excluded.conferencia_status,
+                conferencia_detalhes=excluded.conferencia_detalhes,
+                data_prisao=excluded.data_prisao,
+                pena_total=excluded.pena_total,
+                multa_total=excluded.multa_total,
+                fianca=excluded.fianca,
+                infracoes_quantidade=excluded.infracoes_quantidade,
+                texto_original=excluded.texto_original,
+                foto_individuo_path=excluded.foto_individuo_path,
+                foto_rg_path=excluded.foto_rg_path,
+                foto_mochila_url=excluded.foto_mochila_url,
+                atualizado_em=excluded.atualizado_em
+            """,
+            (
+                int(message.id), int(message.channel.id), str(message.jump_url),
+                origem_msg, origem_canal, origem_guild, individuo_id,
+                nome, _banco_normalizar_rg(rg), str(conferencia.get("nome_ocr") or ""),
+                str(conferencia.get("rg_ocr") or ""), str(conferencia.get("status") or "NAO_CONFERIDO"),
+                str(conferencia.get("detalhes") or "")[:1000], str(detalhes.get("data_prisao") or ""),
+                str(detalhes.get("pena_total") or ""), str(detalhes.get("multa_total") or ""),
+                str(detalhes.get("fianca") or ""), int(detalhes.get("infracoes_quantidade") or 0),
+                str(texto or "")[:12000], foto_individuo_path, foto_rg_path,
+                foto_mochila_url[:1000], int(getattr(message.author, "id", 0) or 0), agora, agora,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO fontes_ficha_individuo
+            (individuo_id, tipo, mensagem_id, canal_id, mensagem_url,
+             numero_referencia, descricao, criado_em)
+            VALUES (?, 'PRISAO', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tipo, mensagem_id) DO UPDATE SET
+                individuo_id=excluded.individuo_id,
+                mensagem_url=excluded.mensagem_url,
+                numero_referencia=excluded.numero_referencia,
+                descricao=excluded.descricao
+            """,
+            (
+                individuo_id, int(message.id), int(message.channel.id), str(message.jump_url),
+                str(detalhes.get("data_prisao") or ""),
+                f"Prisão registrada; conferência {conferencia.get('status')}", agora,
+            ),
+        )
+        total = int(db.execute(
+            "SELECT COUNT(*) FROM historico_prisoes WHERE individuo_id=?", (individuo_id,)
+        ).fetchone()[0])
+        _banco_historico(
+            "INDIVIDUO", _banco_normalizar_rg(rg), "PRISAO_VINCULADA",
+            f"Mensagem {message.id} | Data: {detalhes.get('data_prisao') or 'N/I'} | Conferência: {conferencia.get('status')}",
+            int(getattr(message.author, "id", 0) or 0), db,
+        )
+    perfil = _banco_ficha_geral_carregar("individuo", individuo_id)
+    _banco_ficha_geral_snapshot(perfil)
+    try:
+        _banco_criar_backup_duravel("historico-prisao")
+    except Exception:
+        pass
+    return {"individuo": individuo, "perfil": perfil, "total_prisoes": total}
+
+
+def _prisao_ja_processada(mensagem_id: int) -> bool:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        row = db.execute("SELECT 1 FROM historico_prisoes WHERE mensagem_id=?", (int(mensagem_id),)).fetchone()
+    return bool(row)
+
+
+async def _prisao_processar_mensagem(message: discord.Message, *, historico: bool = False) -> Optional[Dict[str, Any]]:
+    if int(message.channel.id) != HISTORICO_PRISAO_CHANNEL_ID:
+        return None
+    if message.author.bot:
+        return None
+    if not isinstance(message.author, discord.Member) or not _membro_inspetor_mais(message.author):
+        return None
+    async with _prisao_lock(message.id):
+        if await asyncio.to_thread(_prisao_ja_processada, message.id):
+            return None
+        texto = await _prisao_texto_completo(message)
+        nome, rg = _prisao_extrair_identidade(texto)
+        if not nome or not rg:
+            if not historico:
+                await message.reply(
+                    "⚠️ **HISTÓRICO DE PRISÃO NÃO IMPORTADO**\n"
+                    "Não foi possível identificar os campos **Nome** e **RG** na mensagem encaminhada. "
+                    "Mantenha o modelo `Nome: ...` e `RG: ...`.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            return None
+        descritores = await _prisao_coletar_descritores_midia(message)
+        if not descritores:
+            if not historico:
+                await message.reply(
+                    f"⚠️ A prisão de **{nome}** (`{rg}`) possui texto, mas nenhuma imagem foi encontrada no encaminhamento.",
+                    mention_author=False,
+                )
+            return None
+        with tempfile.TemporaryDirectory(prefix="dicor-prisao-") as tmp:
+            pasta = Path(tmp)
+            midias: List[Dict[str, Any]] = []
+            for descritor in descritores:
+                caminho = await _prisao_baixar_descritor(descritor, pasta)
+                if caminho is None or not _prisao_eh_imagem(caminho):
+                    continue
+                ocr_texto, ocr_linhas = await asyncio.to_thread(_prisao_ocr_texto, caminho)
+                item = dict(descritor)
+                item.update({"path": caminho, "ocr_texto": ocr_texto, "ocr_linhas": ocr_linhas})
+                midias.append(item)
+            if not midias:
+                return None
+            classes = _prisao_classificar_midias(midias, nome, rg)
+            individuo_item = classes.get("individuo")
+            rg_item = classes.get("rg")
+            mochila_item = classes.get("mochila")
+            conferencia = _prisao_conferir_identidade(nome, rg, rg_item)
+            foto_ind_path = ""
+            foto_rg_path = ""
+            foto_ind_url = ""
+            foto_rg_url = ""
+            if individuo_item and individuo_item.get("path"):
+                destino, url = await asyncio.to_thread(
+                    _prisao_comprimir_para_upload, Path(individuo_item["path"]), rg, "individuo"
+                )
+                foto_ind_path, foto_ind_url = str(destino), (url or str(individuo_item.get("url") or ""))
+            if rg_item and rg_item.get("path"):
+                destino, url = await asyncio.to_thread(
+                    _prisao_comprimir_para_upload, Path(rg_item["path"]), rg, "rg"
+                )
+                foto_rg_path, foto_rg_url = str(destino), (url or str(rg_item.get("url") or ""))
+            detalhes = _prisao_extrair_detalhes(texto)
+            salvo = await asyncio.to_thread(
+                _prisao_salvar_registro_sync,
+                message=message,
+                nome=nome,
+                rg=rg,
+                texto=texto,
+                detalhes=detalhes,
+                conferencia=conferencia,
+                foto_individuo_path=foto_ind_path,
+                foto_rg_path=foto_rg_path,
+                foto_individuo_url=foto_ind_url,
+                foto_rg_url=foto_rg_url,
+                foto_mochila_url=str((mochila_item or {}).get("url") or ""),
+            )
+        if not historico:
+            cor = discord.Color.green() if conferencia["status"] in {"VALIDADO", "VALIDADO_RG"} else discord.Color.orange()
+            embed = discord.Embed(
+                title="✅ FICHA PRISIONAL SINCRONIZADA" if conferencia["status"] != "DIVERGENTE" else "⚠️ FICHA SALVA — CONFERÊNCIA NECESSÁRIA",
+                description=(
+                    "O registro foi vinculado à ficha geral. Futuras prisões com o mesmo RG serão adicionadas ao histórico, sem criar ficha duplicada."
+                ),
+                color=cor,
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            embed.add_field(name="👤 Indivíduo", value=f"**{nome}**\nRG `{rg}`", inline=True)
+            embed.add_field(name="🔎 Conferência", value=f"**{conferencia['status']}**\n{conferencia['detalhes']}", inline=True)
+            embed.add_field(name="🚔 Prisões vinculadas", value=f"**{salvo.get('total_prisoes', 1)}**", inline=True)
+            embed.add_field(name="📷 Imagens", value=(
+                f"Indivíduo: **{'salva' if foto_ind_path else 'não identificada'}**\n"
+                f"RG: **{'salva' if foto_rg_path else 'não identificado'}**\n"
+                f"Mochila: **{'vinculada pela mensagem' if mochila_item else 'não identificada'}**"
+            ), inline=False)
+            if foto_ind_url.startswith("http"):
+                embed.set_image(url=foto_ind_url)
+            if foto_rg_url.startswith("http"):
+                embed.set_thumbnail(url=foto_rg_url)
+            await message.reply(embed=embed, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            await enviar_log(
+                f"🚔 Histórico de prisão sincronizado | {nome} | RG `{rg}` | "
+                f"mensagem `{message.id}` | conferência `{conferencia['status']}` | "
+                f"imagens `{len(midias)}`."
+            )
+        return salvo
+
+
+@bot.listen("on_message")
+async def historico_prisao_automatico(message: discord.Message):
+    if int(getattr(message.channel, "id", 0) or 0) != HISTORICO_PRISAO_CHANNEL_ID:
+        return
+    if int(message.id) in _PRISAO_PROCESSANDO:
+        return
+    _PRISAO_PROCESSANDO.add(int(message.id))
+    try:
+        await _prisao_processar_mensagem(message)
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f"❌ Falha ao importar histórico de prisão da mensagem `{message.id}`: "
+            f"{type(erro).__name__}: {erro}"
+        )
+    finally:
+        _PRISAO_PROCESSANDO.discard(int(message.id))
+
+
+async def _prisao_importar_historico(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    canal = guild.get_channel(HISTORICO_PRISAO_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(HISTORICO_PRISAO_CHANNEL_ID)
+        except Exception:
+            return 0
+    if not isinstance(canal, discord.TextChannel):
+        return 0
+    importados = 0
+    try:
+        async for msg in canal.history(limit=HISTORICO_PRISAO_SCAN_LIMIT, oldest_first=True):
+            if msg.author.bot:
+                continue
+            if await asyncio.to_thread(_prisao_ja_processada, msg.id):
+                continue
+            try:
+                resultado = await _prisao_processar_mensagem(msg, historico=True)
+                importados += int(bool(resultado))
+            except Exception:
+                traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+    return importados
+
+
+def _prisao_url_discord(guild_id: int, canal_id: int, mensagem_id: int) -> str:
+    if guild_id and canal_id and mensagem_id:
+        return f"https://discord.com/channels/{guild_id}/{canal_id}/{mensagem_id}"
+    return ""
+
+
+def _prisao_fontes_dinamicas(perfil: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ind = dict(perfil.get("individuo") or {})
+    if not ind:
+        return []
+    individuo_id = int(ind.get("id") or 0)
+    rg = _banco_normalizar_rg(ind.get("rg"))
+    nome_norm = normalizar_busca(ind.get("nome") or "") if "normalizar_busca" in globals() else str(ind.get("nome") or "").lower()
+    fontes: List[Dict[str, Any]] = []
+    with _banco_conexao() as db:
+        rows = db.execute(
+            "SELECT * FROM fontes_ficha_individuo WHERE individuo_id=? ORDER BY criado_em DESC LIMIT 50",
+            (individuo_id,),
+        ).fetchall()
+        fontes.extend(dict(x) for x in rows)
+    for veiculo in list(perfil.get("veiculos") or []):
+        url = str(veiculo.get("mensagem_url") or "").strip()
+        if url:
+            fontes.append({"tipo": "PERICIA", "mensagem_url": url, "descricao": f"Veículo {veiculo.get('placa') or ''}"})
+    ultima = str(ind.get("ultima_origem_url") or "").strip()
+    if ultima:
+        fontes.append({"tipo": "REGISTRO", "mensagem_url": ultima, "descricao": "Origem mais recente"})
+
+    def corresponde(item: Dict[str, Any]) -> bool:
+        serializado = json.dumps(item, ensure_ascii=False, default=str)
+        serial_alnum = re.sub(r"[^0-9A-Za-z]", "", serializado).upper()
+        serial_norm = normalizar_busca(serializado) if "normalizar_busca" in globals() else serializado.lower()
+        return bool((rg and rg in serial_alnum) or (nome_norm and len(nome_norm) >= 5 and nome_norm in serial_norm))
+
+    try:
+        for bo in carregar_atendimentos_boletins():
+            if not isinstance(bo, dict) or not corresponde(bo):
+                continue
+            url = str(bo.get("mensagem_original_url") or bo.get("mensagem_url") or "").strip()
+            if not url:
+                mid = int(bo.get("mensagem_original_id") or 0)
+                cid = int(bo.get("canal_origem_id") or bo.get("canal_id") or BOLETINS_CHANNEL_ID or 0)
+                url = _prisao_url_discord(int(bo.get("guild_id") or GUILD_ID or 0), cid, mid)
+            if url:
+                fontes.append({
+                    "tipo": "BOLETIM",
+                    "mensagem_url": url,
+                    "numero_referencia": numero_curto_boletim(bo.get("numero") or ""),
+                    "descricao": "Boletim vinculado ao indivíduo",
+                })
+    except Exception:
+        pass
+    try:
+        for pericia in _pericia_carregar():
+            if not isinstance(pericia, dict) or not corresponde(pericia):
+                continue
+            url = str(pericia.get("mensagem_original_url") or "").strip()
+            if url:
+                fontes.append({
+                    "tipo": "PERICIA",
+                    "mensagem_url": url,
+                    "numero_referencia": str(pericia.get("numero") or ""),
+                    "descricao": "Perícia vinculada ao indivíduo",
+                })
+    except Exception:
+        pass
+    saida: List[Dict[str, Any]] = []
+    vistos: set[str] = set()
+    for fonte in fontes:
+        url = str(fonte.get("mensagem_url") or "").strip()
+        if not url or url in vistos:
+            continue
+        vistos.add(url)
+        saida.append(fonte)
+    return saida[:50]
+
+
+def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
+    perfil = dict(_BANCO_FICHA_GERAL_CARREGAR_ANTES_PRISAO(tipo, registro_id) or {})
+    ind = dict(perfil.get("individuo") or {})
+    if not ind:
+        perfil["historico_prisoes"] = []
+        perfil["fontes_documentais"] = []
+        return perfil
+    with _banco_conexao() as db:
+        prisoes = db.execute(
+            "SELECT * FROM historico_prisoes WHERE individuo_id=? ORDER BY criado_em DESC LIMIT 30",
+            (int(ind.get("id") or 0),),
+        ).fetchall()
+    perfil["historico_prisoes"] = [dict(x) for x in prisoes]
+    perfil["fontes_documentais"] = _prisao_fontes_dinamicas(perfil)
+    return perfil
+
+
+def _banco_embed_ficha_geral(perfil: Dict[str, Any]) -> discord.Embed:
+    embed = _BANCO_EMBED_FICHA_GERAL_ANTES_PRISAO(perfil)
+    ind = dict(perfil.get("individuo") or {})
+    prisoes = list(perfil.get("historico_prisoes") or [])
+    fontes = list(perfil.get("fontes_documentais") or [])
+    foto_ind = str(ind.get("foto_individuo_url") or "")
+    foto_rg = str(ind.get("foto_rg_url") or "")
+    if foto_ind.startswith("http"):
+        embed.set_image(url=foto_ind)
+    if foto_rg.startswith("http"):
+        embed.set_thumbnail(url=foto_rg)
+    if foto_ind or foto_rg:
+        linhas_fotos = []
+        if foto_ind:
+            linhas_fotos.append(f"• [Foto do indivíduo]({foto_ind})" if foto_ind.startswith("http") else "• Foto do indivíduo salva no volume")
+        if foto_rg:
+            linhas_fotos.append(f"• [Foto do RG]({foto_rg})" if foto_rg.startswith("http") else "• Foto do RG salva no volume")
+        embed.add_field(name="📸 IDENTIFICAÇÃO VISUAL", value="\n".join(linhas_fotos), inline=False)
+    if prisoes:
+        linhas = []
+        for indice, prisao in enumerate(prisoes[:6], 1):
+            data = str(prisao.get("data_prisao") or prisao.get("criado_em") or "Data não informada")[:35]
+            status = str(prisao.get("conferencia_status") or "N/I")
+            url = str(prisao.get("mensagem_url") or "")
+            rotulo = f"Prisão {indice} • {data} • {status}"
+            linhas.append(f"• [{rotulo}]({url})" if url else f"• {rotulo}")
+        if len(prisoes) > 6:
+            linhas.append(f"• +{len(prisoes) - 6} registro(s) de prisão")
+        embed.add_field(name=f"🚔 HISTÓRICO DE PRISÕES ({len(prisoes)})", value="\n".join(linhas)[:1024], inline=False)
+    if fontes:
+        icones = {"PERICIA": "🔬", "BOLETIM": "📄", "PRISAO": "🚔", "REGISTRO": "🔗"}
+        linhas = []
+        for fonte in fontes[:10]:
+            tipo = str(fonte.get("tipo") or "REGISTRO").upper()
+            numero = str(fonte.get("numero_referencia") or "").strip()
+            titulo = tipo.title() + (f" Nº {numero}" if numero else "")
+            url = str(fonte.get("mensagem_url") or "")
+            linhas.append(f"{icones.get(tipo, '🔗')} [{titulo}]({url})")
+        if len(fontes) > 10:
+            linhas.append(f"• +{len(fontes) - 10} fonte(s)")
+        embed.add_field(name="🔗 FONTES DOCUMENTAIS", value="\n".join(linhas)[:1024], inline=False)
+    return embed
+
+
+class BancoVerIdentificacaoButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Ver identificação",
+            emoji="📸",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        perfil = dict(getattr(view, "perfil", {}) or {})
+        if not perfil:
+            return await interaction.response.send_message("Selecione uma ficha primeiro.", ephemeral=True)
+        ind = dict(perfil.get("individuo") or {})
+        arquivos: List[discord.File] = []
+        for campo, nome in (("foto_individuo_path", "foto-individuo.jpg"), ("foto_rg_path", "foto-rg.jpg")):
+            caminho = Path(str(ind.get(campo) or ""))
+            try:
+                if caminho.exists() and caminho.is_file() and caminho.stat().st_size <= 10 * 1024 * 1024:
+                    arquivos.append(discord.File(str(caminho), filename=nome))
+            except Exception:
+                pass
+        embed = discord.Embed(
+            title=f"📸 IDENTIFICAÇÃO — {ind.get('nome') or 'INDIVÍDUO'}",
+            description="Foto do indivíduo e documento de identificação vinculados à ficha geral.",
+            color=discord.Color.dark_blue(),
+        )
+        foto_ind = str(ind.get("foto_individuo_url") or "")
+        foto_rg = str(ind.get("foto_rg_url") or "")
+        if foto_ind.startswith("http"):
+            embed.set_image(url=foto_ind)
+        if foto_rg.startswith("http"):
+            embed.set_thumbnail(url=foto_rg)
+        await interaction.response.send_message(embed=embed, files=arquivos[:2], ephemeral=True)
+
+
+class BancoFichaGeralView(_BANCO_FICHA_GERAL_VIEW_ANTES_PRISAO):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if getattr(self, "perfil", None):
+            self.add_item(BancoVerIdentificacaoButton())
+
+
+async def _prisao_configurar_permissoes_canal(guild: Optional[discord.Guild]) -> None:
+    if guild is None:
+        return
+    canal = guild.get_channel(HISTORICO_PRISAO_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(HISTORICO_PRISAO_CHANNEL_ID)
+        except Exception:
+            return
+    if not isinstance(canal, discord.TextChannel):
+        return
+    try:
+        padrao = canal.overwrites_for(guild.default_role)
+        padrao.send_messages = False
+        await canal.set_permissions(guild.default_role, overwrite=padrao, reason="Histórico de Prisão: envio restrito a Inspetor+")
+        for cargo_id in (1490200388912156692, 1490200383614615725, 1490200382776021132):
+            cargo = guild.get_role(int(cargo_id))
+            if cargo is None:
+                continue
+            ow = canal.overwrites_for(cargo)
+            ow.view_channel = True
+            ow.read_message_history = True
+            ow.send_messages = True
+            ow.attach_files = True
+            ow.embed_links = True
+            await canal.set_permissions(cargo, overwrite=ow, reason="Histórico de Prisão: acesso Inspetor+")
+        bot_member = guild.me
+        if bot_member is not None:
+            ow = canal.overwrites_for(bot_member)
+            ow.view_channel = True
+            ow.read_message_history = True
+            ow.send_messages = True
+            ow.manage_messages = True
+            ow.attach_files = True
+            ow.embed_links = True
+            await canal.set_permissions(bot_member, overwrite=ow, reason="Histórico de Prisão: permissões do bot")
+    except discord.Forbidden:
+        print("⚠️ O bot não possui permissão para ajustar o canal Histórico de Prisão.", flush=True)
+    except Exception:
+        traceback.print_exc()
+
+
+@bot.event
+async def on_ready():
+    await _PRISAO_ON_READY_ANTERIOR()
+    try:
+        inicializar_banco_dicor()
+        guild = bot.get_guild(GUILD_ID)
+        await _prisao_configurar_permissoes_canal(guild)
+        asyncio.create_task(_prisao_importar_historico(guild), name="historico-prisao-importacao")
+        print(
+            f"✅ Histórico de Prisão ativo no canal {HISTORICO_PRISAO_CHANNEL_ID}: "
+            "encaminhamentos, conferência Nome/RG, fotos persistentes e histórico na ficha geral.",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao iniciar Histórico de Prisão: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ Histórico de Prisão V1 carregado: 3 imagens por encaminhamento, comparação com RG, "
+    "foto do indivíduo/documento e links de Perícia, BO e prisões na ficha.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
