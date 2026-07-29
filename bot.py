@@ -8112,6 +8112,42 @@ async def hierarquia_dicor_automatica():
 async def antes_hierarquia_dicor_automatica():
     await bot.wait_until_ready()
 
+async def _prisao_limpar_confirmacoes_antigas(guild: Optional[discord.Guild]) -> int:
+    """Remove cartões antigos de confirmação, mantendo apenas os registros no banco."""
+    if guild is None:
+        return 0
+    canal = guild.get_channel(HISTORICO_PRISAO_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(HISTORICO_PRISAO_CHANNEL_ID)
+        except Exception:
+            return 0
+    if not isinstance(canal, discord.TextChannel):
+        return 0
+    removidos = 0
+    try:
+        async for msg in canal.history(limit=300, oldest_first=False):
+            if not getattr(msg.author, "bot", False):
+                continue
+            titulos = [str(getattr(embed, "title", "") or "") for embed in list(getattr(msg, "embeds", []) or [])]
+            if not any(
+                titulo.startswith("✅ FICHA PRISIONAL SINCRONIZADA")
+                or titulo.startswith("⚠️ FICHA SALVA — CONFERÊNCIA NECESSÁRIA")
+                for titulo in titulos
+            ):
+                continue
+            try:
+                await msg.delete(reason="Confirmação temporária do Histórico de Prisão")
+                removidos += 1
+            except (discord.NotFound, discord.Forbidden):
+                continue
+            except Exception:
+                continue
+    except Exception:
+        traceback.print_exc()
+    return removidos
+
+
 @bot.event
 async def on_ready():
     global comandos_ja_sincronizados
@@ -25019,9 +25055,19 @@ def _momento_responsavel_registro_alerta(
 ) -> datetime.datetime:
     candidatos: List[datetime.datetime] = []
     for chave in ('agente_atribuido_em', 'responsavel_alterado_em', 'data_atualizacao'):
-        data = _data_boletim_alerta_para_utc(atendimento.get(chave))
+        try:
+            data = _data_boletim_alerta_para_utc(atendimento.get(chave))
+        except Exception:
+            data = None
         if data:
-            candidatos.append(data)
+            try:
+                if data.tzinfo is None:
+                    data = data.replace(tzinfo=datetime.timezone.utc)
+                data = data.astimezone(datetime.timezone.utc)
+                if 2015 <= data.year <= 2100:
+                    candidatos.append(data)
+            except (OverflowError, OSError, ValueError, TypeError):
+                pass
     historico = atendimento.get('historico', [])
     if isinstance(historico, list):
         for item in historico:
@@ -25029,13 +25075,25 @@ def _momento_responsavel_registro_alerta(
                 continue
             if not (item.get('agente_novo_id') or item.get('novo_agente_id')):
                 continue
-            data = _data_boletim_alerta_para_utc(
-                item.get('data') or item.get('em') or item.get('criado_em')
-            )
+            try:
+                data = _data_boletim_alerta_para_utc(
+                    item.get('data') or item.get('em') or item.get('criado_em')
+                )
+            except Exception:
+                data = None
             if data:
-                candidatos.append(data)
-    return max(candidatos) if candidatos else datetime.datetime.min.replace(
-        tzinfo=datetime.timezone.utc
+                try:
+                    if data.tzinfo is None:
+                        data = data.replace(tzinfo=datetime.timezone.utc)
+                    data = data.astimezone(datetime.timezone.utc)
+                    if 2015 <= data.year <= 2100:
+                        candidatos.append(data)
+                except (OverflowError, OSError, ValueError, TypeError):
+                    pass
+    # Nunca usa datetime.min: ao converter para UTC-3 ele pode cair no ano 0
+    # e gerar OverflowError. 2015 é anterior à existência dos snowflakes usados.
+    return max(candidatos) if candidatos else datetime.datetime(
+        2015, 1, 1, tzinfo=datetime.timezone.utc
     )
 
 
@@ -25063,9 +25121,23 @@ def _responsavel_por_registros_alerta(
                 agente_id = 0
             if not agente_id:
                 continue
-            data = _data_boletim_alerta_para_utc(
-                item.get('data') or item.get('em') or item.get('criado_em')
-            ) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+            try:
+                data = _data_boletim_alerta_para_utc(
+                    item.get('data') or item.get('em') or item.get('criado_em')
+                )
+            except Exception:
+                data = None
+            if data is None:
+                data = datetime.datetime(2015, 1, 1, tzinfo=datetime.timezone.utc)
+            else:
+                try:
+                    if data.tzinfo is None:
+                        data = data.replace(tzinfo=datetime.timezone.utc)
+                    data = data.astimezone(datetime.timezone.utc)
+                    if not (2015 <= data.year <= 2100):
+                        data = datetime.datetime(2015, 1, 1, tzinfo=datetime.timezone.utc)
+                except (OverflowError, OSError, ValueError, TypeError):
+                    data = datetime.datetime(2015, 1, 1, tzinfo=datetime.timezone.utc)
             if melhor_data is None or data >= melhor_data:
                 melhor_id = agente_id
                 melhor_nome = str(
@@ -25128,8 +25200,15 @@ async def _responsavel_mais_recente_no_topico_alerta(
             membro = topico.guild.get_member(agente_id) if topico.guild else None
             nome = str(membro) if membro else ''
             data = getattr(mensagem, 'created_at', None)
-            if data and data.tzinfo is None:
-                data = data.replace(tzinfo=datetime.timezone.utc)
+            try:
+                if data and data.tzinfo is None:
+                    data = data.replace(tzinfo=datetime.timezone.utc)
+                if data:
+                    data = data.astimezone(datetime.timezone.utc)
+                    if not (2015 <= data.year <= 2100):
+                        data = None
+            except (OverflowError, OSError, ValueError, TypeError):
+                data = None
             return agente_id, nome, data
     return 0, '', None
 
@@ -25148,10 +25227,17 @@ def _sincronizar_responsavel_boletim_alerta(
     alterou = False
     data_texto = None
     if atribuido_em:
-        data_br = atribuido_em.astimezone(
-            datetime.timezone(datetime.timedelta(hours=-3))
-        )
-        data_texto = data_br.strftime('%d/%m/%Y %H:%M')
+        try:
+            if atribuido_em.tzinfo is None:
+                atribuido_em = atribuido_em.replace(tzinfo=datetime.timezone.utc)
+            atribuido_em = atribuido_em.astimezone(datetime.timezone.utc)
+            if 2015 <= atribuido_em.year <= 2100:
+                data_br = atribuido_em.astimezone(
+                    datetime.timezone(datetime.timedelta(hours=-3))
+                )
+                data_texto = data_br.strftime('%d/%m/%Y %H:%M')
+        except (OverflowError, OSError, ValueError, TypeError):
+            data_texto = None
 
     for item in lista:
         mesmo_topico = _topico_id_atendimento_alerta(item) == int(topico_id or 0)
@@ -36793,10 +36879,12 @@ def _dicor_alerta_bo_parado_ja_publicado_no_periodo(
     inicio_periodo: datetime.datetime,
 ) -> Optional[discord.Message]:
     for mensagem in mensagens:
-        criado = getattr(mensagem, 'created_at', None)
-        if criado and criado.tzinfo is None:
-            criado = criado.replace(tzinfo=datetime.timezone.utc)
-        if criado and criado.astimezone(datetime.timezone.utc) < inicio_periodo:
+        mensagem_id = int(getattr(mensagem, 'id', 0) or 0)
+        criado = _dicor_normalizar_data_alerta_bo(
+            getattr(mensagem, 'created_at', None),
+            mensagem_id,
+        )
+        if criado is None or criado < inicio_periodo:
             continue
         autor = getattr(mensagem, 'author', None)
         if autor is None or not bool(getattr(autor, 'bot', False)):
@@ -42242,6 +42330,8 @@ print(
 
 
 # =====================================================
+import tempfile
+
 # PATCH FINAL — HISTÓRICO DE PRISÃO INTEGRADO À FICHA GERAL
 # - Canal exclusivo: 1532097197292654622;
 # - Lê mensagens encaminhadas, inclusive message_snapshots da API;
@@ -42980,7 +43070,12 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 embed.set_image(url=foto_ind_url)
             if foto_rg_url.startswith("http"):
                 embed.set_thumbnail(url=foto_rg_url)
-            await message.reply(embed=embed, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            await message.reply(
+                embed=embed,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+                delete_after=60,
+            )
             await enviar_log(
                 f"🚔 Histórico de prisão sincronizado | {nome} | RG `{rg}` | "
                 f"mensagem `{message.id}` | conferência `{conferencia['status']}` | "
@@ -43287,10 +43382,12 @@ async def on_ready():
         inicializar_banco_dicor()
         guild = bot.get_guild(GUILD_ID)
         await _prisao_configurar_permissoes_canal(guild)
+        removidos = await _prisao_limpar_confirmacoes_antigas(guild)
         asyncio.create_task(_prisao_importar_historico(guild), name="historico-prisao-importacao")
         print(
             f"✅ Histórico de Prisão ativo no canal {HISTORICO_PRISAO_CHANNEL_ID}: "
-            "encaminhamentos, conferência Nome/RG, fotos persistentes e histórico na ficha geral.",
+            f"encaminhamentos, conferência Nome/RG, fotos persistentes e histórico na ficha geral; "
+            f"confirmações temporárias de 60s; {removidos} cartão(ões) antigo(s) removido(s).",
             flush=True,
         )
     except Exception as erro:
@@ -43306,6 +43403,18 @@ print(
 print(
     "✅ Histórico de Prisão V2 carregado: captura robusta de encaminhamentos/snapshots, "
     "reprocessamento recente e classificação profissional das 3 imagens.",
+    flush=True,
+)
+print(
+    "✅ Histórico de Prisão V2.1 carregado: confirmação da ficha é temporária por 60s e cartões antigos são limpos no início.",
+    flush=True,
+)
+print(
+    "✅ Histórico de Prisão V2.2 carregado: tempfile importado, criação de ficha restaurada e reprocessamento automático ativo.",
+    flush=True,
+)
+print(
+    "✅ Alertas BO parado V3.2 carregados: datas mínimas inválidas e conversão UTC-3 protegidas.",
     flush=True,
 )
 
