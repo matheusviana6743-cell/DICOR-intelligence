@@ -7927,9 +7927,35 @@ class PainelAdministrativoView(View):
         super().__init__(timeout=None)
         self.add_item(AdminAgenteSelect())
 
-    @discord.ui.button(label="Varredura Geral", emoji="📊", style=discord.ButtonStyle.blurple, custom_id="dic_adm_varredura_geral")
+    @discord.ui.button(
+        label="Varredura Geral", emoji="📊", style=discord.ButtonStyle.blurple,
+        custom_id="dic_adm_varredura_geral", row=1,
+    )
     async def varredura_geral(self, interaction: discord.Interaction, button: Button):
         await enviar_relatorio_estatistica(interaction, None)
+
+    @discord.ui.button(
+        label="Central de Pendências", emoji="📋", style=discord.ButtonStyle.success,
+        custom_id="dic_adm_central_pendencias", row=1,
+    )
+    async def central_pendencias(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_pode_painel_adm(interaction.user):
+            await interaction.response.send_message(
+                "❌ Apenas Inspetor DICOR para cima pode acessar a Central de Pendências.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            embed = await _central_pendencias_embed(interaction.guild)
+            await interaction.edit_original_response(embed=embed, view=CentralPendenciasView())
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.edit_original_response(
+                content=f"❌ Não foi possível abrir a Central de Pendências: {type(erro).__name__}: {erro}",
+                embed=None,
+                view=None,
+            )
 
 
 @bot.tree.command(name="paineladministrativo", description="Envia o painel administrativo da DICOR.")
@@ -7943,7 +7969,8 @@ async def paineladministrativo(interaction: discord.Interaction):
         description=(
             "Área restrita para Inspetor DICOR para cima.\n\n"
             "📊 **Varredura Geral:** gera um relatório com todos os agentes, nome por nome.\n"
-            "👤 **Selecionar agente:** escolha um membro no menu abaixo para gerar o relatório individual.\n\n"
+            "👤 **Selecionar agente:** escolha um membro no menu abaixo para gerar o relatório individual.\n"
+            "📋 **Central de Pendências:** reúne perícias, boletins e tarefas de mesas ainda não concluídas.\n\n"
             "O relatório conta procurados, boletins, tocaias, OLBs, perícias externas, relatórios diários, mesas e dossiês.\n"
             "Ele mostra apenas **quantidades** e **o que foi criado**, sem exibir o texto completo das mensagens."
         ),
@@ -41175,6 +41202,1041 @@ async def on_ready():
 print(
     "✅ Perícia Externa controlada carregada: tópico privado, responsável por Inspetor+, "
     "Indivíduo pego/não pego, BO obrigatório e cópia completa de anexos.",
+    flush=True,
+)
+
+
+# =====================================================
+# PATCH FINAL — LOTE DE IMAGENS + ANEXOS COMPLETOS + CENTRAL DE PENDÊNCIAS
+# - O banco analisa todas as imagens da mesma mensagem e publica uma única revisão;
+# - Perícias e boletins copiam anexos e imagens de embeds para seus tópicos;
+# - A Central de Pendências passa a existir dentro do Painel Administrativo.
+# =====================================================
+
+_BANCO_LOTE_PUBLICACAO_TASKS: Dict[int, asyncio.Task] = {}
+_BANCO_LOTE_LOCKS: Dict[int, asyncio.Lock] = {}
+_LOTE_ON_READY_ANTERIOR = on_ready
+_PERICIA_MENSAGENS_PUBLICACAO_ANTES_LOTE = _pericia_mensagens_publicacao
+_BO_MENSAGENS_COMPLEMENTARES_ANTES_LOTE = _bo_mensagens_anexos_complementares
+
+
+def _banco_lote_lock(mensagem_id: int) -> asyncio.Lock:
+    mensagem_id = int(mensagem_id or 0)
+    lock = _BANCO_LOTE_LOCKS.get(mensagem_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _BANCO_LOTE_LOCKS[mensagem_id] = lock
+    return lock
+
+
+def _banco_lote_pendentes_mensagem(mensagem_id: int) -> List[Dict[str, Any]]:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM placas_ocr_pendentes
+            WHERE mensagem_id=? AND status='PENDENTE'
+            ORDER BY id ASC
+            """,
+            (int(mensagem_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _banco_lote_mensagem_id_interacao(interaction: discord.Interaction) -> int:
+    mensagem = getattr(interaction, "message", None)
+    if mensagem is None:
+        return 0
+    for embed in list(getattr(mensagem, "embeds", []) or []):
+        footer = str(getattr(getattr(embed, "footer", None), "text", "") or "")
+        achado = re.search(r"OCR-LOTE-MSG:(\d+)", footer, flags=re.I)
+        if achado:
+            return int(achado.group(1))
+    return 0
+
+
+async def _banco_lote_obter_mensagem_origem(
+    guild: Optional[discord.Guild],
+    pendentes: List[Dict[str, Any]],
+) -> Optional[discord.Message]:
+    if guild is None or not pendentes:
+        return None
+    primeiro = pendentes[0]
+    canal_id = int(primeiro.get("canal_id") or 0)
+    mensagem_id = int(primeiro.get("mensagem_id") or 0)
+    if not canal_id or not mensagem_id:
+        return None
+    canal = guild.get_channel(canal_id)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(canal_id)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, "fetch_message"):
+        return None
+    try:
+        return await canal.fetch_message(mensagem_id)
+    except Exception:
+        return None
+
+
+def _banco_lote_resumo_linhas(pendentes: List[Dict[str, Any]]) -> str:
+    linhas: List[str] = []
+    for indice, item in enumerate(pendentes, start=1):
+        placa = str(item.get("placa_sugerida") or "Não identificada")
+        confianca = max(0.0, min(1.0, float(item.get("confianca") or 0.0)))
+        nome = str(item.get("proprietario_nome") or "").strip()
+        rg = str(item.get("proprietario_rg") or "").strip()
+        complemento = ""
+        if nome or rg:
+            complemento = f" • {nome or 'Sem nome'}{f' #{rg}' if rg else ''}"
+        linhas.append(f"**{indice}.** `{placa}` • {confianca * 100:.0f}%{complemento}")
+    return "\n".join(linhas)[:1000] or "Nenhuma placa sugerida."
+
+
+async def _banco_lote_montar_envio(
+    guild: Optional[discord.Guild],
+    pendentes: List[Dict[str, Any]],
+) -> Tuple[List[discord.Embed], List[discord.File]]:
+    if not pendentes:
+        return [], []
+    mensagem_id = int(pendentes[0].get("mensagem_id") or 0)
+    origem = await _banco_lote_obter_mensagem_origem(guild, pendentes)
+    fontes: List[Dict[str, Any]] = []
+    if origem is not None:
+        fontes = _banco_fontes_imagem_mensagem(origem)
+
+    por_fonte: Dict[str, List[Dict[str, Any]]] = {}
+    for item in pendentes:
+        por_fonte.setdefault(str(item.get("fonte_id") or ""), []).append(item)
+
+    resumo = discord.Embed(
+        title="🗂️ REVISÃO EM LOTE • IMAGENS DA MESMA MENSAGEM",
+        description=(
+            "Todas as imagens anexadas nesta mensagem foram analisadas como **um único conjunto**. "
+            "Confirme, corrija ou ignore o lote inteiro abaixo; não será mais publicado um cartão separado por foto."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    resumo.add_field(name="🖼️ Imagens analisadas", value=str(max(len(fontes), len(por_fonte))), inline=True)
+    resumo.add_field(name="🚗 Resultados encontrados", value=str(len(pendentes)), inline=True)
+    resumo.add_field(name="📋 Sugestões", value=_banco_lote_resumo_linhas(pendentes), inline=False)
+    url_origem = str(pendentes[0].get("mensagem_url") or "")
+    if url_origem:
+        resumo.add_field(name="🔗 Origem", value=f"[Abrir mensagem da Perícia Externa]({url_origem})", inline=False)
+    resumo.set_footer(text=f"OCR-LOTE-MSG:{mensagem_id} • confirmação única para todas as imagens")
+
+    embeds: List[discord.Embed] = [resumo]
+    files: List[discord.File] = []
+    fontes_exibicao = fontes[:9]
+    if not fontes_exibicao:
+        vistos: set[str] = set()
+        for item in pendentes:
+            chave = str(item.get("fonte_id") or item.get("imagem_url") or item.get("id"))
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            fontes_exibicao.append({
+                "fonte_id": str(item.get("fonte_id") or ""),
+                "url": str(item.get("imagem_url") or ""),
+                "filename": Path(str(item.get("imagem_path") or "imagem.png")).name,
+            })
+            if len(fontes_exibicao) >= 9:
+                break
+
+    for indice, fonte in enumerate(fontes_exibicao, start=1):
+        fonte_id = str(fonte.get("fonte_id") or "")
+        resultados = por_fonte.get(fonte_id, [])
+        titulo = f"Imagem {indice}"
+        if resultados:
+            placas = ", ".join(str(x.get("placa_sugerida") or "N/A") for x in resultados)
+            titulo += f" • {placas}"
+        else:
+            titulo += " • sem placa sugerida"
+        imagem_embed = discord.Embed(title=titulo[:256], color=discord.Color.dark_grey())
+
+        caminho_local = ""
+        for item in resultados:
+            candidato = str(item.get("imagem_path") or "")
+            if candidato and Path(candidato).exists():
+                caminho_local = candidato
+                break
+        if caminho_local:
+            nome = f"lote-{mensagem_id}-{indice}{Path(caminho_local).suffix or '.png'}"
+            files.append(discord.File(caminho_local, filename=nome))
+            imagem_embed.set_image(url=f"attachment://{nome}")
+        else:
+            url = str(fonte.get("url") or "")
+            if url and not url.startswith("attachment://"):
+                imagem_embed.set_image(url=url)
+        embeds.append(imagem_embed)
+    return embeds[:10], files[:9]
+
+
+async def _banco_lote_apagar_cartoes_antigos(
+    guild: Optional[discord.Guild],
+    pendentes: List[Dict[str, Any]],
+) -> None:
+    if guild is None:
+        return
+    pares = {
+        (int(x.get("revisao_canal_id") or 0), int(x.get("revisao_mensagem_id") or 0))
+        for x in pendentes
+        if int(x.get("revisao_canal_id") or 0) and int(x.get("revisao_mensagem_id") or 0)
+    }
+    for canal_id, mensagem_id in pares:
+        try:
+            canal = guild.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+            msg = await canal.fetch_message(mensagem_id)
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        except Exception:
+            traceback.print_exc()
+
+
+async def _banco_lote_publicar_mensagem(
+    guild: Optional[discord.Guild],
+    mensagem_id: int,
+    canal_fallback_id: int = 0,
+) -> bool:
+    async with _banco_lote_lock(mensagem_id):
+        pendentes = _banco_lote_pendentes_mensagem(mensagem_id)
+        if not pendentes or guild is None:
+            return False
+        canal_id = int(_banco_config_get("painel_canal_id", "0") or 0) or int(canal_fallback_id or 0)
+        if not canal_id:
+            canal_id = int(pendentes[0].get("revisao_canal_id") or 0)
+        if not canal_id:
+            return False
+        canal = guild.get_channel(canal_id)
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(canal_id)
+            except Exception:
+                canal = None
+        if canal is None or not hasattr(canal, "send"):
+            return False
+
+        await _banco_lote_apagar_cartoes_antigos(guild, pendentes)
+        with _banco_conexao() as db:
+            db.execute(
+                "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 "
+                "WHERE mensagem_id=? AND status='PENDENTE'",
+                (int(mensagem_id),),
+            )
+        pendentes = _banco_lote_pendentes_mensagem(mensagem_id)
+        embeds, files = await _banco_lote_montar_envio(guild, pendentes)
+        if not embeds:
+            return False
+        enviada = await canal.send(
+            embeds=embeds,
+            files=files,
+            view=BancoOCRLoteReviewView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        with _banco_conexao() as db:
+            db.execute(
+                """
+                UPDATE placas_ocr_pendentes
+                SET revisao_canal_id=?, revisao_mensagem_id=?, atualizado_em=?
+                WHERE mensagem_id=? AND status='PENDENTE'
+                """,
+                (int(canal.id), int(enviada.id), _banco_agora_iso(), int(mensagem_id)),
+            )
+        return True
+
+
+def _banco_lote_agendar(
+    guild: Optional[discord.Guild],
+    mensagem_id: int,
+    canal_fallback_id: int,
+    atraso: float = 12.0,
+) -> bool:
+    mensagem_id = int(mensagem_id or 0)
+    if not mensagem_id or guild is None:
+        return False
+    anterior = _BANCO_LOTE_PUBLICACAO_TASKS.get(mensagem_id)
+    if anterior is not None and not anterior.done():
+        anterior.cancel()
+
+    async def tarefa() -> None:
+        try:
+            await asyncio.sleep(max(0.5, float(atraso)))
+            await _banco_lote_publicar_mensagem(guild, mensagem_id, canal_fallback_id)
+        except asyncio.CancelledError:
+            return
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"⚠️ Falha ao publicar revisão OCR em lote da mensagem `{mensagem_id}`: "
+                f"{type(erro).__name__}: {erro}"
+            )
+        finally:
+            atual = _BANCO_LOTE_PUBLICACAO_TASKS.get(mensagem_id)
+            if atual is asyncio.current_task():
+                _BANCO_LOTE_PUBLICACAO_TASKS.pop(mensagem_id, None)
+
+    _BANCO_LOTE_PUBLICACAO_TASKS[mensagem_id] = asyncio.create_task(
+        tarefa(), name=f"dicor-ocr-lote-{mensagem_id}"
+    )
+    return anterior is None or anterior.done()
+
+
+async def _banco_ocr_postar_revisao(
+    guild: Optional[discord.Guild],
+    pendente: Dict[str, Any],
+    *,
+    canal_fallback_id: int = 0,
+) -> bool:
+    await asyncio.to_thread(_banco_ocr_reconciliar_confirmadas)
+    pid = int((pendente or {}).get("id") or 0)
+    atual = await asyncio.to_thread(_banco_ocr_pendente_por_id, pid) if pid else {}
+    if not atual or str(atual.get("status") or "").upper() != "PENDENTE":
+        return False
+    if await asyncio.to_thread(_banco_ocr_fechar_pendente_duplicada, atual):
+        return False
+    return _banco_lote_agendar(
+        guild,
+        int(atual.get("mensagem_id") or 0),
+        int(canal_fallback_id or 0),
+    )
+
+
+async def _banco_lote_finalizar_cartao(
+    interaction: discord.Interaction,
+    titulo: str,
+    descricao: str,
+    cor: discord.Color,
+) -> None:
+    if interaction.message:
+        try:
+            await interaction.message.edit(
+                embeds=[discord.Embed(title=titulo, description=descricao, color=cor)],
+                view=None,
+                attachments=[],
+            )
+            asyncio.create_task(_banco_v3_apagar_mensagem_depois(interaction.message, 45))
+        except Exception:
+            traceback.print_exc()
+
+
+class BancoOCRLoteCorrecaoModal(Modal, title="Corrigir resultados do lote"):
+    def __init__(self, mensagem_id: int, pendentes: List[Dict[str, Any]]):
+        super().__init__(timeout=600)
+        self.mensagem_id = int(mensagem_id)
+        padrao = "\n".join(
+            f"{int(item.get('id') or 0)}={str(item.get('placa_sugerida') or '')}"
+            for item in pendentes[:25]
+        )
+        self.placas = TextInput(
+            label="ID=PLACA, uma por linha",
+            default=padrao[:4000],
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.placas)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        mapa: Dict[int, str] = {}
+        for linha in str(self.placas.value or "").splitlines():
+            achado = re.match(r"\s*(\d+)\s*[=:;-]\s*([A-Za-z0-9-]+)\s*$", linha)
+            if achado:
+                mapa[int(achado.group(1))] = achado.group(2)
+        pendentes = _banco_lote_pendentes_mensagem(self.mensagem_id)
+        corrigidas = 0
+        erros: List[str] = []
+        for item in pendentes:
+            pid = int(item.get("id") or 0)
+            placa = mapa.get(pid, str(item.get("placa_sugerida") or ""))
+            try:
+                await asyncio.to_thread(
+                    _banco_ocr_resolver,
+                    pid,
+                    int(interaction.user.id),
+                    placa_final=placa,
+                    status_final="CORRIGIDO",
+                )
+                corrigidas += 1
+            except Exception as erro:
+                erros.append(f"ID {pid}: {erro}")
+        with _banco_conexao() as db:
+            db.execute(
+                "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 "
+                "WHERE mensagem_id=?",
+                (self.mensagem_id,),
+            )
+        await _banco_lote_finalizar_cartao(
+            interaction,
+            "✅ LOTE OCR CORRIGIDO",
+            f"**{corrigidas}** ficha(s) corrigida(s) por {interaction.user.mention}."
+            + ("\n\n⚠️ " + "\n".join(erros[:5]) if erros else ""),
+            discord.Color.green(),
+        )
+        await interaction.followup.send(
+            f"✅ {corrigidas} ficha(s) corrigida(s)." + (f" Falhas: {len(erros)}." if erros else ""),
+            ephemeral=True,
+        )
+        try:
+            await _banco_prof_atualizar_painel()
+        except Exception:
+            traceback.print_exc()
+
+
+class BancoOCRLoteReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode revisar fichas.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Confirmar lote", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id="dicor_banco_ocr_lote_confirmar", row=0,
+    )
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mensagem_id = _banco_lote_mensagem_id_interacao(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with _banco_lote_lock(mensagem_id):
+            pendentes = _banco_lote_pendentes_mensagem(mensagem_id)
+            confirmadas = 0
+            erros: List[str] = []
+            for item in pendentes:
+                pid = int(item.get("id") or 0)
+                try:
+                    await asyncio.to_thread(
+                        _banco_ocr_resolver, pid, int(interaction.user.id), status_final="CONFIRMADO"
+                    )
+                    confirmadas += 1
+                except Exception as erro:
+                    erros.append(f"ID {pid}: {erro}")
+            with _banco_conexao() as db:
+                db.execute(
+                    "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 "
+                    "WHERE mensagem_id=?",
+                    (int(mensagem_id),),
+                )
+        await _banco_lote_finalizar_cartao(
+            interaction,
+            "✅ LOTE OCR CONFIRMADO",
+            f"**{confirmadas}** ficha(s) confirmada(s) por {interaction.user.mention}."
+            + ("\n\n⚠️ " + "\n".join(erros[:5]) if erros else ""),
+            discord.Color.green(),
+        )
+        await interaction.followup.send(
+            f"✅ {confirmadas} ficha(s) confirmada(s) de uma só vez."
+            + (f" Falhas: {len(erros)}." if erros else ""),
+            ephemeral=True,
+        )
+        try:
+            await _banco_prof_atualizar_painel()
+        except Exception:
+            traceback.print_exc()
+
+    @discord.ui.button(
+        label="Corrigir lote", emoji="✏️", style=discord.ButtonStyle.primary,
+        custom_id="dicor_banco_ocr_lote_corrigir", row=0,
+    )
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mensagem_id = _banco_lote_mensagem_id_interacao(interaction)
+        pendentes = _banco_lote_pendentes_mensagem(mensagem_id)
+        if not pendentes:
+            return await interaction.response.send_message("✅ Este lote já foi resolvido.", ephemeral=True)
+        await interaction.response.send_modal(BancoOCRLoteCorrecaoModal(mensagem_id, pendentes))
+
+    @discord.ui.button(
+        label="Ignorar lote", emoji="❌", style=discord.ButtonStyle.danger,
+        custom_id="dicor_banco_ocr_lote_ignorar", row=0,
+    )
+    async def ignorar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mensagem_id = _banco_lote_mensagem_id_interacao(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with _banco_lote_lock(mensagem_id):
+            pendentes = _banco_lote_pendentes_mensagem(mensagem_id)
+            ignoradas = 0
+            for item in pendentes:
+                try:
+                    await asyncio.to_thread(
+                        _banco_ocr_resolver,
+                        int(item.get("id") or 0),
+                        int(interaction.user.id),
+                        status_final="IGNORADO",
+                    )
+                    ignoradas += 1
+                except Exception:
+                    traceback.print_exc()
+            with _banco_conexao() as db:
+                db.execute(
+                    "UPDATE placas_ocr_pendentes SET revisao_canal_id=0, revisao_mensagem_id=0 "
+                    "WHERE mensagem_id=?",
+                    (int(mensagem_id),),
+                )
+        await _banco_lote_finalizar_cartao(
+            interaction,
+            "❌ LOTE OCR IGNORADO",
+            f"**{ignoradas}** resultado(s) ignorado(s) por {interaction.user.mention}.",
+            discord.Color.red(),
+        )
+        await interaction.followup.send(f"✅ {ignoradas} resultado(s) removido(s) da fila.", ephemeral=True)
+        try:
+            await _banco_prof_atualizar_painel()
+        except Exception:
+            traceback.print_exc()
+
+
+async def _banco_lote_reagrupar_pendentes(guild: Optional[discord.Guild]) -> int:
+    if guild is None:
+        return 0
+    with _banco_conexao() as db:
+        rows = db.execute(
+            "SELECT DISTINCT mensagem_id FROM placas_ocr_pendentes WHERE status='PENDENTE' ORDER BY mensagem_id"
+        ).fetchall()
+    total = 0
+    canal_fallback = int(_banco_config_get("painel_canal_id", "0") or 0)
+    for row in rows:
+        mensagem_id = int(row[0] or 0)
+        if mensagem_id:
+            _banco_lote_agendar(guild, mensagem_id, canal_fallback, atraso=2.0)
+            total += 1
+    return total
+
+
+async def _dicor_baixar_url_para_pasta(urls: List[str], pasta: Path, prefixo: str) -> Optional[Path]:
+    urls = [str(x) for x in urls if str(x).strip() and not str(x).startswith("attachment://")]
+    if not urls:
+        return None
+    pasta.mkdir(parents=True, exist_ok=True)
+    timeout = ClientTimeout(total=90)
+    async with ClientSession(timeout=timeout) as sessao:
+        for url in urls:
+            try:
+                async with sessao.get(url) as resposta:
+                    if resposta.status != 200:
+                        continue
+                    dados = await resposta.read()
+                    if not dados:
+                        continue
+                    tipo = str(resposta.headers.get("Content-Type", "") or "").lower()
+                    ext = Path(url.split("?", 1)[0]).suffix.lower()
+                    if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".txt"}:
+                        ext = ".jpg" if "jpeg" in tipo else ".webp" if "webp" in tipo else ".gif" if "gif" in tipo else ".png"
+                    digest = hashlib.sha1(dados).hexdigest()[:16]
+                    caminho = pasta / f"{slugify(prefixo)}-{digest}{ext}"
+                    if not caminho.exists():
+                        caminho.write_bytes(dados)
+                    return caminho
+            except Exception:
+                continue
+    return None
+
+
+async def _dicor_arquivos_mensagens_completos(
+    mensagens: List[discord.Message],
+    pasta: Path,
+    prefixo: str,
+) -> List[Path]:
+    caminhos: List[Path] = []
+    vistos: set[str] = set()
+    for msg in mensagens:
+        for anexo in list(getattr(msg, "attachments", []) or []):
+            chave = f"att:{int(getattr(anexo, 'id', 0) or 0)}:{getattr(anexo, 'filename', '')}:{getattr(anexo, 'size', 0)}"
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            caminho = await baixar_anexo_persistente(anexo, pasta, prefixo)
+            if caminho:
+                caminhos.append(caminho)
+        for indice, embed in enumerate(list(getattr(msg, "embeds", []) or [])):
+            for tipo_nome, media in (("imagem", getattr(embed, "image", None)), ("miniatura", getattr(embed, "thumbnail", None))):
+                urls: List[str] = []
+                for url in (getattr(media, "proxy_url", None), getattr(media, "url", None)):
+                    if url and str(url) not in urls:
+                        urls.append(str(url))
+                if not urls:
+                    continue
+                chave = "embed:" + "|".join(urls)
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                caminho = await _dicor_baixar_url_para_pasta(
+                    urls,
+                    pasta,
+                    f"{prefixo}-msg-{getattr(msg, 'id', 0)}-{tipo_nome}-{indice}",
+                )
+                if caminho:
+                    caminhos.append(caminho)
+    # Deduplicação real pelo conteúdo.
+    unicos: List[Path] = []
+    hashes: set[str] = set()
+    for caminho in caminhos:
+        try:
+            digest = hashlib.sha256(caminho.read_bytes()).hexdigest()
+        except Exception:
+            digest = str(caminho)
+        if digest in hashes:
+            continue
+        hashes.add(digest)
+        unicos.append(caminho)
+    return unicos
+
+
+def _dicor_mensagem_tem_midias(message: discord.Message) -> bool:
+    if list(getattr(message, "attachments", []) or []):
+        return True
+    for embed in list(getattr(message, "embeds", []) or []):
+        if getattr(getattr(embed, "image", None), "url", None) or getattr(getattr(embed, "thumbnail", None), "url", None):
+            return True
+    return False
+
+
+async def _pericia_mensagens_publicacao(message: discord.Message, numero: str) -> List[discord.Message]:
+    base = await _PERICIA_MENSAGENS_PUBLICACAO_ANTES_LOTE(message, numero)
+    encontrados: Dict[int, discord.Message] = {int(x.id): x for x in base}
+    # Aguarda o Discord concluir lotes adicionais do mesmo relatório.
+    await asyncio.sleep(3.0)
+    try:
+        async for msg in message.channel.history(limit=60, after=message.created_at, oldest_first=True):
+            if int(msg.id) == int(message.id):
+                continue
+            principal, outro_numero, texto = _pericia_mensagem_principal(msg)
+            if principal and _pericia_numero_chave(outro_numero) != _pericia_numero_chave(numero):
+                break
+            if not _dicor_mensagem_tem_midias(msg):
+                continue
+            norm = normalizar_busca(texto) if "normalizar_busca" in globals() else str(texto).lower()
+            referenciada = int(getattr(getattr(msg, "reference", None), "message_id", 0) or 0) == int(message.id)
+            mesmo_numero = bool(_pericia_numero_chave(numero) in _pericia_numero_chave(texto))
+            continuacao = any(x in norm for x in ("continuacao", "anexos", "provas", "registros fotograficos"))
+            mesmo_autor = int(getattr(msg.author, "id", 0) or 0) == int(getattr(message.author, "id", 0) or 0)
+            if referenciada or mesmo_numero or continuacao or mesmo_autor:
+                encontrados[int(msg.id)] = msg
+    except Exception:
+        traceback.print_exc()
+    return [encontrados[k] for k in sorted(encontrados)]
+
+
+async def _pericia_copiar_anexos_para_topico(
+    mensagens: List[discord.Message],
+    topico: discord.Thread,
+    numero: str,
+    ignorar_mensagem_id: int = 0,
+) -> Tuple[int, List[int]]:
+    mensagens_filtradas = [m for m in mensagens if int(m.id) != int(ignorar_mensagem_id or 0)]
+    if not mensagens_filtradas:
+        return 0, []
+    ids_origem = [int(m.id) for m in mensagens_filtradas]
+    enviados = 0
+    with _pericia_tempfile.TemporaryDirectory(prefix="dicor-pericia-completa-") as tmp:
+        caminhos = await _dicor_arquivos_mensagens_completos(
+            mensagens_filtradas,
+            Path(tmp),
+            f"pericia-{_pericia_nome_seguro(numero)}",
+        )
+        if caminhos:
+            enviados = await enviar_arquivos_em_lotes(
+                topico,
+                caminhos,
+                legenda=f"📎 Todas as fotos e anexos da Perícia Nº {numero}",
+            )
+    return enviados, ids_origem
+
+
+async def _bo_mensagens_anexos_complementares(message: discord.Message) -> List[discord.Message]:
+    base = await _BO_MENSAGENS_COMPLEMENTARES_ANTES_LOTE(message)
+    encontrados: Dict[int, discord.Message] = {int(x.id): x for x in base}
+    numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(message))
+    await asyncio.sleep(3.0)
+    try:
+        async for msg in message.channel.history(limit=60, after=message.created_at, oldest_first=True):
+            if eh_boletim_valido_para_atendimento(msg):
+                break
+            if not _dicor_mensagem_tem_midias(msg):
+                continue
+            texto = _pericia_texto_mensagem(msg)
+            norm = normalizar_busca(texto) if "normalizar_busca" in globals() else texto.lower()
+            referenciada = int(getattr(getattr(msg, "reference", None), "message_id", 0) or 0) == int(message.id)
+            mesmo_numero = bool(numero and _pericia_numero_chave(numero) in _pericia_numero_chave(texto))
+            continuacao = any(x in norm for x in ("provas", "anexos", "fotos", "continuacao"))
+            mesmo_autor = int(getattr(msg.author, "id", 0) or 0) == int(getattr(message.author, "id", 0) or 0)
+            if referenciada or mesmo_numero or continuacao or mesmo_autor:
+                encontrados[int(msg.id)] = msg
+    except Exception:
+        traceback.print_exc()
+    return [encontrados[k] for k in sorted(encontrados)]
+
+
+def _dicor_hash_arquivo(caminho: Path) -> str:
+    try:
+        return hashlib.sha256(caminho.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+async def _bo_copiar_mensagens_no_topico(
+    atendimento: Dict[str, Any],
+    mensagens: List[discord.Message],
+) -> int:
+    topico_id = int(atendimento.get("thread_id") or atendimento.get("area_id") or 0)
+    topico = bot.get_channel(topico_id)
+    if topico is None:
+        try:
+            topico = await bot.fetch_channel(topico_id)
+        except Exception:
+            topico = None
+    if not isinstance(topico, discord.Thread):
+        return 0
+
+    hashes = {str(x) for x in (atendimento.get("anexos_hashes_copiados") or []) if str(x)}
+    for p in list(atendimento.get("anexos_salvos") or []):
+        caminho = Path(str(p))
+        if caminho.exists():
+            digest = _dicor_hash_arquivo(caminho)
+            if digest:
+                hashes.add(digest)
+
+    with _pericia_tempfile.TemporaryDirectory(prefix="dicor-bo-completo-") as tmp:
+        caminhos = await _dicor_arquivos_mensagens_completos(
+            mensagens,
+            Path(tmp),
+            f"bo-{numero_curto_boletim(atendimento.get('numero'))}",
+        )
+        novos: List[Path] = []
+        novos_hashes: List[str] = []
+        for caminho in caminhos:
+            digest = _dicor_hash_arquivo(caminho)
+            if digest and digest in hashes:
+                continue
+            if digest:
+                hashes.add(digest)
+                novos_hashes.append(digest)
+            novos.append(caminho)
+        if not novos:
+            atendimento["anexos_hashes_copiados"] = sorted(hashes)
+            atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+            return 0
+        enviados = await enviar_arquivos_em_lotes(
+            topico,
+            novos,
+            legenda=f"📎 Todas as fotos e anexos do BO Nº {numero_curto_boletim(atendimento.get('numero'))}",
+        )
+    atendimento["anexos_hashes_copiados"] = sorted(hashes)
+    ids = {int(x) for x in (atendimento.get("mensagens_anexos_complementares_ids") or []) if str(x).isdigit()}
+    ids.update(int(m.id) for m in mensagens)
+    atendimento["mensagens_anexos_complementares_ids"] = sorted(ids)
+    atendimento["anexos_complementares_copiados"] = int(atendimento.get("anexos_complementares_copiados") or 0) + enviados
+    atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+    return enviados
+
+
+async def _bo_copiar_anexos_complementares(
+    message: discord.Message,
+    atendimento: Dict[str, Any],
+) -> None:
+    await asyncio.sleep(2.0)
+    extras = await _bo_mensagens_anexos_complementares(message)
+    mensagens = [message] + [x for x in extras if int(x.id) != int(message.id)]
+    try:
+        enviados = await _bo_copiar_mensagens_no_topico(atendimento, mensagens)
+        if enviados:
+            await enviar_log(
+                f"📎 BO `{atendimento.get('numero')}` recebeu {enviados} foto(s)/anexo(s) adicionais no tópico."
+            )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f"⚠️ Falha ao copiar todas as fotos do BO `{atendimento.get('numero')}`: {type(erro).__name__}: {erro}"
+        )
+
+
+async def _pericia_encontrar_registro_para_midia(message: discord.Message) -> Optional[Dict[str, Any]]:
+    texto = _pericia_texto_mensagem(message)
+    numero = _pericia_extrair_numero(texto)
+    if numero:
+        registro = _pericia_por_numero(numero)
+        if registro:
+            return registro
+    ref_id = int(getattr(getattr(message, "reference", None), "message_id", 0) or 0)
+    if ref_id:
+        registro = _pericia_por_mensagem(ref_id)
+        if registro:
+            return registro
+    try:
+        async for anterior in message.channel.history(limit=25, before=message.created_at, oldest_first=False):
+            principal, numero_anterior, _ = _pericia_mensagem_principal(anterior)
+            if principal:
+                return _pericia_por_numero(numero_anterior)
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+async def _bo_encontrar_atendimento_para_midia(message: discord.Message) -> Optional[Dict[str, Any]]:
+    ref_id = int(getattr(getattr(message, "reference", None), "message_id", 0) or 0)
+    if ref_id:
+        encontrado = buscar_atendimento_por_mensagem(ref_id)
+        if encontrado:
+            return encontrado
+    texto = _pericia_texto_mensagem(message)
+    numero = extrair_numero_boletim_seguro(texto)
+    if numero:
+        encontrado = buscar_atendimento_por_numero(numero)
+        if encontrado:
+            return encontrado
+    try:
+        async for anterior in message.channel.history(limit=25, before=message.created_at, oldest_first=False):
+            if eh_boletim_valido_para_atendimento(anterior):
+                encontrado = buscar_atendimento_por_mensagem(anterior.id)
+                if encontrado:
+                    return encontrado
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+@bot.listen("on_message")
+async def dicor_copiar_midias_tardias_pericia_bo(message: discord.Message):
+    try:
+        if not message.guild or isinstance(message.channel, discord.Thread) or not _dicor_mensagem_tem_midias(message):
+            return
+        canal_id = int(getattr(message.channel, "id", 0) or 0)
+        if canal_id == int(PERICIA_FLUXO_CHANNEL_ID):
+            principal, _, _ = _pericia_mensagem_principal(message)
+            if principal:
+                return
+            await asyncio.sleep(1.5)
+            registro = await _pericia_encontrar_registro_para_midia(message)
+            if not registro:
+                return
+            ids = {int(x) for x in (registro.get("mensagens_origem_ids") or []) if str(x).isdigit()}
+            if int(message.id) in ids:
+                return
+            topico = await _pericia_obter_topico(registro)
+            if not topico:
+                return
+            enviados, novos_ids = await _pericia_copiar_anexos_para_topico(
+                [message], topico, str(registro.get("numero") or "")
+            )
+            ids.update(novos_ids)
+            registro["mensagens_origem_ids"] = sorted(ids)
+            registro["anexos_copiados"] = int(registro.get("anexos_copiados") or 0) + enviados
+            _pericia_atualizar(registro)
+            await _pericia_atualizar_painel(registro)
+            return
+
+        if canal_id == int(BOLETINS_CHANNEL_ID):
+            if eh_boletim_valido_para_atendimento(message):
+                return
+            await asyncio.sleep(1.5)
+            atendimento = await _bo_encontrar_atendimento_para_midia(message)
+            if atendimento:
+                await _bo_copiar_mensagens_no_topico(atendimento, [message])
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f"⚠️ Falha ao copiar mídia tardia da mensagem `{getattr(message, 'id', 0)}`: "
+            f"{type(erro).__name__}: {erro}"
+        )
+
+
+def _pendencia_horas_desde_id(snowflake_id: int) -> float:
+    try:
+        data = discord.utils.snowflake_time(int(snowflake_id))
+        agora = datetime.datetime.now(datetime.timezone.utc)
+        return max(0.0, (agora - data).total_seconds() / 3600.0)
+    except Exception:
+        return 0.0
+
+
+def _pendencia_linha(
+    emoji: str,
+    titulo: str,
+    status: str,
+    responsavel_id: int,
+    topico_id: int,
+    horas: Optional[float] = None,
+) -> str:
+    responsavel = f"<@{int(responsavel_id)}>" if int(responsavel_id or 0) else "Sem responsável"
+    link = f"<#{int(topico_id)}>" if int(topico_id or 0) else "Sem tópico"
+    tempo = f" • {int(horas)}h" if horas is not None and horas >= 1 else ""
+    return f"{emoji} **{titulo}** — {status}{tempo}\n└ {responsavel} • {link}"
+
+
+async def _central_pendencias_boletins(guild: discord.Guild) -> Tuple[List[str], int]:
+    linhas: List[str] = []
+    parados = 0
+    registros: Dict[int, Dict[str, Any]] = {}
+    for item in carregar_atendimentos_boletins():
+        if not isinstance(item, dict) or str(item.get("status") or "").upper() == "FINALIZADO":
+            continue
+        tid = int(item.get("thread_id") or item.get("area_id") or 0)
+        if tid:
+            registros[tid] = item
+    semaforo = asyncio.Semaphore(5)
+
+    async def analisar(tid: int, item: Dict[str, Any]) -> Tuple[str, bool]:
+        async with semaforo:
+            horas = _pendencia_horas_desde_id(tid)
+            try:
+                topico = guild.get_channel(tid) or await bot.fetch_channel(tid)
+                if isinstance(topico, discord.Thread):
+                    mensagens = [m async for m in topico.history(limit=80, oldest_first=False)]
+                    ultima, _ = _dicor_ultima_atividade_humana(mensagens, topico)
+                    if ultima is not None:
+                        horas = max(0.0, (datetime.datetime.now(datetime.timezone.utc) - ultima).total_seconds() / 3600.0)
+            except Exception:
+                pass
+            parado = horas >= 48.0
+            numero = numero_curto_boletim(item.get("numero") or "")
+            linha = _pendencia_linha(
+                "🔴" if parado else "📄",
+                f"BO Nº {numero}",
+                "Parado há mais de 48h" if parado else str(item.get("status") or "Em andamento"),
+                int(item.get("agente_id") or 0),
+                tid,
+                horas,
+            )
+            return linha, parado
+
+    resultados = await asyncio.gather(
+        *(analisar(tid, item) for tid, item in list(registros.items())[:40]),
+        return_exceptions=True,
+    )
+    for resultado in resultados:
+        if isinstance(resultado, Exception):
+            continue
+        linha, parado = resultado
+        linhas.append(linha)
+        parados += int(parado)
+    return linhas, parados
+
+
+async def _central_pendencias_embed(guild: Optional[discord.Guild]) -> discord.Embed:
+    if guild is None:
+        raise RuntimeError("Servidor não localizado.")
+    pericias = [
+        x for x in _pericia_carregar()
+        if str(x.get("status") or "").upper() not in _PERICIA_STATUS_FINAIS
+    ]
+    boletins_linhas, boletins_parados = await _central_pendencias_boletins(guild)
+    tarefas_dados = _carregar_tarefas() if "_carregar_tarefas" in globals() else {}
+    tarefas = [
+        x for x in (tarefas_dados.values() if isinstance(tarefas_dados, dict) else [])
+        if isinstance(x, dict) and str(x.get("status") or "").upper() != "CONCLUIDA"
+    ]
+
+    aguardando_agente = sum(str(x.get("status") or "").upper() == "AGUARDANDO_AGENTE" for x in pericias)
+    aguardando_bo = sum(str(x.get("status") or "").upper() == "AGUARDANDO_BO" for x in pericias)
+    embed = discord.Embed(
+        title="📋 CENTRAL DE PENDÊNCIAS • DICOR",
+        description=(
+            "Visão operacional restrita a **Inspetor+**. Reúne procedimentos ainda não concluídos "
+            "e mostra o responsável atual, o tópico e o tempo sem atualização."
+        ),
+        color=discord.Color.dark_blue(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="🔬 PERÍCIAS EXTERNAS",
+        value=(
+            f"Aguardando responsável: **{aguardando_agente}**\n"
+            f"Em atendimento: **{sum(str(x.get('status') or '').upper() == 'PENDENTE' for x in pericias)}**\n"
+            f"Aguardando BO: **{aguardando_bo}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="📄 BOLETINS",
+        value=(
+            f"Em aberto: **{len(boletins_linhas)}**\n"
+            f"Parados há 48h+: **{boletins_parados}**\n"
+            f"Sem responsável: **{sum('Sem responsável' in x for x in boletins_linhas)}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(name="🕵️ TAREFAS DE MESAS", value=f"Pendentes: **{len(tarefas)}**", inline=True)
+
+    linhas_pericia: List[str] = []
+    for item in pericias[:8]:
+        numero = str(item.get("numero") or "S/N")
+        tid = int(item.get("topico_id") or item.get("thread_id") or 0)
+        horas = _pendencia_horas_desde_id(tid or int(item.get("mensagem_original_id") or 0))
+        linhas_pericia.append(
+            _pendencia_linha(
+                "🔬",
+                f"Perícia Nº {numero}",
+                _pericia_status_label(item.get("status")),
+                int(item.get("agente_id") or 0),
+                tid,
+                horas,
+            )
+        )
+    if linhas_pericia:
+        embed.add_field(name="🔬 Perícias prioritárias", value="\n\n".join(linhas_pericia)[:1024], inline=False)
+    if boletins_linhas:
+        embed.add_field(name="📄 Boletins pendentes", value="\n\n".join(boletins_linhas[:8])[:1024], inline=False)
+
+    linhas_tarefas: List[str] = []
+    for tarefa in tarefas[:6]:
+        titulo = str(tarefa.get("titulo") or tarefa.get("descricao") or "Tarefa da mesa")[:90]
+        responsavel_id = int(tarefa.get("responsavel_id") or tarefa.get("agente_id") or 0)
+        topico_id = int(tarefa.get("topico_id") or tarefa.get("canal_id") or 0)
+        linhas_tarefas.append(
+            _pendencia_linha(
+                "🕵️",
+                titulo,
+                str(tarefa.get("status") or "Pendente"),
+                responsavel_id,
+                topico_id,
+                _pendencia_horas_desde_id(int(tarefa.get("mensagem_id") or topico_id or 0)),
+            )
+        )
+    if linhas_tarefas:
+        embed.add_field(name="🕵️ Tarefas de mesas", value="\n\n".join(linhas_tarefas)[:1024], inline=False)
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • atualização sob demanda")
+    return embed
+
+
+class CentralPendenciasView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Atualizar pendências", emoji="🔄", style=discord.ButtonStyle.secondary,
+        custom_id="dicor_adm_pendencias_atualizar",
+    )
+    async def atualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_pode_painel_adm(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Inspetor+ pode atualizar este painel.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = await _central_pendencias_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
+@bot.event
+async def on_ready():
+    await _LOTE_ON_READY_ANTERIOR()
+    try:
+        bot.add_view(BancoOCRLoteReviewView())
+        bot.add_view(CentralPendenciasView())
+        grupos = await _banco_lote_reagrupar_pendentes(bot.get_guild(GUILD_ID))
+        print(
+            f"✅ Revisão OCR em lote ativa: {grupos} mensagem(ns) pendente(s) agrupada(s); "
+            "Perícia/BO com cópia completa de fotos; Central de Pendências no painel administrativo.",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao carregar lote de imagens/Central de Pendências: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ Lote de imagens V1 carregado: confirmação única por mensagem, anexos completos em Perícia/BO e Central de Pendências administrativa.",
     flush=True,
 )
 
