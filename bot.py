@@ -42375,17 +42375,56 @@ async def _prisao_raw_message_json(message: discord.Message) -> Dict[str, Any]:
 
 
 async def _prisao_payloads_mensagem(message: discord.Message) -> List[Any]:
+    """Retorna a mensagem atual e todos os snapshots de encaminhamento.
+
+    Compatível com discord.py que exponha ``message_snapshots``/``snapshots`` e
+    também com o JSON bruto da API. O GET é feito sempre, pois algumas versões
+    da biblioteca recebem a flag HAS_SNAPSHOT, mas não materializam o conteúdo
+    do encaminhamento no objeto Message.
+    """
     payloads: List[Any] = [message]
-    snapshots = list(getattr(message, "message_snapshots", []) or [])
-    for snapshot in snapshots:
-        payload = getattr(snapshot, "message", None) or snapshot
+    vistos: set[str] = {f"obj:{id(message)}"}
+
+    def adicionar(snapshot: Any) -> None:
+        if snapshot is None:
+            return
+        if isinstance(snapshot, dict):
+            payload = snapshot.get("message") or snapshot.get("message_snapshot") or snapshot
+            chave = "dict:" + str(payload.get("id") or "") + ":" + str(hash(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)[:4000]))
+        else:
+            payload = getattr(snapshot, "message", None) or getattr(snapshot, "message_snapshot", None) or snapshot
+            chave = f"obj:{id(payload)}"
+        if chave in vistos:
+            return
+        vistos.add(chave)
         payloads.append(payload)
-    if len(payloads) == 1:
+
+    for atributo in ("message_snapshots", "snapshots", "message_snapshot"):
+        valor = getattr(message, atributo, None)
+        if not valor:
+            continue
+        if isinstance(valor, (list, tuple)):
+            for snapshot in valor:
+                adicionar(snapshot)
+        else:
+            adicionar(valor)
+
+    bruto: Dict[str, Any] = {}
+    for tentativa in range(3):
         bruto = await _prisao_raw_message_json(message)
-        for snapshot in list(bruto.get("message_snapshots") or []):
-            payload = snapshot.get("message") if isinstance(snapshot, dict) else None
-            if payload:
-                payloads.append(payload)
+        snapshots_brutos = list(bruto.get("message_snapshots") or bruto.get("snapshots") or []) if bruto else []
+        if snapshots_brutos:
+            for snapshot in snapshots_brutos:
+                adicionar(snapshot)
+            break
+        if tentativa < 2:
+            await asyncio.sleep(0.8 * (tentativa + 1))
+
+    # Fallback adicional para payloads futuros que usem snapshot singular.
+    if bruto:
+        singular = bruto.get("message_snapshot")
+        if singular:
+            adicionar(singular)
     return payloads
 
 
@@ -42603,11 +42642,25 @@ def _prisao_classificar_midias(midias: List[Dict[str, Any]], nome: str, rg: str)
         # O segundo anexo é o documento no padrão operacional informado.
         rg_item = sorted(midias, key=lambda x: int(x.get("ordem") or 0))[1]
     restantes = [x for x in midias if x is not rg_item]
-    mochila_item = max(restantes, key=lambda x: float(x.get("mochila_score") or 0), default=None)
-    if mochila_item and float(mochila_item.get("mochila_score") or 0) <= 0:
-        mochila_item = sorted(restantes, key=lambda x: int(x.get("ordem") or 0))[-1] if len(restantes) >= 2 else None
+    # A mochila/inventário costuma ter muito mais caixas e linhas OCR que a foto
+    # do indivíduo. Isso evita depender da ordem em que o Discord monta a grade.
+    mochila_item = max(
+        restantes,
+        key=lambda x: (
+            float(x.get("mochila_score") or 0),
+            len(list(x.get("ocr_linhas") or [])),
+            len(str(x.get("ocr_texto") or "")),
+        ),
+        default=None,
+    )
+    if mochila_item and float(mochila_item.get("mochila_score") or 0) <= 0 and len(restantes) < 2:
+        mochila_item = None
     individuo_restantes = [x for x in restantes if x is not mochila_item]
-    individuo_item = sorted(individuo_restantes, key=lambda x: int(x.get("ordem") or 0))[0] if individuo_restantes else None
+    individuo_item = min(
+        individuo_restantes,
+        key=lambda x: (len(list(x.get("ocr_linhas") or [])), int(x.get("ordem") or 0)),
+        default=None,
+    )
     if individuo_item is None and restantes:
         individuo_item = sorted(restantes, key=lambda x: int(x.get("ordem") or 0))[0]
     return {"individuo": individuo_item, "rg": rg_item, "mochila": mochila_item}
@@ -42810,13 +42863,35 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
         return None
     if message.author.bot:
         return None
-    if not isinstance(message.author, discord.Member) or not _membro_inspetor_mais(message.author):
+    membro: Optional[discord.Member] = message.author if isinstance(message.author, discord.Member) else None
+    if membro is None and message.guild is not None:
+        membro = message.guild.get_member(int(getattr(message.author, "id", 0) or 0))
+        if membro is None:
+            try:
+                membro = await message.guild.fetch_member(int(getattr(message.author, "id", 0) or 0))
+            except Exception:
+                membro = None
+    if membro is None or not _membro_inspetor_mais(membro):
+        try:
+            await message.reply(
+                "⚠️ Não foi possível validar seu cargo de **Inspetor+** para importar esta prisão.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
         return None
     async with _prisao_lock(message.id):
         if await asyncio.to_thread(_prisao_ja_processada, message.id):
             return None
         texto = await _prisao_texto_completo(message)
+        payloads_debug = await _prisao_payloads_mensagem(message)
         nome, rg = _prisao_extrair_identidade(texto)
+        print(
+            f"📥 Prisão V2 mensagem {message.id}: payload(s)={len(payloads_debug)}, "
+            f"texto={len(texto)} caractere(s), nome={'sim' if nome else 'não'}, rg={'sim' if rg else 'não'}.",
+            flush=True,
+        )
         if not nome or not rg:
             if not historico:
                 await message.reply(
@@ -42828,6 +42903,7 @@ async def _prisao_processar_mensagem(message: discord.Message, *, historico: boo
                 )
             return None
         descritores = await _prisao_coletar_descritores_midia(message)
+        print(f"📷 Prisão V2 mensagem {message.id}: {len(descritores)} mídia(s) encontrada(s) no encaminhamento.", flush=True)
         if not descritores:
             if not historico:
                 await message.reply(
@@ -42921,7 +42997,16 @@ async def historico_prisao_automatico(message: discord.Message):
         return
     _PRISAO_PROCESSANDO.add(int(message.id))
     try:
+        try:
+            await message.add_reaction("🔄")
+        except Exception:
+            pass
+        await asyncio.sleep(1.2)
         await _prisao_processar_mensagem(message)
+        try:
+            await message.remove_reaction("🔄", bot.user)
+        except Exception:
+            pass
     except Exception as erro:
         traceback.print_exc()
         await enviar_log(
@@ -42933,6 +43018,11 @@ async def historico_prisao_automatico(message: discord.Message):
 
 
 async def _prisao_importar_historico(guild: Optional[discord.Guild]) -> int:
+    """Reprocessa encaminhamentos que chegaram enquanto o bot estava offline.
+
+    Registros das últimas 24 horas recebem o mesmo cartão de confirmação de uma
+    mensagem nova. Registros mais antigos são importados silenciosamente.
+    """
     if guild is None:
         return 0
     canal = guild.get_channel(HISTORICO_PRISAO_CHANNEL_ID)
@@ -42944,19 +43034,25 @@ async def _prisao_importar_historico(guild: Optional[discord.Guild]) -> int:
     if not isinstance(canal, discord.TextChannel):
         return 0
     importados = 0
+    agora = datetime.datetime.now(datetime.timezone.utc)
     try:
-        async for msg in canal.history(limit=HISTORICO_PRISAO_SCAN_LIMIT, oldest_first=True):
-            if msg.author.bot:
+        async for msg in canal.history(limit=HISTORICO_PRISAO_SCAN_LIMIT, oldest_first=False):
+            if msg.author.bot or await asyncio.to_thread(_prisao_ja_processada, msg.id):
                 continue
-            if await asyncio.to_thread(_prisao_ja_processada, msg.id):
-                continue
+            criado = getattr(msg, "created_at", agora) or agora
+            if criado.tzinfo is None:
+                criado = criado.replace(tzinfo=datetime.timezone.utc)
+            recente = (agora - criado).total_seconds() <= 24 * 3600
             try:
-                resultado = await _prisao_processar_mensagem(msg, historico=True)
+                resultado = await _prisao_processar_mensagem(msg, historico=not recente)
                 importados += int(bool(resultado))
-            except Exception:
+            except Exception as erro:
                 traceback.print_exc()
+                print(f"⚠️ Falha ao reprocessar prisão {msg.id}: {type(erro).__name__}: {erro}", flush=True)
     except Exception:
         traceback.print_exc()
+    if importados:
+        print(f"✅ Histórico de Prisão V2: {importados} encaminhamento(s) pendente(s) importado(s).", flush=True)
     return importados
 
 
@@ -43205,6 +43301,11 @@ async def on_ready():
 print(
     "✅ Histórico de Prisão V1 carregado: 3 imagens por encaminhamento, comparação com RG, "
     "foto do indivíduo/documento e links de Perícia, BO e prisões na ficha.",
+    flush=True,
+)
+print(
+    "✅ Histórico de Prisão V2 carregado: captura robusta de encaminhamentos/snapshots, "
+    "reprocessamento recente e classificação profissional das 3 imagens.",
     flush=True,
 )
 
