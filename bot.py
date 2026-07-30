@@ -10428,29 +10428,73 @@ def preparar_registro_comparecimento(atendimento: Dict[str, Any], dados: Dict[st
     }
 
 
+def converter_pdf_comparecimento_para_imagem(caminho_pdf: Path, caminho_png: Path) -> None:
+    """Converte todas as páginas do PDF em uma única imagem PNG vertical.
+
+    O PDF continua salvo internamente para histórico, mas a publicação no Discord
+    é feita como imagem, facilitando a visualização em celular e desktop.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as erro:
+        raise RuntimeError(
+            "A biblioteca PyMuPDF não está disponível para converter o mandado em imagem. "
+            "Adicione `PyMuPDF` ao requirements.txt."
+        ) from erro
+
+    documento = fitz.open(str(caminho_pdf))
+    imagens = []
+    try:
+        for pagina in documento:
+            # 2.2x oferece boa leitura sem gerar arquivos excessivamente grandes.
+            pix = pagina.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False)
+            imagens.append(Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB"))
+    finally:
+        documento.close()
+
+    if not imagens:
+        raise RuntimeError("O mandado não possui páginas para conversão em imagem.")
+
+    margem = 24
+    largura = max(img.width for img in imagens)
+    altura = sum(img.height for img in imagens) + margem * max(0, len(imagens) - 1)
+    fundo = Image.new("RGB", (largura, altura), (7, 9, 8))
+    y = 0
+    for img in imagens:
+        x = (largura - img.width) // 2
+        fundo.paste(img, (x, y))
+        y += img.height + margem
+
+    caminho_png.parent.mkdir(parents=True, exist_ok=True)
+    fundo.save(caminho_png, format="PNG", optimize=True)
+
+
 async def gerar_e_enviar_comparecimento(interaction: discord.Interaction, atendimento: Dict[str, Any], registro: Dict[str, Any]) -> Dict[str, Any]:
-    """Gera e envia o mandado como PDF real anexado ao Discord."""
+    """Gera o mandado oficial, arquiva o PDF e publica uma imagem no Discord."""
     pasta = COMPARECIMENTOS_DIR / slugify(str(registro.get("numero") or registro.get("id") or data_caso()))
     pasta.mkdir(parents=True, exist_ok=True)
     numero_limpo = re.sub(r"[^0-9A-Za-z_-]+", "_", str(registro.get("numero", "comparecimento")))
     nome_pdf = f"SOLICITACAO_COMPARECIMENTO_{numero_limpo}.pdf"
-    nome_docx = f"SOLICITACAO_COMPARECIMENTO_{numero_limpo}.docx"
+    nome_png = f"SOLICITACAO_COMPARECIMENTO_{numero_limpo}.png"
     caminho_pdf = pasta / nome_pdf
-    caminho_docx = pasta / nome_docx
+    caminho_png = pasta / nome_png
 
+    # Mantém o PDF apenas como arquivo interno/histórico e usa a imagem na publicação.
     await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
     if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 0:
-        raise RuntimeError("O PDF do mandado foi gerado vazio ou não foi encontrado.")
-    try:
-        await asyncio.to_thread(gerar_docx_comparecimento, registro, caminho_docx)
-    except Exception as erro_docx:
-        await enviar_log(f"⚠️ PDF gerado, mas o DOCX do mandado falhou: {erro_docx}")
+        raise RuntimeError("O documento do mandado foi gerado vazio ou não foi encontrado.")
+
+    await asyncio.to_thread(converter_pdf_comparecimento_para_imagem, caminho_pdf, caminho_png)
+    if not caminho_png.exists() or caminho_png.stat().st_size <= 0:
+        raise RuntimeError("A imagem do mandado foi gerada vazia ou não foi encontrada.")
 
     registro["arquivo_pdf"] = str(caminho_pdf)
-    registro["arquivo_docx"] = str(caminho_docx) if caminho_docx.exists() and caminho_docx.stat().st_size > 0 else ""
+    registro["arquivo_imagem"] = str(caminho_png)
+    registro["arquivo_docx"] = ""
     registro["gerado_em"] = agora_br()
     await enviar_log(
-        f"📄 PDF de mandado gerado | solicitação `{registro.get('numero')}` | autorizador `{registro.get('autorizado_por_id')}` | tamanho `{caminho_pdf.stat().st_size}` bytes"
+        f"🖼️ Imagem de mandado gerada | solicitação `{registro.get('numero')}` | "
+        f"autorizador `{registro.get('autorizado_por_id')}` | tamanho `{caminho_png.stat().st_size}` bytes"
     )
 
     destino = interaction.guild.get_channel(MANDADOS_CHANNEL_ID) if interaction.guild else None
@@ -10463,16 +10507,16 @@ async def gerar_e_enviar_comparecimento(interaction: discord.Interaction, atendi
         raise RuntimeError(f"Canal de mandados `{MANDADOS_CHANNEL_ID}` não encontrado ou sem permissão de envio.")
 
     limite = int(getattr(getattr(destino, "guild", None), "filesize_limit", 25 * 1024 * 1024) or 25 * 1024 * 1024)
-    tamanho_pdf = caminho_pdf.stat().st_size
-    if tamanho_pdf > limite:
+    tamanho_png = caminho_png.stat().st_size
+    if tamanho_png > limite:
         raise RuntimeError(
-            f"O PDF possui {tamanho_pdf / 1024 / 1024:.1f} MB e ultrapassa o limite do Discord de {limite / 1024 / 1024:.1f} MB."
+            f"A imagem possui {tamanho_png / 1024 / 1024:.1f} MB e ultrapassa o limite do Discord de {limite / 1024 / 1024:.1f} MB."
         )
 
     embed = discord.Embed(
         title="📩 Solicitação de Comparecimento emitida",
-        description="Documento autorizado e anexado diretamente para download.",
-        color=discord.Color.from_rgb(0, 43, 91),
+        description="Mandado autorizado e exibido diretamente como imagem.",
+        color=discord.Color.from_rgb(192, 151, 39),
     )
     embed.add_field(name="Solicitação", value=f"`{registro.get('numero')}`", inline=True)
     embed.add_field(name="Processo/Boletim", value=f"`{registro.get('processo') or atendimento.get('numero') or 'N/I'}`", inline=True)
@@ -10484,42 +10528,27 @@ async def gerar_e_enviar_comparecimento(interaction: discord.Interaction, atendi
         value=f"{registro.get('autorizado_por_nome', 'Não identificado')}\n{registro.get('autorizado_por_cargo', 'Cargo não identificado')}",
         inline=False,
     )
-    embed.set_footer(text="Polícia Federal - DICOR • PDF anexado diretamente pelo Discord")
+    embed.set_image(url=f"attachment://{nome_png}")
+    embed.set_footer(text="Polícia Federal • DICOR • Documento publicado como imagem")
 
-    pdf_buffer = io.BytesIO(caminho_pdf.read_bytes())
-    pdf_buffer.seek(0)
+    imagem_buffer = io.BytesIO(caminho_png.read_bytes())
+    imagem_buffer.seek(0)
     try:
         mensagem = await destino.send(
-            content="📄 **Mandado/Solicitação de Comparecimento DICOR — PDF para download**",
+            content="🖼️ **Mandado/Solicitação de Comparecimento DICOR**",
             embed=embed,
-            file=discord.File(pdf_buffer, filename=nome_pdf),
+            file=discord.File(imagem_buffer, filename=nome_png),
             allowed_mentions=discord.AllowedMentions.none(),
         )
     finally:
-        pdf_buffer.close()
-
-    if registro.get("arquivo_docx"):
-        try:
-            tamanho_docx = caminho_docx.stat().st_size
-            if 0 < tamanho_docx <= limite:
-                docx_buffer = io.BytesIO(caminho_docx.read_bytes())
-                docx_buffer.seek(0)
-                try:
-                    await destino.send(
-                        content="📝 **Versão editável do documento**",
-                        file=discord.File(docx_buffer, filename=nome_docx),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                finally:
-                    docx_buffer.close()
-        except Exception as erro_docx_envio:
-            await enviar_log(f"⚠️ PDF enviado, mas o DOCX não pôde ser anexado: {erro_docx_envio}")
+        imagem_buffer.close()
 
     registro.update({
         "publicacao_id": mensagem.id,
         "publicacao_url": mensagem.jump_url,
         "publicacao_canal_id": getattr(destino, "id", None),
         "status": "AUTORIZADO/EMITIDO",
+        "formato_publicado": "imagem",
     })
     lista = carregar_comparecimentos()
     if not any(str(x.get("id")) == str(registro.get("id")) for x in lista):
@@ -10530,7 +10559,8 @@ async def gerar_e_enviar_comparecimento(interaction: discord.Interaction, atendi
                 item.update(registro)
     salvar_comparecimentos(lista)
     await enviar_log(
-        f"📤 Mandado enviado como PDF anexo | solicitação `{registro.get('numero')}` | mensagem `{mensagem.id}` | canal `{getattr(destino, 'id', 0)}` | {agora_br()}"
+        f"📤 Mandado enviado como imagem | solicitação `{registro.get('numero')}` | "
+        f"mensagem `{mensagem.id}` | canal `{getattr(destino, 'id', 0)}` | {agora_br()}"
     )
     return registro
 
@@ -47606,7 +47636,7 @@ def _central_salvar_acesso(request: web.Request) -> None:
 
 _CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>
 :root{--bg:#070806;--panel:#10120d;--line:#3b321a;--gold:#d7a93d;--gold2:#f2d47d;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:82px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 5vw;background:#090a07e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:5}.brand{display:flex;align-items:center;gap:15px}.seal{width:52px;height:52px;border-radius:14px;display:grid;place-items:center;border:1px solid #8b712d;background:#080906;box-shadow:0 0 25px #d7a93d22;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:4px}.brand h1{font-size:17px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{font-size:12px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px;max-width:780px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65;max-width:760px}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center;box-shadow:0 25px 80px #0008}.hero-mark .crest{width:178px;height:178px;border:1px solid #8b712d;border-radius:28px;display:grid;place-items:center;background:#080906;box-shadow:0 0 60px #d7a93d22;overflow:hidden}.hero-mark .crest img{width:100%;height:100%;object-fit:contain;padding:10px}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;overflow:hidden;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d;box-shadow:0 20px 45px #0007}.card .icon{font-size:29px}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5;margin:0 0 25px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.card.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.card.disabled{opacity:.55}.card.disabled a{pointer-events:none;background:#39382f;color:#888}footer{text-align:center;color:#625f52;font-size:11px;padding:50px 15px;letter-spacing:1px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.hero h2{font-size:40px}.grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){header{padding:0 18px}.brand small,.status{display:none}main{padding:42px 16px}.hero h2{font-size:34px}.grid{grid-template-columns:1fr}}
-</style></head><body><header><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Ambiente integrado para consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div class="icon">🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados e dos dados autorizados para divulgação.</p><a href="/catalogo">Abrir catálogo público</a></article><article class="card private"><div class="icon">🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo de pessoas, organizações, veículos, perícias e demais conexões registradas.</p><a href="/arvore">Acessar com senha</a></article><article class="card private"><div class="icon">👥</div><h3>Central de Fichas</h3><p>Área reservada para consulta e administração das fichas investigativas da DICOR.</p><a href="/fichas">Acessar com senha</a></article><article class="card private disabled"><div class="icon">📋</div><h3>Boletins</h3><p>Módulo preparado para integração futura com boletins e atendimentos.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">🧪</div><h3>Perícias</h3><p>Módulo preparado para histórico e cruzamento completo das perícias externas.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">📂</div><h3>Dossiês</h3><p>Módulo preparado para consulta centralizada dos dossiês operacionais.</p><a href="#">Em desenvolvimento</a></article></section></main><footer>DICOR • USO OPERACIONAL EM AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+</style></head><body><header><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Ambiente integrado para consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div class="icon">🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados e dos dados autorizados para divulgação.</p><a href="/catalogo">Abrir catálogo público</a></article><article class="card private"><div class="icon">🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo de pessoas, organizações, veículos, perícias e demais conexões registradas.</p><a href="/arvore">Acessar com senha</a></article><article class="card private"><div class="icon">👥</div><h3>Central de Fichas</h3><p>Área reservada para consulta e administração das fichas investigativas da DICOR.</p><a href="/fichas">Acessar com senha</a></article><article class="card private"><div class="icon">📋</div><h3>Boletins</h3><p>Consulta interna dos boletins em aberto e concluídos, com textos, fotos e perícias vinculadas.</p><a href="/boletins">Abrir boletins</a></article><article class="card private disabled"><div class="icon">🧪</div><h3>Perícias</h3><p>Módulo preparado para histórico e cruzamento completo das perícias externas.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">📂</div><h3>Dossiês</h3><p>Módulo preparado para consulta centralizada dos dossiês operacionais.</p><a href="#">Em desenvolvimento</a></article></section></main><footer>DICOR • USO OPERACIONAL EM AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
 
 
 _CENTRAL_LOGIN_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acesso Restrito • DICOR</title><style>
@@ -47735,12 +47765,15 @@ async def start_web_server():
     app.router.add_get("/arvore.html", arvore_pagina_http)
     app.router.add_get("/api/arvore/{individuo_id}", arvore_api_http)
     app.router.add_get("/fichas", central_fichas_http)
+    app.router.add_get("/boletins", central_boletins_http)
+    app.router.add_get("/boletins.html", central_boletins_http)
     app.router.add_get("/health", healthcheck_http)
     app.router.add_get("/healthz", healthcheck_http)
     app.router.add_get("/dossies/{caminho:.+}", baixar_dossie_http)
     app.router.add_get("/backups/{caminho:.+}", baixar_backup_http)
     app.router.add_post("/api/catalogo/apagar", api_apagar_procurado)
     app.router.add_static("/uploads/", path=str(UPLOADS_DIR), show_index=False)
+    app.router.add_static("/central-bo-media/", path=str(CENTRAL_BO_MEDIA_DIR), show_index=False)
     porta = int(os.getenv("PORT", str(PORT)) or PORT)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -48117,7 +48150,7 @@ def gerar_catalogo_html() -> None:
 
 
 # Portal com brasão realmente centralizado no cabeçalho.
-_CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>:root{--gold:#d7a93d;--gold2:#f2d47d;--bg:#070806;--panel:#10120d;--line:#3b321a;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:106px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07e8;position:sticky;top:0;z-index:5}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.seal{width:70px;height:70px;border-radius:16px;display:grid;place-items:center;border:1px solid #8b712d;background:#080906;box-shadow:0 0 25px #d7a93d22;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:5px}.brand h1{font-size:18px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{justify-self:end;font-size:11px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center}.hero-mark img{width:185px;height:185px;object-fit:contain;filter:drop-shadow(0 0 30px #d7a93d35)}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.disabled{opacity:.55}footer{text-align:center;color:#625f52;font-size:11px;padding:50px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.grid{grid-template-columns:1fr 1fr}.status{display:none}}@media(max-width:600px){header{grid-template-columns:1fr}.brand{grid-column:1;justify-self:center}.grid{grid-template-columns:1fr}.hero h2{font-size:36px}}</style></head><body><header><div></div><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><img src="/central/brasao-dicor.png"></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div>🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados.</p><a href="/catalogo">Abrir catálogo</a></article><article class="card private"><div>🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo completo de pessoas, organizações, veículos e registros.</p><a href="/arvore">Abrir árvore</a></article><article class="card private"><div>👥</div><h3>Central de Fichas</h3><p>Consulta e administração das fichas investigativas.</p><a href="/fichas">Abrir fichas</a></article><article class="card private disabled"><div>📋</div><h3>Boletins</h3><p>Integração web em desenvolvimento.</p></article><article class="card private disabled"><div>🧪</div><h3>Perícias</h3><p>Integração web em desenvolvimento.</p></article><article class="card private disabled"><div>📂</div><h3>Dossiês</h3><p>Integração web em desenvolvimento.</p></article></section></main><footer>DICOR • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+_CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>:root{--gold:#d7a93d;--gold2:#f2d47d;--bg:#070806;--panel:#10120d;--line:#3b321a;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:106px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07e8;position:sticky;top:0;z-index:5}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.seal{width:70px;height:70px;border-radius:16px;display:grid;place-items:center;border:1px solid #8b712d;background:#080906;box-shadow:0 0 25px #d7a93d22;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:5px}.brand h1{font-size:18px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{justify-self:end;font-size:11px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center}.hero-mark img{width:185px;height:185px;object-fit:contain;filter:drop-shadow(0 0 30px #d7a93d35)}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.disabled{opacity:.55}footer{text-align:center;color:#625f52;font-size:11px;padding:50px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.grid{grid-template-columns:1fr 1fr}.status{display:none}}@media(max-width:600px){header{grid-template-columns:1fr}.brand{grid-column:1;justify-self:center}.grid{grid-template-columns:1fr}.hero h2{font-size:36px}}</style></head><body><header><div></div><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><img src="/central/brasao-dicor.png"></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div>🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados.</p><a href="/catalogo">Abrir catálogo</a></article><article class="card private"><div>🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo completo de pessoas, organizações, veículos e registros.</p><a href="/arvore">Abrir árvore</a></article><article class="card private"><div>👥</div><h3>Central de Fichas</h3><p>Consulta e administração das fichas investigativas.</p><a href="/fichas">Abrir fichas</a></article><article class="card private"><div>📋</div><h3>Boletins</h3><p>Consulta interna dos boletins em aberto e concluídos, com textos e fotos.</p><a href="/boletins">Abrir boletins</a></article><article class="card private disabled"><div>🧪</div><h3>Perícias</h3><p>Integração web em desenvolvimento.</p></article><article class="card private disabled"><div>📂</div><h3>Dossiês</h3><p>Integração web em desenvolvimento.</p></article></section></main><footer>DICOR • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
 
 
 # Login e página de fichas também usam o brasão centralizado.
@@ -51969,6 +52002,180 @@ async def _v17_analise_fotos_background() -> None:
     except Exception as erro:
         print(f"⚠️ V18 análise de fotos: {type(erro).__name__}: {erro}", flush=True)
 
+
+# =====================================================
+# V19 — PERÍCIA COM FOTOS + STATUS + CENTRAL DE BOLETINS
+# =====================================================
+CENTRAL_BO_MEDIA_DIR = Path(DATA_DIR) / "central_boletins_media"
+CENTRAL_BO_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+_V19_SYNC_BO_INICIADO = False
+
+
+def _v19_status_bo_final(status: Any) -> bool:
+    s = normalizar_busca(str(status or "")) if "normalizar_busca" in globals() else str(status or "").lower()
+    return any(x in s for x in ("finalizado", "finalizada", "concluido", "concluida", "arquivado", "arquivada", "encerrado", "encerrada"))
+
+
+def _v19_caminhos_pericia_persistidos(registro: Dict[str, Any]) -> List[Path]:
+    achados: List[Path] = []
+    def incluir(valor: Any):
+        if isinstance(valor, dict):
+            for v in valor.values(): incluir(v)
+        elif isinstance(valor, (list, tuple, set)):
+            for v in valor: incluir(v)
+        elif valor:
+            texto = str(valor).strip()
+            if not texto or texto.startswith(("http://", "https://")): return
+            p = Path(texto)
+            candidatos = [p]
+            if not p.is_absolute(): candidatos += [Path(DATA_DIR)/p, Path(PUBLIC_DIR)/p, Path(UPLOADS_DIR)/p.name]
+            for c in candidatos:
+                try:
+                    if c.exists() and c.is_file() and c.stat().st_size > 0:
+                        achados.append(c.resolve()); return
+                except Exception: pass
+    for chave in ("anexos_salvos","arquivos_salvos","fotos_salvas","caminhos_anexos","arquivos","fotos","anexos","evidencias_arquivos"):
+        incluir(registro.get(chave))
+    numero = _pericia_nome_seguro(registro.get("numero")).casefold()
+    for raiz in (Path(DATA_DIR), Path(UPLOADS_DIR)):
+        try:
+            for arq in raiz.rglob("*"):
+                if arq.is_file() and numero and numero in arq.name.casefold() and arq.suffix.lower() in {".png",".jpg",".jpeg",".webp",".gif",".pdf"}:
+                    achados.append(arq.resolve())
+        except Exception: pass
+    unicos=[]; vistos=set()
+    for arq in achados:
+        try: chave=(str(arq), arq.stat().st_size)
+        except Exception: continue
+        if chave not in vistos: vistos.add(chave); unicos.append(arq)
+    return unicos
+
+
+_V19_MENSAGENS_ORIGEM_V18 = _v18_mensagens_origem_pericia
+async def _v18_mensagens_origem_pericia(registro: Dict[str, Any]) -> List[discord.Message]:
+    encontrados: Dict[int, discord.Message] = {}
+    try:
+        for msg in await _V19_MENSAGENS_ORIGEM_V18(registro): encontrados[int(msg.id)] = msg
+    except Exception: traceback.print_exc()
+    topico = await _pericia_obter_topico(registro)
+    if topico is not None and hasattr(topico, "history"):
+        try:
+            async for msg in topico.history(limit=500, oldest_first=True):
+                tem_imagem_embed = any(getattr(getattr(e, "image", None), "url", None) for e in (msg.embeds or []))
+                if msg.attachments or tem_imagem_embed or "conteúdo da perícia" in str(msg.content or "").casefold() or "continuação da perícia" in str(msg.content or "").casefold():
+                    encontrados[int(msg.id)] = msg
+        except Exception: traceback.print_exc()
+    return [encontrados[k] for k in sorted(encontrados)]
+
+
+_V19_ENCAMINHAR_V18 = _v18_encaminhar_pericia_ao_bo
+async def _v18_encaminhar_pericia_ao_bo(registro: Dict[str, Any], numero_bo: str, interaction: discord.Interaction) -> Dict[str, Any]:
+    resultado = await _V19_ENCAMINHAR_V18(registro, numero_bo, interaction)
+    destino = resultado.get("destino")
+    extras = _v19_caminhos_pericia_persistidos(registro)
+    if destino is not None and extras:
+        try:
+            qtd = await enviar_arquivos_em_lotes(destino, extras, legenda=f"📎 Arquivos persistentes da Perícia Nº {registro.get('numero')} • {numero_bo}")
+            resultado["anexos"] = int(resultado.get("anexos") or 0) + int(qtd or 0)
+        except Exception: traceback.print_exc()
+    return resultado
+
+
+def _v19_url_midia(caminho: Any) -> str:
+    try:
+        arq = Path(str(caminho or ""))
+        if arq.exists() and arq.is_file():
+            destino = CENTRAL_BO_MEDIA_DIR / arq.name
+            if not destino.exists() or destino.stat().st_size != arq.stat().st_size: shutil.copy2(arq, destino)
+            return "/central-bo-media/" + quote(destino.name)
+    except Exception: pass
+    return ""
+
+
+def _v19_boletins_html() -> str:
+    abertos, concluidos = [], []
+    for bo in carregar_atendimentos_boletins():
+        if not isinstance(bo, dict): continue
+        numero = str(bo.get("numero") or "Sem número")
+        status = str(bo.get("status") or "EM ABERTO")
+        textos=[]
+        for chave in ("texto_original","conteudo","descricao","relato","historico_texto"):
+            valor=bo.get(chave)
+            if isinstance(valor,str) and valor.strip(): textos.append(valor.strip())
+        midias=[]
+        for chave in ("anexos_salvos","fotos_salvas","arquivos_salvos","midias_salvas"):
+            valor=bo.get(chave) or []
+            if not isinstance(valor,list): valor=[valor]
+            for item in valor:
+                url=_v19_url_midia(item)
+                if url and url not in midias: midias.append(url)
+        imgs=''.join(f'<a href="{html.escape(u)}" target="_blank"><img src="{html.escape(u)}" loading="lazy"></a>' for u in midias)
+        pericias=bo.get("pericias_vinculadas") or []
+        lista_pericias=''.join(f'<li>Perícia Nº {html.escape(str((x or {}).get("numero") or "S/N"))} • {int((x or {}).get("anexos") or 0)} anexo(s)</li>' for x in pericias if isinstance(x,dict))
+        corpo=html.escape("\n\n".join(textos) or "Conteúdo preservado no tópico do Discord.").replace("\n","<br>")
+        card=(f'<article class="bo"><div class="head"><div><small>BOLETIM</small><h2>{html.escape(numero)}</h2></div><span>{html.escape(status)}</span></div>'
+              f'<div class="texto">{corpo}</div>'
+              + (f'<div class="media">{imgs}</div>' if imgs else '<p class="muted">Nenhuma foto persistida ainda.</p>')
+              + (f'<h3>Perícias vinculadas</h3><ul>{lista_pericias}</ul>' if lista_pericias else '')
+              + '<p class="muted">A resolução e alterações continuam exclusivamente no Discord/e-mail operacional.</p></article>')
+        (concluidos if _v19_status_bo_final(status) else abertos).append(card)
+    css=':root{--g:#d7a93d;--g2:#f4d77c;--bg:#070806;--p:#10120e;--line:#433719;--mut:#a59e88}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#3a2d0c55,transparent 35%),var(--bg);color:#f7f1db;font-family:Inter,Arial,sans-serif}.top{height:105px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw}.brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:70px;height:70px;object-fit:contain;border:1px solid #806a2d;border-radius:16px;padding:5px}.brand h1{margin:0;font-size:18px;letter-spacing:2px}.brand small,.ey{color:var(--g);letter-spacing:1.5px}.nav{justify-self:end}.nav a{color:var(--g2);text-decoration:none;margin-left:15px}.wrap{max-width:1350px;margin:45px auto;padding:0 22px}.hero{text-align:center;margin-bottom:30px}.hero h2{font-size:38px;margin:8px}.tabs{display:flex;justify-content:center;gap:10px;margin:25px}.tabs button{background:#11130e;color:#eee3c5;border:1px solid var(--line);border-radius:10px;padding:12px 18px;font-weight:800;cursor:pointer}.tabs button.active{background:linear-gradient(135deg,#7b5b09,var(--g));color:#080906}.panel{display:none}.panel.active{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px}.bo{background:var(--p);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 20px 50px #0005}.head{display:flex;justify-content:space-between;gap:15px}.head h2{margin:5px 0;color:var(--g2)}.head span{border:1px solid #675321;border-radius:99px;padding:7px 11px;height:max-content;color:#e8cf7b}.texto{color:#d7d0bb;line-height:1.55;max-height:260px;overflow:auto;border-top:1px solid #292515;padding-top:15px}.media{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:16px}.media img{width:100%;height:170px;object-fit:contain;background:#050604;border:1px solid #4c3e1d;border-radius:10px}.muted{color:var(--mut);font-size:13px}@media(max-width:650px){.top{grid-template-columns:1fr}.brand{grid-column:1}.nav{display:none}.panel.active{grid-template-columns:1fr}.media{grid-template-columns:1fr 1fr}}'
+    pagina=f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Boletins • Central DICOR</title><style>{css}</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>DICOR • CENTRAL DE BOLETINS</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/arvore">Vínculos</a><a href="/sair">Sair</a></nav></header><main class="wrap"><section class="hero"><div class="ey">PLATAFORMA OPERACIONAL</div><h2>Boletins de Ocorrência</h2><p class="muted">Os boletins e fotos são espelhados aqui. A resolução permanece exclusivamente no Discord/e-mail operacional.</p></section><div class="tabs"><button class="active" onclick="tab('open',this)">EM ABERTO ({len(abertos)})</button><button onclick="tab('done',this)">CONCLUÍDOS ({len(concluidos)})</button></div><section id="open" class="panel active">{''.join(abertos) or '<p class="muted">Nenhum boletim em aberto.</p>'}</section><section id="done" class="panel">{''.join(concluidos) or '<p class="muted">Nenhum boletim concluído.</p>'}</section></main><script>function tab(id,b){{document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');b.classList.add('active')}}</script></body></html>'''
+    return pagina
+
+
+async def central_boletins_http(request: web.Request) -> web.Response:
+    return web.Response(text=await asyncio.to_thread(_v19_boletins_html), content_type="text/html", charset="utf-8")
+
+
+async def _v19_sincronizar_boletins_completos() -> Dict[str, int]:
+    canal = await _v18_resolver_canal_id(BOLETINS_CHANNEL_ID)
+    if canal is None or not hasattr(canal, "history"): return {"boletins":0,"fotos":0}
+    mensagens = [m async for m in canal.history(limit=3000, oldest_first=True)]
+    grupos=[]; atual=[]
+    for msg in mensagens:
+        if eh_boletim_valido_para_atendimento(msg):
+            if atual: grupos.append(atual)
+            atual=[msg]
+        elif atual and (_dicor_mensagem_tem_midias(msg) or str(msg.content or "").strip()): atual.append(msg)
+    if atual: grupos.append(atual)
+    total_bo=total_fotos=0
+    for grupo in grupos:
+        numero=extrair_numero_boletim_seguro(_pericia_texto_mensagem(grupo[0]))
+        if not numero: continue
+        atendimento=_v18_buscar_atendimento_bo(numero)
+        if not atendimento: continue
+        try:
+            qtd=await _bo_copiar_mensagens_no_topico(atendimento, grupo)
+            textos=[]
+            for msg in grupo:
+                texto=_pericia_texto_mensagem(msg).strip()
+                if texto and texto not in textos: textos.append(texto)
+            atendimento["texto_original"]="\n\n".join(textos)[:30000]
+            atendimento["ultima_sincronizacao_central"]=agora_br()
+            atendimento["fotos_copiadas_topico"]=int(atendimento.get("fotos_copiadas_topico") or 0)+int(qtd or 0)
+            atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+            total_bo+=1; total_fotos+=int(qtd or 0)
+        except Exception: traceback.print_exc()
+    return {"boletins":total_bo,"fotos":total_fotos}
+
+
+@bot.listen("on_ready")
+async def _v19_iniciar_sync_boletins():
+    global _V19_SYNC_BO_INICIADO
+    if _V19_SYNC_BO_INICIADO: return
+    _V19_SYNC_BO_INICIADO=True
+    async def tarefa():
+        await asyncio.sleep(12)
+        try:
+            resultado=await _v19_sincronizar_boletins_completos()
+            print(f"✅ V19 boletins: {resultado['boletins']} sincronizado(s), {resultado['fotos']} foto(s)/arquivo(s) copiado(s) para os tópicos.", flush=True)
+        except Exception as erro:
+            print(f"⚠️ V19 sincronização de boletins: {type(erro).__name__}: {erro}", flush=True)
+    asyncio.create_task(tarefa(), name="v19-sync-boletins")
+
+
+print("✅ V19 carregada: status de perícia consolidado, fotos recuperadas e Central de Boletins em /boletins.", flush=True)
 
 print(
     "✅ V18 carregada: catálogo documental ampliado, reclassificação RG/corpo e perícia encaminhada ao BO.",
