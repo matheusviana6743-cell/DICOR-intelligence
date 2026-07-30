@@ -49577,5 +49577,615 @@ async def _dicor_v11_on_ready() -> None:
 
 print('✅ Patch V11 carregado: resposta dupla removida, painel V11 e reparo ampliado do RG 28457.', flush=True)
 
+
+# =====================================================
+# V12 — NÚCLEO ÚNICO DE PAINÉIS E INICIALIZAÇÃO NÃO BLOQUEANTE
+# =====================================================
+# Diagnóstico estrutural corrigido nesta versão:
+# - o arquivo possuía várias redefinições encadeadas de on_ready;
+# - havia múltiplos registros das mesmas Views/custom_ids;
+# - tarefas pesadas de inicialização atrasavam as interações por mais de 3s;
+# - mensagens antigas do banco não eram atualizadas quando o canal tinha emoji;
+# - versões V8/V10/V11 da Central de Fichas disputavam o mesmo painel.
+#
+# A V12 mantém os fluxos existentes, mas:
+# 1) registra Views persistentes no setup_hook, antes da conexão com o Discord;
+# 2) usa um on_ready leve e agenda manutenção em tarefas separadas;
+# 3) remove listeners obsoletos da Central de Fichas;
+# 4) oferece compatibilidade com todos os custom_ids antigos;
+# 5) atualiza fisicamente os painéis antigos para as Views atuais.
+
+import types as _v12_types
+
+_V12_INICIADO = False
+_V12_BOOTSTRAP_TASK: Optional[asyncio.Task] = None
+_V12_PAINEL_TASK: Optional[asyncio.Task] = None
+_V12_SYNC_COMMANDS_TASK: Optional[asyncio.Task] = None
+_V12_VIEWS_REGISTRADAS = False
+_V12_VIEW_ERROS: List[str] = []
+
+
+def _v12_normalizar(texto: Any) -> str:
+    bruto = unicodedata.normalize('NFKD', str(texto or ''))
+    bruto = ''.join(c for c in bruto if not unicodedata.combining(c))
+    bruto = re.sub(r'[^a-zA-Z0-9]+', ' ', bruto).casefold()
+    return re.sub(r'\s+', ' ', bruto).strip()
+
+
+def _v12_texto_mensagem(msg: discord.Message) -> str:
+    partes = [str(getattr(msg, 'content', '') or '')]
+    for embed in list(getattr(msg, 'embeds', []) or []):
+        partes.append(str(getattr(embed, 'title', '') or ''))
+        partes.append(str(getattr(embed, 'description', '') or ''))
+        for campo in list(getattr(embed, 'fields', []) or []):
+            partes.append(str(getattr(campo, 'name', '') or ''))
+            partes.append(str(getattr(campo, 'value', '') or ''))
+    return '\n'.join(partes)
+
+
+async def _v12_enviar_erro_interacao(interaction: discord.Interaction, texto: str, erro: Exception) -> None:
+    traceback.print_exception(type(erro), erro, erro.__traceback__)
+    mensagem = f"❌ {texto}\n`{type(erro).__name__}: {str(erro)[:300]}`"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(mensagem, ephemeral=True)
+        else:
+            await interaction.response.send_message(mensagem, ephemeral=True)
+    except (discord.NotFound, discord.InteractionResponded):
+        pass
+    except Exception:
+        traceback.print_exc()
+
+
+class BancoConsultaModalV12(Modal, title='Pesquisar fichas DICOR'):
+    consulta = TextInput(
+        label='Nome, RG, telefone, placa ou organização',
+        placeholder='Ex.: 28457, Arlindo Silva ou ABC1D23',
+        min_length=1,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # O modal é confirmado antes de qualquer SQLite/OCR.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            termo = str(self.consulta.value or '').strip()
+            if not termo:
+                await interaction.followup.send('❌ Digite algo para pesquisar.', ephemeral=True)
+                return
+            await _banco_prof_enviar_consulta(interaction, termo)
+        except Exception as erro:
+            await _v12_enviar_erro_interacao(interaction, 'Falha ao pesquisar as fichas.', erro)
+
+
+async def _v12_banco_criar(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction), name=f'v12-criar-ficha-{interaction.id}')
+
+
+async def _v12_banco_pesquisar(interaction: discord.Interaction) -> None:
+    # send_modal precisa ser literalmente a primeira operação de rede.
+    await interaction.response.send_modal(BancoConsultaModalV12())
+
+
+async def _v12_banco_importar(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title='🏴 ESCOLHA O MODO DE ATUALIZAÇÃO',
+        description='Selecione como o painel deverá atualizar os registros.',
+        color=discord.Color.from_rgb(30, 105, 190),
+    )
+    embed.add_field(name='🔗 MESCLAR • recomendado', value='Adiciona e atualiza registros sem desativar ausentes.', inline=False)
+    embed.add_field(name='♻️ SUBSTITUIR LISTA ATUAL', value='A lista enviada vira a formação atual; o histórico é preservado.', inline=False)
+    await interaction.response.send_message(
+        embed=embed,
+        view=BancoEscolherModoPainelView(
+            int(interaction.user.id),
+            int(getattr(interaction.channel, 'id', 0) or 0),
+            int(getattr(interaction.message, 'id', 0) or 0),
+        ),
+        ephemeral=True,
+    )
+
+
+async def _v12_banco_sync(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    if _BANCO_PROF_SYNC_LOCK.locked():
+        await interaction.followup.send('⏳ Já existe uma sincronização em andamento.', ephemeral=True)
+        return
+    await interaction.followup.send('🔄 Sincronização iniciada.', ephemeral=True)
+    asyncio.create_task(
+        _banco_v4_sync_com_revisao(
+            interaction,
+            int(getattr(interaction.channel, 'id', 0) or 0),
+            int(getattr(interaction.message, 'id', 0) or 0),
+        ),
+        name=f'v12-sync-banco-{interaction.id}',
+    )
+
+
+class _BancoBaseV12(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _banco_prof_equipe(interaction):
+            return True
+        try:
+            await interaction.response.send_message('❌ Apenas a equipe DICOR pode usar esta central.', ephemeral=True)
+        except Exception:
+            pass
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _v12_enviar_erro_interacao(interaction, 'A Central de Fichas apresentou uma falha.', error)
+
+
+class BancoDadosViewV12(_BancoBaseV12):
+    @discord.ui.button(label='Criar ficha', emoji='📋', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_criar_ficha_v12', row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_criar(interaction)
+
+    @discord.ui.button(label='Pesquisar fichas', emoji='🔎', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar_v12', row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_pesquisar(interaction)
+
+    @discord.ui.button(label='Importar painel', emoji='🏴', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_importar_painel_v12', row=0)
+    async def importar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Sincronizar dados', emoji='🔄', style=discord.ButtonStyle.success,
+                       custom_id='dicor_banco_sync_tudo_v12', row=0)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_sync(interaction)
+
+
+class BancoDadosCompatViewV12(_BancoBaseV12):
+    """Roteia mensagens antigas V3/V8/V10/V11 para o mesmo motor V12."""
+
+    @discord.ui.button(label='Criar ficha legado', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_criar_ficha_v3', row=0)
+    async def criar_v3(self, interaction, button): await _v12_banco_criar(interaction)
+
+    @discord.ui.button(label='Pesquisar legado', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar', row=0)
+    async def pesquisar_v3(self, interaction, button): await _v12_banco_pesquisar(interaction)
+
+    @discord.ui.button(label='Importar legado', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_importar_painel', row=0)
+    async def importar_v3(self, interaction, button): await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Sincronizar legado', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_sync_tudo', row=0)
+    async def sync_v3(self, interaction, button): await _v12_banco_sync(interaction)
+
+    @discord.ui.button(label='Criar V10', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_criar_ficha_v10', row=1)
+    async def criar_v10(self, interaction, button): await _v12_banco_criar(interaction)
+
+    @discord.ui.button(label='Pesquisar V10', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar_v10', row=1)
+    async def pesquisar_v10(self, interaction, button): await _v12_banco_pesquisar(interaction)
+
+    @discord.ui.button(label='Importar V10', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_importar_painel_v10', row=1)
+    async def importar_v10(self, interaction, button): await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Sincronizar V10', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_sync_tudo_v10', row=1)
+    async def sync_v10(self, interaction, button): await _v12_banco_sync(interaction)
+
+    @discord.ui.button(label='Criar V11', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_criar_ficha_v11', row=2)
+    async def criar_v11(self, interaction, button): await _v12_banco_criar(interaction)
+
+    @discord.ui.button(label='Pesquisar V11', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar_v11', row=2)
+    async def pesquisar_v11(self, interaction, button): await _v12_banco_pesquisar(interaction)
+
+    @discord.ui.button(label='Importar V11', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_importar_painel_v11', row=2)
+    async def importar_v11(self, interaction, button): await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Sincronizar V11', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_sync_tudo_v11', row=2)
+    async def sync_v11(self, interaction, button): await _v12_banco_sync(interaction)
+
+
+def _v12_instanciar(nome: str, *args, **kwargs) -> Optional[View]:
+    classe = globals().get(nome)
+    if classe is None:
+        return None
+    try:
+        return classe(*args, **kwargs)
+    except Exception as erro:
+        _V12_VIEW_ERROS.append(f'{nome}: {type(erro).__name__}: {erro}')
+        return None
+
+
+def _v12_add_view(view: Optional[View]) -> bool:
+    if view is None:
+        return False
+    try:
+        bot.add_view(view)
+        return True
+    except Exception as erro:
+        _V12_VIEW_ERROS.append(f'{type(view).__name__}: {type(erro).__name__}: {erro}')
+        return False
+
+
+def _v12_registrar_views_persistentes(*, limpar: bool = False) -> int:
+    """Registra uma única vez as Views usadas por mensagens persistentes."""
+    global _V12_VIEWS_REGISTRADAS
+    if limpar:
+        for view in list(getattr(bot, 'persistent_views', []) or []):
+            try:
+                bot.remove_view(view)
+            except Exception:
+                pass
+        _V12_VIEWS_REGISTRADAS = False
+    if _V12_VIEWS_REGISTRADAS:
+        return len(list(getattr(bot, 'persistent_views', []) or []))
+
+    views: List[Optional[View]] = [
+        _v12_instanciar('RelatoriosPainelView'),
+        _v12_instanciar('IniciarFormularioRelatorioView', tipo='tocaia'),
+        _v12_instanciar('IniciarFormularioRelatorioView', tipo='olb'),
+        _v12_instanciar('IniciarFormularioRelatorioView', tipo='pericia_externa'),
+        _v12_instanciar('PainelBoletimView'),
+        _v12_instanciar('IniciarBoletimView'),
+        _v12_instanciar('InformarRGBoletimView'),
+        _v12_instanciar('TipoIdentificacaoBoletimView'),
+        _v12_instanciar('ContinuarVeiculoBoletimView'),
+        _v12_instanciar('ProvasBoletimView'),
+        _v12_instanciar('PreviaBoletimView'),
+        _v12_instanciar('PainelProcuradosView'),
+        _v12_instanciar('AutorizacaoCentralView'),
+        _v12_instanciar('PainelMandadosView'),
+        _v12_instanciar('FinalizarProcuradoView'),
+        _v12_instanciar('PainelMesasView'),
+        _v12_instanciar('FecharMesaView'),
+        _v12_instanciar('ReabrirMesaView'),
+        _v12_instanciar('PainelOrganizacoesView'),
+        _v12_instanciar('PainelAdministrativoView'),
+        _v12_instanciar('BoletimAtendimentoView'),
+        _v12_instanciar('FotoProcuradoBoletimView'),
+        _v12_instanciar('FinalizarRelatorioFotosView'),
+        _v12_instanciar('EditarRelatorioView'),
+        _v12_instanciar('SolicitarAutorizacaoProcuradoComFotosView'),
+        _v12_instanciar('AutorizacaoBoletimViewV3'),
+        _v12_instanciar('AutorizacaoOrganizacaoView'),
+        _v12_instanciar('SolicitarProcuradoSemLimiteFotosView'),
+        _v12_instanciar('FotoIndividuoProcuradoPainelView'),
+        _v12_instanciar('FotoRgProcuradoPainelView'),
+        _v12_instanciar('FotoIndividuoProcuradoBoletimView'),
+        _v12_instanciar('FotoRgProcuradoBoletimView'),
+        _v12_instanciar('PesquisaCrimesView'),
+        _v12_instanciar('GerenciamentoTarefasView'),
+        _v12_instanciar('TarefaInvestigativaView'),
+        _v12_instanciar('EditarCrimesPesquisaView'),
+        BancoDadosCompatViewV12(),
+        BancoDadosViewV12(),
+        _v12_instanciar('BancoOCRReviewView'),
+        _v12_instanciar('BancoOCRLoteReviewView'),
+        _v12_instanciar('CentralPendenciasView'),
+        _v12_instanciar('PericiaAtendimentoView'),
+        _v12_instanciar('SetSolicitarView'),
+        _v12_instanciar('SetAprovacaoView'),
+    ]
+    adicionadas = sum(1 for view in views if _v12_add_view(view))
+    _V12_VIEWS_REGISTRADAS = True
+    print(f'✅ V12: {adicionadas} Views persistentes registradas antes das interações.', flush=True)
+    if _V12_VIEW_ERROS:
+        print('⚠️ V12 Views ignoradas: ' + ' | '.join(_V12_VIEW_ERROS[:12]), flush=True)
+    return adicionadas
+
+
+# Remove listeners de versões que voltariam a registrar a Central de Fichas antiga.
+def _v12_filtrar_listeners_obsoletos() -> None:
+    remover_ready = {
+        '_banco_compacto_recarregar_view',
+        '_dicor_v10_on_ready',
+        '_dicor_v11_on_ready',
+    }
+    eventos = getattr(bot, 'extra_events', {})
+    if isinstance(eventos, dict):
+        lista = list(eventos.get('on_ready', []) or [])
+        eventos['on_ready'] = [f for f in lista if getattr(f, '__name__', '') not in remover_ready]
+        # A auditoria antiga aguardava envio de log a cada clique. A V12 usa tarefa desacoplada.
+        interacoes = list(eventos.get('on_interaction', []) or [])
+        eventos['on_interaction'] = [
+            f for f in interacoes if getattr(f, '__name__', '') != 'auditoria_todas_interacoes'
+        ]
+
+
+_v12_filtrar_listeners_obsoletos()
+
+
+@bot.listen('on_interaction')
+async def _v12_auditoria_interacao_nao_bloqueante(interaction: discord.Interaction) -> None:
+    try:
+        acao = _nome_interacao_log(interaction)
+        canal_desc = getattr(interaction.channel, 'mention', None) or f'ID {getattr(interaction, "channel_id", "?")}'
+        guild_desc = interaction.guild.name if interaction.guild else 'DM/sem servidor'
+        texto = (
+            '🧾 **Ação executada no bot**\n'
+            f'Ação: {acao}\n'
+            f'Usuário: {interaction.user.mention} (`{interaction.user.id}`)\n'
+            f'Canal: {canal_desc}\n'
+            f'Servidor: {guild_desc}\n'
+            f'Data: {agora_br()}'
+        )
+        asyncio.create_task(enviar_log(texto), name=f'v12-auditoria-{interaction.id}')
+    except Exception:
+        pass
+
+
+_V12_SETUP_HOOK_ORIGINAL = bot.setup_hook
+
+
+async def _v12_setup_hook(self) -> None:
+    try:
+        await _V12_SETUP_HOOK_ORIGINAL()
+    except Exception as erro:
+        print(f'⚠️ setup_hook anterior falhou: {type(erro).__name__}: {erro}', flush=True)
+    _v12_registrar_views_persistentes(limpar=True)
+
+
+bot.setup_hook = _v12_types.MethodType(_v12_setup_hook, bot)
+
+
+async def _v12_sincronizar_comandos() -> None:
+    global comandos_ja_sincronizados
+    try:
+        if GUILD_ID > 0:
+            guild_obj = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild_obj)
+            comandos = await bot.tree.sync(guild=guild_obj)
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+        else:
+            comandos = await bot.tree.sync()
+        comandos_ja_sincronizados = True
+        print(f'✅ V12: {len(comandos)} comandos sincronizados.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V12: sincronização de comandos falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+async def _v12_tarefa_segura(nome: str, awaitable) -> None:
+    try:
+        await awaitable
+    except asyncio.CancelledError:
+        raise
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ V12 tarefa {nome} falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+def _v12_iniciar_loop(nome: str) -> bool:
+    tarefa = globals().get(nome)
+    if tarefa is None:
+        return False
+    try:
+        if hasattr(tarefa, 'is_running') and not tarefa.is_running():
+            tarefa.start()
+        return True
+    except Exception as erro:
+        print(f'⚠️ V12 não iniciou {nome}: {type(erro).__name__}: {erro}', flush=True)
+        return False
+
+
+async def _v12_bootstrap_background() -> None:
+    global _VOLUME_MANUTENCAO_TASK, _VOLUME_LIMPEZA_INICIAL_FEITA
+    await asyncio.sleep(1)
+    # Banco e arquivos locais fora do event loop.
+    try:
+        await asyncio.to_thread(inicializar_banco_dicor)
+    except Exception as erro:
+        print(f'⚠️ V12 banco: {type(erro).__name__}: {erro}', flush=True)
+
+    for nome in (
+        'hierarquia_dicor_automatica',
+        'banco_dados_sincronizacao_automatica',
+        '_dicor_verificar_boletins_parados_v3',
+    ):
+        _v12_iniciar_loop(nome)
+
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    tarefas = []
+
+    # Operações assíncronas independentes: nenhuma bloqueia a ativação dos painéis.
+    for nome, args in (
+        ('liberar_fotos_em_topicos_antigos_boletins', ()),
+        ('_bo_num_reconciliar_existentes', ()),
+        ('_bo_reconciliar_numero_com_origem', ()),
+        ('_banco_lote_reagrupar_pendentes', (guild,)),
+        ('_prisao_configurar_permissoes_canal', (guild,)),
+        ('_prisao_limpar_confirmacoes_antigas', (guild,)),
+    ):
+        func = globals().get(nome)
+        if callable(func):
+            try:
+                tarefas.append(asyncio.create_task(
+                    _v12_tarefa_segura(nome, func(*args)), name=f'v12-{nome}'
+                ))
+            except Exception:
+                traceback.print_exc()
+
+    # Importações históricas já foram projetadas para rodar em tarefas.
+    for nome in ('_prisao_importar_historico', '_prisao_migrar_mochilas_antigas'):
+        func = globals().get(nome)
+        if callable(func):
+            try:
+                tarefas.append(asyncio.create_task(
+                    _v12_tarefa_segura(nome, func(guild)), name=f'v12-{nome}'
+                ))
+            except Exception:
+                traceback.print_exc()
+
+    reparo_catalogo = globals().get('_catalogo_reparo_automatico_inicio')
+    if callable(reparo_catalogo):
+        tarefas.append(asyncio.create_task(
+            _v12_tarefa_segura('catalogo-reparo', reparo_catalogo()), name='v12-catalogo-reparo'
+        ))
+
+    # Limpezas síncronas são movidas para threads.
+    async def manutencao_local():
+        global _VOLUME_MANUTENCAO_TASK, _VOLUME_LIMPEZA_INICIAL_FEITA
+        try:
+            reconciliar = globals().get('_banco_ocr_reconciliar_confirmadas')
+            if callable(reconciliar):
+                await asyncio.to_thread(reconciliar)
+            limpar_fp = globals().get('_banco_v4_limpar_falsos_positivos_pendentes')
+            if callable(limpar_fp):
+                await asyncio.to_thread(limpar_fp)
+            limpar_volume = globals().get('_volume_limpeza_real_sync')
+            if callable(limpar_volume) and not bool(globals().get('_VOLUME_LIMPEZA_INICIAL_FEITA', False)):
+                _VOLUME_LIMPEZA_INICIAL_FEITA = True
+                await asyncio.to_thread(limpar_volume)
+            periodica = globals().get('_volume_manutencao_periodica')
+            if callable(periodica):
+                atual = globals().get('_VOLUME_MANUTENCAO_TASK')
+                if atual is None or atual.done():
+                    _VOLUME_MANUTENCAO_TASK = asyncio.create_task(periodica(), name='dicor-volume-maintenance-v12')
+        except Exception:
+            traceback.print_exc()
+
+    tarefas.append(asyncio.create_task(manutencao_local(), name='v12-manutencao-local'))
+    print(f'✅ V12: inicialização de fundo distribuída em {len(tarefas)} tarefa(s).', flush=True)
+
+
+async def _v12_atualizar_paineis_existentes() -> Dict[str, int]:
+    """Atualiza mensagens antigas, inclusive canais com emoji no nome."""
+    await asyncio.sleep(2)
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    resultado = {'canais': 0, 'mensagens': 0, 'erros': 0}
+    if guild is None or bot.user is None:
+        return resultado
+
+    palavras_canal = (
+        'banco', 'mesa', 'procur', 'bolet', 'relatorio', 'pericia',
+        'organiz', 'administr', 'entrada', 'set', 'mandado',
+    )
+    canais = []
+    for canal in list(getattr(guild, 'text_channels', []) or []):
+        nome = _v12_normalizar(getattr(canal, 'name', ''))
+        if any(p in nome for p in palavras_canal):
+            canais.append(canal)
+
+    def view_para(texto: str) -> Optional[View]:
+        t = _v12_normalizar(texto)
+        if 'central de fichas' in t:
+            return BancoDadosViewV12()
+        if 'sistema de mesas' in t or 'painel de mesas' in t:
+            return _v12_instanciar('PainelMesasView')
+        if 'painel de procurados' in t or 'sistema de procurados' in t:
+            return _v12_instanciar('PainelProcuradosView')
+        if 'painel de boletins' in t or 'sistema de boletins' in t:
+            return _v12_instanciar('PainelBoletimView')
+        if 'painel de relatorios' in t or 'relatorios operacionais' in t:
+            return _v12_instanciar('RelatoriosPainelView')
+        if 'painel administrativo' in t or 'central administrativa' in t:
+            return _v12_instanciar('PainelAdministrativoView')
+        if 'painel de organizacoes' in t or 'sistema de organizacoes' in t:
+            return _v12_instanciar('PainelOrganizacoesView')
+        if 'pericia externa' in t and ('painel' in t or 'atendimento' in t):
+            return _v12_instanciar('PericiaAtendimentoView')
+        return None
+
+    semaforo = asyncio.Semaphore(3)
+
+    async def processar(canal):
+        async with semaforo:
+            local = 0
+            try:
+                async for msg in canal.history(limit=120, oldest_first=False):
+                    if int(getattr(getattr(msg, 'author', None), 'id', 0) or 0) != int(bot.user.id):
+                        continue
+                    if not list(getattr(msg, 'components', []) or []):
+                        continue
+                    view = view_para(_v12_texto_mensagem(msg))
+                    if view is None:
+                        continue
+                    try:
+                        await msg.edit(view=view)
+                        local += 1
+                        await asyncio.sleep(0.15)
+                    except (discord.Forbidden, discord.NotFound):
+                        resultado['erros'] += 1
+                    except Exception:
+                        resultado['erros'] += 1
+                        traceback.print_exc()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            except Exception:
+                resultado['erros'] += 1
+                traceback.print_exc()
+            if local:
+                resultado['canais'] += 1
+                resultado['mensagens'] += local
+
+    await asyncio.gather(*(processar(c) for c in canais), return_exceptions=True)
+    print(
+        f"✅ V12: {resultado['mensagens']} painel(is) antigo(s) atualizado(s) em "
+        f"{resultado['canais']} canal(is); {resultado['erros']} erro(s).",
+        flush=True,
+    )
+    return resultado
+
+
+@bot.tree.command(name='repararpaineis', description='Recarrega as Views e atualiza os painéis antigos da DICOR.')
+async def reparar_paineis_v12(interaction: discord.Interaction):
+    permitido = False
+    try:
+        permitido = bool(
+            isinstance(interaction.user, discord.Member)
+            and (usuario_pode_painel_adm(interaction.user) or usuario_e_administrador(interaction.user))
+        )
+    except Exception:
+        permitido = False
+    if not permitido:
+        await interaction.response.send_message('❌ Apenas Inspetor+ pode reparar os painéis.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        registradas = _v12_registrar_views_persistentes(limpar=True)
+        resultado = await _v12_atualizar_paineis_existentes()
+        await interaction.followup.send(
+            '✅ **Painéis DICOR reparados**\n'
+            f'Views persistentes: `{registradas}`\n'
+            f'Mensagens atualizadas: `{resultado["mensagens"]}`\n'
+            f'Canais revisados: `{resultado["canais"]}`\n'
+            f'Erros: `{resultado["erros"]}`',
+            ephemeral=True,
+        )
+    except Exception as erro:
+        await _v12_enviar_erro_interacao(interaction, 'Não foi possível reparar os painéis.', erro)
+
+
+@bot.event
+async def on_ready() -> None:
+    """Evento leve: interações ficam disponíveis imediatamente."""
+    global _V12_INICIADO, _V12_BOOTSTRAP_TASK, _V12_PAINEL_TASK, _V12_SYNC_COMMANDS_TASK
+    # Reforça o registro sem remover Views que já estão ativas.
+    _v12_registrar_views_persistentes(limpar=False)
+    print(f'✅ Bot online como {bot.user} • Painéis V12 disponíveis imediatamente.', flush=True)
+    if _V12_INICIADO:
+        return
+    _V12_INICIADO = True
+    _V12_SYNC_COMMANDS_TASK = asyncio.create_task(_v12_sincronizar_comandos(), name='v12-sync-comandos')
+    _V12_BOOTSTRAP_TASK = asyncio.create_task(_v12_bootstrap_background(), name='v12-bootstrap')
+    _V12_PAINEL_TASK = asyncio.create_task(_v12_atualizar_paineis_existentes(), name='v12-atualizar-paineis')
+
+
+print(
+    '✅ V12 carregada: setup_hook persistente, on_ready leve, Central de Fichas compatível '
+    'com V3/V8/V10/V11 e atualização automática de todos os painéis antigos.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
