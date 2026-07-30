@@ -10,3 +10,4 @@ onnxruntime==1.27.0
 opencv-python-headless
 Pillow
 numpy
+PyMuPDF
