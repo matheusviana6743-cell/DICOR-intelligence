@@ -50917,5 +50917,309 @@ print(
     flush=True,
 )
 
+# =====================================================
+# V15 — PERFORMANCE INTERNA + ÁRVORE DICOR PREMIUM
+# =====================================================
+# Não altera botões, permissões, canais, fluxos ou dados.
+# Otimizações transparentes:
+# - cache invalidado automaticamente quando SQLite/perícias mudam;
+# - hash de imagens por mtime/tamanho, sem reler arquivos iguais;
+# - índices SQLite para consultas já existentes;
+# - respostas web compactadas e renderização SVG mais leve;
+# - árvore escura/dourada sem círculos brancos e sem textos sobrepostos.
+
+import copy as _v15_copy
+import threading as _v15_threading
+
+_V15_LOCK = _v15_threading.RLock()
+_V15_CACHE_BUSCA: Dict[Any, Any] = {}
+_V15_CACHE_FICHA: Dict[Any, Any] = {}
+_V15_CACHE_PERICIAS_ARQUIVO: Dict[Any, Any] = {}
+_V15_CACHE_PERICIAS_PESSOA: Dict[Any, Any] = {}
+_V15_CACHE_HASH_IMAGEM: Dict[Any, Any] = {}
+_V15_CACHE_ROUPAS: Dict[Any, Any] = {}
+_V15_CACHE_ARVORE: Dict[Any, Any] = {}
+_V15_CACHE_ARVORE_FINAL: Dict[Any, Any] = {}
+_V15_LAST_SIGNATURE: Any = None
+
+
+def _v15_stat_signature(caminho: Any) -> Tuple[int, int]:
+    try:
+        p = Path(caminho)
+        st = p.stat()
+        return int(st.st_mtime_ns), int(st.st_size)
+    except Exception:
+        return 0, 0
+
+
+def _v15_data_signature() -> Tuple[Any, ...]:
+    banco = Path(BANCO_DADOS_SQLITE)
+    wal = Path(str(banco) + '-wal')
+    shm = Path(str(banco) + '-shm')
+    pericias = Path(globals().get('PERICIA_ATENDIMENTOS_JSON', Path(DATA_DIR) / 'pericias_atendimentos.json'))
+    return (
+        _v15_stat_signature(banco),
+        _v15_stat_signature(wal),
+        _v15_stat_signature(shm),
+        _v15_stat_signature(pericias),
+    )
+
+
+def _v15_prepare_signature() -> Tuple[Any, ...]:
+    global _V15_LAST_SIGNATURE
+    assinatura = _v15_data_signature()
+    with _V15_LOCK:
+        if _V15_LAST_SIGNATURE is not None and assinatura != _V15_LAST_SIGNATURE:
+            _V15_CACHE_BUSCA.clear()
+            _V15_CACHE_FICHA.clear()
+            _V15_CACHE_PERICIAS_PESSOA.clear()
+            _V15_CACHE_ROUPAS.clear()
+            _V15_CACHE_ARVORE.clear()
+            _V15_CACHE_ARVORE_FINAL.clear()
+        _V15_LAST_SIGNATURE = assinatura
+    return assinatura
+
+
+def _v15_cache_set(cache: Dict[Any, Any], chave: Any, valor: Any, limite: int = 160) -> None:
+    with _V15_LOCK:
+        if len(cache) >= limite:
+            # Dicionários mantêm ordem de inserção; remove os 25% mais antigos.
+            for antiga in list(cache.keys())[: max(1, limite // 4)]:
+                cache.pop(antiga, None)
+        cache[chave] = _v15_copy.deepcopy(valor)
+
+
+def _v15_criar_indices() -> None:
+    comandos = (
+        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_nome ON individuos(nome COLLATE NOCASE)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_rg ON individuos(rg)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_faccao ON individuos(faccao_atual COLLATE NOCASE)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_status ON individuos(status)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_fontes_individuo ON fontes_ficha_individuo(individuo_id)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_fontes_mensagem ON fontes_ficha_individuo(mensagem_id)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_vinculos_individuo ON vinculos_individuo_veiculo(individuo_id, ativo)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_vinculos_veiculo ON vinculos_individuo_veiculo(veiculo_id, ativo)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_historico_individuo ON historico_prisoes(individuo_id)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_arquivos_individuo ON arquivos_ficha_geral(individuo_id)",
+        "CREATE INDEX IF NOT EXISTS idx_v15_identificadores_valor ON identificadores_ficha(valor)",
+    )
+    try:
+        inicializar_banco_dicor()
+        with _banco_conexao() as db:
+            try:
+                db.execute('PRAGMA synchronous=NORMAL')
+                db.execute('PRAGMA temp_store=MEMORY')
+                db.execute('PRAGMA cache_size=-32768')
+                db.execute('PRAGMA mmap_size=134217728')
+            except Exception:
+                pass
+            for comando in comandos:
+                try:
+                    db.execute(comando)
+                except Exception:
+                    # Instalações antigas podem ainda não ter alguma tabela opcional.
+                    pass
+    except Exception as erro:
+        print(f'⚠️ V15 não conseguiu preparar todos os índices: {erro}', flush=True)
+
+
+# Cache transparente da leitura de perícias.
+_PERICIA_CARREGAR_ANTES_V15 = _pericia_carregar
+
+
+def _pericia_carregar() -> List[Dict[str, Any]]:
+    caminho = Path(globals().get('PERICIA_ATENDIMENTOS_JSON', Path(DATA_DIR) / 'pericias_atendimentos.json'))
+    chave = _v15_stat_signature(caminho)
+    with _V15_LOCK:
+        cached = _V15_CACHE_PERICIAS_ARQUIVO.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = list(_PERICIA_CARREGAR_ANTES_V15() or [])
+    with _V15_LOCK:
+        _V15_CACHE_PERICIAS_ARQUIVO.clear()
+    _v15_cache_set(_V15_CACHE_PERICIAS_ARQUIVO, chave, resultado, limite=4)
+    return _v15_copy.deepcopy(resultado)
+
+
+_DICOR_PERICIAS_PESSOA_ANTES_V15 = _dicor_pericias_do_individuo
+
+
+def _dicor_pericias_do_individuo(individuo: Dict[str, Any]) -> List[Dict[str, Any]]:
+    assinatura = _v15_prepare_signature()
+    chave = (
+        assinatura,
+        int((individuo or {}).get('id') or 0),
+        _banco_normalizar_rg((individuo or {}).get('rg')),
+        _arvore_normalizar((individuo or {}).get('nome')),
+    )
+    with _V15_LOCK:
+        cached = _V15_CACHE_PERICIAS_PESSOA.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = list(_DICOR_PERICIAS_PESSOA_ANTES_V15(individuo) or [])
+    _v15_cache_set(_V15_CACHE_PERICIAS_PESSOA, chave, resultado, limite=320)
+    return _v15_copy.deepcopy(resultado)
+
+
+# Hash visual persistente em memória enquanto o arquivo não mudar.
+_ARVORE_HASH_IMAGEM_ANTES_V15 = _arvore_hash_imagem
+
+
+def _arvore_hash_imagem(caminho: Any) -> Optional[Dict[str, Any]]:
+    p = Path(str(caminho or ''))
+    assinatura = _v15_stat_signature(p)
+    chave = (str(p), assinatura)
+    with _V15_LOCK:
+        if chave in _V15_CACHE_HASH_IMAGEM:
+            valor = _V15_CACHE_HASH_IMAGEM[chave]
+            return _v15_copy.deepcopy(valor) if valor is not None else None
+    resultado = _ARVORE_HASH_IMAGEM_ANTES_V15(caminho)
+    _v15_cache_set(_V15_CACHE_HASH_IMAGEM, chave, resultado, limite=1200)
+    return _v15_copy.deepcopy(resultado) if resultado is not None else None
+
+
+_ARVORE_ROUPAS_ANTES_V15 = _arvore_roupas_por_individuo
+
+
+def _arvore_roupas_por_individuo(db: sqlite3.Connection) -> Dict[int, List[Dict[str, Any]]]:
+    assinatura = _v15_prepare_signature()
+    chave = ('roupas', assinatura)
+    with _V15_LOCK:
+        cached = _V15_CACHE_ROUPAS.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = dict(_ARVORE_ROUPAS_ANTES_V15(db) or {})
+    _v15_cache_set(_V15_CACHE_ROUPAS, chave, resultado, limite=8)
+    return _v15_copy.deepcopy(resultado)
+
+
+# Pesquisa e abertura de ficha: cache invalidado assim que o banco/perícias mudarem.
+_BANCO_BUSCAR_ANTES_V15 = banco_buscar
+
+
+def banco_buscar(consulta: str) -> Dict[str, List[Dict[str, Any]]]:
+    assinatura = _v15_prepare_signature()
+    chave = (assinatura, _arvore_normalizar(consulta))
+    with _V15_LOCK:
+        cached = _V15_CACHE_BUSCA.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = dict(_BANCO_BUSCAR_ANTES_V15(consulta) or {})
+    _v15_cache_set(_V15_CACHE_BUSCA, chave, resultado, limite=180)
+    return _v15_copy.deepcopy(resultado)
+
+
+_BANCO_FICHA_CARREGAR_ANTES_V15 = _banco_ficha_geral_carregar
+
+
+def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
+    assinatura = _v15_prepare_signature()
+    chave = (assinatura, str(tipo or '').lower(), int(registro_id or 0))
+    with _V15_LOCK:
+        cached = _V15_CACHE_FICHA.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = dict(_BANCO_FICHA_CARREGAR_ANTES_V15(tipo, registro_id) or {})
+    _v15_cache_set(_V15_CACHE_FICHA, chave, resultado, limite=220)
+    return _v15_copy.deepcopy(resultado)
+
+
+# Árvore completa: mantém todos os vínculos e usa assinatura dos dados como invalidação.
+_ARVORE_CALCULAR_ANTES_V15 = _arvore_calcular
+
+
+def _arvore_calcular(individuo_id: int, *, ignorar_cache: bool = False) -> Dict[str, Any]:
+    assinatura = _v15_prepare_signature()
+    chave = (assinatura, int(individuo_id or 0))
+    with _V15_LOCK:
+        cached = _V15_CACHE_ARVORE.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = dict(_ARVORE_CALCULAR_ANTES_V15(individuo_id, ignorar_cache=True) or {})
+    _v15_cache_set(_V15_CACHE_ARVORE, chave, resultado, limite=120)
+    return _v15_copy.deepcopy(resultado)
+
+
+_ARVORE_CONSTRUIR_ANTES_V15 = _arvore_construir
+
+
+def _arvore_construir(individuo_id: int, usar_cache: bool = True) -> Dict[str, Any]:
+    assinatura = _v15_prepare_signature()
+    chave = (assinatura, int(individuo_id or 0))
+    with _V15_LOCK:
+        cached = _V15_CACHE_ARVORE_FINAL.get(chave)
+    if cached is not None:
+        return _v15_copy.deepcopy(cached)
+    resultado = dict(_ARVORE_CONSTRUIR_ANTES_V15(individuo_id, usar_cache=False) or {})
+    _v15_cache_set(_V15_CACHE_ARVORE_FINAL, chave, resultado, limite=120)
+    return _v15_copy.deepcopy(resultado)
+
+
+_ARVORE_DADOS_API_ANTES_V15 = _arvore_dados_api
+
+
+def _arvore_dados_api(chave: Any) -> Dict[str, Any]:
+    # O resolvedor e todos os vínculos continuam exatamente os mesmos.
+    return _ARVORE_DADOS_API_ANTES_V15(chave)
+
+
+async def arvore_api_http(request: web.Request) -> web.Response:
+    chave = str(request.match_info.get('individuo_id') or request.query.get('id') or '').strip()
+    if not chave:
+        return web.json_response({'ok': False, 'erro': 'Informe um RG, nome ou ID.'}, status=400)
+    try:
+        dados = await asyncio.to_thread(_arvore_dados_api, chave)
+        status = 200 if dados.get('ok') else 404
+        resposta = web.Response(
+            text=json.dumps(dados, ensure_ascii=False, separators=(',', ':')),
+            status=status,
+            content_type='application/json',
+            charset='utf-8',
+            headers={'Cache-Control': 'private, max-age=20'},
+        )
+        resposta.enable_compression()
+        return resposta
+    except Exception as exc:
+        traceback.print_exc()
+        return web.json_response({'ok': False, 'erro': f'{type(exc).__name__}: {exc}'}, status=500)
+
+
+_ARVORE_HTML_DICOR = r'''<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Central de Vínculos • DICOR</title>
+<style>
+:root{--gold:#d8aa3d;--gold2:#f4d77c;--gold3:#8f6d22;--bronze:#725622;--bg:#050604;--panel:#0a0c08;--panel2:#10130d;--line:#302819;--text:#eee7cf;--muted:#8f8a78;--danger:#b86f3c}*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:radial-gradient(circle at 50% -15%,#44340f55,transparent 38%),#050604;color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;overflow:hidden}header{height:98px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 24px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0b0c08f7,#070805f3);position:relative;z-index:4}.header-center{grid-column:2;justify-self:center;display:flex;align-items:center;gap:14px}.crest{width:66px;height:66px;border:1px solid #7d6428;border-radius:18px;background:#050604;display:grid;place-items:center;box-shadow:0 0 35px #d8aa3d24,inset 0 0 24px #d8aa3d0b;overflow:hidden}.crest img{width:100%;height:100%;object-fit:contain;padding:5px}.header-center h1{margin:0;font-size:18px;letter-spacing:2.4px}.header-center small{color:var(--gold);letter-spacing:1.25px}.actions{justify-self:end;display:flex;gap:8px}button,input,select{border:1px solid #4b3d20;background:#11140d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}input:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px #d8aa3d14}button{cursor:pointer;font-weight:750;transition:.16s}button:hover{border-color:var(--gold);color:var(--gold2);transform:translateY(-1px)}main{height:calc(100vh - 98px);display:grid;grid-template-columns:318px minmax(0,1fr) 354px}.side{background:linear-gradient(180deg,#0b0d09f7,#080a07f7);border-right:1px solid var(--line);padding:18px;overflow:auto;scrollbar-width:thin;scrollbar-color:#5b4720 transparent}.right{border-left:1px solid var(--line);border-right:0}.lookup{display:grid;grid-template-columns:1fr auto;gap:7px}.lookup input{width:100%}.label{font-size:10px;letter-spacing:1.9px;color:var(--gold);font-weight:900;margin:18px 0 8px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.card{background:linear-gradient(150deg,#15180f,#0e100b);border:1px solid #342c1a;border-radius:13px;padding:13px}.card b{display:block;font-size:22px;color:var(--gold2)}#stage{position:relative;overflow:hidden;background:radial-gradient(circle at center,#2d250d30,transparent 38%),linear-gradient(#d8aa3d06 1px,transparent 1px),linear-gradient(90deg,#d8aa3d06 1px,transparent 1px),#060704;background-size:auto,34px 34px,34px 34px}svg{width:100%;height:100%;cursor:grab;user-select:none}.edge{fill:none;stroke-linecap:round;transition:opacity .15s,stroke-width .15s}.edge.weak{stroke:#665226;opacity:.46}.edge.medium{stroke:#9a772b;opacity:.62}.edge.strong{stroke:#d2a436;opacity:.76}.edge.selected{stroke:#f2d878;opacity:1;filter:drop-shadow(0 0 5px #d8aa3d66)}.node{cursor:pointer;outline:none}.node .halo{opacity:.18;transition:.18s}.node .body{transition:.18s;filter:drop-shadow(0 7px 12px #000b)}.node:hover .halo,.node.active .halo{opacity:.55}.node:hover .body,.node.active .body{filter:drop-shadow(0 0 16px #d8aa3d55)}.node .title{fill:#f0d782;font-size:13px;font-weight:800;letter-spacing:.2px;pointer-events:none}.node .sub{fill:#938760;font-size:10px;pointer-events:none}.node.central .title{fill:#f7dfa0;font-size:15px}.node.central .sub{fill:#c9ab58}.node .strength{fill:#0c0e09;stroke-width:1.5}.node .strength-text{font-size:8px;font-weight:900;letter-spacing:.8px;pointer-events:none}.relation-label{display:none}.person{display:grid;grid-template-columns:12px 1fr auto;gap:10px;align-items:center;padding:10px;border:1px solid #302919;border-radius:11px;margin:7px 0;cursor:pointer;background:#0e110b;transition:.15s}.person:hover,.person.active{border-color:#8d6f29;background:#15170f}.dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 8px currentColor}.person strong{display:block;font-size:13px}.person small,.empty{color:var(--muted);font-size:11px}.score{color:#c9ad5e;font-size:10px}.badge{display:inline-block;border:1px solid #5b4921;color:#d7bd6a;background:#18150c;border-radius:99px;padding:5px 8px;font-size:10px;margin:3px}.detail h2{color:var(--gold2);margin-bottom:7px}.detail p{color:#beb7a0;line-height:1.55}.detail .open-person{margin-top:12px}.welcome,.loading{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:30px}.welcome{pointer-events:none}.welcome>div,.loading>div{max-width:500px}.welcome img{width:120px;height:120px;object-fit:contain;filter:drop-shadow(0 0 28px #d8aa3d42)}.welcome h2{color:var(--gold2);font-size:29px;margin:12px}.welcome p,.loading p{color:var(--muted);line-height:1.6}.loading{display:none;background:#050604b8;backdrop-filter:blur(3px);z-index:3}.spinner{width:42px;height:42px;margin:0 auto 15px;border:3px solid #4d3d1c;border-top-color:var(--gold2);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.hint{position:absolute;left:15px;bottom:14px;background:#090a08e8;border:1px solid #3d321b;border-radius:10px;padding:9px 12px;color:var(--muted);font-size:11px}.legend{position:absolute;right:15px;bottom:14px;display:flex;gap:9px;background:#090a08e8;border:1px solid #3d321b;border-radius:10px;padding:8px 10px;color:var(--muted);font-size:10px}.legend span:before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--c)}@media(max-width:1060px){main{grid-template-columns:285px 1fr}.right{display:none}}@media(max-width:760px){header{grid-template-columns:1fr auto;height:82px}.header-center{grid-column:1;justify-self:start}.header-center small{display:none}.crest{width:52px;height:52px}.actions{grid-column:2}.actions button:nth-child(2),.actions button:nth-child(3){display:none}main{height:calc(100vh - 82px);grid-template-columns:1fr}.side{display:none}}
+</style></head>
+<body><header><div></div><div class="header-center"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>DICOR • CENTRAL DE VÍNCULOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="actions"><button onclick="fitGraph()">Centralizar</button><button onclick="location.href='/'">Central</button><button onclick="location.href='/catalogo'">Catálogo</button></div></header>
+<main><aside class="side"><div class="label">LOCALIZAR FICHA PRINCIPAL</div><div class="lookup"><input id="lookup" placeholder="RG, nome ou ID interno"><button id="open">ABRIR</button></div><div class="stats"><div class="card"><b id="total">0</b>Conexões</div><div class="card"><b id="visible">0</b>Visíveis</div></div><div class="label">FILTRAR ESTA ÁRVORE</div><input id="filter" style="width:100%" placeholder="Nome, RG ou organização"><div class="label">FORÇA MÍNIMA</div><select id="strength" style="width:100%"><option value="0">Todas</option><option value="5">Moderada+</option><option value="9">Forte+</option><option value="15">Muito forte</option></select><div class="label">PESSOAS RELACIONADAS</div><div id="list"><div class="empty">Pesquise uma ficha para começar.</div></div></aside>
+<section id="stage"><svg id="graph"><defs><radialGradient id="nodeGrad" cx="35%" cy="25%"><stop offset="0" stop-color="#24271a"/><stop offset="1" stop-color="#0b0d09"/></radialGradient><radialGradient id="centralGrad" cx="35%" cy="20%"><stop offset="0" stop-color="#463915"/><stop offset=".55" stop-color="#1d1a0d"/><stop offset="1" stop-color="#090a07"/></radialGradient></defs><g id="viewport"></g></svg><div id="welcome" class="welcome"><div><img src="/central/brasao-dicor.png"><h2>Mapa de vínculos DICOR</h2><p>Consulte uma ficha para visualizar todas as conexões registradas. O grafo permanece completo, mas os rótulos ficam organizados no painel lateral para evitar sobreposição.</p></div></div><div id="loading" class="loading"><div><div class="spinner"></div><b>Montando análise de vínculos</b><p>A primeira abertura pode levar alguns segundos. As próximas consultas usam cache automático.</p></div></div><div class="hint">Arraste para mover • Scroll para zoom • Clique para analisar • Duplo clique para abrir outra árvore</div><div class="legend"><span style="--c:#755f2a">Fraca</span><span style="--c:#aa812d">Moderada</span><span style="--c:#e1b443">Forte</span></div></section>
+<aside class="side right"><div class="label">ANÁLISE DO VÍNCULO</div><div id="detail" class="detail"><div class="empty">Selecione uma pessoa.</div></div></aside></main>
+<script>
+const NS='http://www.w3.org/2000/svg',q=new URLSearchParams(location.search),initial=(q.get('id')||q.get('rg')||q.get('q')||'').trim();let D={nodes:[],edges:[]},scale=1,tx=0,ty=0,drag=false,last=[0,0],selected=null,positions={};const svg=document.getElementById('graph'),vp=document.getElementById('viewport'),lookup=document.getElementById('lookup'),filter=document.getElementById('filter'),strength=document.getElementById('strength'),welcome=document.getElementById('welcome'),loading=document.getElementById('loading'),list=document.getElementById('list'),total=document.getElementById('total'),visible=document.getElementById('visible');lookup.value=initial;function E(s){return String(s??'').replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}function openTree(){const v=lookup.value.trim();if(v)location.href='/arvore?id='+encodeURIComponent(v)}document.getElementById('open').onclick=openTree;lookup.addEventListener('keydown',e=>{if(e.key==='Enter')openTree()});function nodeColor(n){return n.score>=15?'#e6b946':n.score>=9?'#c99832':n.score>=5?'#997329':'#675329'}function strengthClass(s){return s>=9?'strong':s>=5?'medium':'weak'}function layout(ns){const c=ns.find(n=>n.central),others=ns.filter(n=>!n.central).sort((a,b)=>b.score-a.score||a.nome.localeCompare(b.nome)),p={};if(!c)return p;p[c.id]={x:0,y:0};let used=0,ring=1;while(used<others.length){const radius=245+(ring-1)*170,capacity=Math.max(10,Math.floor(2*Math.PI*radius/145)),count=Math.min(capacity,others.length-used);for(let i=0;i<count;i++){const n=others[used+i],offset=(ring%2?-.5:0),angle=-Math.PI/2+2*Math.PI*(i+offset)/Math.max(1,count);p[n.id]={x:Math.cos(angle)*radius,y:Math.sin(angle)*radius}}used+=count;ring++}return p}function svgEl(tag,attrs={}){const e=document.createElementNS(NS,tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,String(v));return e}function render(){const term=filter.value.trim().toLowerCase(),min=Number(strength.value),ns=D.nodes.filter(n=>n.central||(n.score>=min&&(`${n.nome} ${n.rg} ${n.organizacao}`.toLowerCase().includes(term)))),ids=new Set(ns.map(n=>n.id)),es=D.edges.filter(e=>ids.has(e.from)&&ids.has(e.to));positions=layout(ns);const frag=document.createDocumentFragment();for(const e of es){const a=positions[e.from],b=positions[e.to];if(!a||!b)continue;const path=svgEl('path',{d:`M ${a.x} ${a.y} Q ${(a.x+b.x)/2} ${(a.y+b.y)/2-18} ${b.x} ${b.y}`,class:`edge ${strengthClass(e.score)}${selected===e.to?' selected':''}`,'stroke-width':Math.max(1.2,Math.min(5.5,1+e.score/5))});path.dataset.to=e.to;frag.appendChild(path)}for(const n of ns){const p=positions[n.id];if(!p)continue;const radius=n.central?74:Math.max(42,Math.min(57,43+n.score*.6)),color=n.central?'#e4b746':nodeColor(n),g=svgEl('g',{class:`node${n.central?' central':''}${selected===n.id?' active':''}`,transform:`translate(${p.x},${p.y})`,tabindex:'0'});g.dataset.id=n.id;g.appendChild(svgEl('circle',{class:'halo',r:radius+10,fill:'none',stroke:color,'stroke-width':8}));g.appendChild(svgEl('circle',{class:'body',r:radius,fill:n.central?'url(#centralGrad)':'url(#nodeGrad)',stroke:color,'stroke-width':n.central?4:2.5}));if(n.central){const image=svgEl('image',{href:'/central/brasao-dicor.png',x:-27,y:-54,width:54,height:54,preserveAspectRatio:'xMidYMid meet'});g.appendChild(image)}const title=svgEl('text',{class:'title','text-anchor':'middle',y:n.central?18:-7});title.textContent=n.nome.length>20?n.nome.slice(0,19)+'…':n.nome;g.appendChild(title);const sub=svgEl('text',{class:'sub','text-anchor':'middle',y:n.central?37:13});sub.textContent='RG '+(n.rg||'—');g.appendChild(sub);if(!n.central){const pill=svgEl('rect',{class:'strength',x:-29,y:24,width:58,height:17,rx:8,fill:'#0b0d08',stroke:color});g.appendChild(pill);const st=svgEl('text',{class:'strength-text','text-anchor':'middle',y:36,fill:color});st.textContent=n.forca==='MUITO FORTE'?'M. FORTE':n.forca;g.appendChild(st)}g.addEventListener('click',()=>selectNode(n.id));g.addEventListener('dblclick',()=>{if(!n.central)location.href='/arvore?id='+encodeURIComponent(n.rg||n.id)});frag.appendChild(g)}vp.replaceChildren(frag);visible.textContent=Math.max(0,ns.length-1);list.innerHTML=ns.filter(n=>!n.central).map(n=>`<div class="person${selected===n.id?' active':''}" onclick="selectNode(${n.id})"><span class="dot" style="color:${nodeColor(n)};background:${nodeColor(n)}"></span><div><strong>${E(n.nome)}</strong><small>RG ${E(n.rg||'—')} • ${E(n.forca)}</small></div><span class="score">${n.score} pts</span></div>`).join('')||'<div class="empty">Nenhuma conexão registrada para estes filtros.</div>';transform()}function selectNode(id){selected=id;const n=D.nodes.find(x=>x.id===id);detail(n);render()}function detail(n){if(!n)return;document.getElementById('detail').innerHTML=`<h2>${E(n.nome)}</h2><p><b>RG:</b> ${E(n.rg||'Não informado')}<br><b>Organização:</b> ${E(n.organizacao||'Não informada')}<br><b>Força:</b> ${E(n.forca)}${n.central?'':`<br><b>Pontuação:</b> ${n.score}`}</p><div>${(n.motivos||[]).map(x=>`<span class="badge">${E(x)}</span>`).join('')}</div><div class="label">EVIDÊNCIAS</div><p>${(n.evidencias||[]).map(E).join('<br>')||'Nenhuma evidência resumida.'}</p>${n.central?'':`<button class="open-person" onclick="location.href='/arvore?id=${encodeURIComponent(n.rg||n.id)}'">Abrir árvore desta pessoa</button>`}`}function transform(){vp.setAttribute('transform',`translate(${svg.clientWidth/2+tx},${svg.clientHeight/2+ty}) scale(${scale})`)}function fitGraph(){const ns=D.nodes;if(!ns.length){scale=1;tx=0;ty=0;transform();return}const ps=Object.values(positions);if(!ps.length)return;const xs=ps.map(p=>p.x),ys=ps.map(p=>p.y),w=Math.max(...xs)-Math.min(...xs)+210,h=Math.max(...ys)-Math.min(...ys)+210;scale=Math.max(.18,Math.min(1.15,Math.min(svg.clientWidth/w,svg.clientHeight/h)));tx=-(Math.max(...xs)+Math.min(...xs))/2*scale;ty=-(Math.max(...ys)+Math.min(...ys))/2*scale;transform()}svg.addEventListener('wheel',e=>{e.preventDefault();scale=Math.max(.15,Math.min(3.2,scale*(e.deltaY<0?1.09:.91)));transform()},{passive:false});svg.addEventListener('mousedown',e=>{drag=true;last=[e.clientX,e.clientY];svg.style.cursor='grabbing'});window.addEventListener('mouseup',()=>{drag=false;svg.style.cursor='grab'});window.addEventListener('mousemove',e=>{if(!drag)return;tx+=e.clientX-last[0];ty+=e.clientY-last[1];last=[e.clientX,e.clientY];transform()});let renderTimer=0;function scheduleRender(){clearTimeout(renderTimer);renderTimer=setTimeout(render,70)}filter.addEventListener('input',scheduleRender);strength.addEventListener('input',render);async function load(v){if(!v)return;welcome.style.display='none';loading.style.display='grid';try{const r=await fetch('/api/arvore/'+encodeURIComponent(v),{headers:{Accept:'application/json'}}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.erro||'Erro ao montar a árvore');D=d;selected=d.alvo_id;total.textContent=d.total;render();detail(d.nodes.find(n=>n.central));requestAnimationFrame(()=>requestAnimationFrame(fitGraph))}catch(e){D={nodes:[],edges:[]};vp.replaceChildren();total.textContent='0';visible.textContent='0';list.innerHTML='<div class="empty">Nenhuma ficha carregada.</div>';welcome.style.display='grid';document.getElementById('detail').innerHTML=`<h2>Ficha não localizada</h2><p>${E(e.message)}</p>`}finally{loading.style.display='none'}}if(initial)load(initial);window.addEventListener('resize',()=>requestAnimationFrame(fitGraph));
+</script></body></html>'''
+
+
+async def arvore_pagina_http(request: web.Request) -> web.Response:
+    resposta = web.Response(
+        text=_ARVORE_HTML_DICOR,
+        content_type='text/html',
+        charset='utf-8',
+        headers={'Cache-Control': 'private, max-age=60'},
+    )
+    resposta.enable_compression()
+    return resposta
+
+
+# Prepara os índices sem bloquear o gateway do Discord por muito tempo.
+try:
+    _v15_criar_indices()
+except Exception:
+    traceback.print_exc()
+
+print(
+    '✅ V15 carregada: cache invalidado por alteração dos dados, índices SQLite e árvore DICOR premium sem alterar funcionalidades.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
