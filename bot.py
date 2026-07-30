@@ -52183,5 +52183,235 @@ print(
 )
 
 
+# =====================================================
+# V21 — CENTRAL DE BOLETINS DIRETO DO CANAL + IA SEM CARREGAMENTO INFINITO
+# =====================================================
+CENTRAL_BO_CANAL_SNAPSHOT_JSON = Path(DATA_DIR) / "central_boletins_canal_snapshot.json"
+_V21_SYNC_CANAL_BO_INICIADO = False
+
+
+def _v21_numero_bo_texto(texto: str) -> str:
+    bruto = str(texto or "")
+    m = re.search(r"(?:BO[-\s]*DICOR[-\s]*|BOLETIM(?:\s+DE\s+OCORR[EÊ]NCIA)?\s*[—–-]?\s*(?:N[º°O.]*)?\s*)(\d{1,6})", bruto, re.I)
+    if not m:
+        m = re.search(r"\bN[º°O.]*\s*(\d{1,6})\b", bruto, re.I)
+    return f"BO-DICOR-{int(m.group(1)):03d}" if m else ""
+
+
+def _v21_status_numero(numero: str) -> str:
+    try:
+        atendimento = _v18_buscar_atendimento_bo(numero) if "_v18_buscar_atendimento_bo" in globals() else None
+        if isinstance(atendimento, dict):
+            return str(atendimento.get("status") or atendimento.get("situacao") or "EM ABERTO")
+        bo = buscar_boletim_numero(numero) if "buscar_boletim_numero" in globals() else None
+        if isinstance(bo, dict):
+            return str(bo.get("status") or bo.get("situacao") or "EM ABERTO")
+    except Exception:
+        pass
+    return "EM ABERTO"
+
+
+async def _v21_salvar_anexo_bo(anexo: discord.Attachment, numero: str) -> str:
+    pasta = CENTRAL_BO_MEDIA_DIR / re.sub(r"[^A-Za-z0-9_-]+", "-", numero)
+    pasta.mkdir(parents=True, exist_ok=True)
+    nome = nome_arquivo_seguro(getattr(anexo, "filename", "arquivo")) if "nome_arquivo_seguro" in globals() else Path(str(getattr(anexo, "filename", "arquivo"))).name
+    caminho = pasta / f"{int(getattr(anexo, 'id', 0) or 0)}-{nome}"
+    if not caminho.exists() or caminho.stat().st_size <= 0:
+        salvo = None
+        try:
+            salvo = await baixar_anexo_persistente(anexo, pasta, f"bo-{numero}")
+        except Exception:
+            salvo = None
+        if salvo and Path(salvo).exists():
+            caminho = Path(salvo)
+        else:
+            try:
+                await anexo.save(str(caminho), use_cached=True)
+            except TypeError:
+                await anexo.save(str(caminho))
+    return str(caminho) if caminho.exists() and caminho.stat().st_size > 0 else ""
+
+
+async def _v21_snapshot_boletins_do_canal() -> Dict[str, int]:
+    if "_v18_resolver_canal_id" in globals():
+        canal = await _v18_resolver_canal_id(BOLETINS_CHANNEL_ID)
+    else:
+        canal = bot.get_channel(BOLETINS_CHANNEL_ID)
+        if canal is None:
+            canal = await bot.fetch_channel(BOLETINS_CHANNEL_ID)
+    if canal is None or not hasattr(canal, "history"):
+        return {"boletins": 0, "arquivos": 0}
+
+    mensagens = [m async for m in canal.history(limit=None, oldest_first=True)]
+    grupos: List[List[discord.Message]] = []
+    atual: List[discord.Message] = []
+    for msg in mensagens:
+        texto = _pericia_texto_mensagem(msg) if "_pericia_texto_mensagem" in globals() else str(msg.content or "")
+        numero = _v21_numero_bo_texto(texto)
+        inicio = bool(numero) and (eh_boletim_valido_para_atendimento(msg) if "eh_boletim_valido_para_atendimento" in globals() else True)
+        if inicio:
+            if atual:
+                grupos.append(atual)
+            atual = [msg]
+        elif atual:
+            atual.append(msg)
+    if atual:
+        grupos.append(atual)
+
+    registros: List[Dict[str, Any]] = []
+    arquivos_total = 0
+    for grupo in grupos:
+        texto_inicio = _pericia_texto_mensagem(grupo[0]) if "_pericia_texto_mensagem" in globals() else str(grupo[0].content or "")
+        numero = _v21_numero_bo_texto(texto_inicio)
+        if not numero:
+            continue
+        textos: List[str] = []
+        midias: List[str] = []
+        for msg in grupo:
+            txt = (_pericia_texto_mensagem(msg) if "_pericia_texto_mensagem" in globals() else str(msg.content or "")).strip()
+            if txt and txt not in textos:
+                textos.append(txt)
+            for anexo in list(getattr(msg, "attachments", []) or []):
+                try:
+                    salvo = await _v21_salvar_anexo_bo(anexo, numero)
+                    if salvo and salvo not in midias:
+                        midias.append(salvo)
+                        arquivos_total += 1
+                except Exception:
+                    traceback.print_exc()
+            for emb in list(getattr(msg, "embeds", []) or []):
+                url = str(getattr(getattr(emb, "image", None), "url", "") or getattr(getattr(emb, "thumbnail", None), "url", "") or "")
+                if url and url not in midias:
+                    midias.append(url)
+        registros.append({
+            "numero": numero,
+            "status": _v21_status_numero(numero),
+            "texto": "\n\n".join(textos)[:60000],
+            "midias": midias,
+            "mensagem_id": int(grupo[0].id),
+            "canal_id": int(getattr(canal, "id", BOLETINS_CHANNEL_ID)),
+            "criado_em": getattr(grupo[0], "created_at", datetime.datetime.now(datetime.timezone.utc)).isoformat(),
+            "autor": str(getattr(grupo[0], "author", "Não informado")),
+        })
+
+    salvar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {
+        "origem_canal_id": int(BOLETINS_CHANNEL_ID),
+        "atualizado_em": agora_br(),
+        "boletins": registros,
+    })
+    return {"boletins": len(registros), "arquivos": arquivos_total}
+
+
+def _v21_midia_url(item: Any) -> str:
+    texto = str(item or "").strip()
+    if not texto:
+        return ""
+    if texto.startswith(("http://", "https://")):
+        return texto
+    try:
+        p = Path(texto)
+        if p.exists() and p.is_file():
+            destino = CENTRAL_BO_MEDIA_DIR / p.name
+            if p.resolve() != destino.resolve() and (not destino.exists() or destino.stat().st_size != p.stat().st_size):
+                shutil.copy2(p, destino)
+            return "/central-bo-media/" + quote(destino.name)
+    except Exception:
+        pass
+    return ""
+
+
+def _v19_boletins_html() -> str:
+    payload = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    registros = payload.get("boletins", []) if isinstance(payload, dict) else []
+    abertos: List[str] = []
+    concluidos: List[str] = []
+    for bo in registros:
+        if not isinstance(bo, dict):
+            continue
+        numero = str(bo.get("numero") or "Sem número")
+        status = str(bo.get("status") or "EM ABERTO")
+        corpo = html.escape(str(bo.get("texto") or "Conteúdo não informado.")).replace("\n", "<br>")
+        urls: List[str] = []
+        for item in bo.get("midias", []) or []:
+            u = _v21_midia_url(item)
+            if u and u not in urls:
+                urls.append(u)
+        imagens: List[str] = []
+        arquivos: List[str] = []
+        for u in urls:
+            ext = u.split("?")[0].lower()
+            if ext.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")) or u.startswith("http"):
+                imagens.append(f'<a href="{html.escape(u)}" target="_blank"><img src="{html.escape(u)}" loading="lazy"></a>')
+            else:
+                arquivos.append(f'<a class="file" href="{html.escape(u)}" target="_blank">📎 Abrir anexo</a>')
+        galeria = "".join(imagens)
+        links = "".join(arquivos)
+        card = (
+            f'<article class="bo"><div class="head"><div><small>BOLETIM</small><h2>{html.escape(numero)}</h2></div><span>{html.escape(status)}</span></div>'
+            f'<div class="texto">{corpo}</div>'
+            + (f'<div class="media">{galeria}</div>' if galeria else '<p class="muted">Nenhuma foto anexada no canal de boletins.</p>')
+            + (f'<div class="files">{links}</div>' if links else "")
+            + '<p class="muted">Fonte: canal oficial de boletins. Consulta somente leitura.</p></article>'
+        )
+        (concluidos if _v19_status_bo_final(status) else abertos).append(card)
+
+    css = ':root{--g:#d7a93d;--g2:#f4d77c;--bg:#070806;--p:#10120e;--line:#433719;--mut:#a59e88}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#3a2d0c55,transparent 35%),var(--bg);color:#f7f1db;font-family:Inter,Arial,sans-serif}.top{height:105px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw}.brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:70px;height:70px;object-fit:contain;border:1px solid #806a2d;border-radius:16px;padding:5px}.brand h1{margin:0;font-size:18px;letter-spacing:2px}.brand small,.ey{color:var(--g);letter-spacing:1.5px}.nav{justify-self:end}.nav a{color:var(--g2);text-decoration:none;margin-left:15px}.wrap{max-width:1450px;margin:45px auto;padding:0 22px}.hero{text-align:center;margin-bottom:30px}.hero h2{font-size:38px;margin:8px}.tabs{display:flex;justify-content:center;gap:10px;margin:25px}.tabs button{background:#11130e;color:#eee3c5;border:1px solid var(--line);border-radius:10px;padding:12px 18px;font-weight:800;cursor:pointer}.tabs button.active{background:linear-gradient(135deg,#7b5b09,var(--g));color:#080906}.panel{display:none}.panel.active{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:18px}.bo{background:var(--p);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 20px 50px #0005}.head{display:flex;justify-content:space-between;gap:15px}.head h2{margin:5px 0;color:var(--g2)}.head span{border:1px solid #675321;border-radius:99px;padding:7px 11px;height:max-content;color:#e8cf7b}.texto{color:#d7d0bb;line-height:1.55;max-height:420px;overflow:auto;border-top:1px solid #292515;padding-top:15px}.media{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:16px}.media img{width:100%;height:260px;object-fit:contain;background:#050604;border:1px solid #4c3e1d;border-radius:10px}.files{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.file{color:var(--g2);border:1px solid var(--line);padding:8px 10px;border-radius:8px;text-decoration:none}.muted{color:var(--mut);font-size:13px}@media(max-width:650px){.top{grid-template-columns:1fr}.brand{grid-column:1}.nav{display:none}.panel.active{grid-template-columns:1fr}.media{grid-template-columns:1fr}}'
+    pagina = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Boletins - Central DICOR</title><style>{css}</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>DICOR - CENTRAL DE BOLETINS</h1><small>FONTE: CANAL OFICIAL - SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/arvore">Vínculos</a><a href="/sair">Sair</a></nav></header><main class="wrap"><section class="hero"><div class="ey">PLATAFORMA OPERACIONAL</div><h2>Boletins de Ocorrência</h2><p class="muted">Conteúdo e fotos carregados diretamente do canal oficial {BOLETINS_CHANNEL_ID}. A resolução permanece no Discord/e-mail operacional.</p></section><div class="tabs"><button class="active" onclick="tab('open',this)">EM ABERTO ({len(abertos)})</button><button onclick="tab('done',this)">CONCLUÍDOS ({len(concluidos)})</button></div><section id="open" class="panel active">{"".join(abertos) or '<p class="muted">Nenhum boletim em aberto.</p>'}</section><section id="done" class="panel">{"".join(concluidos) or '<p class="muted">Nenhum boletim concluído.</p>'}</section></main><script>function tab(id,b){{document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');b.classList.add('active')}}</script></body></html>'''
+    return pagina
+
+
+@bot.listen("on_ready")
+async def _v21_iniciar_snapshot_canal_bo():
+    global _V21_SYNC_CANAL_BO_INICIADO
+    if _V21_SYNC_CANAL_BO_INICIADO:
+        return
+    _V21_SYNC_CANAL_BO_INICIADO = True
+
+    async def loop():
+        await asyncio.sleep(8)
+        while not bot.is_closed():
+            try:
+                r = await _v21_snapshot_boletins_do_canal()
+                print(f"✅ V21 Central BO: {r['boletins']} boletim(ns) e {r['arquivos']} arquivo(s) lidos diretamente do canal {BOLETINS_CHANNEL_ID}.", flush=True)
+            except Exception as erro:
+                print(f"⚠️ V21 Central BO: {type(erro).__name__}: {erro}", flush=True)
+            await asyncio.sleep(300)
+
+    asyncio.create_task(loop(), name="v21-central-bo-canal")
+
+
+async def _v21_ia_callback(self, interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await asyncio.wait_for(
+            _dossie_ia_criar_canal(interaction, self.tipo, self.registro_id, self.perfil),
+            timeout=25,
+        )
+        try:
+            await interaction.edit_original_response(content="✅ Sala do Dossiê Inteligente criada. Confira o canal novo da IA.", embed=None, view=None)
+        except Exception:
+            pass
+    except asyncio.TimeoutError:
+        try:
+            await interaction.edit_original_response(content="❌ A criação da sala da IA demorou além do limite. Verifique a categoria e as permissões do bot.", embed=None, view=None)
+        except Exception:
+            pass
+    except discord.Forbidden:
+        try:
+            await interaction.edit_original_response(content="❌ O bot não possui permissão para criar ou visualizar canais na categoria da IA.", embed=None, view=None)
+        except Exception:
+            pass
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await interaction.edit_original_response(content=f"❌ Falha ao abrir o Dossiê Inteligente: `{type(erro).__name__}: {str(erro)[:180]}`", embed=None, view=None)
+        except Exception:
+            pass
+
+
+BancoConsultarIAButton.callback = _v21_ia_callback
+
+print("✅ V21 carregada: Central de Boletins usa apenas o canal oficial; IA sem carregamento infinito.", flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
