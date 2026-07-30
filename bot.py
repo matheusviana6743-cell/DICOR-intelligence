@@ -48887,5 +48887,369 @@ async def _dicor_v9_on_ready() -> None:
 
 print("✅ Patch V9 carregado: pesquisa direta e recuperação forense de fotos ativas.", flush=True)
 
+
+# =====================================================
+# PATCH V10 — PAINEL NOVO SEM COLISÃO + REPOSTAGEM REAL COM 2 FOTOS
+# =====================================================
+# Corrige dois problemas observados em produção:
+# 1) mensagens antigas ainda usavam o custom_id antigo e disputavam handlers;
+# 2) postar_procurado_oficial só procurava PUBLIC_DIR / rel, ignorando /data.
+
+_V10_REPARO_LOCK = asyncio.Lock()
+_V10_INICIO_EXECUTADO = False
+
+
+def _v10_resolver_foto(valor: Any) -> Optional[Path]:
+    referencia = str(valor or '').strip()
+    if not referencia:
+        return None
+    try:
+        resolvedor = globals().get('_catalogo_caminho_local')
+        if callable(resolvedor):
+            p = resolvedor(referencia)
+            if p is not None and p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+    except Exception:
+        pass
+    texto = referencia.replace('\\', '/')
+    if texto.startswith(('http://', 'https://')):
+        try:
+            texto = urlparse(texto).path
+        except Exception:
+            pass
+    rel = texto.lstrip('/')
+    nome = Path(rel).name
+    candidatos = []
+    bruto = Path(referencia)
+    if bruto.is_absolute() and not texto.startswith('/uploads/'):
+        candidatos.append(bruto)
+    candidatos.extend([
+        BASE_DIR / rel,
+        PUBLIC_DIR / rel,
+        PUBLIC_DIR / 'uploads' / nome,
+        Path(UPLOADS_DIR) / nome,
+        Path(DATA_DIR) / 'catalogo_uploads' / nome,
+        Path(DATA_DIR) / 'uploads' / nome,
+    ])
+    for pasta_nome in ('procurados_arquivos', 'boletins_arquivos', 'central_fichas_uploads', 'fichas_arquivos'):
+        candidatos.append(Path(DATA_DIR) / pasta_nome / nome)
+    vistos = set()
+    for p in candidatos:
+        k = str(p)
+        if not k or k in vistos:
+            continue
+        vistos.add(k)
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+async def postar_procurado_oficial(registro: Dict[str, Any]) -> Optional[discord.Message]:
+    """Publica somente quando as duas fotos foram realmente resolvidas e anexadas."""
+    canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+    if canal is None:
+        raise RuntimeError('Canal oficial de procurados não encontrado.')
+
+    pessoa = _v10_resolver_foto(registro.get('foto_individuo'))
+    documento = _v10_resolver_foto(registro.get('foto_rg'))
+    faltando = []
+    if pessoa is None:
+        faltando.append('foto do indivíduo')
+    if documento is None:
+        faltando.append('foto do RG')
+    if faltando:
+        raise FileNotFoundError('Ausente: ' + ' e '.join(faltando))
+
+    rg_nome = re.sub(r'[^0-9A-Za-z_-]+', '-', str(registro.get('rg') or 'sem-rg')).strip('-') or 'sem-rg'
+    arquivos = [
+        discord.File(str(pessoa), filename=f'foto_individuo_{rg_nome}{pessoa.suffix.lower() or ".png"}'),
+        discord.File(str(documento), filename=f'foto_rg_{rg_nome}{documento.suffix.lower() or ".png"}'),
+    ]
+    texto = cortar_discord(criar_texto_procurado(registro), 1900)
+    mensagem = await canal.send(
+        content=texto,
+        files=arquivos,
+        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+    )
+    # Confirma pelo objeto retornado e, se necessário, busca novamente no Discord.
+    conferida = mensagem
+    try:
+        if len(getattr(conferida, 'attachments', []) or []) < 2:
+            conferida = await canal.fetch_message(int(mensagem.id))
+    except Exception:
+        conferida = mensagem
+    if len(getattr(conferida, 'attachments', []) or []) < 2:
+        try:
+            await mensagem.delete()
+        except Exception:
+            pass
+        raise RuntimeError('O Discord não confirmou os dois anexos; publicação cancelada.')
+    return conferida
+
+
+class BancoConsultaModalV10(Modal, title='Pesquisar fichas DICOR'):
+    consulta = TextInput(
+        label='Nome, RG, telefone, placa ou organização',
+        placeholder='Ex.: 28457, Arquildo Silva ou ABC1D23',
+        min_length=1,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            termo = str(self.consulta.value or '').strip()
+            await _banco_prof_enviar_consulta(interaction, termo)
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await interaction.followup.send(
+                    f'❌ Falha ao pesquisar: `{type(erro).__name__}: {str(erro)[:250]}`', ephemeral=True
+                )
+            except Exception:
+                pass
+
+
+class BancoDadosViewV10(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            if not interaction.response.is_done():
+                await interaction.response.send_message('❌ Apenas a equipe DICOR pode usar esta central.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Criar ficha', emoji='📋', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_criar_ficha_v10', row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+
+    @discord.ui.button(label='Pesquisar fichas', emoji='🔎', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar_v10', row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Modal é a primeira operação: responde dentro dos 3 segundos.
+        await interaction.response.send_modal(BancoConsultaModalV10())
+
+    @discord.ui.button(label='Importar painel', emoji='🏴', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_importar_painel_v10', row=0)
+    async def importar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title='🏴 ESCOLHA O MODO DE ATUALIZAÇÃO',
+            description='Selecione como o painel deverá atualizar os registros.',
+            color=discord.Color.from_rgb(30, 105, 190),
+        )
+        embed.add_field(name='🔗 MESCLAR • recomendado', value='Adiciona e atualiza registros sem desativar ausentes.', inline=False)
+        embed.add_field(name='♻️ SUBSTITUIR LISTA ATUAL', value='A lista enviada vira a formação atual; o histórico é preservado.', inline=False)
+        await interaction.response.send_message(
+            embed=embed,
+            view=BancoEscolherModoPainelView(
+                int(interaction.user.id), int(getattr(interaction.channel, 'id', 0) or 0),
+                int(getattr(interaction.message, 'id', 0) or 0),
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label='Sincronizar dados', emoji='🔄', style=discord.ButtonStyle.success,
+                       custom_id='dicor_banco_sync_tudo_v10', row=0)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send('⏳ Já existe uma sincronização em andamento.', ephemeral=True)
+        await interaction.followup.send('🔄 Sincronização iniciada.', ephemeral=True)
+        asyncio.create_task(_banco_v4_sync_com_revisao(
+            interaction, int(getattr(interaction.channel, 'id', 0) or 0),
+            int(getattr(interaction.message, 'id', 0) or 0),
+        ))
+
+
+async def _v10_atualizar_paineis() -> int:
+    """Edita painéis antigos para trocar fisicamente os botões/custom_ids."""
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    if guild is None:
+        return 0
+    canal_id = int(os.getenv('BANCO_DADOS_CHANNEL_ID', '0') or 0)
+    canal = guild.get_channel(canal_id) if canal_id else None
+    if canal is None:
+        for c in list(getattr(guild, 'text_channels', []) or []):
+            if str(getattr(c, 'name', '') or '').casefold().replace('_', '-') == 'banco-de-dados':
+                canal = c
+                break
+    if canal is None or not hasattr(canal, 'history'):
+        return 0
+    editados = 0
+    async for msg in canal.history(limit=150):
+        if int(getattr(getattr(msg, 'author', None), 'id', 0) or 0) != int(getattr(bot.user, 'id', 0) or 0):
+            continue
+        texto = _v9_texto_mensagem(msg).casefold()
+        if 'central de fichas' not in texto:
+            continue
+        try:
+            await msg.edit(view=BancoDadosViewV10())
+            editados += 1
+        except Exception:
+            traceback.print_exc()
+    if editados == 0:
+        try:
+            await canal.send(embed=_banco_prof_embed_painel(), view=BancoDadosViewV10())
+            editados = 1
+        except Exception:
+            traceback.print_exc()
+    return editados
+
+
+async def _v10_recuperar_por_ids(registro: Dict[str, Any]) -> bool:
+    """Usa IDs das mensagens de confirmação salvos nos pedidos/autorização."""
+    rg_norm = _procurado_rg_normalizado_v8(str(registro.get('rg') or ''))
+    fontes = []
+    for arquivo in (PROCURADOS_PENDENTES_JSON, AUTORIZACOES_JSON, BOLETINS_PENDENTES_JSON):
+        try:
+            dados = carregar_json(arquivo, {})
+            if isinstance(dados, dict):
+                fontes.extend(dados.values())
+            elif isinstance(dados, list):
+                fontes.extend(dados)
+        except Exception:
+            continue
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    if guild is None:
+        return False
+    for item in fontes:
+        if not isinstance(item, dict):
+            continue
+        mesclado = dict(item)
+        if isinstance(item.get('dados'), dict):
+            mesclado.update(item.get('dados'))
+        if rg_norm and rg_norm != _procurado_rg_normalizado_v8(str(mesclado.get('rg') or mesclado.get('procurado_rg') or '')):
+            continue
+        pares = [
+            ('foto_individuo', mesclado.get('foto_individuo_msg_id')),
+            ('foto_rg', mesclado.get('foto_rg_msg_id')),
+        ]
+        canal_id = int(mesclado.get('canal_id') or mesclado.get('channel_id') or mesclado.get('topico_id') or 0)
+        canal = guild.get_channel(canal_id) if canal_id else None
+        for campo, mid in pares:
+            if _v10_resolver_foto(registro.get(campo)) is not None or not mid:
+                continue
+            msg = None
+            if canal is not None and hasattr(canal, 'fetch_message'):
+                try:
+                    msg = await canal.fetch_message(int(mid))
+                except Exception:
+                    msg = None
+            if msg is None:
+                # Procura o ID nos canais mais prováveis.
+                for c in list(getattr(guild, 'text_channels', []) or []):
+                    if not hasattr(c, 'fetch_message'):
+                        continue
+                    try:
+                        msg = await c.fetch_message(int(mid)); break
+                    except Exception:
+                        continue
+            if msg and getattr(msg, 'attachments', None):
+                salvo = await _v9_salvar_anexo(msg.attachments[0], f'v10-{campo}-{registro.get("rg")}')
+                if salvo:
+                    registro[campo] = _procurado_importar_foto_local_v8(str(salvo), f'v10-{campo}-{registro.get("rg")}')
+    return _v10_resolver_foto(registro.get('foto_individuo')) is not None and _v10_resolver_foto(registro.get('foto_rg')) is not None
+
+
+async def _v10_reparar_e_repostar() -> Dict[str, int]:
+    async with _V10_REPARO_LOCK:
+        lista = carregar_procurados()
+        canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+        saida = {'repostados': 0, 'sem_fotos': 0, 'ja_corretos': 0, 'verificados': 0}
+        alterou = False
+        for registro in lista:
+            if str(registro.get('status') or 'A PROCURAR').upper() != 'A PROCURAR':
+                continue
+            saida['verificados'] += 1
+            antiga = None
+            try:
+                if canal and int(registro.get('mensagem_id') or 0):
+                    antiga = await canal.fetch_message(int(registro.get('mensagem_id')))
+            except Exception:
+                antiga = None
+            if antiga is not None and len(getattr(antiga, 'attachments', []) or []) >= 2:
+                saida['ja_corretos'] += 1
+                continue
+
+            ok = (_v10_resolver_foto(registro.get('foto_individuo')) is not None and
+                  _v10_resolver_foto(registro.get('foto_rg')) is not None)
+            if not ok:
+                ok = await _v10_recuperar_por_ids(registro)
+            if not ok:
+                ok = await _v9_reparar_registro(registro)
+            if not ok:
+                saida['sem_fotos'] += 1
+                await enviar_log(
+                    f'⚠️ V10: não foi possível recuperar as 2 fotos de {registro.get("nome")} | RG `{registro.get("rg")}`.'
+                )
+                continue
+
+            try:
+                nova = await postar_procurado_oficial(registro)
+                if nova is None or len(getattr(nova, 'attachments', []) or []) < 2:
+                    raise RuntimeError('nova publicação não confirmou 2 anexos')
+                registro['mensagem_id'] = int(nova.id)
+                registro['mensagem_url'] = nova.jump_url
+                registro['repostado_com_fotos_em'] = agora_br()
+                registro['repostado_correcao'] = 'V10'
+                if antiga is not None and antiga.id != nova.id:
+                    try:
+                        await antiga.delete()
+                    except Exception:
+                        pass
+                saida['repostados'] += 1
+                alterou = True
+                await enviar_log(
+                    f'✅ V10 repostou COM 2 FOTOS: {registro.get("nome")} | RG `{registro.get("rg")}` | {nova.jump_url}'
+                )
+            except Exception as erro:
+                saida['sem_fotos'] += 1
+                await enviar_log(
+                    f'❌ V10 falhou ao repostar {registro.get("nome")} | RG `{registro.get("rg")}`: '
+                    f'`{type(erro).__name__}: {str(erro)[:300]}`'
+                )
+            await asyncio.sleep(0.4)
+        if alterou:
+            salvar_procurados(lista)
+            await asyncio.to_thread(gerar_catalogo_html)
+        return saida
+
+
+@bot.listen('on_ready')
+async def _dicor_v10_on_ready() -> None:
+    global _V10_INICIO_EXECUTADO
+    try:
+        bot.add_view(BancoDadosViewV10())
+    except Exception:
+        pass
+    if _V10_INICIO_EXECUTADO:
+        return
+    _V10_INICIO_EXECUTADO = True
+
+    async def iniciar_v10():
+        await asyncio.sleep(3)
+        paineis = await _v10_atualizar_paineis()
+        await asyncio.sleep(2)
+        resultado = await _v10_reparar_e_repostar()
+        print(
+            '✅ Patch V10 ativo: '
+            f'{paineis} painel(is) atualizado(s); '
+            f'{resultado["repostados"]} repostado(s) com 2 fotos; '
+            f'{resultado["sem_fotos"]} sem fotos recuperáveis; '
+            f'{resultado["ja_corretos"]} já correto(s).',
+            flush=True,
+        )
+    asyncio.create_task(iniciar_v10(), name='dicor_v10_painel_e_repostagem')
+
+
+print('✅ Patch V10 carregado: painel com custom_ids novos e repostagem validada por 2 anexos.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
