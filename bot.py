@@ -47269,7 +47269,10 @@ def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
     return perfil
 
 
-_ARVORE_CONSTRUIR_ANTES_PERICIA_V6 = _arvore_construir
+# Compatibilidade: em algumas versões antigas a função pública `_arvore_construir`
+# ainda não existia neste ponto. Usa o motor real `_arvore_calcular` como base,
+# evitando NameError durante o import e preservando toda a mecânica da árvore.
+_ARVORE_CONSTRUIR_ANTES_PERICIA_V6 = globals().get("_arvore_construir") or _arvore_calcular
 
 def _arvore_construir(individuo_id: int, usar_cache: bool = True) -> Dict[str, Any]:
     # Ignora cache antigo para que novas perícias/placas apareçam imediatamente.
@@ -47667,10 +47670,22 @@ async def central_fichas_http(request: web.Request) -> web.Response:
 
 
 async def start_web_server():
+    """Sobe o HTTP imediatamente para o healthcheck do Railway.
+
+    A geração do catálogo pode ser pesada quando o volume possui muitos arquivos.
+    Por isso ela roda somente depois que /health já está respondendo.
+    """
     global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
     if _WEB_RUNNER_DICOR is not None:
         return
-    gerar_catalogo_html()
+
+    # Evita falha no add_static quando o volume acabou de ser criado.
+    for pasta in (DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, DOSSIES_DIR, PUBLIC_BACKUPS_DIR):
+        try:
+            Path(pasta).mkdir(parents=True, exist_ok=True)
+        except Exception as erro_pasta:
+            print(f"⚠️ Não foi possível preparar {pasta}: {erro_pasta}", flush=True)
+
     app = web.Application(client_max_size=100 * 1024 * 1024, middlewares=[central_auth_middleware])
     app.router.add_get("/", central_portal_http)
     app.router.add_get("/index.html", central_portal_http)
@@ -47696,7 +47711,22 @@ async def start_web_server():
     await site.start()
     _WEB_RUNNER_DICOR = runner
     _WEB_SITE_DICOR = site
+    print(f"✅ HTTP/health ativo em 0.0.0.0:{porta}", flush=True)
     print("✅ Central DICOR ativa | / público | /catalogo público | módulos internos protegidos", flush=True)
+
+    async def _gerar_catalogo_em_segundo_plano() -> None:
+        try:
+            await asyncio.to_thread(gerar_catalogo_html)
+            print("✅ Catálogo público atualizado em segundo plano.", flush=True)
+        except Exception as erro_catalogo:
+            print(
+                f"⚠️ O HTTP permaneceu ativo, mas o catálogo não pôde ser regenerado: "
+                f"{type(erro_catalogo).__name__}: {erro_catalogo}",
+                flush=True,
+            )
+            traceback.print_exc()
+
+    asyncio.create_task(_gerar_catalogo_em_segundo_plano())
 
 
 print("✅ Portal Central DICOR carregado: catálogo público e acesso interno persistente por dispositivo.", flush=True)
