@@ -47528,5 +47528,178 @@ def _arvore_embed(resultado: Dict[str, Any]) -> discord.Embed:
 
 print('✅ Plataforma profissional dourada da árvore DICOR carregada, sem limite artificial.', flush=True)
 
+# =====================================================
+# PORTAL CENTRAL DICOR — CATÁLOGO PÚBLICO + ÁREAS PRIVADAS
+# =====================================================
+CENTRAL_DICOR_PASSWORD = os.getenv("CENTRAL_DICOR_PASSWORD", CATALOG_ADMIN_PASSWORD).strip()
+CENTRAL_DICOR_COOKIE_SECRET = os.getenv("CENTRAL_DICOR_COOKIE_SECRET", "").strip() or hashlib.sha256(
+    f"{DISCORD_TOKEN}|{CENTRAL_DICOR_PASSWORD}|DICOR-CENTRAL".encode("utf-8")
+).hexdigest()
+CENTRAL_DICOR_COOKIE_NAME = "dicor_central_access"
+CENTRAL_DICOR_COOKIE_DIAS = max(1, env_int("CENTRAL_DICOR_COOKIE_DIAS", 180))
+CENTRAL_DICOR_ACESSOS_JSON = DATA_DIR / "central_acessos_autorizados.json"
+
+
+def _central_b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _central_assinar(payload: str) -> str:
+    return hmac.new(CENTRAL_DICOR_COOKIE_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _central_fingerprint(request: web.Request) -> str:
+    ua = request.headers.get("User-Agent", "")[:500]
+    return hashlib.sha256(ua.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def _central_criar_token(request: web.Request) -> str:
+    emitido = int(time.time())
+    payload = f"{emitido}.{_central_fingerprint(request)}.{secrets.token_hex(10)}"
+    return f"{_central_b64(payload.encode('utf-8'))}.{_central_assinar(payload)}"
+
+
+def _central_token_valido(request: web.Request) -> bool:
+    token = str(request.cookies.get(CENTRAL_DICOR_COOKIE_NAME, "") or "").strip()
+    if not token or "." not in token:
+        return False
+    try:
+        corpo_b64, assinatura = token.rsplit(".", 1)
+        corpo_b64 += "=" * (-len(corpo_b64) % 4)
+        payload = base64.urlsafe_b64decode(corpo_b64.encode("ascii")).decode("utf-8")
+        if not hmac.compare_digest(assinatura, _central_assinar(payload)):
+            return False
+        emitido_s, fingerprint, _nonce = payload.split(".", 2)
+        if fingerprint != _central_fingerprint(request):
+            return False
+        idade = int(time.time()) - int(emitido_s)
+        return 0 <= idade <= CENTRAL_DICOR_COOKIE_DIAS * 86400
+    except Exception:
+        return False
+
+
+def _central_salvar_acesso(request: web.Request) -> None:
+    try:
+        dados = carregar_json(CENTRAL_DICOR_ACESSOS_JSON, [])
+        if not isinstance(dados, list):
+            dados = []
+        fp = _central_fingerprint(request)
+        agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ip = request.headers.get("X-Forwarded-For", request.remote or "").split(",")[0].strip()
+        item = next((x for x in dados if isinstance(x, dict) and x.get("fingerprint") == fp), None)
+        registro = {
+            "fingerprint": fp,
+            "primeiro_acesso": (item or {}).get("primeiro_acesso", agora),
+            "ultimo_acesso": agora,
+            "ip_ultimo_acesso": ip,
+            "navegador": request.headers.get("User-Agent", "")[:300],
+        }
+        dados = [x for x in dados if not (isinstance(x, dict) and x.get("fingerprint") == fp)]
+        dados.append(registro)
+        salvar_json(CENTRAL_DICOR_ACESSOS_JSON, dados[-1000:])
+    except Exception as exc:
+        print(f"⚠️ Não foi possível registrar acesso à Central DICOR: {exc}", flush=True)
+
+
+_CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>
+:root{--bg:#070806;--panel:#10120d;--line:#3b321a;--gold:#d7a93d;--gold2:#f2d47d;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:82px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 5vw;background:#090a07e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:5}.brand{display:flex;align-items:center;gap:15px}.seal{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;border:2px solid var(--gold);color:var(--gold2);font-weight:900;box-shadow:0 0 25px #d7a93d22}.brand h1{font-size:17px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{font-size:12px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px;max-width:780px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65;max-width:760px}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center;box-shadow:0 25px 80px #0008}.hero-mark div{width:155px;height:155px;border:2px solid var(--gold);border-radius:50%;display:grid;place-items:center;font-size:54px;font-weight:900;color:var(--gold2);box-shadow:0 0 60px #d7a93d22}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;overflow:hidden;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d;box-shadow:0 20px 45px #0007}.card .icon{font-size:29px}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5;margin:0 0 25px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.card.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.card.disabled{opacity:.55}.card.disabled a{pointer-events:none;background:#39382f;color:#888}footer{text-align:center;color:#625f52;font-size:11px;padding:50px 15px;letter-spacing:1px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.hero h2{font-size:40px}.grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){header{padding:0 18px}.brand small,.status{display:none}main{padding:42px 16px}.hero h2{font-size:34px}.grid{grid-template-columns:1fr}}
+</style></head><body><header><div class="brand"><div class="seal">D</div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Ambiente integrado para consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><div>D</div></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div class="icon">🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados e dos dados autorizados para divulgação.</p><a href="/catalogo">Abrir catálogo público</a></article><article class="card private"><div class="icon">🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo de pessoas, organizações, veículos, perícias e demais conexões registradas.</p><a href="/arvore">Acessar com senha</a></article><article class="card private"><div class="icon">👥</div><h3>Central de Fichas</h3><p>Área reservada para consulta e administração das fichas investigativas da DICOR.</p><a href="/fichas">Acessar com senha</a></article><article class="card private disabled"><div class="icon">📋</div><h3>Boletins</h3><p>Módulo preparado para integração futura com boletins e atendimentos.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">🧪</div><h3>Perícias</h3><p>Módulo preparado para histórico e cruzamento completo das perícias externas.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">📂</div><h3>Dossiês</h3><p>Módulo preparado para consulta centralizada dos dossiês operacionais.</p><a href="#">Em desenvolvimento</a></article></section></main><footer>DICOR • USO OPERACIONAL EM AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+
+
+_CENTRAL_LOGIN_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acesso Restrito • DICOR</title><style>
+:root{--gold:#d7a93d;--gold2:#f2d47d}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top,#3a2d0c66,transparent 40%),#070806;color:#f5f0dc;font-family:Inter,Arial,sans-serif}.box{width:min(430px,calc(100% - 30px));background:#10120e;border:1px solid #4b3d1c;border-radius:22px;padding:34px;box-shadow:0 30px 90px #000a}.seal{width:62px;height:62px;border:2px solid var(--gold);border-radius:50%;display:grid;place-items:center;color:var(--gold2);font-size:25px;font-weight:900;margin-bottom:25px}.eyebrow{color:var(--gold);font-size:10px;letter-spacing:2px}.box h1{margin:8px 0;font-size:27px}.box p{color:#9e9987;line-height:1.5;margin-bottom:24px}label{font-size:12px;color:#c9bd95}input{width:100%;margin:8px 0 15px;background:#080906;border:1px solid #38301a;color:#fff7d6;border-radius:10px;padding:14px;font-size:16px;outline:none}input:focus{border-color:var(--gold)}button{width:100%;border:0;border-radius:10px;padding:14px;background:linear-gradient(135deg,var(--gold2),var(--gold));font-weight:900;cursor:pointer}.error{background:#361616;border:1px solid #793434;color:#ffc8c8;padding:10px;border-radius:9px;margin-bottom:14px;font-size:13px}.back{display:block;text-align:center;color:#a99455;text-decoration:none;margin-top:18px;font-size:12px}</style></head><body><form class="box" method="post" action="/acesso"><div class="seal">D</div><div class="eyebrow">CENTRAL DE INTELIGÊNCIA</div><h1>Acesso restrito</h1><p>Insira a senha operacional. Após a primeira validação, este navegador permanecerá autorizado por este dispositivo.</p>{erro}<input type="hidden" name="next" value="{next}"><label>Senha de acesso</label><input type="password" name="senha" autocomplete="current-password" required autofocus><button type="submit">AUTORIZAR DISPOSITIVO</button><a class="back" href="/">← Voltar à Central</a></form></body></html>'''
+
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    return web.Response(text=_CENTRAL_PORTAL_HTML, content_type="text/html", charset="utf-8")
+
+
+async def central_login_get(request: web.Request) -> web.Response:
+    destino = str(request.query.get("next") or "/arvore")
+    if not destino.startswith("/") or destino.startswith("//"):
+        destino = "/arvore"
+    html_login = _CENTRAL_LOGIN_HTML.format(erro="", next=html.escape(destino, quote=True))
+    return web.Response(text=html_login, content_type="text/html", charset="utf-8")
+
+
+async def central_login_post(request: web.Request) -> web.Response:
+    try:
+        form = await request.post()
+    except Exception:
+        form = {}
+    senha = str(form.get("senha") or "")
+    destino = str(form.get("next") or "/arvore")
+    if not destino.startswith("/") or destino.startswith("//"):
+        destino = "/arvore"
+    if not CENTRAL_DICOR_PASSWORD:
+        erro = "A senha ainda não foi configurada no Railway. Defina CENTRAL_DICOR_PASSWORD."
+        return web.Response(text=_CENTRAL_LOGIN_HTML.format(erro=f'<div class="error">{erro}</div>', next=html.escape(destino, quote=True)), content_type="text/html", charset="utf-8", status=503)
+    if not hmac.compare_digest(senha.encode("utf-8"), CENTRAL_DICOR_PASSWORD.encode("utf-8")):
+        erro = "Senha incorreta. A tentativa não autorizou este dispositivo."
+        return web.Response(text=_CENTRAL_LOGIN_HTML.format(erro=f'<div class="error">{erro}</div>', next=html.escape(destino, quote=True)), content_type="text/html", charset="utf-8", status=401)
+    resposta = web.HTTPFound(destino)
+    resposta.set_cookie(CENTRAL_DICOR_COOKIE_NAME, _central_criar_token(request), max_age=CENTRAL_DICOR_COOKIE_DIAS * 86400, httponly=True, secure=True, samesite="Lax", path="/")
+    _central_salvar_acesso(request)
+    return resposta
+
+
+async def central_logout_http(request: web.Request) -> web.Response:
+    resposta = web.HTTPFound("/")
+    resposta.del_cookie(CENTRAL_DICOR_COOKIE_NAME, path="/")
+    return resposta
+
+
+@web.middleware
+async def central_auth_middleware(request: web.Request, handler):
+    caminho = request.path
+    publicos = (caminho == "/" or caminho == "/index.html" or caminho.startswith("/catalogo") or caminho.startswith("/uploads/") or caminho in {"/acesso", "/sair", "/health", "/healthz"})
+    if publicos or _central_token_valido(request):
+        return await handler(request)
+    if caminho.startswith("/api/"):
+        return web.json_response({"ok": False, "erro": "Acesso restrito. Autorize este dispositivo."}, status=401)
+    destino = quote(str(request.rel_url), safe="/?=&")
+    raise web.HTTPFound(f"/acesso?next={destino}")
+
+
+async def central_fichas_http(request: web.Request) -> web.Response:
+    html_fichas = """<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Central de Fichas DICOR</title><style>body{margin:0;background:#080906;color:#f7f1db;font-family:Arial}.top{padding:22px 5vw;border-bottom:1px solid #3b321a;display:flex;justify-content:space-between}.top b{color:#f2d47d}.wrap{max-width:1100px;margin:70px auto;padding:25px}.box{border:1px solid #44381c;background:#11130e;border-radius:18px;padding:35px}.box h1{color:#f2d47d}.box p{color:#aaa38d;line-height:1.6}a{color:#d7a93d}</style></head><body><div class='top'><b>DICOR • CENTRAL DE FICHAS</b><span><a href='/'>Central</a> • <a href='/sair'>Sair</a></span></div><div class='wrap'><div class='box'><h1>Área protegida ativada</h1><p>Este dispositivo já está autorizado. A interface web completa das fichas será ligada ao banco interno nesta área sem tornar os dados públicos.</p><p>Enquanto isso, a administração das fichas permanece disponível pelo painel do Discord.</p></div></div></body></html>"""
+    return web.Response(text=html_fichas, content_type="text/html", charset="utf-8")
+
+
+async def start_web_server():
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+    if _WEB_RUNNER_DICOR is not None:
+        return
+    gerar_catalogo_html()
+    app = web.Application(client_max_size=100 * 1024 * 1024, middlewares=[central_auth_middleware])
+    app.router.add_get("/", central_portal_http)
+    app.router.add_get("/index.html", central_portal_http)
+    app.router.add_get("/acesso", central_login_get)
+    app.router.add_post("/acesso", central_login_post)
+    app.router.add_get("/sair", central_logout_http)
+    app.router.add_get("/catalogo", pagina_inicial)
+    app.router.add_get("/catalogo.html", pagina_inicial)
+    app.router.add_get("/arvore", arvore_pagina_http)
+    app.router.add_get("/arvore.html", arvore_pagina_http)
+    app.router.add_get("/api/arvore/{individuo_id}", arvore_api_http)
+    app.router.add_get("/fichas", central_fichas_http)
+    app.router.add_get("/health", healthcheck_http)
+    app.router.add_get("/healthz", healthcheck_http)
+    app.router.add_get("/dossies/{caminho:.+}", baixar_dossie_http)
+    app.router.add_get("/backups/{caminho:.+}", baixar_backup_http)
+    app.router.add_post("/api/catalogo/apagar", api_apagar_procurado)
+    app.router.add_static("/uploads/", path=str(UPLOADS_DIR), show_index=False)
+    porta = int(os.getenv("PORT", str(PORT)) or PORT)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=porta)
+    await site.start()
+    _WEB_RUNNER_DICOR = runner
+    _WEB_SITE_DICOR = site
+    print("✅ Central DICOR ativa | / público | /catalogo público | módulos internos protegidos", flush=True)
+
+
+print("✅ Portal Central DICOR carregado: catálogo público e acesso interno persistente por dispositivo.", flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
