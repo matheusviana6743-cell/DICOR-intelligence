@@ -47605,24 +47605,60 @@ def _central_salvar_acesso(request: web.Request) -> None:
 
 
 _CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>
-:root{--bg:#070806;--panel:#10120d;--line:#3b321a;--gold:#d7a93d;--gold2:#f2d47d;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:82px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 5vw;background:#090a07e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:5}.brand{display:flex;align-items:center;gap:15px}.seal{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;border:2px solid var(--gold);color:var(--gold2);font-weight:900;box-shadow:0 0 25px #d7a93d22}.brand h1{font-size:17px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{font-size:12px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px;max-width:780px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65;max-width:760px}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center;box-shadow:0 25px 80px #0008}.hero-mark div{width:155px;height:155px;border:2px solid var(--gold);border-radius:50%;display:grid;place-items:center;font-size:54px;font-weight:900;color:var(--gold2);box-shadow:0 0 60px #d7a93d22}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;overflow:hidden;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d;box-shadow:0 20px 45px #0007}.card .icon{font-size:29px}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5;margin:0 0 25px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.card.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.card.disabled{opacity:.55}.card.disabled a{pointer-events:none;background:#39382f;color:#888}footer{text-align:center;color:#625f52;font-size:11px;padding:50px 15px;letter-spacing:1px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.hero h2{font-size:40px}.grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){header{padding:0 18px}.brand small,.status{display:none}main{padding:42px 16px}.hero h2{font-size:34px}.grid{grid-template-columns:1fr}}
-</style></head><body><header><div class="brand"><div class="seal">D</div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Ambiente integrado para consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><div>D</div></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div class="icon">🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados e dos dados autorizados para divulgação.</p><a href="/catalogo">Abrir catálogo público</a></article><article class="card private"><div class="icon">🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo de pessoas, organizações, veículos, perícias e demais conexões registradas.</p><a href="/arvore">Acessar com senha</a></article><article class="card private"><div class="icon">👥</div><h3>Central de Fichas</h3><p>Área reservada para consulta e administração das fichas investigativas da DICOR.</p><a href="/fichas">Acessar com senha</a></article><article class="card private disabled"><div class="icon">📋</div><h3>Boletins</h3><p>Módulo preparado para integração futura com boletins e atendimentos.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">🧪</div><h3>Perícias</h3><p>Módulo preparado para histórico e cruzamento completo das perícias externas.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">📂</div><h3>Dossiês</h3><p>Módulo preparado para consulta centralizada dos dossiês operacionais.</p><a href="#">Em desenvolvimento</a></article></section></main><footer>DICOR • USO OPERACIONAL EM AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+:root{--bg:#070806;--panel:#10120d;--line:#3b321a;--gold:#d7a93d;--gold2:#f2d47d;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:82px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 5vw;background:#090a07e8;backdrop-filter:blur(14px);position:sticky;top:0;z-index:5}.brand{display:flex;align-items:center;gap:15px}.seal{width:52px;height:52px;border-radius:14px;display:grid;place-items:center;border:1px solid #8b712d;background:#080906;box-shadow:0 0 25px #d7a93d22;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:4px}.brand h1{font-size:17px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{font-size:12px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px;max-width:780px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65;max-width:760px}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center;box-shadow:0 25px 80px #0008}.hero-mark .crest{width:178px;height:178px;border:1px solid #8b712d;border-radius:28px;display:grid;place-items:center;background:#080906;box-shadow:0 0 60px #d7a93d22;overflow:hidden}.hero-mark .crest img{width:100%;height:100%;object-fit:contain;padding:10px}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;overflow:hidden;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d;box-shadow:0 20px 45px #0007}.card .icon{font-size:29px}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5;margin:0 0 25px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.card.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.card.disabled{opacity:.55}.card.disabled a{pointer-events:none;background:#39382f;color:#888}footer{text-align:center;color:#625f52;font-size:11px;padding:50px 15px;letter-spacing:1px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.hero h2{font-size:40px}.grid{grid-template-columns:1fr 1fr}}@media(max-width:600px){header{padding:0 18px}.brand small,.status{display:none}main{padding:42px 16px}.hero h2{font-size:34px}.grid{grid-template-columns:1fr}}
+</style></head><body><header><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Ambiente integrado para consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div class="icon">🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados e dos dados autorizados para divulgação.</p><a href="/catalogo">Abrir catálogo público</a></article><article class="card private"><div class="icon">🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo de pessoas, organizações, veículos, perícias e demais conexões registradas.</p><a href="/arvore">Acessar com senha</a></article><article class="card private"><div class="icon">👥</div><h3>Central de Fichas</h3><p>Área reservada para consulta e administração das fichas investigativas da DICOR.</p><a href="/fichas">Acessar com senha</a></article><article class="card private disabled"><div class="icon">📋</div><h3>Boletins</h3><p>Módulo preparado para integração futura com boletins e atendimentos.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">🧪</div><h3>Perícias</h3><p>Módulo preparado para histórico e cruzamento completo das perícias externas.</p><a href="#">Em desenvolvimento</a></article><article class="card private disabled"><div class="icon">📂</div><h3>Dossiês</h3><p>Módulo preparado para consulta centralizada dos dossiês operacionais.</p><a href="#">Em desenvolvimento</a></article></section></main><footer>DICOR • USO OPERACIONAL EM AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
 
 
 _CENTRAL_LOGIN_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acesso Restrito • DICOR</title><style>
-:root{--gold:#d7a93d;--gold2:#f2d47d}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top,#3a2d0c66,transparent 40%),#070806;color:#f5f0dc;font-family:Inter,Arial,sans-serif}.box{width:min(430px,calc(100% - 30px));background:#10120e;border:1px solid #4b3d1c;border-radius:22px;padding:34px;box-shadow:0 30px 90px #000a}.seal{width:62px;height:62px;border:2px solid var(--gold);border-radius:50%;display:grid;place-items:center;color:var(--gold2);font-size:25px;font-weight:900;margin-bottom:25px}.eyebrow{color:var(--gold);font-size:10px;letter-spacing:2px}.box h1{margin:8px 0;font-size:27px}.box p{color:#9e9987;line-height:1.5;margin-bottom:24px}label{font-size:12px;color:#c9bd95}input{width:100%;margin:8px 0 15px;background:#080906;border:1px solid #38301a;color:#fff7d6;border-radius:10px;padding:14px;font-size:16px;outline:none}input:focus{border-color:var(--gold)}button{width:100%;border:0;border-radius:10px;padding:14px;background:linear-gradient(135deg,var(--gold2),var(--gold));font-weight:900;cursor:pointer}.error{background:#361616;border:1px solid #793434;color:#ffc8c8;padding:10px;border-radius:9px;margin-bottom:14px;font-size:13px}.back{display:block;text-align:center;color:#a99455;text-decoration:none;margin-top:18px;font-size:12px}</style></head><body><form class="box" method="post" action="/acesso"><div class="seal">D</div><div class="eyebrow">CENTRAL DE INTELIGÊNCIA</div><h1>Acesso restrito</h1><p>Insira a senha operacional. Após a primeira validação, este navegador permanecerá autorizado por este dispositivo.</p>{erro}<input type="hidden" name="next" value="{next}"><label>Senha de acesso</label><input type="password" name="senha" autocomplete="current-password" required autofocus><button type="submit">AUTORIZAR DISPOSITIVO</button><a class="back" href="/">← Voltar à Central</a></form></body></html>'''
+:root{--gold:#d7a93d;--gold2:#f2d47d}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top,#3a2d0c66,transparent 40%),#070806;color:#f5f0dc;font-family:Inter,Arial,sans-serif}.box{width:min(430px,calc(100% - 30px));background:#10120e;border:1px solid #4b3d1c;border-radius:22px;padding:34px;box-shadow:0 30px 90px #000a}.seal{width:78px;height:78px;border:1px solid #8b712d;border-radius:18px;display:grid;place-items:center;background:#080906;margin-bottom:25px;overflow:hidden;box-shadow:0 0 34px #d7a93d22}.seal img{width:100%;height:100%;object-fit:contain;padding:6px}.eyebrow{color:var(--gold);font-size:10px;letter-spacing:2px}.box h1{margin:8px 0;font-size:27px}.box p{color:#9e9987;line-height:1.5;margin-bottom:24px}label{font-size:12px;color:#c9bd95}input{width:100%;margin:8px 0 15px;background:#080906;border:1px solid #38301a;color:#fff7d6;border-radius:10px;padding:14px;font-size:16px;outline:none}input:focus{border-color:var(--gold)}button{width:100%;border:0;border-radius:10px;padding:14px;background:linear-gradient(135deg,var(--gold2),var(--gold));font-weight:900;cursor:pointer}.error{background:#361616;border:1px solid #793434;color:#ffc8c8;padding:10px;border-radius:9px;margin-bottom:14px;font-size:13px}.back{display:block;text-align:center;color:#a99455;text-decoration:none;margin-top:18px;font-size:12px}</style></head><body><form class="box" method="post" action="/acesso"><div class="seal"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div class="eyebrow">CENTRAL DE INTELIGÊNCIA</div><h1>Acesso restrito</h1><p>Insira a senha operacional. Após a primeira validação, este navegador permanecerá autorizado por este dispositivo.</p>{erro}<input type="hidden" name="next" value="{next}"><label>Senha de acesso</label><input type="password" name="senha" autocomplete="current-password" required autofocus><button type="submit">AUTORIZAR DISPOSITIVO</button><a class="back" href="/">← Voltar à Central</a></form></body></html>'''
 
 
 async def central_portal_http(request: web.Request) -> web.Response:
     return web.Response(text=_CENTRAL_PORTAL_HTML, content_type="text/html", charset="utf-8")
 
 
+async def central_brasao_dicor_http(request: web.Request) -> web.Response:
+    """Entrega o brasão oficial embutido no bot para o cabeçalho e o login."""
+    try:
+        caminho = caminho_brasao_dicor()
+        if caminho and Path(caminho).exists():
+            dados = Path(caminho).read_bytes()
+        else:
+            dados = base64.b64decode(DOSSIE_BRASAO_DICOR_PADRAO_B64)
+        return web.Response(
+            body=dados,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except Exception as exc:
+        print(f"⚠️ Falha ao carregar brasão da Central DICOR: {type(exc).__name__}: {exc}", flush=True)
+        raise web.HTTPNotFound(text="Brasão indisponível")
+
+
+def _central_render_login(*, erro: str = "", destino: str = "/arvore") -> str:
+    """Renderiza o login sem usar str.format.
+
+    O HTML contém muitas chaves CSS ({...}); str.format tentava interpretá-las
+    como campos e provocava HTTP 500. A substituição explícita altera apenas
+    os dois marcadores reais do formulário.
+    """
+    destino_seguro = html.escape(str(destino or "/arvore"), quote=True)
+    return (
+        _CENTRAL_LOGIN_HTML
+        .replace("{erro}", str(erro or ""))
+        .replace("{next}", destino_seguro)
+    )
+
+
 async def central_login_get(request: web.Request) -> web.Response:
     destino = str(request.query.get("next") or "/arvore")
     if not destino.startswith("/") or destino.startswith("//"):
         destino = "/arvore"
-    html_login = _CENTRAL_LOGIN_HTML.format(erro="", next=html.escape(destino, quote=True))
-    return web.Response(text=html_login, content_type="text/html", charset="utf-8")
+    return web.Response(
+        text=_central_render_login(destino=destino),
+        content_type="text/html",
+        charset="utf-8",
+    )
 
 
 async def central_login_post(request: web.Request) -> web.Response:
@@ -47636,10 +47672,10 @@ async def central_login_post(request: web.Request) -> web.Response:
         destino = "/arvore"
     if not CENTRAL_DICOR_PASSWORD:
         erro = "A senha ainda não foi configurada no Railway. Defina CENTRAL_DICOR_PASSWORD."
-        return web.Response(text=_CENTRAL_LOGIN_HTML.format(erro=f'<div class="error">{erro}</div>', next=html.escape(destino, quote=True)), content_type="text/html", charset="utf-8", status=503)
+        return web.Response(text=_central_render_login(erro=f'<div class="error">{html.escape(erro)}</div>', destino=destino), content_type="text/html", charset="utf-8", status=503)
     if not hmac.compare_digest(senha.encode("utf-8"), CENTRAL_DICOR_PASSWORD.encode("utf-8")):
         erro = "Senha incorreta. A tentativa não autorizou este dispositivo."
-        return web.Response(text=_CENTRAL_LOGIN_HTML.format(erro=f'<div class="error">{erro}</div>', next=html.escape(destino, quote=True)), content_type="text/html", charset="utf-8", status=401)
+        return web.Response(text=_central_render_login(erro=f'<div class="error">{html.escape(erro)}</div>', destino=destino), content_type="text/html", charset="utf-8", status=401)
     resposta = web.HTTPFound(destino)
     resposta.set_cookie(CENTRAL_DICOR_COOKIE_NAME, _central_criar_token(request), max_age=CENTRAL_DICOR_COOKIE_DIAS * 86400, httponly=True, secure=True, samesite="Lax", path="/")
     _central_salvar_acesso(request)
@@ -47655,7 +47691,7 @@ async def central_logout_http(request: web.Request) -> web.Response:
 @web.middleware
 async def central_auth_middleware(request: web.Request, handler):
     caminho = request.path
-    publicos = (caminho == "/" or caminho == "/index.html" or caminho.startswith("/catalogo") or caminho.startswith("/uploads/") or caminho in {"/acesso", "/sair", "/health", "/healthz"})
+    publicos = (caminho == "/" or caminho == "/index.html" or caminho.startswith("/catalogo") or caminho.startswith("/uploads/") or caminho.startswith("/central/") or caminho in {"/acesso", "/sair", "/health", "/healthz"})
     if publicos or _central_token_valido(request):
         return await handler(request)
     if caminho.startswith("/api/"):
@@ -47689,6 +47725,7 @@ async def start_web_server():
     app = web.Application(client_max_size=100 * 1024 * 1024, middlewares=[central_auth_middleware])
     app.router.add_get("/", central_portal_http)
     app.router.add_get("/index.html", central_portal_http)
+    app.router.add_get("/central/brasao-dicor.png", central_brasao_dicor_http)
     app.router.add_get("/acesso", central_login_get)
     app.router.add_post("/acesso", central_login_post)
     app.router.add_get("/sair", central_logout_http)
@@ -47730,6 +47767,7 @@ async def start_web_server():
 
 
 print("✅ Portal Central DICOR carregado: catálogo público e acesso interno persistente por dispositivo.", flush=True)
+print("✅ Login da Central corrigido e brasão DICOR aplicado no lugar da letra D.", flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
