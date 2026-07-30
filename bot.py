@@ -47769,5 +47769,367 @@ async def start_web_server():
 print("✅ Portal Central DICOR carregado: catálogo público e acesso interno persistente por dispositivo.", flush=True)
 print("✅ Login da Central corrigido e brasão DICOR aplicado no lugar da letra D.", flush=True)
 
+# =====================================================
+# PATCH CENTRAL DICOR V2 — ÁRVORE POR RG/NOME + BRASÃO CENTRALIZADO
+# + CATÁLOGO OURO + CLASSIFICAÇÃO AUTOMÁTICA DAS FOTOS
+# =====================================================
+
+# Corrige a compatibilidade interna da árvore V6. A implementação antiga chama
+# o motor base com ``usar_cache=``; o motor real recebe ``ignorar_cache=``.
+def _arvore_base_compativel_dicor(individuo_id: int, usar_cache: bool = True) -> Dict[str, Any]:
+    return _arvore_calcular(int(individuo_id or 0), ignorar_cache=not bool(usar_cache))
+
+_ARVORE_CONSTRUIR_ANTES_PERICIA_V6 = _arvore_base_compativel_dicor
+
+
+def _dicor_normalizar_identificador(valor: Any) -> str:
+    texto = unicodedata.normalize("NFKD", str(valor or ""))
+    texto = "".join(c for c in texto if not unicodedata.combining(c)).lower().strip()
+    return re.sub(r"[^a-z0-9]", "", texto)
+
+
+def _dicor_resolver_individuo(chave: Any) -> Optional[Dict[str, Any]]:
+    """Resolve uma pessoa por RG, ID interno ou nome.
+
+    RG tem prioridade, pois é o identificador que os agentes normalmente
+    digitam na Central. Assim, ``/arvore?id=27365`` funciona mesmo quando
+    27365 não é o ID interno do SQLite.
+    """
+    termo = str(chave or "").strip()
+    normalizado = _dicor_normalizar_identificador(termo)
+    if not normalizado:
+        return None
+    inicializar_banco_dicor()
+    try:
+        with _banco_conexao() as db:
+            linhas = [dict(x) for x in db.execute(
+                "SELECT * FROM individuos WHERE UPPER(COALESCE(status,''))<>'ARQUIVADO' ORDER BY nome COLLATE NOCASE"
+            ).fetchall()]
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    # 1) RG/documento exato.
+    for pessoa in linhas:
+        if _dicor_normalizar_identificador(pessoa.get("rg")) == normalizado:
+            return pessoa
+
+    # 2) ID interno exato.
+    if termo.isdigit():
+        numero = int(termo)
+        for pessoa in linhas:
+            if int(pessoa.get("id") or 0) == numero:
+                return pessoa
+
+    # 3) Nome exato e depois começo/trecho do nome.
+    for pessoa in linhas:
+        if _dicor_normalizar_identificador(pessoa.get("nome")) == normalizado:
+            return pessoa
+    candidatos = [
+        pessoa for pessoa in linhas
+        if normalizado in _dicor_normalizar_identificador(pessoa.get("nome"))
+        or normalizado in _dicor_normalizar_identificador(pessoa.get("rg"))
+    ]
+    return candidatos[0] if candidatos else None
+
+
+def _arvore_dados_api(chave: Any) -> Dict[str, Any]:
+    pessoa = _dicor_resolver_individuo(chave)
+    if not pessoa:
+        return {
+            "ok": False,
+            "erro": "Nenhuma ficha encontrada com esse RG, nome ou ID.",
+            "nodes": [],
+            "edges": [],
+            "total": 0,
+        }
+
+    individuo_id = int(pessoa.get("id") or 0)
+    try:
+        resultado = _arvore_construir(individuo_id, usar_cache=False) or {}
+    except Exception:
+        traceback.print_exc()
+        resultado = _arvore_calcular(individuo_id, ignorar_cache=True) or {}
+
+    alvo = dict(resultado.get("alvo") or pessoa)
+    conexoes = list(resultado.get("conexoes") or [])  # sem corte artificial
+    alvo_id = int(alvo.get("id") or individuo_id)
+    nodes = [{
+        "id": alvo_id,
+        "nome": str(alvo.get("nome") or "INDIVÍDUO"),
+        "rg": str(alvo.get("rg") or ""),
+        "organizacao": str(alvo.get("faccao_atual") or ""),
+        "score": 999,
+        "forca": "ALVO PRINCIPAL",
+        "central": True,
+        "motivos": ["Ficha principal"],
+        "evidencias": [],
+        "cor": "#f6c453",
+    }]
+    edges = []
+    for conexao in conexoes:
+        oid = int(conexao.get("id") or 0)
+        if not oid:
+            continue
+        score = int(conexao.get("score") or 0)
+        cor = "#f6c453" if score >= 15 else "#d7a93d" if score >= 9 else "#a9832f" if score >= 5 else "#716033"
+        motivos = list(conexao.get("motivos") or [])
+        nodes.append({
+            "id": oid,
+            "nome": str(conexao.get("nome") or "Sem nome"),
+            "rg": str(conexao.get("rg") or ""),
+            "organizacao": str(conexao.get("faccao") or ""),
+            "score": score,
+            "forca": _arvore_forca(score),
+            "central": False,
+            "motivos": motivos,
+            "evidencias": list(conexao.get("evidencias") or []),
+            "roupa_confirmada": bool(conexao.get("roupa_confirmada")),
+            "cor": cor,
+        })
+        edges.append({
+            "from": alvo_id,
+            "to": oid,
+            "score": score,
+            "label": str((motivos or ["Vínculo"])[0]),
+        })
+    return {
+        "ok": True,
+        "consulta": str(chave or ""),
+        "alvo_id": alvo_id,
+        "nodes": nodes,
+        "edges": edges,
+        "total": len(conexoes),
+    }
+
+
+async def arvore_api_http(request: web.Request) -> web.Response:
+    chave = str(request.match_info.get("individuo_id") or request.query.get("id") or "").strip()
+    if not chave:
+        return web.json_response({"ok": False, "erro": "Informe um RG, nome ou ID."}, status=400)
+    try:
+        dados = await asyncio.to_thread(_arvore_dados_api, chave)
+        status = 200 if dados.get("ok") else 404
+        return web.json_response(dados, status=status, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+    except Exception as exc:
+        traceback.print_exc()
+        return web.json_response({"ok": False, "erro": f"{type(exc).__name__}: {exc}"}, status=500)
+
+
+_ARVORE_HTML_DICOR = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central de Vínculos • DICOR</title><style>
+:root{--g:#d7a93d;--g2:#f6d36e;--bg:#060705;--panel:#0d0f0b;--line:#3b321a;--text:#f7f1db;--muted:#9f9985}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -10%,#3a2d0c55,transparent 38%),var(--bg);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;overflow:hidden}header{height:104px;border-bottom:1px solid var(--line);background:#080906f2;position:relative;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 20px}.header-center{display:flex;align-items:center;gap:13px;justify-self:center;text-align:left}.crest{width:67px;height:67px;border:1px solid #8b712d;border-radius:16px;display:grid;place-items:center;background:#050604;overflow:hidden;box-shadow:0 0 34px #d7a93d2c}.crest img{width:100%;height:100%;object-fit:contain;padding:5px}.header-center h1{font-size:18px;letter-spacing:2.4px;margin:0}.header-center small{color:var(--g);letter-spacing:1.4px}.actions{justify-self:end;display:flex;gap:8px}button,input,select{background:#12140e;border:1px solid #55461f;color:var(--text);border-radius:10px;padding:10px 12px}button{cursor:pointer;font-weight:700}button:hover{border-color:var(--g);color:var(--g2)}main{height:calc(100vh - 104px);display:grid;grid-template-columns:315px minmax(0,1fr) 355px}.side{background:#0c0e0aeF;border-right:1px solid var(--line);padding:18px;overflow:auto}.right{border-left:1px solid var(--line);border-right:0}.lookup{display:grid;grid-template-columns:1fr auto;gap:7px}.lookup input{width:100%}.label{font-size:10px;letter-spacing:1.8px;color:var(--g);font-weight:900;margin:18px 0 8px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.card{background:#151711;border:1px solid #393018;border-radius:12px;padding:13px}.card b{display:block;font-size:22px;color:var(--g2)}#stage{position:relative;overflow:hidden;background-image:linear-gradient(#d7a93d08 1px,transparent 1px),linear-gradient(90deg,#d7a93d08 1px,transparent 1px);background-size:32px 32px}svg{width:100%;height:100%;cursor:grab}.edge{stroke:#a38636;stroke-opacity:.65}.edge-label{fill:#ccb96f;font-size:11px;paint-order:stroke;stroke:#080908;stroke-width:4px}.node{cursor:pointer}.node circle{filter:drop-shadow(0 0 14px #d7a93d3a)}.node:hover circle{stroke:#fff1ae;stroke-width:4}.node text{pointer-events:none}.person{display:flex;gap:10px;align-items:center;padding:10px;border:1px solid #332b17;border-radius:10px;margin:7px 0;cursor:pointer}.person:hover{border-color:var(--g)}.dot{width:11px;height:11px;border-radius:50%;flex:none}.person strong{display:block}.person small,.empty{color:var(--muted)}.badge{display:inline-block;border:1px solid #665323;color:#e4c66f;border-radius:99px;padding:4px 8px;font-size:11px;margin:3px}.detail h2{color:var(--g2)}.detail p{color:#c4bea8;line-height:1.48}.welcome{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:30px;pointer-events:none}.welcome div{max-width:510px}.welcome img{width:125px;height:125px;object-fit:contain;filter:drop-shadow(0 0 24px #d7a93d44)}.welcome h2{color:var(--g2);font-size:30px;margin:12px}.welcome p{color:var(--muted);line-height:1.6}.hint{position:absolute;left:15px;bottom:14px;background:#090a08dd;border:1px solid #40351a;border-radius:9px;padding:9px 12px;color:var(--muted);font-size:12px}@media(max-width:1050px){main{grid-template-columns:280px 1fr}.right{display:none}}@media(max-width:760px){header{grid-template-columns:1fr auto}.header-center{justify-self:start}.actions{justify-self:end}.header-center small{display:none}main{grid-template-columns:1fr}.side{display:none}}
+</style></head><body><header><div></div><div class="header-center"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>DICOR • CENTRAL DE VÍNCULOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="actions"><button onclick="fitGraph()">Centralizar</button><button onclick="location.href='/'">Central</button><button onclick="location.href='/catalogo'">Catálogo</button></div></header><main><aside class="side"><div class="label">LOCALIZAR FICHA PRINCIPAL</div><div class="lookup"><input id="lookup" placeholder="RG, nome ou ID interno"><button id="open">ABRIR</button></div><div class="stats"><div class="card"><b id="total">0</b>Conexões</div><div class="card"><b id="visible">0</b>Visíveis</div></div><div class="label">FILTRAR ESTA ÁRVORE</div><input id="filter" style="width:100%" placeholder="Nome, RG ou organização"><div class="label">FORÇA MÍNIMA</div><select id="strength" style="width:100%"><option value="0">Todas</option><option value="5">Moderada+</option><option value="9">Forte+</option><option value="15">Muito forte</option></select><div class="label">PESSOAS RELACIONADAS</div><div id="list"><div class="empty">Pesquise uma ficha para começar.</div></div></aside><section id="stage"><svg id="graph"><g id="viewport"></g></svg><div id="welcome" class="welcome"><div><img src="/central/brasao-dicor.png"><h2>Mapa de vínculos DICOR</h2><p>Digite o RG, nome ou ID interno no campo lateral. A árvore completa será montada com todas as conexões registradas, sem limite artificial.</p></div></div><div class="hint">Arraste para mover • Scroll para zoom • Clique para detalhes • Duplo clique para abrir outra árvore</div></section><aside class="side right"><div class="label">ANÁLISE DO VÍNCULO</div><div id="detail" class="detail"><div class="empty">Selecione uma pessoa.</div></div></aside></main><script>
+const q=new URLSearchParams(location.search),initial=(q.get('id')||q.get('rg')||q.get('q')||'').trim();let D={nodes:[],edges:[]},scale=1,tx=0,ty=0,drag=false,last=[0,0];const svg=document.getElementById('graph'),vp=document.getElementById('viewport'),lookup=document.getElementById('lookup'),filter=document.getElementById('filter'),strength=document.getElementById('strength'),welcome=document.getElementById('welcome');lookup.value=initial;function E(s){return String(s??'').replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}function openTree(){const v=lookup.value.trim();if(!v)return;location.href='/arvore?id='+encodeURIComponent(v)}document.getElementById('open').onclick=openTree;lookup.addEventListener('keydown',e=>{if(e.key==='Enter')openTree()});function layout(ns){const c=ns.find(n=>n.central),o=ns.filter(n=>!n.central),p={};if(!c)return p;p[c.id]={x:0,y:0};let used=0,ring=1;while(used<o.length){const capacity=Math.max(12,Math.floor(2*Math.PI*(230+(ring-1)*155)/115)),count=Math.min(capacity,o.length-used);for(let s=0;s<count;s++){const n=o[used+s],a=-Math.PI/2+2*Math.PI*s/count,r=230+(ring-1)*155;p[n.id]={x:Math.cos(a)*r,y:Math.sin(a)*r}}used+=count;ring++}return p}function render(){const term=filter.value.toLowerCase(),min=Number(strength.value),ns=D.nodes.filter(n=>n.central||(n.score>=min&&(`${n.nome} ${n.rg} ${n.organizacao}`.toLowerCase().includes(term)))),ids=new Set(ns.map(n=>n.id)),es=D.edges.filter(e=>ids.has(e.from)&&ids.has(e.to)),p=layout(ns);vp.innerHTML='';es.forEach(e=>{const a=p[e.from],b=p[e.to];if(!a||!b)return;const l=document.createElementNS('http://www.w3.org/2000/svg','line');Object.entries({x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:'edge','stroke-width':Math.max(1.4,Math.min(8,e.score/3))}).forEach(([k,v])=>l.setAttribute(k,v));vp.appendChild(l);const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',(a.x+b.x)/2);t.setAttribute('y',(a.y+b.y)/2-6);t.setAttribute('text-anchor','middle');t.setAttribute('class','edge-label');t.textContent=e.label;vp.appendChild(t)});ns.forEach(n=>{const pos=p[n.id];if(!pos)return;const g=document.createElementNS('http://www.w3.org/2000/svg','g');g.setAttribute('class','node');g.setAttribute('transform',`translate(${pos.x},${pos.y})`);const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('r',n.central?74:55);c.setAttribute('fill',n.central?'#2a2410':'#14160f');c.setAttribute('stroke',n.cor);c.setAttribute('stroke-width',n.central?5:3);g.appendChild(c);[[-6,n.nome.length>19?n.nome.slice(0,18)+'…':n.nome,14,700],[16,'RG '+(n.rg||'—'),11,400]].forEach(x=>{const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('text-anchor','middle');t.setAttribute('y',x[0]);t.setAttribute('fill','#fff7d6');t.setAttribute('font-size',x[2]);t.setAttribute('font-weight',x[3]);t.textContent=x[1];g.appendChild(t)});g.onclick=()=>detail(n);g.ondblclick=()=>{if(!n.central)location.href='/arvore?id='+encodeURIComponent(n.rg||n.id)};vp.appendChild(g)});visible.textContent=Math.max(0,ns.length-1);list.innerHTML=ns.filter(n=>!n.central).map(n=>`<div class="person" onclick="byId(${n.id})"><span class="dot" style="background:${n.cor}"></span><div><strong>${E(n.nome)}</strong><small>RG ${E(n.rg||'—')} • ${E(n.forca)}</small></div></div>`).join('')||'<div class="empty">Nenhuma conexão registrada para os filtros atuais.</div>';transform()}function byId(id){detail(D.nodes.find(n=>n.id===id))}function detail(n){if(!n)return;document.getElementById('detail').innerHTML=`<h2>${E(n.nome)}</h2><p><b>RG:</b> ${E(n.rg||'Não informado')}<br><b>Organização:</b> ${E(n.organizacao||'Não informada')}<br><b>Força:</b> ${E(n.forca)}${n.central?'':`<br><b>Pontuação:</b> ${n.score}`}</p><div>${(n.motivos||[]).map(x=>`<span class="badge">${E(x)}</span>`).join('')}</div><div class="label">EVIDÊNCIAS</div><p>${(n.evidencias||[]).map(E).join('<br>')||'Nenhuma evidência resumida.'}</p>${n.central?'':`<button onclick="location.href='/arvore?id=${encodeURIComponent(n.rg||n.id)}'">Abrir árvore desta pessoa</button>`}`}function transform(){vp.setAttribute('transform',`translate(${svg.clientWidth/2+tx},${svg.clientHeight/2+ty}) scale(${scale})`)}function fitGraph(){scale=1;tx=0;ty=0;transform()}svg.addEventListener('wheel',e=>{e.preventDefault();scale=Math.max(.18,Math.min(3.2,scale*(e.deltaY<0?1.1:.9)));transform()},{passive:false});svg.onmousedown=e=>{drag=true;last=[e.clientX,e.clientY]};window.onmouseup=()=>drag=false;window.onmousemove=e=>{if(!drag)return;tx+=e.clientX-last[0];ty+=e.clientY-last[1];last=[e.clientX,e.clientY];transform()};filter.oninput=render;strength.oninput=render;function load(v){if(!v)return;welcome.style.display='none';fetch('/api/arvore/'+encodeURIComponent(v)).then(async r=>{const d=await r.json();if(!r.ok||!d.ok)throw Error(d.erro||'Erro ao montar a árvore');return d}).then(d=>{D=d;total.textContent=d.total;render();detail(d.nodes.find(n=>n.central));setTimeout(fitGraph,50)}).catch(e=>{D={nodes:[],edges:[]};vp.innerHTML='';total.textContent='0';visible.textContent='0';list.innerHTML='<div class="empty">Nenhuma ficha carregada.</div>';welcome.style.display='grid';document.getElementById('detail').innerHTML=`<h2>Ficha não localizada</h2><p>${E(e.message)}</p>`})}if(initial)load(initial);window.onresize=transform;
+</script></body></html>'''
+
+
+async def arvore_pagina_http(request: web.Request) -> web.Response:
+    return web.Response(text=_ARVORE_HTML_DICOR, content_type="text/html", charset="utf-8")
+
+
+# ---------- Classificação inteligente das fotos do catálogo ----------
+def _catalogo_caminho_local_foto(valor: Any) -> Optional[Path]:
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    try:
+        if texto.startswith("http://") or texto.startswith("https://"):
+            caminho_url = urlparse(texto).path
+            texto = caminho_url or texto
+        texto = texto.split("?", 1)[0].replace("\\", "/")
+        candidatos: List[Path] = []
+        p = Path(texto)
+        if p.is_absolute() and p.exists():
+            candidatos.append(p)
+        nome = p.name
+        if texto.startswith("/uploads/") or texto.startswith("uploads/"):
+            candidatos.extend([UPLOADS_DIR / nome, PUBLIC_DIR / "uploads" / nome])
+        else:
+            candidatos.extend([BASE_DIR / texto.lstrip("/"), PUBLIC_DIR / texto.lstrip("/"), UPLOADS_DIR / nome])
+        for candidato in candidatos:
+            if candidato.exists() and candidato.is_file() and candidato.stat().st_size > 0:
+                return candidato
+    except Exception:
+        return None
+    return None
+
+
+def _catalogo_url_foto(valor: Any) -> str:
+    texto = str(valor or "").strip()
+    if not texto:
+        return ""
+    if texto.startswith("http://") or texto.startswith("https://"):
+        return texto
+    texto = texto.replace("\\", "/")
+    if texto.startswith("/uploads/"):
+        return texto
+    if texto.startswith("uploads/"):
+        return "/" + texto
+    return "/uploads/" + Path(texto).name
+
+
+def _catalogo_pontuar_documento(caminho: Optional[Path], nome: str, rg: str) -> Dict[str, Any]:
+    if caminho is None or not caminho.exists():
+        return {"score": -99.0, "ocr": "", "motivos": ["arquivo ausente"]}
+    score = 0.0
+    motivos: List[str] = []
+    texto_ocr = ""
+    linhas_ocr: List[Tuple[str, float]] = []
+    try:
+        texto_ocr, linhas_ocr = _prisao_ocr_texto(caminho)
+    except Exception:
+        texto_ocr, linhas_ocr = "", []
+    norm = normalizar_busca(texto_ocr) if "normalizar_busca" in globals() else texto_ocr.lower()
+    alnum = re.sub(r"[^0-9A-Za-z]", "", texto_ocr).upper()
+    rg_n = _banco_normalizar_rg(rg) if "_banco_normalizar_rg" in globals() else re.sub(r"\W", "", str(rg or ""))
+    if rg_n and rg_n.upper() in alnum:
+        score += 26
+        motivos.append("RG reconhecido")
+    tokens_nome = {x for x in re.findall(r"[a-z0-9]+", normalizar_busca(nome) if "normalizar_busca" in globals() else nome.lower()) if len(x) >= 3}
+    encontrados = sum(1 for token in tokens_nome if token in norm)
+    if encontrados:
+        score += min(12, encontrados * 3)
+        motivos.append("nome reconhecido")
+    palavras = (
+        "registro geral", "identidade", "documento", "passaporte", "nome completo",
+        "data de nascimento", "nascimento", "estado civil", "nacionalidade",
+        "sexo", "genero", "telefone", "emprego", "desempregado", "banco",
+        "habilitacao", "fator sanguineo", "rg"
+    )
+    ocorrencias = sum(1 for palavra in palavras if palavra in norm)
+    if ocorrencias:
+        score += min(16, ocorrencias * 2)
+        motivos.append(f"{ocorrencias} campos de identidade")
+    qtd_linhas = len([x for x in linhas_ocr if x and str(x[0]).strip()])
+    if qtd_linhas >= 4:
+        score += min(8, qtd_linhas * 0.6)
+        motivos.append("estrutura textual")
+    try:
+        if PILImage is not None:
+            with PILImage.open(caminho) as imagem:
+                w, h = imagem.size
+                razao = w / max(1, h)
+                if 1.15 <= razao <= 2.15:
+                    score += 2
+                elif razao < 0.68:
+                    score -= 1.5
+    except Exception:
+        pass
+    return {"score": round(score, 2), "ocr": texto_ocr[:1200], "motivos": motivos}
+
+
+def _catalogo_classificar_e_corrigir_fotos(procurados: List[Dict[str, Any]]) -> bool:
+    """Corrige pares invertidos sem apagar arquivos.
+
+    A troca só é persistida quando o documento possui vantagem clara na análise
+    OCR/visual. Em caso de dúvida, a ordem original é preservada.
+    """
+    alterou = False
+    ocr_status = "1" if bool(globals().get("BANCO_OCR_ATIVO") and globals().get("RapidOCR")) else "0"
+    for registro in procurados:
+        foto_corpo = str(registro.get("foto_individuo") or "")
+        foto_rg = str(registro.get("foto_rg") or "")
+        if not foto_corpo or not foto_rg or foto_corpo == foto_rg:
+            continue
+        assinatura_base = f"{foto_corpo}|{foto_rg}|{registro.get('nome')}|{registro.get('rg')}|ocr={ocr_status}"
+        assinatura = hashlib.sha256(assinatura_base.encode("utf-8", errors="ignore")).hexdigest()[:20]
+        if str(registro.get("foto_analise_assinatura") or "") == assinatura:
+            continue
+        analise_corpo = _catalogo_pontuar_documento(_catalogo_caminho_local_foto(foto_corpo), str(registro.get("nome") or ""), str(registro.get("rg") or ""))
+        analise_rg = _catalogo_pontuar_documento(_catalogo_caminho_local_foto(foto_rg), str(registro.get("nome") or ""), str(registro.get("rg") or ""))
+        sc = float(analise_corpo.get("score") or 0)
+        sr = float(analise_rg.get("score") or 0)
+        decisao = "mantido"
+        # Foto atualmente marcada como corpo parece claramente um documento.
+        if sc >= 9 and sc >= sr + 6:
+            registro["foto_individuo"], registro["foto_rg"] = foto_rg, foto_corpo
+            decisao = "trocado_por_analise"
+            alterou = True
+            # A assinatura deve refletir a nova ordem para não repetir OCR no próximo acesso.
+            nova_base = f"{registro['foto_individuo']}|{registro['foto_rg']}|{registro.get('nome')}|{registro.get('rg')}|ocr={ocr_status}"
+            assinatura = hashlib.sha256(nova_base.encode("utf-8", errors="ignore")).hexdigest()[:20]
+        registro["foto_analise_assinatura"] = assinatura
+        registro["foto_analise_resultado"] = {
+            "decisao": decisao,
+            "score_foto_corpo_original": sc,
+            "score_foto_rg_original": sr,
+            "analisado_em": agora_br(),
+        }
+        alterou = True
+    return alterou
+
+
+def gerar_catalogo_html() -> None:
+    procurados = carregar_procurados()
+    if not isinstance(procurados, list):
+        procurados = []
+
+    # Backup de segurança antes da primeira correção automática do lote.
+    antes = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    alterou_fotos = _catalogo_classificar_e_corrigir_fotos(procurados)
+    for registro in procurados:
+        registro["crimes"] = valor_crimes_registro(registro)
+    depois = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    if antes != depois:
+        try:
+            pasta_backup = DATA_DIR / "backups_catalogo_fotos"
+            pasta_backup.mkdir(parents=True, exist_ok=True)
+            nome_backup = pasta_backup / f"procurados-antes-analise-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            if alterou_fotos:
+                nome_backup.write_text(antes, encoding="utf-8")
+        except Exception as exc:
+            print(f"⚠️ Backup da classificação de fotos não pôde ser criado: {exc}", flush=True)
+        salvar_procurados(procurados)
+
+    visiveis = [p for p in procurados if str(p.get("status", "A PROCURAR") or "A PROCURAR").upper() != "APAGADO"]
+    ativos = [p for p in visiveis if str(p.get("status", "A PROCURAR") or "A PROCURAR").upper() != "RETIRADO"]
+    retirados = [p for p in visiveis if str(p.get("status", "") or "").upper() == "RETIRADO"]
+
+    def foto_html(src: Any, alt: str) -> str:
+        url = _catalogo_url_foto(src)
+        if not url:
+            return '<div class="photo-empty">IMAGEM NÃO DISPONÍVEL</div>'
+        return f'<img loading="lazy" src="{escape(url)}" alt="{escape(alt)}" onclick="openPhoto(this.src,this.alt)" onerror="this.outerHTML=\'<div class=&quot;photo-empty&quot;>IMAGEM INDISPONÍVEL</div>\'">'
+
+    def card(registro: Dict[str, Any]) -> str:
+        status = str(registro.get("status") or "A PROCURAR").upper()
+        classe = "retired" if status == "RETIRADO" else "wanted"
+        crimes = valor_crimes_registro(registro)
+        caso = str(registro.get("caso") or registro.get("id") or "SEM NÚMERO")
+        boletim = str(registro.get("numero_boletim") or registro.get("boletim") or "Não informado")
+        return f'''<article class="wanted-card {classe}" data-search="{escape(str(registro.get('nome') or '')+' '+str(registro.get('rg') or '')+' '+crimes+' '+caso).lower()}">
+        <div class="case-top"><div><span>CASO</span><strong>{escape(caso)}</strong></div><div><span>DATA</span><strong>{escape(registro.get('data') or 'Não informada')}</strong></div><em>{escape(status)}</em></div>
+        <div class="wanted-body"><div class="media-grid"><figure class="person-photo"><figcaption>FOTO DO INDIVÍDUO</figcaption>{foto_html(registro.get('foto_individuo'),'Foto do indivíduo')}</figure><figure class="document-photo"><figcaption>DOCUMENTO / RG</figcaption>{foto_html(registro.get('foto_rg'),'Foto do RG')}</figure></div>
+        <div class="wanted-info"><div class="identity"><small>IDENTIFICAÇÃO</small><h2>{escape(registro.get('nome') or 'Nome não informado')}</h2><div class="rg">RG • {escape(registro.get('rg') or 'NÃO INFORMADO')}</div></div><div class="info-box danger"><span>CRIMES REGISTRADOS</span><p>{escape(crimes)}</p></div><div class="info-box"><span>ÚLTIMO AVISTAMENTO</span><p>{escape(registro.get('ultimo_avistamento') or 'Não informado')}</p></div><div class="details"><div><span>BOLETIM</span><b>{escape(boletim)}</b></div><div><span>SITUAÇÃO</span><b>{escape(status)}</b></div></div></div></div></article>'''
+
+    cards_ativos = "".join(card(x) for x in ativos) or '<div class="empty-state"><img src="/central/brasao-dicor.png"><h2>Nenhum procurado ativo</h2><p>Os novos registros aparecerão automaticamente.</p></div>'
+    cards_retirados = "".join(card(x) for x in retirados) or '<div class="empty-state"><img src="/central/brasao-dicor.png"><h2>Nenhum registro retirado</h2></div>'
+    template = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Catálogo de Procurados • DICOR</title><style>
+:root{--gold:#d7a93d;--gold2:#f2d47d;--bg:#060705;--panel:#10120d;--line:#3b321a;--text:#f7f1db;--muted:#99937f;--red:#a6342f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -10%,#3a2d0c55,transparent 36%),var(--bg);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;min-height:100vh}.top{height:118px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw;background:#080906ed;position:sticky;top:0;z-index:10;backdrop-filter:blur(13px)}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:76px;height:76px;object-fit:contain;border:1px solid #8b712d;border-radius:18px;background:#050604;padding:5px;box-shadow:0 0 35px #d7a93d2b}.brand h1{margin:0;font-size:20px;letter-spacing:2.3px}.brand small{color:var(--gold);letter-spacing:1.5px}.top-actions{justify-self:end;display:flex;gap:9px}.top-actions a{color:var(--text);text-decoration:none;border:1px solid #54451f;border-radius:9px;padding:10px 13px}.top-actions a:hover{border-color:var(--gold);color:var(--gold2)}main{max-width:1440px;margin:0 auto;padding:38px 22px 70px}.intro{text-align:center;margin:15px auto 31px}.intro span{color:var(--gold);font-size:10px;letter-spacing:2.4px}.intro h2{font-size:42px;margin:10px 0 7px}.intro p{color:var(--muted)}.toolbar{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin-bottom:28px}.toolbar input{width:min(520px,100%);background:#10120d;border:1px solid #4b3d1c;color:#fff;border-radius:10px;padding:13px 15px;font-size:15px}.tabs{display:flex;gap:8px}.tabs button{background:#11130e;border:1px solid #4b3d1c;color:var(--text);border-radius:10px;padding:12px 16px;cursor:pointer;font-weight:800}.tabs button.active{background:linear-gradient(135deg,var(--gold2),var(--gold));color:#161207}.tab{display:none}.tab.active{display:grid;gap:20px}.wanted-card{border:1px solid #393018;border-radius:20px;background:linear-gradient(150deg,#15170f,#0b0c09);overflow:hidden;box-shadow:0 18px 55px #0005}.case-top{min-height:66px;display:grid;grid-template-columns:1fr 1fr auto;align-items:center;gap:20px;padding:13px 20px;border-bottom:1px solid #393018;background:#0c0e0a}.case-top span,.details span,.info-box span,.identity small{display:block;color:var(--gold);font-size:9px;letter-spacing:1.6px;margin-bottom:4px}.case-top strong{font-size:13px}.case-top em{font-style:normal;color:#ffccc8;border:1px solid #79342f;background:#341411;border-radius:99px;padding:7px 11px;font-size:10px;letter-spacing:1.2px}.retired .case-top em{color:#d0cab7;border-color:#575346;background:#24231e}.wanted-body{display:grid;grid-template-columns:minmax(410px,.95fr) 1.05fr;gap:0}.media-grid{display:grid;grid-template-columns:1.5fr .8fr;min-height:410px;background:#050604;border-right:1px solid #393018}.media-grid figure{margin:0;position:relative;min-width:0;overflow:hidden;border-right:1px solid #2e2818}.media-grid figure:last-child{border-right:0}.media-grid figcaption{position:absolute;z-index:2;left:12px;top:12px;background:#070806e8;border:1px solid #54451f;color:var(--gold2);padding:6px 8px;border-radius:7px;font-size:9px;letter-spacing:1.3px}.media-grid img{width:100%;height:100%;object-fit:cover;cursor:zoom-in;transition:.25s}.document-photo img{object-fit:contain;background:#090a07}.media-grid img:hover{transform:scale(1.025)}.photo-empty{height:100%;display:grid;place-items:center;color:#5d594d;font-size:11px;letter-spacing:1.4px}.wanted-info{padding:29px;display:flex;flex-direction:column;gap:15px}.identity h2{font-size:30px;margin:5px 0 9px}.rg{display:inline-flex;border:1px solid #6b5522;background:#201b0d;color:var(--gold2);border-radius:8px;padding:8px 11px;font-weight:900}.info-box{border:1px solid #332b17;border-radius:12px;background:#11130e;padding:15px}.info-box p{margin:7px 0 0;color:#c5bea8;line-height:1.55}.info-box.danger{border-color:#5d2925;background:#1c0e0c}.info-box.danger span{color:#ee8077}.details{display:grid;grid-template-columns:1fr 1fr;gap:10px}.details div{border:1px solid #332b17;border-radius:10px;padding:13px}.empty-state{text-align:center;border:1px dashed #4a3d1c;border-radius:20px;padding:65px;color:var(--muted)}.empty-state img{width:100px}.lightbox{display:none;position:fixed;inset:0;background:#000e;z-index:99;align-items:center;justify-content:center;padding:25px}.lightbox.open{display:flex}.lightbox img{max-width:94vw;max-height:90vh;object-fit:contain;border:1px solid #8b712d;border-radius:12px}.lightbox button{position:absolute;right:25px;top:20px;background:#111;color:#fff;border:1px solid #765f2a;border-radius:9px;padding:10px 13px;cursor:pointer}@media(max-width:900px){.top{grid-template-columns:auto 1fr;height:auto;padding:13px}.brand{grid-column:1;justify-self:start}.brand img{width:58px;height:58px}.top-actions{grid-column:2}.brand small{display:none}.wanted-body{grid-template-columns:1fr}.media-grid{border-right:0;border-bottom:1px solid #393018}.intro h2{font-size:34px}}@media(max-width:600px){.top-actions a:first-child{display:none}.brand h1{font-size:15px}.media-grid{grid-template-columns:1fr;min-height:650px}.media-grid figure{min-height:320px;border-right:0;border-bottom:1px solid #2e2818}.case-top{grid-template-columns:1fr auto}.case-top>div:nth-child(2){display:none}.details{grid-template-columns:1fr}}
+</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"><div><h1>DICOR • CATÁLOGO DE PROCURADOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><nav class="top-actions"><a href="/">Central DICOR</a><a href="/acesso?next=/arvore">Área restrita</a></nav></header><main><section class="intro"><span>CONSULTA PÚBLICA OFICIAL</span><h2>Indivíduos procurados</h2><p>Registros divulgados pela DICOR para consulta operacional.</p></section><div class="toolbar"><input id="search" placeholder="Pesquisar por nome, RG, crime ou número do caso"><div class="tabs"><button id="btn-active" class="active" onclick="tab('active')">PROCURADOS (__COUNT_ACTIVE__)</button><button id="btn-retired" onclick="tab('retired')">RETIRADOS (__COUNT_RETIRED__)</button></div></div><section id="active" class="tab active">__CARDS_ACTIVE__</section><section id="retired" class="tab">__CARDS_RETIRED__</section></main><div id="lightbox" class="lightbox" onclick="closePhoto()"><button onclick="closePhoto()">FECHAR</button><img id="lightbox-image"></div><script>let current='active';function tab(name){current=name;document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(name).classList.add('active');document.getElementById('btn-'+name).classList.add('active');filter()}function filter(){const q=document.getElementById('search').value.toLowerCase();document.querySelectorAll('#'+current+' .wanted-card').forEach(c=>c.style.display=c.dataset.search.includes(q)?'block':'none')}document.getElementById('search').addEventListener('input',filter);function openPhoto(src,alt){document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=alt||'';document.getElementById('lightbox').classList.add('open')}function closePhoto(){document.getElementById('lightbox').classList.remove('open')}document.addEventListener('keydown',e=>{if(e.key==='Escape')closePhoto()});</script></body></html>'''
+    html_final = (template
+        .replace("__COUNT_ACTIVE__", str(len(ativos)))
+        .replace("__COUNT_RETIRED__", str(len(retirados)))
+        .replace("__CARDS_ACTIVE__", cards_ativos)
+        .replace("__CARDS_RETIRED__", cards_retirados))
+    CATALOGO_HTML.parent.mkdir(parents=True, exist_ok=True)
+    CATALOGO_HTML.write_text(html_final, encoding="utf-8")
+
+
+# Portal com brasão realmente centralizado no cabeçalho.
+_CENTRAL_PORTAL_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>:root{--gold:#d7a93d;--gold2:#f2d47d;--bg:#070806;--panel:#10120d;--line:#3b321a;--text:#f7f1db;--muted:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:106px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07e8;position:sticky;top:0;z-index:5}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.seal{width:70px;height:70px;border-radius:16px;display:grid;place-items:center;border:1px solid #8b712d;background:#080906;box-shadow:0 0 25px #d7a93d22;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:5px}.brand h1{font-size:18px;letter-spacing:2px;margin:0}.brand small{color:var(--gold);letter-spacing:1.5px}.status{justify-self:end;font-size:11px;color:var(--muted)}main{max-width:1250px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:34px;align-items:center;margin-bottom:55px}.hero h2{font-size:52px;line-height:1.02;margin:0 0 18px}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.hero-mark{height:270px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center}.hero-mark img{width:185px;height:185px;object-fit:contain;filter:drop-shadow(0 0 30px #d7a93d35)}.label{font-size:11px;letter-spacing:2px;color:var(--gold);margin:0 0 15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.card{min-height:210px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative;transition:.2s}.card:hover{transform:translateY(-4px);border-color:#8b712d}.card h3{margin:22px 0 8px;font-size:19px}.card p{color:var(--muted);line-height:1.5}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--gold2),var(--gold));padding:10px 14px;border-radius:9px;font-weight:800}.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;letter-spacing:1.4px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}.disabled{opacity:.55}footer{text-align:center;color:#625f52;font-size:11px;padding:50px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.grid{grid-template-columns:1fr 1fr}.status{display:none}}@media(max-width:600px){header{grid-template-columns:1fr}.brand{grid-column:1;justify-self:center}.grid{grid-template-columns:1fr}.hero h2{font-size:36px}}</style></head><body><header><div></div><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main><section class="hero"><div><div class="label">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Consulta pública de procurados e acesso restrito às ferramentas internas de análise, fichas e vínculos investigativos.</p></div><div class="hero-mark"><img src="/central/brasao-dicor.png"></div></section><div class="label">MÓDULOS DISPONÍVEIS</div><section class="grid"><article class="card"><div>🚨</div><h3>Catálogo de Procurados</h3><p>Consulta pública dos indivíduos atualmente procurados.</p><a href="/catalogo">Abrir catálogo</a></article><article class="card private"><div>🧬</div><h3>Árvore de Inteligência</h3><p>Mapa interativo completo de pessoas, organizações, veículos e registros.</p><a href="/arvore">Abrir árvore</a></article><article class="card private"><div>👥</div><h3>Central de Fichas</h3><p>Consulta e administração das fichas investigativas.</p><a href="/fichas">Abrir fichas</a></article><article class="card private disabled"><div>📋</div><h3>Boletins</h3><p>Integração web em desenvolvimento.</p></article><article class="card private disabled"><div>🧪</div><h3>Perícias</h3><p>Integração web em desenvolvimento.</p></article><article class="card private disabled"><div>📂</div><h3>Dossiês</h3><p>Integração web em desenvolvimento.</p></article></section></main><footer>DICOR • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+
+
+# Login e página de fichas também usam o brasão centralizado.
+_CENTRAL_LOGIN_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acesso DICOR</title><style>:root{--gold:#d7a93d;--gold2:#f2d47d}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at top,#3a2d0c66,transparent 40%),#070806;color:#f5f0dc;font-family:Inter,Arial,sans-serif}.box{width:min(430px,calc(100% - 30px));background:#10120e;border:1px solid #4b3d1c;border-radius:22px;padding:34px;box-shadow:0 30px 90px #000a;text-align:center}.seal{width:92px;height:92px;border:1px solid #8b712d;border-radius:20px;display:grid;place-items:center;background:#080906;margin:0 auto 24px;overflow:hidden}.seal img{width:100%;height:100%;object-fit:contain;padding:6px}.eyebrow{color:var(--gold);font-size:10px;letter-spacing:2px}.box h1{margin:8px 0;font-size:27px}.box p{color:#9e9987;line-height:1.5}label{display:block;text-align:left;font-size:12px;color:#c9bd95}input{width:100%;margin:8px 0 15px;background:#080906;border:1px solid #38301a;color:#fff7d6;border-radius:10px;padding:14px;font-size:16px}button{width:100%;border:0;border-radius:10px;padding:14px;background:linear-gradient(135deg,var(--gold2),var(--gold));font-weight:900;cursor:pointer}.error{background:#361616;border:1px solid #793434;color:#ffc8c8;padding:10px;border-radius:9px;margin:14px 0;font-size:13px}.back{display:block;color:#a99455;text-decoration:none;margin-top:18px;font-size:12px}</style></head><body><form class="box" method="post" action="/acesso"><div class="seal"><img src="/central/brasao-dicor.png"></div><div class="eyebrow">CENTRAL DE INTELIGÊNCIA</div><h1>Acesso restrito</h1><p>Insira a senha operacional. Este navegador ficará autorizado após a validação.</p>{erro}<input type="hidden" name="next" value="{next}"><label>Senha de acesso</label><input type="password" name="senha" required autofocus><button type="submit">AUTORIZAR DISPOSITIVO</button><a class="back" href="/">← Voltar à Central</a></form></body></html>'''
+
+
+async def central_fichas_http(request: web.Request) -> web.Response:
+    pagina = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central de Fichas DICOR</title><style>body{margin:0;background:#070806;color:#f7f1db;font-family:Arial}.top{height:105px;border-bottom:1px solid #3b321a;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw}.brand{grid-column:2;display:flex;align-items:center;gap:13px}.brand img{width:70px;height:70px;object-fit:contain;border:1px solid #8b712d;border-radius:16px;padding:5px}.brand b{color:#f2d47d;letter-spacing:2px}.links{justify-self:end}.links a{color:#d7a93d}.wrap{max-width:1100px;margin:70px auto;padding:25px}.box{border:1px solid #44381c;background:#11130e;border-radius:18px;padding:35px;text-align:center}.box img{width:125px}.box h1{color:#f2d47d}.box p{color:#aaa38d;line-height:1.6}</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png"><b>DICOR • CENTRAL DE FICHAS</b></div><div class="links"><a href="/">Central</a> • <a href="/sair">Sair</a></div></header><div class="wrap"><div class="box"><img src="/central/brasao-dicor.png"><h1>Área protegida ativada</h1><p>Este dispositivo está autorizado. A interface completa das fichas será integrada nesta área.</p></div></div></body></html>'''
+    return web.Response(text=pagina, content_type="text/html", charset="utf-8")
+
+
+print("✅ Central DICOR V2: árvore por RG/nome, brasões centralizados e catálogo ouro com análise de fotos.", flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
