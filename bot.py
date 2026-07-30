@@ -53031,6 +53031,198 @@ async def _dossie_ia_consultar_openai(perfil:Dict[str,Any],pergunta:str,historic
 
 print('✅ V23 carregada: IA RP global, fichas completas, perícias do canal oficial, dossiês com prévia/BO e proteção visual em fichas/árvore.',flush=True)
 
+# =====================================================
+# V24 — LAYOUT CLÁSSICO DICOR + DADOS ADICIONAIS + IA PELO CHAT
+# =====================================================
+
+def _v24_texto_pericia_limpo(texto: Any) -> str:
+    bruto = str(texto or "")
+    bruto = re.sub(r'https?://(?:cdn\.|media\.)?discordapp\.(?:com|net)/attachments/\S+', '', bruto, flags=re.I)
+    bruto = re.sub(r'https?://\S+', '', bruto, flags=re.I)
+    bruto = bruto.replace('**', '').replace('__', '').replace('```', '')
+    bruto = re.sub(r'^\s*[•·-]\s*$', '', bruto, flags=re.M)
+    bruto = re.sub(r'\n{3,}', '\n\n', bruto).strip()
+    return bruto
+
+
+def _v24_html_linhas(texto: Any) -> str:
+    blocos=[]
+    for linha in _v24_texto_pericia_limpo(texto).splitlines():
+        s=linha.strip()
+        if not s:
+            blocos.append('<div class="space"></div>'); continue
+        esc=_v23_escape(s)
+        if re.search(r'(RELATÓRIO DE PERÍCIA|CONCLUSÃO DO LAUDO|REGISTROS FOTOGRÁFICOS|PROVAS EM ANEXO)', s, re.I):
+            blocos.append(f'<h3>{esc}</h3>')
+        elif ':' in s and len(s.split(':',1)[0]) <= 35:
+            a,b=s.split(':',1)
+            blocos.append(f'<p><strong>{_v23_escape(a)}:</strong>{_v23_escape(b)}</p>')
+        else:
+            blocos.append(f'<p>{esc}</p>')
+    return ''.join(blocos)
+
+
+async def _v24_baixar_url_imagem(url: str, prefixo: str) -> str:
+    try:
+        if not url or not str(url).startswith('http'): return ''
+        ext=Path(str(url).split('?',1)[0]).suffix.lower()
+        if ext not in {'.png','.jpg','.jpeg','.webp','.gif'}: ext='.png'
+        nome=f"{prefixo}_{hashlib.sha256(str(url).encode()).hexdigest()[:18]}{ext}"
+        destino=CENTRAL_PERICIAS_MEDIA_DIR/nome
+        if not destino.exists():
+            async with ClientSession(timeout=ClientTimeout(total=25)) as sess:
+                async with sess.get(str(url)) as resp:
+                    if resp.status>=400: return ''
+                    destino.write_bytes(await resp.read())
+        return '/central-pericias-media/'+quote(destino.name)
+    except Exception:
+        return ''
+
+
+async def _v23_sincronizar_pericias() -> Dict[str,int]:
+    canal=bot.get_channel(PERICIAS_CHANNEL_ID)
+    if canal is None:
+        try: canal=await bot.fetch_channel(PERICIAS_CHANNEL_ID)
+        except Exception: canal=None
+    if canal is None or not hasattr(canal,'history'): return {'pericias':0,'fotos':0}
+    mensagens=[m async for m in canal.history(limit=5000,oldest_first=True)]
+    grupos=[]; atual=[]
+    for m in mensagens:
+        texto=_pericia_texto_mensagem(m) if '_pericia_texto_mensagem' in globals() else str(m.content or '')
+        if _v23_pericia_inicio(texto):
+            if atual: grupos.append(atual)
+            atual=[m]
+        elif atual and (m.attachments or str(texto).strip() or m.embeds):
+            atual.append(m)
+    if atual: grupos.append(atual)
+    saida=[]; fotos=0
+    for idx,g in enumerate(grupos,1):
+        textos=[]; midias=[]
+        for m in g:
+            tx=(_pericia_texto_mensagem(m) if '_pericia_texto_mensagem' in globals() else str(m.content or '')).strip()
+            if tx and tx not in textos: textos.append(tx)
+            for a in m.attachments:
+                u=await _v23_baixar_attachment(a,f"p{idx}")
+                if u and u not in midias: midias.append(u); fotos+=1
+            for e in (m.embeds or []):
+                for obj in (getattr(e,'image',None),getattr(e,'thumbnail',None)):
+                    u=str(getattr(obj,'url','') or '')
+                    if not u: continue
+                    local=await _v24_baixar_url_imagem(u,f"pe{idx}")
+                    if local and local not in midias: midias.append(local); fotos+=1
+        texto='\n\n'.join(textos)
+        mnum=re.search(r'(?:PER[IÍ]CIA|LAUDO)[^0-9]{0,15}(\d{1,8})',texto,re.I)
+        saida.append({'numero':mnum.group(1) if mnum else str(idx),'texto':texto,'midias':midias,'mensagem_url':str(getattr(g[0],'jump_url','') or ''),'data':str(getattr(g[0],'created_at','') or '')})
+    salvar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON,saida)
+    return {'pericias':len(saida),'fotos':fotos}
+
+
+def _v23_pericias_html() -> str:
+    regs=carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON,[])
+    cards=[]
+    for r in regs if isinstance(regs,list) else []:
+        corpo=_v24_html_linhas(r.get('texto') or 'Texto não informado')
+        imagens=[]
+        for i,u in enumerate(r.get('midias') or [],1):
+            ue=_v23_escape(u)
+            imagens.append(f'<button class="photo" type="button" onclick="openPhoto(\'{ue}\')"><img src="{ue}" loading="lazy"><span>PROVA FOTOGRÁFICA {i:02d}</span></button>')
+        galeria=''.join(imagens)
+        evidencias=(f'<section class="evidencias"><h3>REGISTROS FOTOGRÁFICOS</h3><div class="gallery">{galeria}</div></section>' if galeria else '<p class="empty">Nenhuma imagem disponível no registro.</p>')
+        numero=_v23_escape(r.get('numero'))
+        cards.append(f'<article class="laudo"><div class="doc-head"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><small>POLÍCIA FEDERAL • DICOR</small><h2>RELATÓRIO DE PERÍCIA EXTERNA</h2><b>Nº {numero}</b></div></div><div class="rule"></div><section class="conteudo">{corpo}</section>{evidencias}</article>')
+    css='''*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -10%,#6e54152d,transparent 34%),#070806;color:#f6f0dc;font-family:Inter,Arial}.top{min-height:112px;border-bottom:1px solid #5b471f;background:#0a0b08e8;display:flex;align-items:center;justify-content:space-between;padding:16px 5vw;position:sticky;top:0;z-index:5;backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:16px}.brand img{width:76px;height:76px;object-fit:contain}.brand b{letter-spacing:2.4px}.brand small,.eyebrow{color:#d6ad43;letter-spacing:1.5px}.top a{color:#e7c75e;text-decoration:none}.wrap{max-width:1280px;margin:48px auto;padding:0 22px}.hero{text-align:center;margin-bottom:34px}.hero h1{font-family:Georgia,serif;font-size:46px;margin:9px}.hero p{color:#aaa38d}.grid{display:grid;gap:24px}.laudo{background:linear-gradient(145deg,#12140f,#0c0e0a);border:1px solid #5a4720;border-radius:20px;padding:30px;box-shadow:0 22px 60px #0008}.doc-head{display:flex;align-items:center;gap:20px}.seal{width:90px;height:90px;border:1px solid #6c5524;border-radius:16px;background:#090a07;display:grid;place-items:center}.seal img{width:76px;height:76px;object-fit:contain}.doc-head small{color:#d8b54d;letter-spacing:1.8px}.doc-head h2{font-family:Georgia,serif;margin:6px 0;font-size:25px}.doc-head b{color:#efe0a6}.rule{height:1px;background:linear-gradient(90deg,#d0aa42,transparent);margin:24px 0}.conteudo{font-family:Georgia,serif;font-size:17px;line-height:1.72;color:#e2dcc9}.conteudo h3,.evidencias h3{font-family:Inter,Arial;color:#e5c763;font-size:13px;letter-spacing:1.5px;margin:22px 0 10px}.conteudo p{margin:7px 0}.conteudo strong{color:#f4df97}.space{height:9px}.evidencias{margin-top:28px}.gallery{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.photo{border:1px solid #59471f;background:#070806;border-radius:14px;padding:10px;cursor:pointer;color:#d8b54d;text-align:left}.photo:hover{border-color:#d7b44d;transform:translateY(-2px)}.photo img{display:block;width:100%;height:330px;object-fit:contain;background:#040503;border-radius:9px}.photo span{display:block;padding:10px 4px 2px;font-size:11px;letter-spacing:1px}.empty{color:#8f8977}.viewer{display:none;position:fixed;inset:0;background:#000e;z-index:20;align-items:center;justify-content:center;padding:24px}.viewer.open{display:flex}.viewer img{max-width:96vw;max-height:92vh;object-fit:contain}.viewer button{position:absolute;right:24px;top:20px;border:0;background:#d7b44d;color:#070806;border-radius:50%;width:42px;height:42px;font-size:22px;font-weight:900}@media(max-width:650px){.doc-head{align-items:flex-start}.seal{width:68px;height:68px}.seal img{width:58px;height:58px}.doc-head h2{font-size:20px}.laudo{padding:20px}.photo img{height:280px}.hero h1{font-size:36px}}'''
+    body=''.join(cards) or '<p>Nenhuma perícia sincronizada.</p>'
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Perícias • Central DICOR</title><style>{css}</style></head><body><header class="top"><div class="brand"><img src="/central/brasao-dicor.png"><div><b>DICOR • CENTRAL DE PERÍCIAS</b><small>DOCUMENTAÇÃO TÉCNICA OPERACIONAL</small></div></div><a href="/">VOLTAR À CENTRAL</a></header><main class="wrap"><section class="hero"><div class="eyebrow">CANAL OFICIAL {PERICIAS_CHANNEL_ID}</div><h1>Relatórios periciais</h1><p>Conteúdo completo, provas fotográficas organizadas e sem links brutos.</p></section><section class="grid">{body}</section></main><div id="viewer" class="viewer" onclick="closePhoto(event)"><button onclick="closePhoto(event)">×</button><img id="viewerImg"></div><script>function openPhoto(u){{viewerImg.src=u;viewer.classList.add('open')}}function closePhoto(e){{if(e)e.stopPropagation();viewer.classList.remove('open');viewerImg.src=''}}</script></body></html>'''
+
+
+def _v23_fichas_html() -> str:
+    inicializar_banco_dicor(); pessoas=[]
+    try:
+        with _banco_conexao() as db:
+            pessoas=[dict(x) for x in db.execute("SELECT * FROM individuos WHERE UPPER(COALESCE(status,''))<>'ARQUIVADO' ORDER BY nome COLLATE NOCASE").fetchall()]
+    except Exception: traceback.print_exc()
+    cards=[]
+    for p in pessoas:
+        iid=int(p.get('id') or 0); nome=_v23_escape(p.get('nome') or 'Nome não informado'); rg=_v23_escape(p.get('rg') or 'Não informado')
+        org=_v23_escape(p.get('organizacao') or p.get('faccao') or 'Não informada'); status=_v23_escape(p.get('status') or 'ATIVO')
+        foto=_catalogo_url_foto(p.get('foto_individuo_path') or p.get('foto_individuo_url')) if '_catalogo_url_foto' in globals() else ''
+        img=f'<img src="{_v23_escape(foto)}" loading="lazy">' if foto else '<div class="noimg">SEM FOTO CADASTRADA</div>'
+        nome_js=nome.replace("'","&#39;")
+        cards.append(f'<article class="ficha" data-search="{nome.lower()} {rg.lower()} {org.lower()}"><div class="photo">{img}<span class="status">{status}</span></div><div class="body"><small>REGISTRO INVESTIGATIVO</small><h2>{nome}</h2><div class="meta"><span>RG <b>{rg}</b></span><span>ORGANIZAÇÃO <b>{org}</b></span></div><div class="actions"><a href="/arvore?id={iid}">ABRIR ÁRVORE</a><button onclick="details({iid},\'{nome_js}\')">DADOS ADICIONAIS</button></div></div></article>')
+    css='''*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -5%,#7058142c,transparent 32%),#070806;color:#f6f0dc;font-family:Inter,Arial}.top{min-height:112px;border-bottom:1px solid #57441e;background:#0a0b08e8;display:flex;align-items:center;justify-content:space-between;padding:15px 5vw;position:sticky;top:0;z-index:7;backdrop-filter:blur(12px)}.brand{display:flex;align-items:center;gap:16px}.brand img{width:78px;height:78px;object-fit:contain}.brand b{letter-spacing:2.2px}.brand small,.hero small{display:block;color:#d7b34b;letter-spacing:1.4px}.top a{color:#e8cb6d;text-decoration:none}.wrap{max-width:1400px;margin:48px auto;padding:0 24px}.hero{text-align:center}.hero h1{font-family:Georgia,serif;font-size:46px;margin:8px}.hero p{color:#aaa38d}.search{width:100%;padding:16px 18px;border:1px solid #59481f;border-radius:12px;background:#0d0f0b;color:#fff;margin:28px 0;outline:none}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:18px}.ficha{background:linear-gradient(145deg,#12140f,#0c0e0a);border:1px solid #4c3d1d;border-radius:18px;overflow:hidden;display:grid;grid-template-columns:165px 1fr;min-height:245px;box-shadow:0 18px 50px #0007}.ficha:hover{border-color:#a88a38;transform:translateY(-2px)}.photo{background:#050604;position:relative;display:grid;place-items:center}.photo img{width:100%;height:100%;object-fit:contain}.status{position:absolute;left:10px;bottom:10px;background:#0b0c09e8;border:1px solid #655224;border-radius:30px;padding:6px 9px;color:#dfc56f;font-size:10px}.noimg{font-size:11px;color:#6f6957;text-align:center}.body{padding:25px}.body small{color:#d8b54d;letter-spacing:1.2px}.body h2{font-family:Georgia,serif;font-size:27px;margin:8px 0 20px}.meta{display:grid;gap:10px}.meta span{font-size:10px;color:#8f8977;letter-spacing:1px}.meta b{display:block;color:#e9e1cb;font-size:14px;margin-top:3px;letter-spacing:0}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:22px}.actions a,.actions button{border:1px solid #d0aa42;border-radius:8px;padding:10px 12px;font-weight:900;font-size:11px;letter-spacing:.5px;text-decoration:none;cursor:pointer}.actions a{background:#d0aa42;color:#080906}.actions button{background:transparent;color:#e5c766}.modal{display:none;position:fixed;inset:0;background:#000c;z-index:30;align-items:center;justify-content:center;padding:20px}.modal.open{display:flex}.panel{width:min(900px,96vw);max-height:90vh;overflow:auto;background:#0e100c;border:1px solid #725b27;border-radius:18px;box-shadow:0 30px 100px #000;padding:28px}.panel-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;border-bottom:1px solid #3e341c;padding-bottom:16px}.panel h2{font-family:Georgia,serif;margin:4px 0}.close{border:0;background:#d4af45;color:#080906;width:40px;height:40px;border-radius:50%;font-size:22px;font-weight:900}.sections{display:grid;grid-template-columns:repeat(2,1fr);gap:13px;margin-top:18px}.section{background:#090a07;border:1px solid #37301c;border-radius:12px;padding:16px}.section h3{color:#d8b54d;font-size:12px;letter-spacing:1px;margin:0 0 10px}.section p{color:#d7d0ba;line-height:1.55;white-space:pre-wrap;word-break:break-word}.loading{color:#d8b54d}@media(max-width:650px){.ficha{grid-template-columns:1fr}.photo{height:320px}.sections{grid-template-columns:1fr}.hero h1{font-size:36px}}'''
+    js='''const modal=document.getElementById("modal"),content=document.getElementById("detailContent");function esc(s){return String(s??"").replace(/[&<>\"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\\"":"&quot;"}[m]))}function closeDetails(){modal.classList.remove("open")}function makeSection(title,value){let txt;if(Array.isArray(value))txt=value.length?value.map(x=>typeof x==="object"?JSON.stringify(x,null,2):String(x)).join("\\n\\n"):"Nenhum registro.";else if(value&&typeof value==="object")txt=Object.keys(value).length?JSON.stringify(value,null,2):"Nenhum registro.";else txt=value||"Não informado.";return `<div class="section"><h3>${esc(title)}</h3><p>${esc(txt)}</p></div>`}async function details(id,name){modal.classList.add("open");content.innerHTML='<p class="loading">Carregando dados investigativos...</p>';try{const r=await fetch("/api/arvore/"+id);const d=await r.json();if(!r.ok||!d.ok)throw Error(d.erro||"Falha ao carregar");const alvo=(d.nodes||[]).find(x=>x.central)||{},ligados=(d.nodes||[]).filter(x=>!x.central);content.innerHTML=`<div class="panel-head"><div><small>DADOS ADICIONAIS</small><h2>${esc(name)}</h2><p>RG ${esc(alvo.rg||"—")} • ${esc(alvo.organizacao||"Sem organização")}</p></div><button class="close" onclick="closeDetails()">×</button></div><div class="sections">${makeSection("RESUMO DA FICHA",`Força do vínculo: ${alvo.forca||"ALVO PRINCIPAL"}\\nTotal de conexões: ${ligados.length}`)}${makeSection("MOTIVOS E MARCADORES",alvo.motivos||[])}${makeSection("EVIDÊNCIAS",alvo.evidencias||[])}${makeSection("PESSOAS RELACIONADAS",ligados.map(x=>`${x.nome} • RG ${x.rg||"—"} • ${x.forca||"vínculo"}`))}${makeSection("ORGANIZAÇÕES IDENTIFICADAS",[...new Set(ligados.map(x=>x.organizacao).filter(Boolean))])}${makeSection("DADOS DO CRUZAMENTO",`Consulta interna: ${d.consulta||id}\\nPessoas analisadas: ${(d.nodes||[]).length}\\nRelações identificadas: ${(d.edges||[]).length}`)}</div>`}catch(e){content.innerHTML=`<div class="panel-head"><h2>Não foi possível carregar</h2><button class="close" onclick="closeDetails()">×</button></div><p>${esc(e.message)}</p>`}}q.oninput=()=>{const v=q.value.toLowerCase();document.querySelectorAll(".ficha").forEach(x=>x.style.display=x.dataset.search.includes(v)?"grid":"none")};modal.addEventListener("click",e=>{if(e.target===modal)closeDetails()});'''
+    body=''.join(cards) or '<p>Nenhuma ficha cadastrada.</p>'
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fichas • Central DICOR</title><style>{css}</style></head><body><header class="top"><div class="brand"><img src="/central/brasao-dicor.png"><div><b>DICOR • CENTRAL DE FICHAS</b><small>INTELIGÊNCIA INVESTIGATIVA</small></div></div><a href="/">VOLTAR À CENTRAL</a></header><main class="wrap"><section class="hero"><small>AMBIENTE RESTRITO E MONITORADO</small><h1>Fichas investigativas</h1><p>{len(pessoas)} registros ativos disponíveis.</p></section><input id="q" class="search" placeholder="Pesquisar por nome, RG ou organização"><section class="grid">{body}</section></main><div id="modal" class="modal"><div class="panel" id="detailContent"></div></div>{_v23_protecao_visual()}<script>{js}</script></body></html>'''
+
+
+class DossieIAV24View(discord.ui.View):
+    def __init__(self, canal_id:int):
+        super().__init__(timeout=None); self.canal_id=int(canal_id)
+
+    @discord.ui.button(label='Atualizar dados', emoji='🔄', style=discord.ButtonStyle.secondary, custom_id='dicor_ia_v24_atualizar')
+    async def atualizar(self, interaction:discord.Interaction, button:discord.ui.Button):
+        sessao=_DOSSIE_IA_SESSOES.get(int(interaction.channel_id or 0))
+        if not sessao: return await interaction.response.send_message('❌ Sessão não encontrada.',ephemeral=True)
+        perfil=await asyncio.to_thread(_banco_ficha_geral_carregar,str(sessao.get('tipo') or 'individuo'),int(sessao.get('registro_id') or 0))
+        if perfil:sessao['perfil']=perfil
+        await interaction.response.send_message('✅ Dados atualizados. Continue conversando pelo chat.',ephemeral=True)
+
+    @discord.ui.button(label='Encerrar sala', emoji='🗑️', style=discord.ButtonStyle.danger, custom_id='dicor_ia_v24_encerrar')
+    async def encerrar(self, interaction:discord.Interaction, button:discord.ui.Button):
+        sessao=_DOSSIE_IA_SESSOES.get(int(interaction.channel_id or 0)); permitido=bool(sessao and int(sessao.get('autor_id') or 0)==interaction.user.id)
+        if isinstance(interaction.user,discord.Member): permitido=permitido or any(r.id in {1490200388912156692,1490200383614615725,1490200382776021132} for r in interaction.user.roles)
+        if not permitido:return await interaction.response.send_message('❌ Somente o solicitante ou Inspetor+ pode encerrar.',ephemeral=True)
+        await interaction.response.send_message('✅ Encerrando a sala...',ephemeral=True); _DOSSIE_IA_SESSOES.pop(int(interaction.channel_id or 0),None); await asyncio.sleep(2)
+        try: await interaction.channel.delete(reason=f'Sala IA encerrada por {interaction.user}')
+        except Exception: pass
+
+
+async def _dossie_ia_criar_canal(interaction: discord.Interaction, tipo: str, registro_id: int, perfil: Optional[Dict[str, Any]] = None) -> None:
+    if interaction.guild is None or not isinstance(interaction.user,discord.Member): return await interaction.followup.send('❌ Esta função só pode ser usada no servidor.',ephemeral=True)
+    guild=interaction.guild; perfil=dict(perfil or {})
+    if not perfil: perfil=await asyncio.to_thread(_banco_ficha_geral_carregar,str(tipo),int(registro_id))
+    if not perfil:return await interaction.followup.send('❌ A ficha não foi localizada.',ephemeral=True)
+    categoria=guild.get_channel(int(DOSSIE_IA_CATEGORY_ID))
+    if not isinstance(categoria,discord.CategoryChannel):
+        try: categoria=await bot.fetch_channel(int(DOSSIE_IA_CATEGORY_ID))
+        except Exception: categoria=None
+    if not isinstance(categoria,discord.CategoryChannel):return await interaction.followup.send(f'❌ Categoria `{DOSSIE_IA_CATEGORY_ID}` não localizada.',ephemeral=True)
+    overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=False),interaction.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True)}
+    if guild.me:overwrites[guild.me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,manage_channels=True,manage_messages=True,attach_files=True,embed_links=True)
+    for cargo_id in (1490200388912156692,1490200383614615725,1490200382776021132):
+        cargo=guild.get_role(cargo_id)
+        if cargo:overwrites[cargo]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True)
+    nome=_dossie_ia_normalizar(_banco_ficha_geral_titulo(perfil)); nome=re.sub(r'[^a-z0-9-]+','-',nome).strip('-')[:45] or 'individuo'
+    canal=await guild.create_text_channel(name=f'🧠┃ia-{nome}',category=categoria,overwrites=overwrites,topic=f'IA DICOR • ficha {tipo}:{registro_id} • solicitante {interaction.user.id}',reason=f'IA DICOR solicitada por {interaction.user}')
+    _DOSSIE_IA_SESSOES[canal.id]={'autor_id':interaction.user.id,'tipo':str(tipo),'registro_id':int(registro_id),'perfil':perfil,'historico':[],'criado_em':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    ficha=_banco_embed_ficha_geral(perfil); ficha.color=discord.Color.from_rgb(185,145,38)
+    painel=discord.Embed(title='🧠 ANALISTA DE INTELIGÊNCIA DICOR',description='Esta sala funciona como um chat direto com a IA. Digite normalmente neste canal. A IA usa a ficha, boletins, perícias, dossiês, vínculos e o contexto do RP.',color=discord.Color.from_rgb(74,56,14))
+    painel.add_field(name='💬 Exemplos',value='`Faça um resumo completo`\n`Quais boletins e perícias estão vinculados?`\n`Como podemos localizar este indivíduo no RP?`\n`Monte uma linha de investigação profissional`',inline=False)
+    painel.add_field(name='🔒 Acesso',value='Somente quem abriu esta sala e os cargos de **Inspetor+** podem visualizar e conversar.',inline=False)
+    painel.set_footer(text=f'DICOR Intelligence • expiração em {DOSSIE_IA_CHANNEL_TTL_MINUTES} minutos')
+    await canal.send(content=interaction.user.mention,embed=ficha); await canal.send(embed=painel,view=DossieIAV24View(canal.id)); await interaction.followup.send(f'✅ Sala de IA criada: {canal.mention}',ephemeral=True)
+    asyncio.create_task(_dossie_ia_expirar_canal(canal.id),name=f'dossie-ia-v24-expirar-{canal.id}')
+
+
+@bot.listen('on_message')
+async def _v24_ia_chat_canal(message:discord.Message):
+    if message.author.bot or not isinstance(message.channel,discord.TextChannel):return
+    sessao=_DOSSIE_IA_SESSOES.get(message.channel.id)
+    if not sessao:return
+    autorizado=message.author.id==int(sessao.get('autor_id') or 0)
+    if isinstance(message.author,discord.Member): autorizado=autorizado or any(r.id in {1490200388912156692,1490200383614615725,1490200382776021132} for r in message.author.roles)
+    if not autorizado:return
+    pergunta=str(message.content or '').strip()
+    if not pergunta or pergunta.startswith(('!','/')):return
+    try:
+        async with message.channel.typing(): embed=await _dossie_ia_responder_hibrido(sessao,pergunta)
+        await message.reply(embed=embed,mention_author=False)
+    except Exception as erro:
+        traceback.print_exc(); await message.reply(f'❌ Não consegui analisar agora: `{type(erro).__name__}`. Tente novamente.',mention_author=False)
+
+
+print('✅ V24 carregada: layout clássico com brasão, dados adicionais internos, perícias sem URLs brutas e IA pelo chat com acesso solicitante + Inspetor+.',flush=True)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
