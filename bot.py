@@ -48131,5 +48131,462 @@ async def central_fichas_http(request: web.Request) -> web.Response:
 
 print("✅ Central DICOR V2: árvore por RG/nome, brasões centralizados e catálogo ouro com análise de fotos.", flush=True)
 
+
+# =====================================================
+# PATCH V8 — PROCURADOS SEM FOTO + PESQUISA SEM TIMEOUT
+# =====================================================
+# 1) Resolve corretamente caminhos como /uploads/arquivo.png no volume /data.
+# 2) Impede publicação de procurado sem as duas imagens obrigatórias.
+# 3) Reposta automaticamente publicações ativas que ficaram sem anexos.
+# 4) Recarrega o painel do banco com uma View única e modal de pesquisa imediato.
+
+_PROCURADO_REPARO_V8_LOCK = asyncio.Lock()
+_PROCURADO_REPARO_V8_TASK: Optional[asyncio.Task] = None
+
+
+def _procurado_rg_normalizado_v8(valor: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", unicodedata.normalize("NFKD", str(valor or "")).encode("ascii", "ignore").decode("ascii").upper())
+
+
+def _procurado_caminho_foto_v8(valor: Any) -> Optional[Path]:
+    """Localiza uma foto persistente sem tratar /uploads como raiz do Linux."""
+    try:
+        if "_catalogo_caminho_local" in globals():
+            caminho = _catalogo_caminho_local(valor)
+            if caminho is not None:
+                return caminho
+    except Exception:
+        pass
+
+    texto = str(valor or "").strip()
+    if not texto or texto.startswith(("http://", "https://", "data:")):
+        return None
+    nome = Path(texto.replace("\\", "/")).name
+    if not nome:
+        return None
+    candidatos = [
+        UPLOADS_DIR / nome,
+        PUBLIC_DIR / "uploads" / nome,
+        DATA_DIR / "catalogo_uploads" / nome,
+        DATA_DIR / "central_fichas_uploads" / nome,
+        BASE_DIR / texto.lstrip("/"),
+    ]
+    for candidato in candidatos:
+        try:
+            if candidato.exists() and candidato.is_file() and candidato.stat().st_size > 0:
+                return candidato
+        except Exception:
+            continue
+    return None
+
+
+def _procurado_importar_foto_local_v8(valor: Any, prefixo: str) -> str:
+    caminho = _procurado_caminho_foto_v8(valor)
+    if caminho is None:
+        return ""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    ext = caminho.suffix.lower() if caminho.suffix else ".png"
+    nome = nome_arquivo_seguro(caminho.name)
+    if not nome:
+        nome = f"{slugify(prefixo)}-{secrets.token_hex(4)}{ext}"
+    destino = UPLOADS_DIR / nome
+    try:
+        if caminho.resolve() != destino.resolve():
+            if not destino.exists() or destino.stat().st_size <= 0:
+                shutil.copy2(caminho, destino)
+    except Exception:
+        traceback.print_exc()
+        return ""
+    return f"/uploads/{destino.name}"
+
+
+def _procurado_fotos_ficha_sync_v8(rg: str) -> Dict[str, str]:
+    """Busca as fotos da Central de Fichas quando o catálogo perdeu a referência."""
+    saida: Dict[str, str] = {}
+    if "_banco_conexao" not in globals():
+        return saida
+    alvo = _procurado_rg_normalizado_v8(rg)
+    if not alvo:
+        return saida
+    try:
+        with _banco_conexao() as db:
+            linhas = db.execute(
+                "SELECT rg, foto_individuo_path, foto_rg_path, foto_individuo_url, foto_rg_url FROM individuos"
+            ).fetchall()
+        for linha in linhas:
+            item = dict(linha)
+            if _procurado_rg_normalizado_v8(item.get("rg")) != alvo:
+                continue
+            saida = {
+                "foto_individuo": str(item.get("foto_individuo_path") or item.get("foto_individuo_url") or ""),
+                "foto_rg": str(item.get("foto_rg_path") or item.get("foto_rg_url") or ""),
+            }
+            break
+    except Exception:
+        traceback.print_exc()
+    return saida
+
+
+
+def _procurado_buscar_uploads_por_rg_v8(rg: str, nome: str = "") -> Dict[str, str]:
+    """Último fallback: encontra no volume as imagens já salvas com o RG no nome."""
+    alvo = _procurado_rg_normalizado_v8(rg)
+    if not alvo:
+        return {}
+    candidatos: List[Path] = []
+    for pasta in (UPLOADS_DIR, DATA_DIR / "catalogo_uploads", DATA_DIR / "central_fichas_uploads"):
+        try:
+            if not pasta.exists():
+                continue
+            for arq in pasta.rglob("*"):
+                if not arq.is_file() or arq.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                    continue
+                if alvo in _procurado_rg_normalizado_v8(arq.name):
+                    candidatos.append(arq)
+        except Exception:
+            continue
+    # Remove duplicatas físicas e prioriza arquivos mais recentes.
+    unicos: Dict[str, Path] = {}
+    for arq in candidatos:
+        try:
+            unicos[str(arq.resolve())] = arq
+        except Exception:
+            unicos[str(arq)] = arq
+    candidatos = sorted(unicos.values(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True)
+    if not candidatos:
+        return {}
+
+    pessoa: Optional[Path] = None
+    documento: Optional[Path] = None
+    for arq in candidatos:
+        n = arq.name.casefold()
+        if documento is None and any(chave in n for chave in ("foto-rg", "foto_rg", "-rg-", "documento", "identidade")):
+            documento = arq
+        if pessoa is None and any(chave in n for chave in ("individuo", "pessoa", "corpo", "rosto")):
+            pessoa = arq
+
+    # Quando o nome do arquivo não basta, usa o classificador visual/OCR já existente.
+    if len(candidatos) >= 2 and (pessoa is None or documento is None):
+        avaliados: List[Tuple[float, Path]] = []
+        for arq in candidatos[:12]:
+            score = 0.0
+            try:
+                if "_catalogo_pontuar_documento" in globals():
+                    score = float((_catalogo_pontuar_documento(arq, nome, rg) or {}).get("score") or 0)
+            except Exception:
+                score = 0.0
+            avaliados.append((score, arq))
+        avaliados.sort(key=lambda x: x[0])
+        if pessoa is None:
+            pessoa = avaliados[0][1]
+        if documento is None:
+            documento = avaliados[-1][1]
+
+    if pessoa is documento:
+        documento = next((x for x in candidatos if x != pessoa), None)
+    return {
+        "foto_individuo": str(pessoa or ""),
+        "foto_rg": str(documento or ""),
+    }
+
+
+async def _procurado_baixar_url_v8(url: str, prefixo: str) -> str:
+    url = str(url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return ""
+    try:
+        timeout = ClientTimeout(total=25)
+        async with ClientSession(timeout=timeout) as sessao:
+            async with sessao.get(url) as resposta:
+                if resposta.status != 200:
+                    return ""
+                dados = await resposta.read()
+                if not dados:
+                    return ""
+                content_type = str(resposta.headers.get("Content-Type") or "").lower()
+        ext = ".jpg" if "jpeg" in content_type else ".webp" if "webp" in content_type else ".png"
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        destino = UPLOADS_DIR / f"{data_caso()}-{slugify(prefixo)}-{secrets.token_hex(4)}{ext}"
+        destino.write_bytes(dados)
+        return f"/uploads/{destino.name}"
+    except Exception:
+        return ""
+
+
+async def _procurado_completar_fotos_v8(registro: Dict[str, Any]) -> bool:
+    rg = str(registro.get("rg") or "")
+    fontes_ficha = await asyncio.to_thread(_procurado_fotos_ficha_sync_v8, rg)
+    fontes_volume = await asyncio.to_thread(
+        _procurado_buscar_uploads_por_rg_v8, rg, str(registro.get("nome") or "")
+    )
+    for campo, prefixo in (("foto_individuo", "individuo"), ("foto_rg", "rg")):
+        atual = str(registro.get(campo) or "").strip()
+        normalizado = _procurado_importar_foto_local_v8(atual, f"{prefixo}-{rg}")
+        if normalizado:
+            registro[campo] = normalizado
+            continue
+
+        alternativa = str(fontes_ficha.get(campo) or fontes_volume.get(campo) or "").strip()
+        normalizado = _procurado_importar_foto_local_v8(alternativa, f"ficha-{prefixo}-{rg}")
+        if not normalizado and alternativa.startswith(("http://", "https://")):
+            normalizado = await _procurado_baixar_url_v8(alternativa, f"ficha-{prefixo}-{rg}")
+        if normalizado:
+            registro[campo] = normalizado
+
+    return bool(
+        _procurado_caminho_foto_v8(registro.get("foto_individuo"))
+        and _procurado_caminho_foto_v8(registro.get("foto_rg"))
+    )
+
+
+def _procurado_arquivos_v8(registro: Dict[str, Any]) -> List[discord.File]:
+    arquivos: List[discord.File] = []
+    rg = _procurado_rg_normalizado_v8(registro.get("rg")) or "sem-rg"
+    for campo, base in (("foto_individuo", "foto_individuo"), ("foto_rg", "foto_rg")):
+        caminho = _procurado_caminho_foto_v8(registro.get(campo))
+        if caminho is None:
+            continue
+        ext = caminho.suffix.lower() or ".png"
+        arquivos.append(discord.File(str(caminho), filename=f"{base}_{rg}{ext}"))
+    return arquivos
+
+
+async def postar_procurado_oficial(registro: Dict[str, Any]) -> Optional[discord.Message]:
+    """Publica somente depois de confirmar que as duas fotos serão anexadas."""
+    canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+    if canal is None or not hasattr(canal, "send"):
+        raise RuntimeError("Canal oficial de procurados não encontrado.")
+
+    completo = await _procurado_completar_fotos_v8(registro)
+    arquivos = _procurado_arquivos_v8(registro)
+    if not completo or len(arquivos) < 2:
+        raise RuntimeError(
+            "Publicação bloqueada: a foto do indivíduo e a foto do RG precisam estar salvas no volume persistente."
+        )
+
+    texto = cortar_discord(criar_texto_procurado(registro), 1900)
+    mensagem = await canal.send(
+        content=texto,
+        files=arquivos,
+        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
+    )
+    imagens_publicadas = [
+        anexo for anexo in list(getattr(mensagem, "attachments", []) or [])
+        if str(getattr(anexo, "content_type", "") or "").startswith("image/")
+        or Path(str(getattr(anexo, "filename", "") or "")).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    ]
+    if len(imagens_publicadas) < 2:
+        try:
+            await mensagem.delete()
+        except Exception:
+            pass
+        raise RuntimeError("O Discord não confirmou os dois anexos; a publicação foi cancelada para evitar post sem foto.")
+    return mensagem
+
+
+async def _procurado_reparar_publicacoes_v8() -> Dict[str, int]:
+    """Reposta os ativos sem fotos e atualiza os IDs no catálogo, inclusive o RG 28457."""
+    async with _PROCURADO_REPARO_V8_LOCK:
+        lista = carregar_procurados()
+        reparados = 0
+        pendentes = 0
+        verificados = 0
+        alterou = False
+
+        for registro in lista:
+            if str(registro.get("status") or "A PROCURAR").upper() != "A PROCURAR":
+                continue
+            verificados += 1
+            mensagem_antiga: Optional[discord.Message] = None
+            mensagem_id = int(registro.get("mensagem_id") or 0)
+            canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+            if canal is not None and mensagem_id and hasattr(canal, "fetch_message"):
+                try:
+                    mensagem_antiga = await canal.fetch_message(mensagem_id)
+                except Exception:
+                    mensagem_antiga = None
+
+            anexos_imagem = []
+            if mensagem_antiga is not None:
+                anexos_imagem = [
+                    a for a in list(getattr(mensagem_antiga, "attachments", []) or [])
+                    if str(getattr(a, "content_type", "") or "").startswith("image/")
+                    or Path(str(getattr(a, "filename", "") or "")).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+                ]
+            if len(anexos_imagem) >= 2:
+                continue
+
+            if not await _procurado_completar_fotos_v8(registro):
+                pendentes += 1
+                await enviar_log(
+                    f"⚠️ Procurado sem fotos recuperáveis | {registro.get('nome')} | RG `{registro.get('rg')}`. "
+                    "A publicação antiga foi preservada até as imagens serem corrigidas."
+                )
+                continue
+
+            try:
+                nova = await postar_procurado_oficial(registro)
+                if nova is None:
+                    raise RuntimeError("envio não retornou mensagem")
+                if mensagem_antiga is not None:
+                    try:
+                        await mensagem_antiga.delete()
+                    except Exception as erro:
+                        await enviar_log(
+                            f"⚠️ Novo procurado publicado com fotos, mas o post antigo `{mensagem_antiga.id}` não foi apagado: {erro}"
+                        )
+                registro["mensagem_id"] = int(nova.id)
+                registro["mensagem_url"] = nova.jump_url
+                registro["repostado_com_fotos_em"] = agora_br()
+                reparados += 1
+                alterou = True
+                await enviar_log(
+                    f"✅ Procurado repostado com as duas fotos | {registro.get('nome')} | RG `{registro.get('rg')}` | {nova.jump_url}"
+                )
+            except Exception as erro:
+                pendentes += 1
+                await enviar_log(
+                    f"❌ Falha ao repostar procurado com fotos | {registro.get('nome')} | RG `{registro.get('rg')}` | "
+                    f"`{type(erro).__name__}: {str(erro)[:300]}`"
+                )
+            await asyncio.sleep(0.35)
+
+        if alterou:
+            salvar_procurados(lista)
+            await asyncio.to_thread(gerar_catalogo_html)
+        return {"verificados": verificados, "reparados": reparados, "pendentes": pendentes}
+
+
+# Modal final da pesquisa: a interação é reconhecida imediatamente.
+class BancoConsultaModal(Modal, title="Pesquisar fichas DICOR"):
+    consulta = TextInput(
+        label="Nome, RG, telefone, placa ou organização",
+        placeholder="Ex.: 28457, Arquildo Silva ou ABC1D23",
+        min_length=1,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            termo = str(self.consulta.value or "").strip()
+            if not termo:
+                return await interaction.followup.send("❌ Digite algo para pesquisar.", ephemeral=True)
+            await _banco_prof_enviar_consulta(interaction, termo)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Falha ao pesquisar as fichas.", erro)
+
+
+# View definitiva do painel, removendo handlers antigos/duplicados no on_ready.
+class BancoDadosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message("❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True)
+            return False
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _banco_prof_erro_interacao(interaction, "A Central de Fichas apresentou uma falha.", error)
+
+    @discord.ui.button(label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary,
+                       custom_id="dicor_banco_criar_ficha_v3", row=0)
+    async def criar_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+
+    @discord.ui.button(label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary,
+                       custom_id="dicor_banco_consultar", row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await interaction.response.send_modal(BancoConsultaModal())
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível abrir a pesquisa.", erro)
+
+    @discord.ui.button(label="Importar painel", emoji="🏴", style=discord.ButtonStyle.primary,
+                       custom_id="dicor_banco_importar_painel", row=0)
+    async def importar_painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(
+            title="🏴 ESCOLHA O MODO DE ATUALIZAÇÃO",
+            description="Selecione como o painel deverá atualizar os registros.",
+            color=discord.Color.from_rgb(30, 105, 190),
+        )
+        embed.add_field(name="🔗 MESCLAR • recomendado", value="Adiciona e atualiza registros sem desativar ausentes.", inline=False)
+        embed.add_field(name="♻️ SUBSTITUIR LISTA ATUAL", value="A lista enviada vira a formação atual; o histórico é preservado.", inline=False)
+        await interaction.response.send_message(
+            embed=embed,
+            view=BancoEscolherModoPainelView(
+                int(interaction.user.id), int(getattr(interaction.channel, "id", 0) or 0),
+                int(getattr(interaction.message, "id", 0) or 0),
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Sincronizar dados", emoji="🔄", style=discord.ButtonStyle.success,
+                       custom_id="dicor_banco_sync_tudo", row=0)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        if _BANCO_PROF_SYNC_LOCK.locked():
+            return await interaction.followup.send("⏳ Já existe uma sincronização em andamento.", ephemeral=True)
+        await interaction.followup.send("🔄 Sincronização iniciada.", ephemeral=True)
+        asyncio.create_task(_banco_v4_sync_com_revisao(
+            interaction, int(getattr(interaction.channel, "id", 0) or 0),
+            int(getattr(interaction.message, "id", 0) or 0),
+        ))
+
+
+async def _dicor_v8_recarregar_painel() -> None:
+    # Remove todas as versões antigas do painel para o mesmo custom_id não disputar a interação.
+    for view in list(getattr(bot, "persistent_views", []) or []):
+        ids = {str(getattr(item, "custom_id", "") or "") for item in getattr(view, "children", [])}
+        if ids.intersection({
+            "dicor_banco_criar_ficha_v3", "dicor_banco_consultar",
+            "dicor_banco_importar_painel", "dicor_banco_sync_tudo",
+        }):
+            try:
+                bot.remove_view(view)
+            except Exception:
+                pass
+    bot.add_view(BancoDadosView())
+    try:
+        await _banco_prof_atualizar_painel()
+    except Exception:
+        traceback.print_exc()
+
+
+async def _dicor_v8_iniciar_reparos() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(8)
+    try:
+        await _dicor_v8_recarregar_painel()
+        resultado = await _procurado_reparar_publicacoes_v8()
+        print(
+            "✅ Patch V8 ativo: painel de pesquisa recarregado; "
+            f"{resultado['reparados']} procurado(s) repostado(s) com fotos; "
+            f"{resultado['pendentes']} pendência(s).",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha no reparo V8: {type(erro).__name__}: {erro}", flush=True)
+
+
+@bot.listen("on_ready")
+async def _dicor_v8_on_ready() -> None:
+    global _PROCURADO_REPARO_V8_TASK
+    await _dicor_v8_recarregar_painel()
+    if _PROCURADO_REPARO_V8_TASK is None or _PROCURADO_REPARO_V8_TASK.done():
+        _PROCURADO_REPARO_V8_TASK = asyncio.create_task(
+            _dicor_v8_iniciar_reparos(), name="dicor_v8_reparar_procurados_e_painel"
+        )
+
+
+print(
+    "✅ Patch V8 carregado: procurados só publicam com 2 fotos, posts sem anexo são repostados e pesquisa não expira.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
