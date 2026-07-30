@@ -48588,5 +48588,304 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# PATCH V9 — INTERAÇÃO DIRETA + RECUPERAÇÃO FORENSE DE FOTOS
+# =====================================================
+# Este patch não depende apenas da View persistente. Ele também intercepta
+# diretamente o custom_id da pesquisa, evitando o aviso "não respondeu a tempo"
+# mesmo quando uma mensagem antiga ainda aponta para uma View anterior.
+
+_PROCURADO_V9_REPARO_LOCK = asyncio.Lock()
+_PROCURADO_V9_EXECUTADO = False
+
+
+async def _v9_responder_erro_interacao(interaction: discord.Interaction, texto: str) -> None:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(texto, ephemeral=True)
+        else:
+            await interaction.followup.send(texto, ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.listen("on_interaction")
+async def _dicor_v9_interacao_direta(interaction: discord.Interaction) -> None:
+    """Fallback definitivo para componentes antigos do painel de fichas."""
+    try:
+        if interaction.type != discord.InteractionType.component:
+            return
+        dados = dict(getattr(interaction, "data", {}) or {})
+        custom_id = str(dados.get("custom_id") or "")
+        if custom_id != "dicor_banco_consultar":
+            return
+        if interaction.response.is_done():
+            return
+        if not _banco_prof_equipe(interaction):
+            await interaction.response.send_message(
+                "❌ Apenas a equipe DICOR pode usar esta central.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(BancoConsultaModal())
+    except discord.InteractionResponded:
+        return
+    except Exception as erro:
+        traceback.print_exc()
+        await _v9_responder_erro_interacao(
+            interaction, f"❌ Não foi possível abrir a pesquisa: {type(erro).__name__}."
+        )
+
+
+def _v9_texto_mensagem(mensagem: discord.Message) -> str:
+    partes = [str(getattr(mensagem, "content", "") or "")]
+    for embed in list(getattr(mensagem, "embeds", []) or []):
+        partes.extend([
+            str(getattr(embed, "title", "") or ""),
+            str(getattr(embed, "description", "") or ""),
+        ])
+        for campo in list(getattr(embed, "fields", []) or []):
+            partes.extend([str(getattr(campo, "name", "") or ""), str(getattr(campo, "value", "") or "")])
+    return "\n".join(partes)
+
+
+async def _v9_salvar_anexo(anexo: discord.Attachment, prefixo: str) -> Optional[Path]:
+    pasta = DATA_DIR / "catalogo_uploads"
+    pasta.mkdir(parents=True, exist_ok=True)
+    nome = nome_arquivo_seguro(getattr(anexo, "filename", "foto.png"))
+    destino = pasta / f"{data_caso()}-{slugify(prefixo)}-{secrets.token_hex(4)}-{nome}"
+    tentativas = []
+    try:
+        await anexo.save(str(destino), use_cached=True)
+        if destino.exists() and destino.stat().st_size > 0:
+            return destino
+    except Exception as e:
+        tentativas.append(e)
+    for url in (str(getattr(anexo, "proxy_url", "") or ""), str(getattr(anexo, "url", "") or "")):
+        if not url:
+            continue
+        try:
+            timeout = ClientTimeout(total=25)
+            async with ClientSession(timeout=timeout) as sessao:
+                async with sessao.get(url) as resposta:
+                    if resposta.status != 200:
+                        continue
+                    dados = await resposta.read()
+                    if dados:
+                        destino.write_bytes(dados)
+                        return destino
+        except Exception as e:
+            tentativas.append(e)
+    return None
+
+
+async def _v9_buscar_fotos_no_discord(registro: Dict[str, Any]) -> Dict[str, str]:
+    """Procura as duas fotos antigas em canais visíveis ao bot usando RG e nome."""
+    rg = str(registro.get("rg") or "").strip()
+    nome = str(registro.get("nome") or "").strip()
+    rg_norm = _procurado_rg_normalizado_v8(rg)
+    nome_norm = normalizar_texto(nome) if "normalizar_texto" in globals() else nome.casefold()
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    if guild is None:
+        return {}
+
+    canais_prioritarios = []
+    ids = [
+        PROCURADOS_CHANNEL_ID, HISTORICO_PROCURADOS_ID, AUTORIZACOES_CHANNEL_ID,
+        BOLETINS_CHANNEL_ID, BOLETIM_ATENDIMENTO_CHANNEL_ID,
+    ]
+    vistos = set()
+    for cid in ids:
+        canal = guild.get_channel(int(cid or 0))
+        if canal is not None and hasattr(canal, "history") and canal.id not in vistos:
+            canais_prioritarios.append(canal); vistos.add(canal.id)
+    # Inclui canais cujo nome sugere cadastro, banco, procurado ou autorização.
+    for canal in list(getattr(guild, "text_channels", []) or []):
+        n = str(getattr(canal, "name", "") or "").casefold()
+        if canal.id not in vistos and any(x in n for x in ("procur", "banco", "ficha", "autoriza", "bolet", "pericia")):
+            canais_prioritarios.append(canal); vistos.add(canal.id)
+
+    candidatos: List[Path] = []
+    for canal in canais_prioritarios:
+        try:
+            async for mensagem in canal.history(limit=700):
+                texto = _v9_texto_mensagem(mensagem)
+                texto_norm = _procurado_rg_normalizado_v8(texto)
+                nome_msg = normalizar_texto(texto) if "normalizar_texto" in globals() else texto.casefold()
+                corresponde = bool(rg_norm and rg_norm in texto_norm) or bool(nome_norm and nome_norm in nome_msg)
+                if not corresponde:
+                    continue
+                for anexo in list(getattr(mensagem, "attachments", []) or []):
+                    ext = Path(str(getattr(anexo, "filename", "") or "")).suffix.lower()
+                    ctype = str(getattr(anexo, "content_type", "") or "").lower()
+                    if not (ctype.startswith("image/") or ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}):
+                        continue
+                    salvo = await _v9_salvar_anexo(anexo, f"recuperado-{rg}")
+                    if salvo is not None:
+                        candidatos.append(salvo)
+                if len(candidatos) >= 8:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+        except Exception:
+            traceback.print_exc()
+        if len(candidatos) >= 8:
+            break
+
+    # Deduplica e classifica documento x pessoa.
+    unicos = []
+    hashes = set()
+    for caminho in candidatos:
+        try:
+            chave = (caminho.stat().st_size, caminho.read_bytes()[:2048])
+        except Exception:
+            continue
+        if chave in hashes:
+            continue
+        hashes.add(chave); unicos.append(caminho)
+    if len(unicos) < 2:
+        return {}
+
+    avaliados: List[Tuple[float, Path]] = []
+    for caminho in unicos:
+        score = 0.0
+        try:
+            if "_catalogo_pontuar_documento" in globals():
+                score = float((_catalogo_pontuar_documento(caminho, nome, rg) or {}).get("score") or 0)
+        except Exception:
+            score = 0.0
+        # Nome do arquivo também ajuda.
+        n = caminho.name.casefold()
+        if any(x in n for x in ("rg", "document", "identidade", "copom")):
+            score += 5
+        if any(x in n for x in ("corpo", "pessoa", "individuo", "rosto")):
+            score -= 3
+        avaliados.append((score, caminho))
+    avaliados.sort(key=lambda x: x[0])
+    pessoa = avaliados[0][1]
+    documento = avaliados[-1][1]
+    if pessoa == documento:
+        return {}
+    return {
+        "foto_individuo": _procurado_importar_foto_local_v8(str(pessoa), f"discord-pessoa-{rg}"),
+        "foto_rg": _procurado_importar_foto_local_v8(str(documento), f"discord-rg-{rg}"),
+    }
+
+
+async def _v9_reparar_registro(registro: Dict[str, Any]) -> bool:
+    # Primeiro tenta os caminhos/banco/volume já existentes.
+    if await _procurado_completar_fotos_v8(registro):
+        return True
+    # Depois realiza busca forense nas mensagens antigas do Discord.
+    recuperadas = await _v9_buscar_fotos_no_discord(registro)
+    for campo in ("foto_individuo", "foto_rg"):
+        if recuperadas.get(campo):
+            registro[campo] = recuperadas[campo]
+    return await _procurado_completar_fotos_v8(registro)
+
+
+async def _v9_repostar_sem_fotos() -> Dict[str, int]:
+    async with _PROCURADO_V9_REPARO_LOCK:
+        lista = carregar_procurados()
+        canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+        resultado = {"repostados": 0, "sem_foto": 0, "verificados": 0}
+        alterou = False
+        for registro in lista:
+            if str(registro.get("status") or "A PROCURAR").upper() != "A PROCURAR":
+                continue
+            resultado["verificados"] += 1
+            antiga = None
+            try:
+                mid = int(registro.get("mensagem_id") or 0)
+                if canal is not None and mid:
+                    antiga = await canal.fetch_message(mid)
+            except Exception:
+                antiga = None
+            imagens = []
+            if antiga is not None:
+                imagens = [a for a in antiga.attachments if str(getattr(a, "content_type", "") or "").startswith("image/") or Path(a.filename).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}]
+            if len(imagens) >= 2:
+                continue
+            if not await _v9_reparar_registro(registro):
+                resultado["sem_foto"] += 1
+                await enviar_log(f"⚠️ V9 não encontrou as duas fotos de {registro.get('nome')} | RG `{registro.get('rg')}`.")
+                continue
+            try:
+                nova = await postar_procurado_oficial(registro)
+                if nova is None:
+                    raise RuntimeError("mensagem nova não retornada")
+                registro["mensagem_id"] = int(nova.id)
+                registro["mensagem_url"] = nova.jump_url
+                registro["repostado_com_fotos_em"] = agora_br()
+                # Só apaga a antiga após conferir os anexos da nova.
+                if antiga is not None:
+                    try:
+                        await antiga.delete()
+                    except Exception:
+                        pass
+                resultado["repostados"] += 1
+                alterou = True
+                await enviar_log(f"✅ V9 repostou procurado com fotos: {registro.get('nome')} | RG `{registro.get('rg')}` | {nova.jump_url}")
+            except Exception as erro:
+                resultado["sem_foto"] += 1
+                await enviar_log(f"❌ V9 falhou ao repostar {registro.get('nome')} | RG `{registro.get('rg')}`: `{type(erro).__name__}: {str(erro)[:250]}`")
+            await asyncio.sleep(0.5)
+        if alterou:
+            salvar_procurados(lista)
+            await asyncio.to_thread(gerar_catalogo_html)
+        return resultado
+
+
+async def _v9_forcar_novo_painel() -> None:
+    """Publica um painel novo e remove a dependência da mensagem antiga editada."""
+    try:
+        canal_id = int(os.getenv("BANCO_DADOS_CHANNEL_ID", "0") or 0)
+        if not canal_id:
+            # Tenta localizar pelo painel salvo ou nome do canal.
+            guild = bot.get_guild(int(GUILD_ID or 0))
+            if guild:
+                for c in guild.text_channels:
+                    if str(c.name).casefold() in {"banco-de-dados", "banco_dados"}:
+                        canal_id = c.id; break
+        canal = await obter_canal_por_id(canal_id)
+        if canal is None:
+            return
+        # Atualiza mensagem conhecida e, se ela não existir, cria uma nova.
+        try:
+            await _banco_prof_atualizar_painel()
+            return
+        except Exception:
+            pass
+        await canal.send(embed=_banco_prof_embed_painel(), view=BancoDadosView())
+    except Exception:
+        traceback.print_exc()
+
+
+@bot.listen("on_ready")
+async def _dicor_v9_on_ready() -> None:
+    global _PROCURADO_V9_EXECUTADO
+    # Registra imediatamente antes de qualquer tarefa pesada.
+    try:
+        bot.add_view(BancoDadosView())
+    except Exception:
+        pass
+    asyncio.create_task(_v9_forcar_novo_painel())
+    if _PROCURADO_V9_EXECUTADO:
+        return
+    _PROCURADO_V9_EXECUTADO = True
+    async def executar():
+        await asyncio.sleep(12)
+        resultado = await _v9_repostar_sem_fotos()
+        print(
+            f"✅ Patch V9 ativo: {resultado['repostados']} repostado(s), "
+            f"{resultado['sem_foto']} sem fotos recuperáveis, {resultado['verificados']} verificado(s).",
+            flush=True,
+        )
+    asyncio.create_task(executar(), name="dicor_v9_reparo_total")
+
+
+print("✅ Patch V9 carregado: pesquisa direta e recuperação forense de fotos ativas.", flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
