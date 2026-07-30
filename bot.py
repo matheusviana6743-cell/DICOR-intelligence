@@ -27,6 +27,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
+import aiohttp
 from aiohttp import web, ClientSession, ClientTimeout
 
 # Dependências do Dossiê Operacional Automático DICOR
@@ -371,7 +372,23 @@ def slugify(texto: str) -> str:
 
 
 def limpar_rg(rg: str) -> str:
-    return re.sub(r"\s+", "", str(rg or "").lower())
+    """Normaliza RG para comparação e persistência.
+
+    Aceita, por exemplo, ``12345``, ``12.345``, ``RG 12345`` e
+    ``RG: 12 345``. O resultado mantém somente letras/números em maiúsculas,
+    removendo o prefixo documental quando ele aparece no início.
+    """
+    texto = str(rg or "").strip().upper()
+    if not texto:
+        return ""
+    texto = re.sub(
+        r"^\s*(?:R\.?\s*G\.?|REGISTRO\s+GERAL)\s*"
+        r"(?:(?:N(?:ÚMERO|UMERO)?|NO)\s*[º°.]*)?\s*[:#º°\-]*\s*",
+        "",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"[^0-9A-Z]", "", texto)
 
 
 def normalizar_boletim_procurado(valor: str) -> str:
@@ -10598,60 +10615,88 @@ async def escolher_agente_rodizio(guild: discord.Guild, numero: str) -> Optional
     return escolhido
 
 async def baixar_anexo_persistente(anexo: discord.Attachment, pasta: Path, prefixo: str) -> Optional[Path]:
-    """Baixa anexo de forma mais confiável.
+    """Baixa um anexo e confirma que bytes reais foram gravados no volume.
 
-    Primeiro tenta o método nativo do discord.py com cache. Se falhar, tenta
-    URL original e proxy_url via aiohttp. Isso evita perda de fotos/anexos em
-    boletins, mesas, procurados e arquivamentos.
+    A ordem de tentativa é: leitura pelo cache do Discord, leitura pela URL
+    original e, por último, download HTTP pelas URLs CDN/media. Erros 4xx de
+    anexos antigos não derrubam o fluxo nem geram traceback repetido no Railway.
     """
     pasta.mkdir(parents=True, exist_ok=True)
-    nome_seguro = nome_arquivo_seguro(getattr(anexo, "filename", "arquivo"))
+    nome_seguro = nome_arquivo_seguro(getattr(anexo, "filename", "arquivo")) or "arquivo"
     caminho = pasta / f"{data_caso()}-{slugify(prefixo)}-{secrets.token_hex(4)}-{nome_seguro}"
+    ultimo_erro: Optional[str] = None
 
-    # 1) Caminho mais confiável no discord.py.
-    try:
-        await anexo.save(str(caminho), use_cached=True)
-        if caminho.exists() and caminho.stat().st_size > 0:
-            return caminho
-    except TypeError:
+    async def _gravar_bytes(dados: Any) -> bool:
         try:
-            await anexo.save(str(caminho))
-            if caminho.exists() and caminho.stat().st_size > 0:
-                return caminho
-        except Exception: traceback.print_exc()
-    except Exception: traceback.print_exc()
+            bruto = bytes(dados or b"")
+            if not bruto:
+                return False
+            caminho.write_bytes(bruto)
+            return caminho.exists() and caminho.stat().st_size > 0
+        except Exception as erro_gravacao:
+            nonlocal ultimo_erro
+            ultimo_erro = f"gravação: {type(erro_gravacao).__name__}: {erro_gravacao}"
+            return False
 
-    # 2) Fallback por HTTP. Tenta URL e proxy_url.
-    urls = []
-    for valor in (getattr(anexo, "url", None), getattr(anexo, "proxy_url", None)):
-        if valor and valor not in urls:
-            urls.append(valor)
-
-    ultimo_erro = None
-    for url in urls:
+    # 1) API do discord.py. read() permite tentar cache e origem separadamente.
+    for usar_cache in (True, False):
         try:
-            async with ClientSession(timeout=ClientTimeout(total=90)) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        ultimo_erro = f"HTTP {resp.status}"
-                        continue
-                    with open(caminho, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(1024 * 256):
-                            if chunk:
-                                f.write(chunk)
-            if caminho.exists() and caminho.stat().st_size > 0:
+            try:
+                dados = await anexo.read(use_cached=usar_cache)
+            except TypeError:
+                dados = await anexo.read()
+            if await _gravar_bytes(dados):
                 return caminho
+        except discord.HTTPException as erro:
+            ultimo_erro = f"Discord HTTP {getattr(erro, 'status', '?')}: {erro}"
         except Exception as erro:
-            ultimo_erro = str(erro)
+            ultimo_erro = f"{type(erro).__name__}: {erro}"
+
+    # 2) Fallback HTTP com variações cdn.discordapp.com/media.discordapp.net.
+    urls: List[str] = []
+    for valor in (getattr(anexo, "proxy_url", None), getattr(anexo, "url", None)):
+        url = str(valor or "").strip()
+        if not url:
+            continue
+        variantes = [url]
+        if "cdn.discordapp.com/attachments/" in url:
+            variantes.append(url.replace("cdn.discordapp.com/attachments/", "media.discordapp.net/attachments/", 1))
+        elif "media.discordapp.net/attachments/" in url:
+            variantes.append(url.replace("media.discordapp.net/attachments/", "cdn.discordapp.com/attachments/", 1))
+        for item in variantes:
+            if item not in urls:
+                urls.append(item)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; DICOR-Intelligence/1.0)",
+        "Accept": "*/*",
+        "Referer": "https://discord.com/",
+    }
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=90), headers=headers) as session:
+            for url in urls:
+                try:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            ultimo_erro = f"HTTP {resp.status} em {urlparse(url).netloc or 'CDN'}"
+                            continue
+                        dados = await resp.read()
+                        if await _gravar_bytes(dados):
+                            return caminho
+                except Exception as erro:
+                    ultimo_erro = f"{type(erro).__name__}: {erro}"
+    except Exception as erro:
+        ultimo_erro = f"sessão HTTP: {type(erro).__name__}: {erro}"
 
     try:
-        if caminho.exists() and caminho.stat().st_size == 0:
+        if caminho.exists():
             caminho.unlink()
-    except Exception: traceback.print_exc()
+    except Exception:
+        pass
 
     await enviar_log(
         f"⚠️ Falha ao baixar anexo `{getattr(anexo, 'filename', 'arquivo')}` "
-        f"(`{getattr(anexo, 'id', 'sem-id')}`): {ultimo_erro or 'erro desconhecido'}"
+        f"(`{getattr(anexo, 'id', 'sem-id')}`): {ultimo_erro or 'arquivo sem dados'}"
     )
     return None
 
@@ -14656,20 +14701,66 @@ _resumo_dados_autorizacao_base = resumo_dados_autorizacao
 
 
 def _arquivo_upload_procurado_existe(valor: Any) -> bool:
-    """Confere se a imagem obrigatória realmente foi salva no servidor."""
-    caminho = str(valor or '').strip()
-    if not caminho:
+    """Confere referências locais como uploads/x, /uploads/x e URL pública /uploads/x.
+
+    O catálogo persistente salva fisicamente em ``/data/catalogo_uploads``, mas
+    apresenta a foto como ``/uploads/arquivo``. A validação antiga tratava esse
+    valor como caminho absoluto do Linux (``/uploads``), por isso a foto era
+    confirmada e logo depois aparecia como ausente.
+    """
+    referencia = str(valor or '').strip()
+    if not referencia:
         return False
+    if referencia.startswith('data:'):
+        return True
+
     try:
-        p = Path(caminho)
-        candidatos = [p]
-        if not p.is_absolute():
+        # Usa o resolvedor mais novo do catálogo quando ele já estiver carregado.
+        resolvedor = globals().get('_catalogo_caminho_local')
+        if callable(resolvedor):
+            localizado = resolvedor(referencia)
+            if localizado is not None and localizado.exists() and localizado.stat().st_size > 0:
+                return True
+    except Exception:
+        pass
+
+    try:
+        texto = referencia.replace('\\', '/')
+        if texto.startswith(('http://', 'https://')):
+            texto = urlparse(texto).path
+        relativo = texto.lstrip('/')
+        nome = Path(relativo).name
+
+        candidatos: List[Path] = []
+        # Caminho absoluto real só é aceito quando existe; /uploads/x é tratado
+        # como rota pública, não como diretório raiz do container.
+        bruto = Path(referencia)
+        if bruto.is_absolute() and not texto.startswith('/uploads/'):
+            candidatos.append(bruto)
+        if relativo:
             candidatos.extend([
-                BASE_DIR / p,
-                PUBLIC_DIR / p,
-                UPLOADS_DIR / p.name,
+                BASE_DIR / relativo,
+                PUBLIC_DIR / relativo,
+                PUBLIC_DIR / 'uploads' / nome,
+                Path(DATA_DIR) / 'catalogo_uploads' / nome,
+                Path(UPLOADS_DIR) / nome,
             ])
-        return any(c.exists() and c.is_file() and c.stat().st_size > 0 for c in candidatos)
+        legado = globals().get('_CATALOGO_UPLOADS_LEGADO_DIR')
+        if legado is not None and nome:
+            candidatos.append(Path(legado) / nome)
+
+        vistos = set()
+        for candidato in candidatos:
+            chave = str(candidato)
+            if not chave or chave in vistos:
+                continue
+            vistos.add(chave)
+            try:
+                if candidato.exists() and candidato.is_file() and candidato.stat().st_size > 0:
+                    return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
 
@@ -21617,7 +21708,8 @@ async def _primeira_mensagem_com_imagem_apos(
     Cada etapa aceita exatamente uma imagem na primeira mensagem de anexos, o que
     impede que a foto do indivíduo e a foto do RG sejam enviadas juntas.
     """
-    async for mensagem in canal.history(limit=limite, oldest_first=True):
+    depois = discord.Object(id=int(inicio_msg_id)) if int(inicio_msg_id or 0) else None
+    async for mensagem in canal.history(limit=limite, after=depois, oldest_first=True):
         mensagem_id = int(getattr(mensagem, 'id', 0) or 0)
         if mensagem_id <= int(inicio_msg_id or 0):
             continue
@@ -22297,8 +22389,19 @@ async def _encaminhar_pedido_procurado_boletim_completo(
         '_solicitante_nome': pedido.get('solicitante_nome'),
     })
     if not _fotos_procurado_validas(dados):
+        faltando = []
+        if not _arquivo_upload_procurado_existe(dados.get('foto_individuo')):
+            faltando.append('foto do indivíduo')
+        if not _arquivo_upload_procurado_existe(dados.get('foto_rg')):
+            faltando.append('foto do RG')
+        await enviar_log(
+            f"⚠️ Pedido `{pedido_id}` bloqueado após confirmação: arquivo(s) não localizado(s): "
+            f"{', '.join(faltando) or 'não identificado'}."
+        )
         return await interaction.followup.send(
-            '❌ As duas fotos obrigatórias ainda não foram confirmadas separadamente.',
+            '❌ Não consegui localizar no volume persistente: **' +
+            (' e '.join(faltando) if faltando else 'uma das fotos obrigatórias') +
+            '**. Reenvie apenas a foto indicada e confirme novamente.',
             ephemeral=True,
         )
     if not str(dados.get('ultimo_avistamento') or '').strip():
@@ -24691,8 +24794,19 @@ async def solicitar_autorizacao_procurado_boletim(
     interaction: discord.Interaction,
     dados: Dict[str, str],
 ) -> None:
-    """Guarda o ID do painel de crimes para apagá-lo após a publicação."""
+    """Normaliza o RG e guarda o painel temporário antes de abrir o fluxo."""
     dados_fluxo = dict(dados or {})
+    rg_original = str(dados_fluxo.get('rg') or '').strip()
+    rg_normalizado = limpar_rg(rg_original)
+    if not rg_normalizado:
+        mensagem_erro = (
+            '❌ RG inválido. Informe ao menos um número ou identificador válido. '
+            'Formatos aceitos: `12345`, `12.345` ou `RG: 12345`.'
+        )
+        if interaction.response.is_done():
+            return await interaction.followup.send(mensagem_erro, ephemeral=True)
+        return await interaction.response.send_message(mensagem_erro, ephemeral=True)
+    dados_fluxo['rg'] = rg_normalizado
     mensagem = getattr(interaction, 'message', None)
     if mensagem is not None:
         try:
@@ -25539,7 +25653,8 @@ def _banco_agora_iso() -> str:
 
 
 def _banco_normalizar_rg(valor: Any) -> str:
-    return re.sub(r"[^0-9A-Za-z]", "", str(valor or "").strip()).upper()
+    # Usa a mesma regra dos boletins/procurados para não criar RGs incompatíveis.
+    return limpar_rg(str(valor or ""))
 
 
 def _banco_normalizar_placa(valor: Any) -> str:
@@ -38012,39 +38127,12 @@ def gerar_catalogo_html() -> None:
 
 
 async def salvar_anexo_publico(anexo: discord.Attachment, prefixo: str) -> str:
-    """Salva a imagem do procurado diretamente no volume persistente /data."""
+    """Salva a imagem no volume persistente e devolve a rota pública do catálogo."""
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    ext = _catalogo_extensao_imagem(getattr(anexo, 'filename', ''), getattr(anexo, 'content_type', ''))
-    base = slugify(Path(str(getattr(anexo, 'filename', '') or 'imagem')).stem) or 'imagem'
-    nome = f"{data_caso()}-{slugify(prefixo)}-{base}{ext}"
-    caminho = UPLOADS_DIR / nome
-    try:
-        await anexo.save(str(caminho))
-    except Exception:
-        # Fallback por HTTP para anexos cujo save direto falhou.
-        urls = [str(getattr(anexo, 'proxy_url', '') or ''), str(getattr(anexo, 'url', '') or '')]
-        ultimo_erro: Optional[Exception] = None
-        for url in urls:
-            if not url:
-                continue
-            try:
-                timeout = aiohttp.ClientTimeout(total=40)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resposta:
-                        if resposta.status != 200:
-                            continue
-                        dados = await resposta.read()
-                        if dados:
-                            caminho.write_bytes(dados)
-                            ultimo_erro = None
-                            break
-            except Exception as erro:
-                ultimo_erro = erro
-        if not caminho.exists() or caminho.stat().st_size <= 0:
-            if ultimo_erro:
-                raise ultimo_erro
-            raise RuntimeError('Não foi possível salvar a imagem do catálogo.')
-    return f'/uploads/{nome}'
+    caminho = await baixar_anexo_persistente(anexo, UPLOADS_DIR, prefixo)
+    if caminho is None or not caminho.exists() or caminho.stat().st_size <= 0:
+        raise RuntimeError('Não foi possível salvar a imagem do catálogo no volume persistente.')
+    return f'/uploads/{caminho.name}'
 
 
 def registro_tem_valor_util(valor: Any) -> bool:
@@ -46143,7 +46231,8 @@ def _arvore_hash_imagem(caminho: Any) -> Optional[Dict[str, Any]]:
         with PILImage.open(str(p)) as img:
             largura, altura = img.size
             mini = img.convert("L").resize((16, 16))
-            pixels = list(mini.getdata())
+            obter_pixels = getattr(mini, 'get_flattened_data', None)
+            pixels = list(obter_pixels() if callable(obter_pixels) else mini.getdata())
             media = sum(pixels) / max(1, len(pixels))
             bits = "".join("1" if px >= media else "0" for px in pixels)
             ahash = f"{int(bits, 2):064x}"
@@ -46605,9 +46694,6 @@ print(
     "vínculos por organização, registros, veículos, rádio e vestimenta visual estritamente idêntica.",
     flush=True,
 )
-
-if __name__ == '__main__':
-    asyncio.run(main())
 
 # =====================================================
 # PATCH FINAL — ÁRVORE INTERATIVA + IA OPENAI OPCIONAL
@@ -47352,3 +47438,7 @@ def _dossie_ia_responder(perfil: Dict[str, Any], pergunta: str) -> discord.Embed
 
 
 print("✅ Patch V6 ativo: veículos/placas extraídos das perícias, árvore atualizada e IA conversacional ampliada.", flush=True)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
