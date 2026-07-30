@@ -46089,5 +46089,522 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# ÁRVORE CRIMINAL + ORGANIZAÇÃO FINAL DOS BOTÕES DA FICHA
+# Mantém somente: Editar, Consultar IA, Ver Árvore e Ver RG e Foto.
+# =====================================================
+
+ARVORE_MAX_CONEXOES = max(3, min(15, int(os.getenv("ARVORE_MAX_CONEXOES", "8"))))
+ARVORE_ROUPA_EXATA_SOMENTE = os.getenv("ARVORE_ROUPA_EXATA_SOMENTE", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
+_ARVORE_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _arvore_normalizar(valor: Any) -> str:
+    bruto = unicodedata.normalize("NFKD", str(valor or ""))
+    return "".join(c for c in bruto if not unicodedata.combining(c)).lower().strip()
+
+
+def _arvore_tokens(valor: Any) -> set[str]:
+    return {
+        t for t in re.findall(r"[a-z0-9]{3,}", _arvore_normalizar(valor))
+        if t not in {"nao", "sem", "com", "para", "por", "uma", "dos", "das", "individuo", "registro"}
+    }
+
+
+def _arvore_extrair_radios(*textos: Any) -> set[str]:
+    encontrados: set[str] = set()
+    for texto in textos:
+        base = _arvore_normalizar(texto)
+        for valor in re.findall(r"(?:radio|frequencia|freq)[^0-9]{0,12}([0-9]{3,6})", base):
+            encontrados.add(valor)
+    return encontrados
+
+
+def _arvore_eh_imagem_roupa(nome: str, descricao: str = "") -> bool:
+    base = _arvore_normalizar(f"{nome} {descricao}")
+    termos = (
+        "roupa", "uniforme", "vestimenta", "traje", "colete", "jaqueta",
+        "calca", "blusa", "camisa", "mascara", "capacete", "look", "outfit",
+    )
+    return any(t in base for t in termos)
+
+
+def _arvore_hash_imagem(caminho: Any) -> Optional[Dict[str, Any]]:
+    """Hash estrito: SHA-256 do arquivo + aHash normalizado para detectar imagem visual idêntica."""
+    try:
+        import hashlib
+        p = Path(str(caminho or ""))
+        if not p.exists() or not p.is_file() or p.stat().st_size <= 0:
+            return None
+        sha = hashlib.sha256(p.read_bytes()).hexdigest()
+        if PILImage is None:
+            return {"sha256": sha, "ahash": "", "largura": 0, "altura": 0, "path": str(p)}
+        with PILImage.open(str(p)) as img:
+            largura, altura = img.size
+            mini = img.convert("L").resize((16, 16))
+            pixels = list(mini.getdata())
+            media = sum(pixels) / max(1, len(pixels))
+            bits = "".join("1" if px >= media else "0" for px in pixels)
+            ahash = f"{int(bits, 2):064x}"
+        return {"sha256": sha, "ahash": ahash, "largura": largura, "altura": altura, "path": str(p)}
+    except Exception:
+        return None
+
+
+def _arvore_roupas_por_individuo(db: sqlite3.Connection) -> Dict[int, List[Dict[str, Any]]]:
+    roupas: Dict[int, List[Dict[str, Any]]] = {}
+    try:
+        rows = db.execute(
+            """
+            SELECT id, individuo_id, nome_arquivo, caminho, descricao, url_original
+            FROM arquivos_ficha_geral
+            WHERE individuo_id > 0
+            ORDER BY criado_em DESC
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+    for row in rows:
+        d = dict(row)
+        if not _arvore_eh_imagem_roupa(str(d.get("nome_arquivo") or ""), str(d.get("descricao") or "")):
+            continue
+        h = _arvore_hash_imagem(d.get("caminho"))
+        if not h:
+            continue
+        h.update({
+            "arquivo_id": int(d.get("id") or 0),
+            "nome": str(d.get("nome_arquivo") or "roupa"),
+            "descricao": str(d.get("descricao") or ""),
+            "url": str(d.get("url_original") or ""),
+        })
+        roupas.setdefault(int(d.get("individuo_id") or 0), []).append(h)
+
+    # A foto principal também pode ser usada, mas apenas para correspondência visual estritamente idêntica.
+    try:
+        pessoas = db.execute(
+            "SELECT id, foto_individuo_path, foto_individuo_url FROM individuos WHERE COALESCE(foto_individuo_path,'')<>''"
+        ).fetchall()
+    except Exception:
+        pessoas = []
+    for row in pessoas:
+        d = dict(row)
+        h = _arvore_hash_imagem(d.get("foto_individuo_path"))
+        if h:
+            h.update({"arquivo_id": 0, "nome": "Foto do indivíduo", "descricao": "foto principal", "url": str(d.get("foto_individuo_url") or "")})
+            roupas.setdefault(int(d.get("id") or 0), []).append(h)
+    return roupas
+
+
+def _arvore_comparar_roupas(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Só confirma quando o arquivo ou a imagem normalizada são idênticos."""
+    for ra in a:
+        for rb in b:
+            mesma_arquivo = bool(ra.get("sha256") and ra.get("sha256") == rb.get("sha256"))
+            mesma_visual = bool(
+                ra.get("ahash") and ra.get("ahash") == rb.get("ahash")
+                and int(ra.get("largura") or 0) == int(rb.get("largura") or 0)
+                and int(ra.get("altura") or 0) == int(rb.get("altura") or 0)
+            )
+            if mesma_arquivo or mesma_visual:
+                return {
+                    "confirmada": True,
+                    "tipo": "arquivo idêntico" if mesma_arquivo else "imagem visual idêntica",
+                    "a": ra,
+                    "b": rb,
+                }
+    return None
+
+
+def _arvore_adicionar_motivo(conexoes: Dict[int, Dict[str, Any]], outro_id: int, pontos: int, motivo: str, evidencia: str = "") -> None:
+    if outro_id <= 0:
+        return
+    item = conexoes.setdefault(outro_id, {"score": 0, "motivos": [], "evidencias": []})
+    item["score"] += int(pontos)
+    if motivo and motivo not in item["motivos"]:
+        item["motivos"].append(motivo)
+    if evidencia and evidencia not in item["evidencias"]:
+        item["evidencias"].append(evidencia)
+
+
+def _arvore_calcular(individuo_id: int, *, ignorar_cache: bool = False) -> Dict[str, Any]:
+    import time
+    individuo_id = int(individuo_id or 0)
+    agora = time.time()
+    cache = _ARVORE_CACHE.get(individuo_id)
+    if cache and not ignorar_cache and agora - cache[0] < 180:
+        return cache[1]
+
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        alvo_row = db.execute("SELECT * FROM individuos WHERE id=?", (individuo_id,)).fetchone()
+        if not alvo_row:
+            return {}
+        alvo = dict(alvo_row)
+        pessoas = [dict(x) for x in db.execute(
+            "SELECT * FROM individuos WHERE id<>? AND UPPER(COALESCE(status,''))<>'ARQUIVADO'",
+            (individuo_id,),
+        ).fetchall()]
+        mapa = {int(p["id"]): p for p in pessoas}
+        conexoes: Dict[int, Dict[str, Any]] = {}
+
+        faccao_alvo = _arvore_normalizar(alvo.get("faccao_atual"))
+        if faccao_alvo:
+            for p in pessoas:
+                if _arvore_normalizar(p.get("faccao_atual")) == faccao_alvo:
+                    _arvore_adicionar_motivo(conexoes, int(p["id"]), 4, "mesma organização", str(alvo.get("faccao_atual") or ""))
+
+        # Veículos compartilhados ou vinculados a mais de um indivíduo.
+        try:
+            veiculos_alvo = {
+                int(x[0]) for x in db.execute(
+                    """
+                    SELECT DISTINCT v.id FROM veiculos v
+                    LEFT JOIN vinculos_individuo_veiculo l ON l.veiculo_id=v.id AND l.ativo=1
+                    WHERE l.individuo_id=? OR v.proprietario_individuo_id=? OR v.proprietario_rg=?
+                    """,
+                    (individuo_id, individuo_id, str(alvo.get("rg") or "")),
+                ).fetchall()
+            }
+            for vid in veiculos_alvo:
+                v = db.execute("SELECT placa, modelo FROM veiculos WHERE id=?", (vid,)).fetchone()
+                rotulo = " / ".join(str(x) for x in (v["modelo"], v["placa"]) if x) if v else f"veículo {vid}"
+                ids = {
+                    int(x[0]) for x in db.execute(
+                        "SELECT individuo_id FROM vinculos_individuo_veiculo WHERE veiculo_id=? AND ativo=1 AND individuo_id<>?",
+                        (vid, individuo_id),
+                    ).fetchall() if int(x[0] or 0)>0
+                }
+                # Proprietário também conta como vínculo.
+                dono = db.execute("SELECT proprietario_individuo_id, proprietario_rg FROM veiculos WHERE id=?", (vid,)).fetchone()
+                if dono:
+                    did = int(dono["proprietario_individuo_id"] or 0)
+                    if not did and dono["proprietario_rg"]:
+                        rr = db.execute("SELECT id FROM individuos WHERE rg=?", (str(dono["proprietario_rg"]),)).fetchone()
+                        did = int(rr[0]) if rr else 0
+                    if did and did != individuo_id:
+                        ids.add(did)
+                for oid in ids:
+                    _arvore_adicionar_motivo(conexoes, oid, 6, "veículo em comum", rotulo)
+        except Exception:
+            pass
+
+        # Fontes/documentos idênticos: mesma mensagem de BO, perícia, mesa etc.
+        try:
+            fontes_alvo = db.execute(
+                "SELECT tipo, mensagem_id, mensagem_url, numero_referencia, descricao FROM fontes_ficha_individuo WHERE individuo_id=?",
+                (individuo_id,),
+            ).fetchall()
+            for fonte in fontes_alvo:
+                mid = int(fonte["mensagem_id"] or 0)
+                if not mid:
+                    continue
+                iguais = db.execute(
+                    "SELECT individuo_id FROM fontes_ficha_individuo WHERE mensagem_id=? AND individuo_id<>?",
+                    (mid, individuo_id),
+                ).fetchall()
+                evidencia = str(fonte["numero_referencia"] or fonte["mensagem_url"] or fonte["descricao"] or fonte["tipo"] or "registro compartilhado")
+                for row in iguais:
+                    _arvore_adicionar_motivo(conexoes, int(row[0] or 0), 8, f"mesmo {str(fonte['tipo'] or 'registro').upper()}", evidencia)
+        except Exception:
+            pass
+
+        # Menções de nome/RG nas fontes e históricos do alvo.
+        textos_alvo: List[str] = [str(alvo.get("observacoes") or "")]
+        try:
+            textos_alvo += [str(x[0] or "") for x in db.execute(
+                "SELECT descricao FROM fontes_ficha_individuo WHERE individuo_id=?", (individuo_id,)
+            ).fetchall()]
+            textos_alvo += [str(x[0] or "") for x in db.execute(
+                "SELECT texto_original FROM historico_prisoes WHERE individuo_id=?", (individuo_id,)
+            ).fetchall()]
+        except Exception:
+            pass
+        corpus = _arvore_normalizar("\n".join(textos_alvo))
+        for p in pessoas:
+            nome = _arvore_normalizar(p.get("nome"))
+            rg = _arvore_normalizar(p.get("rg"))
+            if (nome and len(nome) >= 5 and nome in corpus) or (rg and len(rg) >= 3 and re.search(rf"(?<![a-z0-9]){re.escape(rg)}(?![a-z0-9])", corpus)):
+                _arvore_adicionar_motivo(conexoes, int(p["id"]), 3, "citado nos registros", str(p.get("rg") or ""))
+
+        # Rádio/frequência em comum, somente quando há valor explícito.
+        radios_alvo = _arvore_extrair_radios(alvo.get("observacoes"), alvo.get("cargo_faccao"))
+        if radios_alvo:
+            for p in pessoas:
+                radios_p = _arvore_extrair_radios(p.get("observacoes"), p.get("cargo_faccao"))
+                comuns = sorted(radios_alvo & radios_p)
+                if comuns:
+                    _arvore_adicionar_motivo(conexoes, int(p["id"]), 4, "rádio em comum", ", ".join(comuns))
+
+        # Vestimentas: vínculo automático somente em correspondência estritamente idêntica.
+        roupas = _arvore_roupas_por_individuo(db)
+        roupas_alvo = roupas.get(individuo_id, [])
+        if roupas_alvo:
+            for p in pessoas:
+                oid = int(p["id"])
+                comparacao = _arvore_comparar_roupas(roupas_alvo, roupas.get(oid, []))
+                if comparacao:
+                    nome_roupa = str((comparacao.get("a") or {}).get("nome") or "vestimenta")
+                    _arvore_adicionar_motivo(conexoes, oid, 7, "vestimenta visual idêntica", nome_roupa)
+                    conexoes[oid]["roupa_confirmada"] = comparacao
+
+        saida=[]
+        for oid, info in conexoes.items():
+            pessoa = mapa.get(oid)
+            if not pessoa:
+                continue
+            saida.append({
+                "id": oid,
+                "nome": str(pessoa.get("nome") or "Sem nome"),
+                "rg": str(pessoa.get("rg") or ""),
+                "faccao": str(pessoa.get("faccao_atual") or ""),
+                "score": int(info.get("score") or 0),
+                "motivos": list(info.get("motivos") or []),
+                "evidencias": list(info.get("evidencias") or []),
+                "roupa_confirmada": info.get("roupa_confirmada"),
+            })
+        saida.sort(key=lambda x: (-x["score"], -len(x["motivos"]), x["nome"].lower()))
+        resultado={"alvo": alvo, "conexoes": saida[:ARVORE_MAX_CONEXOES], "total": len(saida)}
+        _ARVORE_CACHE[individuo_id]=(agora, resultado)
+        return resultado
+
+
+def _arvore_forca(score: int) -> str:
+    if score >= 15:
+        return "MUITO FORTE"
+    if score >= 9:
+        return "FORTE"
+    if score >= 5:
+        return "MODERADA"
+    return "FRACA"
+
+
+def _arvore_gerar_imagem(resultado: Dict[str, Any]) -> Optional[Path]:
+    if PILImage is None:
+        return None
+    try:
+        from PIL import ImageDraw, ImageFont
+        import math, tempfile
+        alvo = dict(resultado.get("alvo") or {})
+        conexoes = list(resultado.get("conexoes") or [])
+        w, h = 1500, 950
+        img = PILImage.new("RGB", (w, h), (8, 17, 29))
+        draw = ImageDraw.Draw(img)
+        try:
+            font_t = ImageFont.truetype("DejaVuSans-Bold.ttf", 42)
+            font_n = ImageFont.truetype("DejaVuSans-Bold.ttf", 25)
+            font_s = ImageFont.truetype("DejaVuSans.ttf", 19)
+            font_e = ImageFont.truetype("DejaVuSans.ttf", 16)
+        except Exception:
+            font_t = font_n = font_s = font_e = ImageFont.load_default()
+        draw.rounded_rectangle((25, 20, w-25, h-25), radius=28, outline=(35, 104, 170), width=4)
+        draw.text((55, 45), "ÁRVORE CRIMINAL — DICOR", font=font_t, fill=(235, 242, 250))
+        draw.text((55, 100), "Vínculos calculados somente a partir dos registros armazenados", font=font_s, fill=(145, 174, 202))
+        cx, cy = w//2, h//2 + 55
+        raio_c = 115
+        draw.ellipse((cx-raio_c, cy-raio_c, cx+raio_c, cy+raio_c), fill=(18, 76, 128), outline=(102, 180, 240), width=5)
+        nome_alvo = str(alvo.get("nome") or "INDIVÍDUO")[:26]
+        rg_alvo = str(alvo.get("rg") or "")[:20]
+        bbox=draw.textbbox((0,0), nome_alvo, font=font_n)
+        draw.text((cx-(bbox[2]-bbox[0])/2, cy-22), nome_alvo, font=font_n, fill=(255,255,255))
+        bbox=draw.textbbox((0,0), f"RG {rg_alvo}", font=font_s)
+        draw.text((cx-(bbox[2]-bbox[0])/2, cy+18), f"RG {rg_alvo}", font=font_s, fill=(202,226,245))
+        n=max(1,len(conexoes))
+        rx, ry = 555, 335
+        for i,c in enumerate(conexoes):
+            ang=(-math.pi/2)+(2*math.pi*i/n)
+            x=int(cx+rx*math.cos(ang)); y=int(cy+ry*math.sin(ang))
+            score=int(c.get("score") or 0)
+            # linha e rótulo da principal evidência
+            draw.line((cx,cy,x,y), fill=(67,126,178), width=max(2,min(8,score//3+2)))
+            mx,my=(cx+x)//2,(cy+y)//2
+            motivo=(c.get("motivos") or ["vínculo"])[0]
+            draw.rounded_rectangle((mx-92,my-17,mx+92,my+17), radius=10, fill=(12,31,49), outline=(51,91,127), width=1)
+            tb=draw.textbbox((0,0),str(motivo)[:24],font=font_e)
+            draw.text((mx-(tb[2]-tb[0])/2,my-(tb[3]-tb[1])/2-1),str(motivo)[:24],font=font_e,fill=(196,218,236))
+            r=78
+            cor=(115,62,34) if c.get("roupa_confirmada") else (32,73,104)
+            draw.ellipse((x-r,y-r,x+r,y+r), fill=cor, outline=(223,235,246), width=3)
+            nome=str(c.get("nome") or "Sem nome")[:22]
+            rg=str(c.get("rg") or "")[:15]
+            tb=draw.textbbox((0,0),nome,font=font_s)
+            draw.text((x-(tb[2]-tb[0])/2,y-22),nome,font=font_s,fill=(255,255,255))
+            tb=draw.textbbox((0,0),f"RG {rg}",font=font_e)
+            draw.text((x-(tb[2]-tb[0])/2,y+5),f"RG {rg}",font=font_e,fill=(211,226,239))
+            tb=draw.textbbox((0,0),f"{_arvore_forca(score)} • {score} pts",font=font_e)
+            draw.text((x-(tb[2]-tb[0])/2,y+30),f"{_arvore_forca(score)} • {score} pts",font=font_e,fill=(255,215,140))
+        draw.text((55,h-70),"Marrom: vínculo com vestimenta visual idêntica confirmada • Azul: demais vínculos",font=font_s,fill=(145,174,202))
+        pasta = Path(DATA_DIR) / "arvores_criminais"
+        pasta.mkdir(parents=True, exist_ok=True)
+        caminho = pasta / f"arvore_{int(alvo.get('id') or 0)}_{secrets.token_hex(4)}.png"
+        img.save(str(caminho), format="PNG", optimize=True)
+        return caminho
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _arvore_embed(resultado: Dict[str, Any]) -> discord.Embed:
+    alvo = dict(resultado.get("alvo") or {})
+    conexoes = list(resultado.get("conexoes") or [])
+    embed = discord.Embed(
+        title=f"🧬 ÁRVORE CRIMINAL — {str(alvo.get('nome') or 'INDIVÍDUO').upper()}",
+        description=(
+            f"**RG:** `{alvo.get('rg') or 'Não informado'}`\n"
+            f"**Organização atual:** {alvo.get('faccao_atual') or 'Não informada'}\n\n"
+            "Os vínculos abaixo foram encontrados automaticamente nos registros do Banco DICOR."
+        ),
+        color=discord.Color.from_rgb(21, 83, 138),
+    )
+    if not conexoes:
+        embed.add_field(name="Nenhuma conexão encontrada", value="Ainda não há registros suficientes para construir a árvore deste indivíduo.", inline=False)
+    else:
+        for c in conexoes[:8]:
+            motivos = ", ".join(c.get("motivos") or ["registro relacionado"])
+            evidencias = " • ".join(str(x) for x in (c.get("evidencias") or [])[:3]) or "Sem referência resumida"
+            roupa = "\n🧥 **Vestimenta visual idêntica confirmada**" if c.get("roupa_confirmada") else ""
+            embed.add_field(
+                name=f"{c.get('nome')} — RG {c.get('rg')} | {_arvore_forca(int(c.get('score') or 0))}",
+                value=f"**Pontuação:** {c.get('score')}\n**Motivos:** {motivos}\n**Evidências:** {evidencias}{roupa}"[:1024],
+                inline=False,
+            )
+    embed.set_footer(text="A árvore aponta vínculos investigativos; não confirma autoria ou participação criminosa.")
+    return embed
+
+
+class BancoVerArvoreButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, *, row: int = 1):
+        super().__init__(label="Ver Árvore", emoji="🧬", style=discord.ButtonStyle.primary, row=row)
+        self.tipo = str(tipo or "individuo")
+        self.registro_id = int(registro_id or 0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, self.tipo, self.registro_id)
+            individuo_id = int((perfil.get("individuo") or {}).get("id") or perfil.get("registro_id") or 0)
+            if not individuo_id:
+                return await interaction.followup.send("❌ A árvore criminal só está disponível para fichas vinculadas a um indivíduo.", ephemeral=True)
+            resultado = await asyncio.to_thread(_arvore_calcular, individuo_id, ignorar_cache=True)
+            if not resultado:
+                return await interaction.followup.send("❌ Não foi possível localizar os dados desta ficha.", ephemeral=True)
+            embed = _arvore_embed(resultado)
+            caminho = await asyncio.to_thread(_arvore_gerar_imagem, resultado)
+            if caminho and caminho.exists():
+                arquivo = discord.File(str(caminho), filename="arvore-criminal.png")
+                embed.set_image(url="attachment://arvore-criminal.png")
+                await interaction.followup.send(embed=embed, file=arquivo, ephemeral=True)
+                try:
+                    caminho.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Não foi possível montar a árvore: `{type(erro).__name__}: {erro}`", ephemeral=True)
+
+
+# Substitui a organização visual final da ficha sem remover o funcionamento dos recursos.
+_BANCO_FICHA_GERAL_VIEW_ANTES_ARVORE = BancoFichaGeralView
+class BancoFichaGeralView(_BANCO_FICHA_GERAL_VIEW_ANTES_ARVORE):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        perfil = dict(getattr(self, "perfil", {}) or {})
+
+        # Remove somente os controles antigos que o usuário não deseja mais na ficha.
+        remover=[]
+        for item in list(self.children):
+            if not isinstance(item, discord.ui.Button):
+                continue
+            rotulo=_arvore_normalizar(getattr(item, "label", ""))
+            if any(t in rotulo for t in ("adicionar arquivos", "ver arquivos")):
+                remover.append(item)
+        for item in remover:
+            try:
+                self.remove_item(item)
+            except Exception:
+                pass
+
+        # Padroniza os quatro botões finais.
+        tem_arvore=False
+        for item in list(self.children):
+            if not isinstance(item, discord.ui.Button):
+                continue
+            rotulo=_arvore_normalizar(getattr(item, "label", ""))
+            if "adicionar/editar" in rotulo or rotulo == "editar informacoes":
+                item.label="Editar"
+                item.emoji="✏️"
+                item.style=discord.ButtonStyle.secondary
+                item.row=1
+            elif "identificacao" in rotulo or ("rg" in rotulo and "foto" in rotulo):
+                item.label="Ver RG e Foto"
+                item.emoji="🪪"
+                item.style=discord.ButtonStyle.secondary
+                item.row=1
+            elif "consultar ia" in rotulo:
+                item.label="Consultar IA"
+                item.emoji="🧠"
+                item.style=discord.ButtonStyle.success
+                item.row=1
+            elif "ver arvore" in rotulo:
+                tem_arvore=True
+
+        if perfil and not tem_arvore:
+            tipo = str(perfil.get("tipo") or "individuo")
+            registro_id = int(perfil.get("registro_id") or (perfil.get("individuo") or {}).get("id") or 0)
+            if registro_id:
+                self.add_item(BancoVerArvoreButton(tipo, registro_id, row=1))
+
+        # Garante no máximo os controles solicitados, preservando selects de resultados.
+        permitidos=("editar", "consultar ia", "ver arvore", "ver rg e foto")
+        for item in list(self.children):
+            if isinstance(item, discord.ui.Button):
+                rotulo=_arvore_normalizar(getattr(item,"label",""))
+                if rotulo not in permitidos:
+                    try:
+                        self.remove_item(item)
+                    except Exception:
+                        pass
+
+
+# Reaplica a abertura compacta para que use a View final com os quatro botões.
+class BancoAbrirFichaButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, indice: int = 0):
+        rotulo = "Abrir Ficha" if indice == 0 else f"Abrir Ficha {indice + 1}"
+        super().__init__(
+            label=rotulo[:80], emoji="📂", style=discord.ButtonStyle.primary,
+            custom_id=f"dicor_abrir_ficha_arvore:{tipo}:{int(registro_id)}:{secrets.token_hex(3)}",
+        )
+        self.tipo = str(tipo)
+        self.registro_id = int(registro_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if self.tipo == "faccao":
+                registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", self.registro_id)
+                if not registro:
+                    return await interaction.edit_original_response(content="❌ A organização não existe mais.", embed=None, view=None)
+                embed = _banco_embed_consulta_faccao(registro)
+                view = None
+            else:
+                perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, self.tipo, self.registro_id)
+                if not perfil:
+                    return await interaction.edit_original_response(content="❌ A ficha não existe mais.", embed=None, view=None)
+                embed = _banco_embed_ficha_geral(perfil)
+                view = BancoFichaGeralView(int(interaction.user.id), perfil)
+            embed.color = discord.Color.from_rgb(30, 105, 190)
+            await interaction.edit_original_response(embed=embed, view=view)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível abrir a ficha.", erro)
+
+
+print(
+    "✅ Árvore Criminal carregada: ficha reduzida a Editar, Consultar IA, Ver Árvore e Ver RG e Foto; "
+    "vínculos por organização, registros, veículos, rádio e vestimenta visual estritamente idêntica.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
