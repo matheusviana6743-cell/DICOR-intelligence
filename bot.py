@@ -50667,5 +50667,255 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V14 — INTERAÇÕES ÚNICAS E PESQUISA SEM CARREGAMENTO INFINITO
+# =====================================================
+# Correções:
+# - remove o roteador de emergência V13, que executava o mesmo botão junto da View;
+# - elimina o erro Discord 40060 "Interaction has already been acknowledged";
+# - a pesquisa edita a resposta deferida, removendo o estado "pensando...";
+# - adiciona limite de tempo e diagnóstico claro para banco bloqueado/lento;
+# - mantém os mesmos custom_ids, painéis, permissões e mecânicas externas.
+
+_V14_SEARCH_TIMEOUT = max(8.0, float(os.getenv('DICOR_SEARCH_TIMEOUT', '25') or 25))
+_V14_INTERACOES_LIMPAS = False
+
+
+def _v14_limpar_roteadores_duplicados() -> int:
+    """Remove listeners globais que tentavam responder ao mesmo clique da ViewStore."""
+    global _V14_INTERACOES_LIMPAS
+    eventos = getattr(bot, 'extra_events', None)
+    removidos = 0
+    if isinstance(eventos, dict):
+        removidos = len(list(eventos.get('on_interaction', []) or []))
+        eventos['on_interaction'] = []
+    _V14_INTERACOES_LIMPAS = True
+    return removidos
+
+
+_V14_LISTENERS_REMOVIDOS = _v14_limpar_roteadores_duplicados()
+
+
+def _v14_erro_interacao_duplicada(erro: BaseException) -> bool:
+    if isinstance(erro, discord.InteractionResponded):
+        return True
+    codigo = int(getattr(erro, 'code', 0) or 0)
+    # 40060 = Interaction has already been acknowledged
+    # 10062 = Unknown interaction (token expirado)
+    return codigo in {40060, 10062}
+
+
+async def _v12_enviar_erro_interacao(
+    interaction: discord.Interaction,
+    texto: str,
+    erro: Exception,
+) -> None:
+    """Substitui o handler V12: nunca tenta responder duas vezes."""
+    if _v14_erro_interacao_duplicada(erro):
+        print(
+            f'⚠️ V14 ignorou resposta duplicada/expirada em {getattr(interaction, "id", 0)}: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+        return
+    traceback.print_exception(type(erro), erro, erro.__traceback__)
+    mensagem = f'❌ {texto}\n`{type(erro).__name__}: {str(erro)[:300]}`'
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(mensagem, ephemeral=True)
+        else:
+            await interaction.response.send_message(mensagem, ephemeral=True)
+    except Exception as segundo_erro:
+        if not _v14_erro_interacao_duplicada(segundo_erro):
+            print(
+                f'⚠️ V14 não conseguiu enviar erro da interação: '
+                f'{type(segundo_erro).__name__}: {segundo_erro}',
+                flush=True,
+            )
+
+
+async def _v14_editar_resposta(
+    interaction: discord.Interaction,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    view: Optional[View] = None,
+) -> None:
+    """Finaliza sempre a resposta deferida do modal, sem deixar 'pensando'."""
+    try:
+        await interaction.edit_original_response(content=content, embed=embed, view=view)
+    except discord.NotFound:
+        # Fallback apenas quando o webhook original realmente expirou.
+        try:
+            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=True)
+        except Exception:
+            pass
+
+
+async def _v14_consultar_banco(interaction: discord.Interaction, consulta: str) -> None:
+    termo = str(consulta or '').strip()
+    if not termo:
+        await _v14_editar_resposta(interaction, content='❌ Digite algo para pesquisar.', view=None)
+        return
+
+    try:
+        resultados = await asyncio.wait_for(
+            asyncio.to_thread(banco_buscar, termo),
+            timeout=_V14_SEARCH_TIMEOUT,
+        )
+        opcoes = await asyncio.wait_for(
+            asyncio.to_thread(_banco_ficha_geral_opcoes, resultados),
+            timeout=max(5.0, _V14_SEARCH_TIMEOUT / 2),
+        )
+    except asyncio.TimeoutError:
+        await _v14_editar_resposta(
+            interaction,
+            content=(
+                '⌛ **A pesquisa ultrapassou o limite de tempo.**\n'
+                'O banco pode estar ocupado por uma sincronização. Aguarde alguns segundos e tente novamente.'
+            ),
+            view=None,
+        )
+        print(f'⚠️ V14 pesquisa expirou para {termo!r}.', flush=True)
+        return
+    except Exception as erro:
+        await _v14_editar_resposta(
+            interaction,
+            content=f'❌ Falha ao consultar o banco: `{type(erro).__name__}: {str(erro)[:300]}`',
+            view=None,
+        )
+        traceback.print_exception(type(erro), erro, erro.__traceback__)
+        return
+
+    if not opcoes:
+        embed = discord.Embed(
+            title='🔎 CONSULTA AO BANCO',
+            description=f'Nenhum registro foi localizado para **{termo[:100]}**.',
+            color=discord.Color.from_rgb(215, 169, 61),
+        )
+        await _v14_editar_resposta(interaction, embed=embed, view=None)
+        return
+
+    try:
+        if len(opcoes) == 1:
+            tipo, rid, _, _, _ = opcoes[0]
+            if tipo == 'faccao':
+                registro = await asyncio.wait_for(
+                    asyncio.to_thread(_banco_prof_registro_por_id, 'faccao', rid),
+                    timeout=max(5.0, _V14_SEARCH_TIMEOUT / 2),
+                )
+                embed = _banco_embed_consulta_faccao(registro)
+                view = None
+            else:
+                perfil = await asyncio.wait_for(
+                    asyncio.to_thread(_banco_ficha_geral_carregar, tipo, rid),
+                    timeout=max(5.0, _V14_SEARCH_TIMEOUT / 2),
+                )
+                if not perfil:
+                    await _v14_editar_resposta(interaction, content='❌ A ficha não foi encontrada.', view=None)
+                    return
+                embed = _banco_embed_ficha_geral(perfil)
+                view = BancoFichaGeralView(int(interaction.user.id), perfil)
+        else:
+            embed = _banco_ficha_geral_resultados_embed(termo, opcoes)
+            view = BancoFichaGeralView(int(interaction.user.id), None, opcoes)
+
+        try:
+            embed.color = discord.Color.from_rgb(215, 169, 61)
+        except Exception:
+            pass
+        await _v14_editar_resposta(interaction, embed=embed, view=view)
+        print(
+            f'✅ V14 pesquisa concluída: termo={termo!r}, resultados={len(opcoes)}.',
+            flush=True,
+        )
+    except asyncio.TimeoutError:
+        await _v14_editar_resposta(
+            interaction,
+            content='⌛ Os dados foram encontrados, mas a ficha demorou demais para abrir. Tente novamente.',
+            view=None,
+        )
+    except Exception as erro:
+        await _v14_editar_resposta(
+            interaction,
+            content=f'❌ Falha ao montar o resultado: `{type(erro).__name__}: {str(erro)[:300]}`',
+            view=None,
+        )
+        traceback.print_exception(type(erro), erro, erro.__traceback__)
+
+
+class BancoConsultaModalV14(Modal, title='Pesquisar fichas DICOR'):
+    consulta = TextInput(
+        label='Nome, RG, telefone, placa ou organização',
+        placeholder='Ex.: 28457, Arlindo Silva ou ABC1D23',
+        min_length=1,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Primeira e única confirmação desta interação.
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception as erro:
+            if not _v14_erro_interacao_duplicada(erro):
+                raise
+            return
+        await _v14_consultar_banco(interaction, str(self.consulta.value or ''))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        if _v14_erro_interacao_duplicada(error):
+            return
+        try:
+            if interaction.response.is_done():
+                await _v14_editar_resposta(
+                    interaction,
+                    content=f'❌ Falha na pesquisa: `{type(error).__name__}: {str(error)[:300]}`',
+                    view=None,
+                )
+            else:
+                await interaction.response.send_message(
+                    f'❌ Falha na pesquisa: `{type(error).__name__}: {str(error)[:300]}`',
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+
+
+async def _v12_banco_pesquisar(interaction: discord.Interaction) -> None:
+    """Motor V14 aplicado aos botões V12 e aos IDs legados compatíveis."""
+    if interaction.response.is_done():
+        return
+    try:
+        await interaction.response.send_modal(BancoConsultaModalV14())
+    except Exception as erro:
+        if not _v14_erro_interacao_duplicada(erro):
+            await _v12_enviar_erro_interacao(interaction, 'Não foi possível abrir a pesquisa.', erro)
+
+
+# Garante que o setup não reintroduza listeners globais duplicados.
+_V14_SETUP_ANTERIOR = bot.setup_hook
+
+
+async def _v14_setup_hook(self) -> None:
+    _v14_limpar_roteadores_duplicados()
+    await _V14_SETUP_ANTERIOR()
+    # Alguns setup hooks de versões antigas podem alterar extra_events indiretamente.
+    _v14_limpar_roteadores_duplicados()
+    print(
+        f'✅ V14: interações únicas ativas; {_V14_LISTENERS_REMOVIDOS} roteador(es) duplicado(s) removido(s); '
+        f'pesquisa com timeout de {_V14_SEARCH_TIMEOUT:.0f}s.',
+        flush=True,
+    )
+
+
+bot.setup_hook = _v13_types.MethodType(_v14_setup_hook, bot)
+
+
+print(
+    '✅ V14 carregada: resposta dupla removida de todos os painéis e pesquisa sem carregamento infinito.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
