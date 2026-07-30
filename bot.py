@@ -45509,5 +45509,469 @@ class PainelProcuradosView(View):
 print("✅ Patch V3 ativo: pesquisa completa, prisional obrigatório, reações e catálogo automático sem repostagem.", flush=True)
 
 
+
+# =====================================================
+# DOSSIÊ INTELIGENTE — CONSULTA EM CANAL PROVISÓRIO
+# Mantém a ficha atual e adiciona somente o botão "Consultar IA".
+# =====================================================
+
+DOSSIE_IA_CATEGORY_ID = env_int("DOSSIE_IA_CATEGORY_ID", 1532096472965714060)
+DOSSIE_IA_CHANNEL_TTL_MINUTES = env_int("DOSSIE_IA_CHANNEL_TTL_MINUTES", 30)
+_DOSSIE_IA_SESSOES: Dict[int, Dict[str, Any]] = {}
+
+
+def _dossie_ia_normalizar(texto: Any) -> str:
+    bruto = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(c for c in bruto if not unicodedata.combining(c)).lower().strip()
+
+
+def _dossie_ia_lista(valor: Any) -> List[Any]:
+    if isinstance(valor, list):
+        return valor
+    if isinstance(valor, tuple):
+        return list(valor)
+    return []
+
+
+def _dossie_ia_fontes(perfil: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    def visitar(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str) and v.startswith("http") and any(x in _dossie_ia_normalizar(k) for x in ("url", "link", "mensagem", "foto")):
+                    if v not in urls:
+                        urls.append(v)
+                else:
+                    visitar(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                visitar(item)
+    visitar(perfil)
+    return urls[:12]
+
+
+def _dossie_ia_resumo_contexto(perfil: Dict[str, Any]) -> Dict[str, Any]:
+    ind = dict(perfil.get("individuo") or {})
+    veiculos = _dossie_ia_lista(perfil.get("veiculos"))
+    prisoes = _dossie_ia_lista(perfil.get("historico_prisoes")) or _dossie_ia_lista(perfil.get("prisoes"))
+    fontes = _dossie_ia_lista(perfil.get("fontes_documentais"))
+    itens = dict(perfil.get("itens_ilegais_acumulados") or perfil.get("itens_ilegais") or {})
+    evidencias = _dossie_ia_lista(perfil.get("evidencias_mochila"))
+    arquivos = _dossie_ia_lista(perfil.get("arquivos"))
+    return {
+        "nome": str(ind.get("nome") or _banco_ficha_geral_titulo(perfil) or "Não informado"),
+        "rg": str(ind.get("rg") or "Não informado"),
+        "apelido": str(ind.get("apelido") or "Não informado"),
+        "telefone": str(ind.get("telefone") or "Não informado"),
+        "faccao": str(ind.get("faccao_atual") or perfil.get("organizacao_nome") or "Não informada"),
+        "cargo": str(ind.get("cargo_faccao") or "Não informado"),
+        "status": str(ind.get("status") or "CADASTRADO"),
+        "observacoes": str(ind.get("observacoes") or ""),
+        "veiculos": veiculos,
+        "prisoes": prisoes,
+        "fontes": fontes,
+        "itens": itens,
+        "evidencias": evidencias,
+        "arquivos": arquivos,
+        "perfil": perfil,
+    }
+
+
+def _dossie_ia_formatar_itens(itens: Dict[str, Any], filtro: str = "") -> List[str]:
+    linhas: List[str] = []
+    nf = _dossie_ia_normalizar(filtro)
+    for grupo, conteudo in itens.items():
+        if not isinstance(conteudo, dict):
+            continue
+        itens_grupo = []
+        for nome, quantidade in conteudo.items():
+            if nf and nf not in _dossie_ia_normalizar(grupo) and nf not in _dossie_ia_normalizar(nome):
+                continue
+            try:
+                qtd = int(quantidade)
+            except Exception:
+                qtd = quantidade
+            itens_grupo.append(f"• **{nome}:** {qtd}")
+        if itens_grupo:
+            linhas.append(f"\n**{grupo}**\n" + "\n".join(itens_grupo))
+    return linhas
+
+
+def _dossie_ia_busca_textual(perfil: Dict[str, Any], termos: List[str]) -> List[Tuple[str, str]]:
+    achados: List[Tuple[str, str]] = []
+    termos_n = [_dossie_ia_normalizar(t) for t in termos if t]
+    def visitar(obj: Any, caminho: str = "registro") -> None:
+        if len(achados) >= 20:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                visitar(v, f"{caminho} › {k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                visitar(v, f"{caminho} › item {i+1}")
+        elif obj not in (None, "", [], {}):
+            valor = str(obj)
+            nv = _dossie_ia_normalizar(valor)
+            if all(t in nv or t in _dossie_ia_normalizar(caminho) for t in termos_n):
+                par = (caminho, valor)
+                if par not in achados:
+                    achados.append(par)
+    visitar(perfil)
+    return achados
+
+
+def _dossie_ia_responder(perfil: Dict[str, Any], pergunta: str) -> discord.Embed:
+    ctx = _dossie_ia_resumo_contexto(perfil)
+    q = _dossie_ia_normalizar(pergunta)
+    embed = discord.Embed(
+        title="🧠 RESPOSTA DO DOSSIÊ INTELIGENTE",
+        color=discord.Color.from_rgb(24, 91, 158),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="❓ Pergunta", value=str(pergunta)[:1024], inline=False)
+    resposta = ""
+
+    palavras_armas = ("armado", "arma", "armamento", "pistola", "fuzil", "municao")
+    palavras_drogas = ("droga", "rape", "farinha", "balinha", "erva", "skunk", "lanca", "meta", "oxxy", "heroina")
+
+    if any(x in q for x in ("resumo", "resuma", "quem e", "fale sobre", "dossie")):
+        resposta = (
+            f"**{ctx['nome']}** — RG `{ctx['rg']}`\n"
+            f"**Status:** {ctx['status']}\n"
+            f"**Organização:** {ctx['faccao']}\n"
+            f"**Cargo:** {ctx['cargo']}\n"
+            f"**Veículos vinculados:** {len(ctx['veiculos'])}\n"
+            f"**Registros prisionais localizados:** {len(ctx['prisoes'])}\n"
+            f"**Evidências de mochila:** {len(ctx['evidencias'])}"
+        )
+        if ctx["observacoes"]:
+            resposta += f"\n\n**Observações:** {ctx['observacoes'][:700]}"
+    elif any(x in q for x in palavras_armas):
+        linhas = []
+        for filtro in ("armamento", "arma", "municao", "bombas", "armas brancas"):
+            linhas.extend(_dossie_ia_formatar_itens(ctx["itens"], filtro))
+        # remove duplicados preservando ordem
+        linhas = list(dict.fromkeys(linhas))
+        resposta = "Foram encontrados os seguintes registros relacionados a armamentos:\n" + "\n".join(linhas) if linhas else "Não localizei armamentos confirmados nos dados atuais desta ficha."
+    elif any(x in q for x in palavras_drogas):
+        linhas = _dossie_ia_formatar_itens(ctx["itens"], "droga")
+        if not linhas:
+            for termo in palavras_drogas[1:]:
+                linhas.extend(_dossie_ia_formatar_itens(ctx["itens"], termo))
+        linhas = list(dict.fromkeys(linhas))
+        resposta = "Registros de drogas ilícitas encontrados:\n" + "\n".join(linhas) if linhas else "Não localizei drogas ilícitas confirmadas nos dados atuais desta ficha."
+    elif "maior apreens" in q or "maior quantidade" in q:
+        maiores: List[Tuple[int, str, str]] = []
+        for grupo, conteudo in ctx["itens"].items():
+            if isinstance(conteudo, dict):
+                for nome, qtd in conteudo.items():
+                    try:
+                        maiores.append((int(qtd), str(nome), str(grupo)))
+                    except Exception:
+                        pass
+        maiores.sort(reverse=True)
+        if maiores:
+            qtd, nome, grupo = maiores[0]
+            resposta = f"A maior quantidade acumulada registrada é **{qtd}× {nome}**, no grupo **{grupo}**."
+        else:
+            resposta = "Não há quantidades de apreensão suficientes para fazer essa comparação."
+    elif any(x in q for x in ("quantas vezes preso", "quantas prisoes", "foi preso", "prisional", "prisao")):
+        resposta = f"Localizei **{len(ctx['prisoes'])} registro(s) prisional(is)** vinculado(s) à ficha."
+        if ctx["prisoes"]:
+            detalhes=[]
+            for p in ctx["prisoes"][:8]:
+                if isinstance(p, dict):
+                    data=p.get("data") or p.get("criado_em") or p.get("data_prisao") or "Data não informada"
+                    ref=p.get("numero") or p.get("id") or p.get("referencia") or "sem número"
+                    url=p.get("mensagem_url") or p.get("url") or ""
+                    linha=f"• **{data}** — registro `{ref}`"
+                    if str(url).startswith("http"):
+                        linha += f" — [abrir]({url})"
+                    detalhes.append(linha)
+            if detalhes:
+                resposta += "\n\n" + "\n".join(detalhes)
+    elif any(x in q for x in ("veiculo", "carro", "placa")):
+        if ctx["veiculos"]:
+            linhas=[]
+            for v in ctx["veiculos"][:12]:
+                placa=v.get("placa") or "SEM PLACA"
+                modelo=v.get("modelo") or "Modelo não informado"
+                cor=v.get("cor") or "cor não informada"
+                linhas.append(f"• `{placa}` — **{modelo}**, {cor}")
+            resposta="Veículos vinculados:\n"+"\n".join(linhas)
+        else:
+            resposta="Nenhum veículo está vinculado à ficha."
+    elif any(x in q for x in ("foto", "imagem", "prova", "evidencia", "fonte")):
+        urls=_dossie_ia_fontes(perfil)
+        resposta = "Fontes e imagens localizadas:\n" + "\n".join(f"• [Abrir fonte {i+1}]({u})" for i,u in enumerate(urls)) if urls else "Não encontrei links de imagens ou fontes acessíveis nesta ficha."
+    elif any(x in q for x in ("organizacao", "faccao", "familia", "grupo")):
+        resposta=f"A organização atualmente registrada é **{ctx['faccao']}**. Cargo informado: **{ctx['cargo']}**."
+        outras=_dossie_ia_lista(perfil.get("outras_fichas_organizacao"))
+        if outras:
+            resposta += "\n\n**Outras fichas da mesma organização:**\n" + "\n".join(
+                f"• **{x.get('nome') or 'Sem nome'}** — RG `{x.get('rg') or 'N/I'}`" for x in outras[:10] if isinstance(x, dict)
+            )
+    elif any(x in q for x in ("item", "portava", "portando", "apreendido", "apreensao", "mochila")):
+        linhas=_dossie_ia_formatar_itens(ctx["itens"])
+        resposta="Itens ilegais acumulados na ficha:\n"+"\n".join(linhas) if linhas else "Não há itens ilegais confirmados registrados nesta ficha."
+    else:
+        palavras=[p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9.-]+", pergunta) if len(p)>=3 and _dossie_ia_normalizar(p) not in {"que","qual","quais","como","essa","esse","sobre","dele","dela","tem","teve","foi","com"}]
+        achados=_dossie_ia_busca_textual(perfil, palavras[:4])
+        if achados:
+            resposta="Encontrei estas informações relacionadas à pergunta:\n"+"\n".join(
+                f"• **{caminho.split('›')[-1].strip().replace('_',' ').title()}:** {valor[:350]}" for caminho,valor in achados[:10]
+            )
+        else:
+            resposta=(
+                "Não encontrei uma resposta confirmável nos registros desta ficha. "
+                "Tente perguntar sobre prisões, armamentos, drogas, mochila, veículos, organização, fotos, fontes ou solicitar um resumo."
+            )
+
+    embed.add_field(name="📋 Análise", value=str(resposta)[:4000], inline=False)
+    urls = _dossie_ia_fontes(perfil)
+    if urls and not any(x in q for x in ("foto", "imagem", "fonte", "evidencia")):
+        embed.add_field(name="🔗 Fontes disponíveis", value="\n".join(f"• [Fonte {i+1}]({u})" for i,u in enumerate(urls[:5]))[:1024], inline=False)
+    embed.set_footer(text="DICOR • Resposta baseada somente nos registros vinculados à ficha • Confirme dados relevantes")
+    return embed
+
+
+class DossieIAPerguntaModal(Modal, title="Perguntar ao Dossiê Inteligente"):
+    pergunta = TextInput(
+        label="O que deseja investigar?",
+        placeholder="Ex.: Ele já foi preso com armamento?",
+        style=discord.TextStyle.paragraph,
+        min_length=3,
+        max_length=500,
+    )
+
+    def __init__(self, canal_id: int):
+        super().__init__()
+        self.canal_id = int(canal_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        sessao = _DOSSIE_IA_SESSOES.get(self.canal_id)
+        if not sessao:
+            return await interaction.response.send_message("❌ Esta consulta expirou.", ephemeral=True)
+        await interaction.response.defer(thinking=True)
+        try:
+            embed = await asyncio.to_thread(_dossie_ia_responder, dict(sessao.get("perfil") or {}), str(self.pergunta.value))
+            await interaction.followup.send(embed=embed)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Não foi possível analisar a pergunta: `{type(erro).__name__}`", ephemeral=True)
+
+
+class DossieIAChannelView(View):
+    def __init__(self, canal_id: int):
+        super().__init__(timeout=None)
+        self.canal_id = int(canal_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        sessao = _DOSSIE_IA_SESSOES.get(self.canal_id)
+        if not sessao:
+            await interaction.response.send_message("❌ Esta consulta já foi encerrada.", ephemeral=True)
+            return False
+        membro = interaction.user
+        if int(membro.id) == int(sessao.get("autor_id") or 0):
+            return True
+        if isinstance(membro, discord.Member) and usuario_tem_equipe(membro):
+            return True
+        await interaction.response.send_message("❌ Você não possui acesso a esta consulta.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Fazer pergunta", emoji="🧠", style=discord.ButtonStyle.primary, custom_id="dicor_dossie_ia_perguntar")
+    async def perguntar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(DossieIAPerguntaModal(self.canal_id))
+
+    @discord.ui.button(label="Atualizar ficha", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="dicor_dossie_ia_atualizar")
+    async def atualizar(self, interaction: discord.Interaction, button: Button):
+        sessao = _DOSSIE_IA_SESSOES.get(self.canal_id)
+        if not sessao:
+            return await interaction.response.send_message("❌ Consulta expirada.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, str(sessao.get("tipo") or "individuo"), int(sessao.get("registro_id") or 0))
+        if not perfil:
+            return await interaction.followup.send("❌ A ficha não foi localizada.", ephemeral=True)
+        sessao["perfil"] = perfil
+        await interaction.followup.send("✅ Ficha e fontes atualizadas para esta consulta.", ephemeral=True)
+
+    @discord.ui.button(label="Encerrar consulta", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="dicor_dossie_ia_encerrar")
+    async def encerrar(self, interaction: discord.Interaction, button: Button):
+        canal = interaction.channel
+        _DOSSIE_IA_SESSOES.pop(self.canal_id, None)
+        await interaction.response.send_message("🔒 Consulta encerrada. Este canal será apagado em 5 segundos.")
+        await asyncio.sleep(5)
+        try:
+            if isinstance(canal, discord.TextChannel):
+                await canal.delete(reason=f"Dossiê IA encerrado por {interaction.user}")
+        except Exception:
+            pass
+
+
+async def _dossie_ia_expirar_canal(canal_id: int) -> None:
+    await asyncio.sleep(max(5, DOSSIE_IA_CHANNEL_TTL_MINUTES) * 60)
+    sessao = _DOSSIE_IA_SESSOES.pop(int(canal_id), None)
+    if not sessao:
+        return
+    try:
+        canal = bot.get_channel(int(canal_id)) or await bot.fetch_channel(int(canal_id))
+        if isinstance(canal, discord.TextChannel):
+            await canal.send("⏳ Consulta encerrada automaticamente por inatividade.")
+            await asyncio.sleep(5)
+            await canal.delete(reason="Expiração do canal provisório do Dossiê IA")
+    except Exception:
+        pass
+
+
+async def _dossie_ia_criar_canal(interaction: discord.Interaction, tipo: str, registro_id: int, perfil: Optional[Dict[str, Any]] = None) -> None:
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return await interaction.followup.send("❌ Esta função só pode ser usada dentro do servidor.", ephemeral=True)
+    guild = interaction.guild
+    perfil = dict(perfil or {})
+    if not perfil:
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, str(tipo), int(registro_id))
+    if not perfil:
+        return await interaction.followup.send("❌ A ficha não foi localizada.", ephemeral=True)
+
+    categoria = guild.get_channel(int(DOSSIE_IA_CATEGORY_ID))
+    if categoria is None:
+        try:
+            categoria = await bot.fetch_channel(int(DOSSIE_IA_CATEGORY_ID))
+        except Exception:
+            categoria = None
+    if not isinstance(categoria, discord.CategoryChannel):
+        return await interaction.followup.send(
+            f"❌ A categoria `{DOSSIE_IA_CATEGORY_ID}` não foi encontrada ou não é uma categoria de canais.", ephemeral=True
+        )
+
+    overwrites: Dict[Any, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+    }
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True, attach_files=True, embed_links=True)
+    for cargo_id in (1490200391239864352, 1490200390426165290, 1490200388912156692, 1490200383614615725, 1490200382776021132):
+        cargo = guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+
+    nome_ficha = _dossie_ia_normalizar(_banco_ficha_geral_titulo(perfil))
+    nome_ficha = re.sub(r"[^a-z0-9-]+", "-", nome_ficha).strip("-")[:45] or "individuo"
+    canal = await guild.create_text_channel(
+        name=f"🧠┃ia-{nome_ficha}",
+        category=categoria,
+        overwrites=overwrites,
+        topic=f"Consulta provisória do Dossiê Inteligente • ficha {tipo}:{registro_id} • solicitante {interaction.user.id}",
+        reason=f"Dossiê IA solicitado por {interaction.user}",
+    )
+    _DOSSIE_IA_SESSOES[int(canal.id)] = {
+        "autor_id": int(interaction.user.id),
+        "tipo": str(tipo),
+        "registro_id": int(registro_id),
+        "perfil": perfil,
+        "criado_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    ficha_embed = _banco_embed_ficha_geral(perfil)
+    ficha_embed.color = discord.Color.from_rgb(24, 91, 158)
+    painel = discord.Embed(
+        title="🧠 DOSSIÊ INTELIGENTE — SALA DE CONSULTA",
+        description=(
+            "Faça perguntas em linguagem natural sobre os registros desta ficha.\n\n"
+            "**Exemplos:**\n"
+            "• Ele já foi preso com armamento?\n"
+            "• Quais itens ilegais já foram apreendidos?\n"
+            "• Qual foi a maior quantidade apreendida?\n"
+            "• Quais veículos estão vinculados?\n"
+            "• Mostre as fotos e fontes disponíveis.\n"
+            "• Faça um resumo investigativo."
+        ),
+        color=discord.Color.from_rgb(12, 48, 86),
+    )
+    painel.add_field(name="🔒 Privacidade", value="Canal provisório visível somente para a equipe autorizada.", inline=False)
+    painel.add_field(name="⏳ Expiração", value=f"O canal será removido após **{DOSSIE_IA_CHANNEL_TTL_MINUTES} minutos**.", inline=False)
+    painel.set_footer(text="As respostas usam somente os dados registrados no banco DICOR")
+    await canal.send(content=interaction.user.mention, embed=ficha_embed)
+    await canal.send(embed=painel, view=DossieIAChannelView(int(canal.id)))
+    await interaction.followup.send(f"✅ Sala do Dossiê Inteligente criada: {canal.mention}", ephemeral=True)
+    asyncio.create_task(_dossie_ia_expirar_canal(int(canal.id)), name=f"dossie-ia-expirar-{canal.id}")
+    try:
+        await enviar_log(f"🧠 Dossiê IA aberto por {interaction.user.mention} para `{tipo}:{registro_id}` em {canal.mention}.")
+    except Exception:
+        pass
+
+
+class BancoConsultarIAButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, perfil: Optional[Dict[str, Any]] = None, *, row: int = 3):
+        super().__init__(
+            label="Consultar IA",
+            emoji="🧠",
+            style=discord.ButtonStyle.success,
+            row=row,
+        )
+        self.tipo = str(tipo or "individuo")
+        self.registro_id = int(registro_id or 0)
+        self.perfil = dict(perfil or {})
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await _dossie_ia_criar_canal(interaction, self.tipo, self.registro_id, self.perfil)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ O bot não possui permissão para criar canais nessa categoria.", ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha ao abrir o Dossiê Inteligente: `{type(erro).__name__}: {erro}`", ephemeral=True)
+
+
+# Acrescenta o botão à ficha completa existente, sem remover os demais botões.
+_BANCO_FICHA_GERAL_VIEW_ANTES_IA = BancoFichaGeralView
+class BancoFichaGeralView(_BANCO_FICHA_GERAL_VIEW_ANTES_IA):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        perfil = dict(getattr(self, "perfil", {}) or {})
+        if perfil:
+            tipo = str(perfil.get("tipo") or "individuo")
+            registro_id = int(perfil.get("registro_id") or (perfil.get("individuo") or {}).get("id") or 0)
+            if registro_id:
+                self.add_item(BancoConsultarIAButton(tipo, registro_id, perfil, row=3))
+
+
+# A abertura compacta também mantém a ficha e mostra o botão da IA.
+class BancoAbrirFichaButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, indice: int = 0):
+        rotulo = "Abrir Ficha" if indice == 0 else f"Abrir Ficha {indice + 1}"
+        super().__init__(
+            label=rotulo[:80], emoji="📂", style=discord.ButtonStyle.primary,
+            custom_id=f"dicor_abrir_ficha_compacta_ia:{tipo}:{int(registro_id)}:{secrets.token_hex(3)}",
+        )
+        self.tipo = str(tipo)
+        self.registro_id = int(registro_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if self.tipo == "faccao":
+                registro = await asyncio.to_thread(_banco_prof_registro_por_id, "faccao", self.registro_id)
+                if not registro:
+                    return await interaction.edit_original_response(content="❌ A organização não existe mais.", embed=None, view=None)
+                embed = _banco_embed_consulta_faccao(registro)
+                view = None
+            else:
+                perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, self.tipo, self.registro_id)
+                if not perfil:
+                    return await interaction.edit_original_response(content="❌ A ficha não existe mais.", embed=None, view=None)
+                embed = _banco_embed_ficha_geral(perfil)
+                view = BancoFichaGeralView(int(interaction.user.id), perfil)
+            embed.color = discord.Color.from_rgb(30, 105, 190)
+            await interaction.edit_original_response(embed=embed, view=view)
+        except Exception as erro:
+            await _banco_prof_erro_interacao(interaction, "Não foi possível abrir a ficha.", erro)
+
+
+print(
+    f"✅ Dossiê Inteligente carregado: botão Consultar IA, canal provisório na categoria {DOSSIE_IA_CATEGORY_ID} e ficha original preservada.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
