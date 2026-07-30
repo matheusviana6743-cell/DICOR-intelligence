@@ -51322,6 +51322,46 @@ def _v17_analisar_fotos_sync() -> Dict[str, int]:
     return {'analisados': pendentes, 'alterados': 1 if alterou else 0}
 
 
+
+def _v17_analisar_fotos_sync() -> Dict[str, int]:
+    """Reanalisa pares antigos quando a versão da classificação muda."""
+    global _V17_CATALOGO_CACHE_HTML, _V17_CATALOGO_CACHE_KEY
+    procurados = carregar_procurados() or []
+    if not isinstance(procurados, list):
+        return {"analisados": 0, "alterados": 0}
+
+    pendentes = [
+        registro for registro in procurados
+        if str(registro.get("foto_individuo") or "").strip()
+        and str(registro.get("foto_rg") or "").strip()
+        and str(registro.get("foto_individuo") or "").strip() != str(registro.get("foto_rg") or "").strip()
+        and str(registro.get("foto_analise_versao") or "") != _V18_FOTO_ANALISE_VERSAO
+    ]
+    if not pendentes:
+        gerar_catalogo_html()
+        return {"analisados": 0, "alterados": 0}
+
+    antes = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    _catalogo_classificar_e_corrigir_fotos(procurados)
+    depois = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    alterados = 0
+    if antes != depois:
+        try:
+            pasta_backup = DATA_DIR / "backups_catalogo_fotos"
+            pasta_backup.mkdir(parents=True, exist_ok=True)
+            backup = pasta_backup / f"procurados-v18-antes-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            backup.write_text(antes, encoding="utf-8")
+        except Exception as erro:
+            print(f"⚠️ V18 backup de fotos: {erro}", flush=True)
+        salvar_procurados(procurados)
+        alterados = 1
+
+    _V17_CATALOGO_CACHE_HTML = ""
+    _V17_CATALOGO_CACHE_KEY = tuple()
+    gerar_catalogo_html()
+    return {"analisados": len(pendentes), "alterados": alterados}
+
+
 async def _v17_analise_fotos_background() -> None:
     await bot.wait_until_ready()
     await asyncio.sleep(12)
@@ -51344,6 +51384,597 @@ async def _v17_on_ready_catalogo() -> None:
 
 
 print('✅ V17 carregada: catálogo instantâneo; OCR de fotos isolado em segundo plano.', flush=True)
+
+
+# =====================================================
+# V18 — CATÁLOGO DOCUMENTAL + ENCAMINHAMENTO DA PERÍCIA AO BO
+# - Reclassifica foto do indivíduo x documento/RG com assinatura versionada;
+# - Exibe as duas imagens em tamanho grande, sem cortar o documento;
+# - Ao informar o número do BO, encaminha texto, fotos e anexos da perícia
+#   para a área/tópico correspondente antes de concluir o atendimento.
+# - Não altera as demais mecânicas, permissões, painéis ou bancos existentes.
+# =====================================================
+
+_V18_FOTO_ANALISE_VERSAO = "V18-DOCUMENTO-CORPO-3"
+_V18_CATALOGO_CACHE_LOCK = threading.RLock()
+
+
+def _v18_metricas_imagem(caminho: Optional[Path]) -> Dict[str, Any]:
+    saida: Dict[str, Any] = {
+        "largura": 0,
+        "altura": 0,
+        "razao": 0.0,
+        "paisagem": False,
+        "retrato": False,
+    }
+    if caminho is None or not caminho.exists() or PILImage is None:
+        return saida
+    try:
+        with PILImage.open(caminho) as imagem:
+            largura, altura = imagem.size
+        razao = float(largura) / max(1.0, float(altura))
+        saida.update({
+            "largura": int(largura),
+            "altura": int(altura),
+            "razao": round(razao, 4),
+            "paisagem": razao >= 1.12,
+            "retrato": razao <= 0.92,
+        })
+    except Exception:
+        pass
+    return saida
+
+
+def _v18_nome_indica_documento(valor: Any) -> bool:
+    nome = normalizar_busca(Path(str(valor or "")).name) if "normalizar_busca" in globals() else Path(str(valor or "")).name.lower()
+    return any(x in nome for x in ("foto-rg", "foto_rg", "documento", "identidade", "passaporte", "rg-", "rg_"))
+
+
+def _v18_pontuar_par_fotos(
+    valor: Any,
+    nome: str,
+    rg: str,
+) -> Dict[str, Any]:
+    caminho = _catalogo_caminho_local_foto(valor)
+    analise = _catalogo_pontuar_documento(caminho, nome, rg)
+    metricas = _v18_metricas_imagem(caminho)
+    documento = float(analise.get("score") or 0.0)
+    motivos = list(analise.get("motivos") or [])
+    texto = str(analise.get("ocr") or "")
+    norm = normalizar_busca(texto) if "normalizar_busca" in globals() else texto.lower()
+    linhas = [x.strip() for x in texto.splitlines() if x.strip()]
+
+    campos_fortes = (
+        "fator sanguineo", "estado civil", "habilitacao", "carteira", "banco",
+        "data de nascimento", "nacionalidade", "emprego", "desempregado",
+        "registro geral", "documento de identidade", "nome completo",
+    )
+    fortes = sum(1 for campo in campos_fortes if campo in norm)
+    if fortes:
+        documento += fortes * 4.0
+        motivos.append(f"{fortes} campos documentais fortes")
+    if len(linhas) >= 7:
+        documento += min(12.0, len(linhas) * 0.8)
+        motivos.append("muitas linhas de identificação")
+    if metricas["paisagem"] and len(linhas) >= 4:
+        documento += 5.0
+        motivos.append("documento em formato paisagem")
+    if _v18_nome_indica_documento(valor):
+        documento += 18.0
+        motivos.append("nome do arquivo indica documento")
+
+    # Pontuação independente de aparência de foto pessoal/corpo. Ela não tenta
+    # reconhecer identidade biométrica; apenas evita que uma tela documental
+    # ocupe o campo destinado à imagem do indivíduo.
+    pessoa = 0.0
+    if metricas["retrato"]:
+        pessoa += 7.0
+    elif 0.72 <= float(metricas["razao"] or 0.0) <= 1.08:
+        pessoa += 3.0
+    if len(linhas) <= 3:
+        pessoa += 5.0
+    elif len(linhas) <= 6:
+        pessoa += 2.0
+    if fortes == 0:
+        pessoa += 4.0
+    if _v18_nome_indica_documento(valor):
+        pessoa -= 10.0
+
+    return {
+        "documento": round(documento, 2),
+        "pessoa": round(pessoa, 2),
+        "metricas": metricas,
+        "ocr": texto[:1400],
+        "motivos": motivos,
+    }
+
+
+def _catalogo_classificar_e_corrigir_fotos(procurados: List[Dict[str, Any]]) -> bool:
+    """Separa documento/RG e foto do indivíduo sem apagar os arquivos.
+
+    A V18 invalida somente a assinatura antiga da classificação. A troca ocorre
+    quando a imagem atualmente marcada como indivíduo tem evidência documental
+    claramente superior e a outra imagem é mais compatível com foto pessoal.
+    """
+    alterou = False
+    ocr_status = "1" if bool(globals().get("BANCO_OCR_ATIVO") and globals().get("RapidOCR")) else "0"
+    for registro in procurados:
+        foto_individuo = str(registro.get("foto_individuo") or "").strip()
+        foto_rg = str(registro.get("foto_rg") or "").strip()
+        if not foto_individuo or not foto_rg or foto_individuo == foto_rg:
+            continue
+
+        assinatura_base = (
+            f"{_V18_FOTO_ANALISE_VERSAO}|{foto_individuo}|{foto_rg}|"
+            f"{registro.get('nome')}|{registro.get('rg')}|ocr={ocr_status}"
+        )
+        assinatura = hashlib.sha256(assinatura_base.encode("utf-8", errors="ignore")).hexdigest()[:24]
+        if (
+            str(registro.get("foto_analise_versao") or "") == _V18_FOTO_ANALISE_VERSAO
+            and str(registro.get("foto_analise_assinatura") or "") == assinatura
+        ):
+            continue
+
+        nome = str(registro.get("nome") or "")
+        rg = str(registro.get("rg") or "")
+        atual_ind = _v18_pontuar_par_fotos(foto_individuo, nome, rg)
+        atual_rg = _v18_pontuar_par_fotos(foto_rg, nome, rg)
+        di = float(atual_ind.get("documento") or 0.0)
+        dr = float(atual_rg.get("documento") or 0.0)
+        pi = float(atual_ind.get("pessoa") or 0.0)
+        pr = float(atual_rg.get("pessoa") or 0.0)
+        mi = dict(atual_ind.get("metricas") or {})
+        mr = dict(atual_rg.get("metricas") or {})
+
+        nome_ind_doc = _v18_nome_indica_documento(foto_individuo)
+        nome_rg_doc = _v18_nome_indica_documento(foto_rg)
+        evidencia_documental = di >= max(8.0, dr + 4.0)
+        outra_mais_pessoal = pr >= pi + 1.0 or (bool(mr.get("retrato")) and not bool(mi.get("retrato")))
+        formato_tipico_invertido = (
+            bool(mi.get("paisagem")) and bool(mr.get("retrato")) and di >= dr + 2.0
+        )
+        nome_invertido = nome_ind_doc and not nome_rg_doc
+
+        decisao = "MANTIDO"
+        if nome_invertido or (evidencia_documental and outra_mais_pessoal) or formato_tipico_invertido:
+            registro["foto_individuo"], registro["foto_rg"] = foto_rg, foto_individuo
+            decisao = "TROCADO_DOCUMENTO_PARA_RG"
+            alterou = True
+            foto_individuo = str(registro.get("foto_individuo") or "")
+            foto_rg = str(registro.get("foto_rg") or "")
+            nova_base = (
+                f"{_V18_FOTO_ANALISE_VERSAO}|{foto_individuo}|{foto_rg}|"
+                f"{registro.get('nome')}|{registro.get('rg')}|ocr={ocr_status}"
+            )
+            assinatura = hashlib.sha256(nova_base.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+        registro["foto_analise_versao"] = _V18_FOTO_ANALISE_VERSAO
+        registro["foto_analise_assinatura"] = assinatura
+        registro["foto_analise_resultado"] = {
+            "decisao": decisao,
+            "documento_no_campo_individuo": di,
+            "documento_no_campo_rg": dr,
+            "pessoa_no_campo_individuo": pi,
+            "pessoa_no_campo_rg": pr,
+            "metricas_individuo_original": mi,
+            "metricas_rg_original": mr,
+            "analisado_em": agora_br(),
+            "versao": _V18_FOTO_ANALISE_VERSAO,
+        }
+        alterou = True
+    return alterou
+
+
+def _v18_catalogo_card(registro: Dict[str, Any]) -> str:
+    status = str(registro.get("status") or "A PROCURAR").upper().strip()
+    retirado = status == "RETIRADO"
+    classe = "retired" if retirado else "wanted"
+    nome = str(registro.get("nome") or "Nome não informado")
+    rg = str(registro.get("rg") or "NÃO INFORMADO")
+    crimes = str(valor_crimes_registro(registro) or "Não informado")
+    caso = str(registro.get("caso") or registro.get("id") or "SEM NÚMERO")
+    boletim = str(registro.get("numero_boletim") or registro.get("boletim") or "Não informado")
+    data = str(registro.get("data") or registro.get("criado_em") or "Não informada")
+    avistamento = str(registro.get("ultimo_avistamento") or "Não informado")
+    busca = escape(f"{nome} {rg} {crimes} {caso} {boletim}".lower())
+    return f'''<article class="wanted-card {classe}" data-search="{busca}">
+      <header class="case-top">
+        <div><span>NÚMERO DO CASO</span><strong>{escape(caso)}</strong></div>
+        <div><span>DATA DO REGISTRO</span><strong>{escape(data)}</strong></div>
+        <em>{escape(status)}</em>
+      </header>
+      <div class="visual-dossier">
+        <section class="media-grid">
+          <figure class="person-photo">
+            <figcaption><b>01</b><span>FOTO DO INDIVÍDUO</span></figcaption>
+            {_v17_foto_html(registro.get('foto_individuo'), f'Foto do indivíduo {nome}', 'FOTO DO INDIVÍDUO')}
+          </figure>
+          <figure class="document-photo">
+            <figcaption><b>02</b><span>DOCUMENTO / RG</span></figcaption>
+            {_v17_foto_html(registro.get('foto_rg'), f'Documento ou RG de {nome}', 'DOCUMENTO / RG')}
+          </figure>
+        </section>
+        <aside class="wanted-info">
+          <div class="identity"><small>IDENTIFICAÇÃO DO PROCURADO</small><h2>{escape(nome)}</h2><div class="rg">RG • {escape(rg)}</div></div>
+          <div class="info-box danger"><span>CRIMES REGISTRADOS</span><p>{_v17_texto_html(crimes)}</p></div>
+          <div class="info-box"><span>ÚLTIMO AVISTAMENTO</span><p>{_v17_texto_html(avistamento)}</p></div>
+          <div class="details"><div><span>BOLETIM VINCULADO</span><b>{escape(boletim)}</b></div><div><span>SITUAÇÃO ATUAL</span><b>{escape(status)}</b></div></div>
+        </aside>
+      </div>
+    </article>'''
+
+
+_v17_catalogo_card = _v18_catalogo_card
+
+# Novo formato visual: o RG deixa de ser uma miniatura estreita. As duas imagens
+# ficam lado a lado em um painel documental amplo e usam object-fit: contain.
+_V17_CATALOGO_TEMPLATE = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Catálogo de Procurados • DICOR</title><style>
+:root{--gold:#d7a93d;--gold2:#f4d77e;--bg:#050604;--panel:#0d0f0b;--panel2:#12150f;--line:#40351c;--text:#f8f2dc;--muted:#9e9782;--red:#a83b35}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% -15%,#49370d66,transparent 36%),linear-gradient(180deg,#060704,#030403);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}.top{min-height:108px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:13px 5vw;border-bottom:1px solid var(--line);background:#070805f2;position:sticky;top:0;z-index:20;backdrop-filter:blur(14px)}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:72px;height:72px;object-fit:contain;padding:5px;border:1px solid #8d722d;border-radius:17px;background:#040503;box-shadow:0 0 36px #d7a93d2e}.brand h1{margin:0;font-size:19px;letter-spacing:2.4px}.brand small{display:block;margin-top:4px;color:var(--gold);letter-spacing:1.4px}.top-actions{justify-self:end;display:flex;gap:8px}.top-actions a{color:var(--text);text-decoration:none;border:1px solid #594923;border-radius:9px;padding:10px 13px;background:#11130e}.top-actions a:hover{border-color:var(--gold);color:var(--gold2)}main{max-width:1560px;margin:0 auto;padding:38px 24px 80px}.intro{text-align:center;margin:8px auto 30px}.intro span,.case-top span,.identity small,.info-box span,.details span{display:block;color:var(--gold);font-size:9px;font-weight:900;letter-spacing:1.7px}.intro h2{font-size:43px;margin:10px 0 7px}.intro p{color:var(--muted)}.toolbar{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin-bottom:28px}.toolbar input{width:min(560px,100%);background:#0f120d;border:1px solid #51431f;color:#fff;border-radius:11px;padding:14px 16px;font-size:15px}.toolbar input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px #d7a93d18}.tabs{display:flex;gap:8px}.tabs button{background:#11130e;border:1px solid #51431f;color:var(--text);border-radius:10px;padding:12px 16px;cursor:pointer;font-weight:900}.tabs button.active{background:linear-gradient(135deg,var(--gold2),var(--gold));color:#171307}.tab{display:none}.tab.active{display:grid;gap:24px}.wanted-card{overflow:hidden;border:1px solid #40361c;border-radius:20px;background:linear-gradient(145deg,#151810,#090b08);box-shadow:0 22px 65px #0007}.case-top{min-height:68px;display:grid;grid-template-columns:1fr 1fr auto;align-items:center;gap:20px;padding:13px 22px;border-bottom:1px solid #40361c;background:#0b0d09}.case-top strong{font-size:13px}.case-top em{font-style:normal;color:#ffd2cc;border:1px solid #803a34;background:#351512;border-radius:99px;padding:8px 12px;font-size:10px;letter-spacing:1.2px}.retired .case-top em{color:#d2cdbc;border-color:#5d584b;background:#26251f}.visual-dossier{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(350px,.72fr)}.media-grid{display:grid;grid-template-columns:1fr 1.12fr;min-height:520px;background:radial-gradient(circle at 50% 50%,#2e260d33,transparent 58%),#050604;border-right:1px solid #40361c}.media-grid figure{margin:0;position:relative;min-width:0;min-height:520px;overflow:hidden;border-right:1px solid #322a16;display:grid;place-items:center}.media-grid figure:last-child{border-right:0}.media-grid figcaption{position:absolute;z-index:3;left:16px;top:15px;display:flex;align-items:center;gap:8px;background:#070806ed;border:1px solid #655225;color:var(--gold2);padding:7px 10px;border-radius:8px;font-size:9px;letter-spacing:1.3px}.media-grid figcaption b{display:grid;place-items:center;width:21px;height:21px;border-radius:50%;background:var(--gold);color:#171307;font-size:10px}.media-grid img{width:100%;height:100%;max-height:620px;object-fit:contain;padding:12px;cursor:zoom-in;transition:transform .24s,filter .24s;background:linear-gradient(135deg,#060705,#0b0d09)}.media-grid img:hover{transform:scale(1.012);filter:brightness(1.06)}.document-photo img{padding:18px;background:repeating-linear-gradient(135deg,#080a07,#080a07 18px,#0b0d09 18px,#0b0d09 36px)}.photo-empty{width:100%;height:100%;min-height:420px;display:grid;align-content:center;justify-items:center;gap:9px;color:#6f6959;background:radial-gradient(circle,#352b0f40,transparent 56%);font-size:11px;letter-spacing:1.5px}.photo-empty span{color:#9a8e6f;font-weight:900}.photo-empty small{font-size:9px}.wanted-info{padding:30px;display:flex;flex-direction:column;gap:15px;background:linear-gradient(180deg,#11140e,#0b0d09)}.identity{padding-bottom:5px;border-bottom:1px solid #302916}.identity h2{font-size:32px;line-height:1.05;margin:7px 0 12px}.rg{display:inline-flex;border:1px solid #755e26;background:#231d0c;color:var(--gold2);border-radius:9px;padding:9px 12px;font-weight:900;letter-spacing:.4px}.info-box{border:1px solid #38301a;border-radius:12px;background:#11140e;padding:16px}.info-box p{margin:8px 0 0;color:#c9c1aa;line-height:1.55}.info-box.danger{border-color:#652d29;background:#200e0c}.info-box.danger span{color:#ee8b82}.details{display:grid;grid-template-columns:1fr 1fr;gap:10px}.details div{border:1px solid #38301a;border-radius:11px;padding:14px;background:#10120d}.details b{display:block;margin-top:6px}.empty-state{text-align:center;border:1px dashed #4e401d;border-radius:20px;padding:65px;color:var(--muted)}.empty-state img{width:100px}.lightbox{display:none;position:fixed;inset:0;background:#000f;z-index:99;align-items:center;justify-content:center;padding:25px}.lightbox.open{display:flex}.lightbox img{max-width:96vw;max-height:91vh;object-fit:contain;border:1px solid #91762f;border-radius:12px;background:#050604}.lightbox button{position:absolute;right:25px;top:20px;background:#111;color:#fff;border:1px solid #765f2a;border-radius:9px;padding:10px 13px;cursor:pointer}@media(max-width:1120px){.visual-dossier{grid-template-columns:1fr}.media-grid{border-right:0;border-bottom:1px solid #40361c}.wanted-info{display:grid;grid-template-columns:1fr 1fr}.identity,.details{grid-column:1/-1}}@media(max-width:760px){.top{grid-template-columns:auto 1fr}.brand{grid-column:1;justify-self:start}.top-actions{grid-column:2}.brand small{display:none}.media-grid{grid-template-columns:1fr;min-height:0}.media-grid figure{min-height:420px;border-right:0;border-bottom:1px solid #322a16}.wanted-info{display:flex}.case-top{grid-template-columns:1fr auto}.case-top>div:nth-child(2){display:none}.intro h2{font-size:34px}}@media(max-width:520px){.top-actions a:first-child{display:none}.brand h1{font-size:14px}.brand img{width:56px;height:56px}.details{grid-template-columns:1fr}.media-grid figure{min-height:360px}}
+</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"><div><h1>DICOR • CATÁLOGO DE PROCURADOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><nav class="top-actions"><a href="/">Central DICOR</a><a href="/acesso?next=/arvore">Área restrita</a></nav></header><main><section class="intro"><span>CONSULTA PÚBLICA OFICIAL</span><h2>Indivíduos procurados</h2><p>Registro visual completo, com fotografia do indivíduo e documento em tamanho ampliado.</p></section><div class="toolbar"><input id="search" autocomplete="off" placeholder="Pesquisar por nome, RG, crime, boletim ou número do caso"><div class="tabs"><button id="btn-active" class="active" onclick="tab('active')">PROCURADOS (__COUNT_ACTIVE__)</button><button id="btn-retired" onclick="tab('retired')">RETIRADOS (__COUNT_RETIRED__)</button></div></div><section id="active" class="tab active">__CARDS_ACTIVE__</section><section id="retired" class="tab">__CARDS_RETIRED__</section></main><div id="lightbox" class="lightbox" onclick="closePhoto()"><button onclick="closePhoto()">FECHAR</button><img id="lightbox-image"></div><script>let current='active';function tab(name){current=name;document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(name).classList.add('active');document.getElementById('btn-'+name).classList.add('active');filter()}function filter(){const q=document.getElementById('search').value.toLowerCase().trim();document.querySelectorAll('#'+current+' .wanted-card').forEach(c=>c.style.display=c.dataset.search.includes(q)?'block':'none')}document.getElementById('search').addEventListener('input',filter);function openPhoto(src,alt){document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=alt||'';document.getElementById('lightbox').classList.add('open')}function closePhoto(){document.getElementById('lightbox').classList.remove('open')}document.addEventListener('keydown',e=>{if(e.key==='Escape')closePhoto()});</script></body></html>'''
+
+
+def _v18_normalizar_numero_bo(valor: Any) -> str:
+    bruto = str(valor or "").strip().upper()
+    grupos = re.findall(r"\d+", bruto)
+    if not grupos:
+        return ""
+    # O número operacional é o último grupo. Assim, BO-DICOR-2026-017 vira 017.
+    numero = int(grupos[-1])
+    return f"BO-DICOR-{numero:03d}"
+
+
+def _v18_numero_equivalente(a: Any, b: Any) -> bool:
+    na = _v18_normalizar_numero_bo(a)
+    nb = _v18_normalizar_numero_bo(b)
+    return bool(na and nb and na == nb)
+
+
+def _v18_buscar_atendimento_bo(numero_bo: str) -> Optional[Dict[str, Any]]:
+    try:
+        atendimento = buscar_atendimento_por_numero(numero_bo)
+        if atendimento:
+            return atendimento
+    except Exception:
+        pass
+    for item in carregar_atendimentos_boletins():
+        if _v18_numero_equivalente(item.get("numero"), numero_bo):
+            return item
+    return None
+
+
+async def _v18_resolver_canal_id(canal_id: Any) -> Optional[Any]:
+    try:
+        cid = int(canal_id or 0)
+    except Exception:
+        return None
+    if not cid:
+        return None
+    canal = bot.get_channel(cid)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(cid)
+        except Exception:
+            canal = None
+    return canal
+
+
+async def _v18_destino_bo(numero_bo: str) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    atendimento = _v18_buscar_atendimento_bo(numero_bo)
+    if atendimento:
+        for chave in (
+            "thread_id", "forum_thread_id", "area_id", "canal_atendimento_id",
+            "canal_id", "channel_id",
+        ):
+            canal = await _v18_resolver_canal_id(atendimento.get(chave))
+            if canal is not None and hasattr(canal, "send"):
+                if isinstance(canal, discord.Thread):
+                    try:
+                        if bool(getattr(canal, "archived", False)) or bool(getattr(canal, "locked", False)):
+                            await canal.edit(archived=False, locked=False, reason="Recebimento de perícia vinculada")
+                    except Exception:
+                        pass
+                return canal, atendimento
+
+    boletim = None
+    try:
+        boletim = buscar_boletim_numero(numero_bo)
+    except Exception:
+        boletim = None
+    if boletim:
+        for chave in ("thread_id", "area_id", "canal_id", "channel_id"):
+            canal = await _v18_resolver_canal_id(boletim.get(chave))
+            if canal is not None and hasattr(canal, "send"):
+                return canal, atendimento
+        mensagem_id = int(boletim.get("mensagem_id") or 0)
+        canal_id = int(boletim.get("canal_id") or boletim.get("channel_id") or BOLETINS_CHANNEL_ID or 0)
+        canal_origem = await _v18_resolver_canal_id(canal_id)
+        if mensagem_id and canal_origem is not None and hasattr(canal_origem, "fetch_message"):
+            try:
+                mensagem = await canal_origem.fetch_message(mensagem_id)
+                if getattr(mensagem, "thread", None) is not None:
+                    return mensagem.thread, atendimento
+            except Exception:
+                pass
+
+    guild = bot.get_guild(int(GUILD_ID or 0))
+    if guild is not None:
+        curto = numero_curto_boletim(numero_bo).casefold()
+        candidatos = list(getattr(guild, "threads", []) or []) + list(getattr(guild, "text_channels", []) or [])
+        for canal in candidatos:
+            nome = str(getattr(canal, "name", "") or "").casefold()
+            if curto and curto in nome and "boletim" in nome and hasattr(canal, "send"):
+                return canal, atendimento
+    return None, atendimento
+
+
+async def _v18_mensagens_origem_pericia(registro: Dict[str, Any]) -> List[discord.Message]:
+    encontrados: Dict[int, discord.Message] = {}
+    canal_pai = await _v18_resolver_canal_id(registro.get("canal_pai_id"))
+    ids: List[int] = []
+    for valor in [registro.get("mensagem_original_id"), *(registro.get("mensagens_origem_ids") or [])]:
+        try:
+            vid = int(valor or 0)
+            if vid and vid not in ids:
+                ids.append(vid)
+        except Exception:
+            continue
+    if canal_pai is not None and hasattr(canal_pai, "fetch_message"):
+        for mid in ids:
+            try:
+                msg = await canal_pai.fetch_message(mid)
+                encontrados[int(msg.id)] = msg
+            except Exception:
+                continue
+
+    # Fallback: usa as cópias persistidas no tópico da própria perícia.
+    if not encontrados:
+        topico = await _pericia_obter_topico(registro)
+        if topico is not None and hasattr(topico, "history"):
+            try:
+                async for msg in topico.history(limit=250, oldest_first=True):
+                    texto = str(msg.content or "")
+                    relevante = bool(
+                        msg.attachments
+                        or "conteúdo da perícia" in texto.casefold()
+                        or "continuação da perícia" in texto.casefold()
+                    )
+                    if relevante:
+                        encontrados[int(msg.id)] = msg
+            except Exception:
+                traceback.print_exc()
+    return [encontrados[x] for x in sorted(encontrados)]
+
+
+def _v18_textos_pericia(mensagens: List[discord.Message]) -> List[str]:
+    saida: List[str] = []
+    vistos: set[str] = set()
+    for msg in mensagens:
+        texto = _pericia_texto_mensagem(msg).strip()
+        texto = re.sub(r"^\*\*📄 (?:Conteúdo|Continuação) da perícia\*\*\s*", "", texto, flags=re.I)
+        chave = hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest() if texto else ""
+        if texto and chave not in vistos:
+            vistos.add(chave)
+            saida.append(texto)
+    return saida
+
+
+async def _v18_encaminhar_pericia_ao_bo(
+    registro: Dict[str, Any],
+    numero_bo: str,
+    interaction: discord.Interaction,
+) -> Dict[str, Any]:
+    destino, atendimento = await _v18_destino_bo(numero_bo)
+    if destino is None:
+        raise LookupError(
+            f"Não encontrei a área/tópico do {numero_bo}. Confira se o boletim já foi publicado e recebeu atendimento."
+        )
+
+    destino_id = int(getattr(destino, "id", 0) or 0)
+    if (
+        str(registro.get("bo_encaminhado_numero") or "") == numero_bo
+        and int(registro.get("bo_destino_id") or 0) == destino_id
+        and registro.get("bo_encaminhado_em")
+    ):
+        return {
+            "destino": destino,
+            "atendimento": atendimento,
+            "anexos": int(registro.get("bo_anexos_encaminhados") or 0),
+            "mensagens_ids": list(registro.get("bo_mensagens_ids") or []),
+            "duplicado": True,
+        }
+
+    mensagens = await _v18_mensagens_origem_pericia(registro)
+    textos = _v18_textos_pericia(mensagens)
+    enviados_ids: List[int] = []
+    anexos_enviados = 0
+
+    embed = discord.Embed(
+        title=f"🔬 PERÍCIA Nº {registro.get('numero')} VINCULADA AO {numero_bo}",
+        description=(
+            "Material pericial encaminhado automaticamente pelo fluxo da DICOR. "
+            "O conteúdo abaixo integra o atendimento deste boletim."
+        ),
+        color=discord.Color.from_rgb(201, 158, 47),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="📋 Boletim", value=f"**{numero_bo}**", inline=True)
+    embed.add_field(name="👤 Responsável pela perícia", value=f"<@{int(registro.get('agente_id') or 0)}>", inline=True)
+    embed.add_field(name="📌 Resultado", value="Indivíduo não localizado", inline=False)
+    origem = str(registro.get("mensagem_original_url") or "")
+    if origem:
+        embed.add_field(name="🔗 Origem da perícia", value=f"[Abrir publicação original]({origem})", inline=False)
+    embed.set_footer(text="POLÍCIA FEDERAL • DICOR • Material encaminhado automaticamente")
+    cabecalho = await destino.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+    enviados_ids.append(int(cabecalho.id))
+
+    texto_completo = "\n\n".join(textos).strip()
+    if texto_completo:
+        partes = dividir_texto_discord(texto_completo, limite=1850) if "dividir_texto_discord" in globals() else [texto_completo[i:i + 1850] for i in range(0, len(texto_completo), 1850)]
+        for indice, parte in enumerate(partes):
+            titulo = "📄 **CONTEÚDO DA PERÍCIA**" if indice == 0 else "📄 **CONTINUAÇÃO DA PERÍCIA**"
+            msg = await destino.send(f"{titulo}\n{parte}")
+            enviados_ids.append(int(msg.id))
+
+    if mensagens:
+        with _pericia_tempfile.TemporaryDirectory(prefix="dicor-pericia-bo-") as tmp:
+            caminhos = await arquivos_para_reenvio_de_mensagens(
+                mensagens,
+                Path(tmp),
+                f"pericia-{_pericia_nome_seguro(registro.get('numero'))}-bo-{numero_curto_boletim(numero_bo)}",
+            )
+            if caminhos:
+                antes_ids: set[int] = set()
+                try:
+                    # enviar_arquivos_em_lotes retorna quantidade; as mensagens
+                    # são identificadas no histórico apenas para auditoria opcional.
+                    anexos_enviados = await enviar_arquivos_em_lotes(
+                        destino,
+                        caminhos,
+                        legenda=f"📎 Fotos e anexos da Perícia Nº {registro.get('numero')} • {numero_bo}",
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    raise RuntimeError("O texto foi encaminhado, mas não consegui copiar as fotos/anexos da perícia.")
+
+    if atendimento:
+        vinculadas = list(atendimento.get("pericias_vinculadas") or [])
+        chave = str(registro.get("id") or registro.get("numero") or "")
+        vinculadas = [x for x in vinculadas if str((x or {}).get("id") or "") != chave]
+        vinculadas.append({
+            "id": chave,
+            "numero": registro.get("numero"),
+            "bo_numero": numero_bo,
+            "origem_url": origem,
+            "anexos": anexos_enviados,
+            "encaminhada_por_id": int(interaction.user.id),
+            "encaminhada_em": agora_br(),
+        })
+        atendimento["pericias_vinculadas"] = vinculadas[-100:]
+        atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+
+    return {
+        "destino": destino,
+        "atendimento": atendimento,
+        "anexos": anexos_enviados,
+        "mensagens_ids": enviados_ids,
+        "duplicado": False,
+    }
+
+
+class PericiaNumeroBoModal(Modal, title="Vincular e encaminhar ao Boletim"):
+    numero_bo = TextInput(
+        label="Número do boletim",
+        placeholder="Ex.: 017 ou BO-DICOR-017",
+        required=True,
+        min_length=1,
+        max_length=40,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        registro = _pericia_por_topico(interaction.channel_id)
+        if not registro:
+            return await interaction.response.send_message("❌ Atendimento da perícia não encontrado.", ephemeral=True)
+        if not _pericia_usuario_pode_responder(interaction, registro):
+            return await interaction.response.send_message(
+                "❌ Somente o agente responsável ou Inspetor+ pode informar o BO.", ephemeral=True
+            )
+        if str(registro.get("status") or "").upper() != "AGUARDANDO_BO":
+            return await interaction.response.send_message(
+                "⚠️ Esta perícia não está aguardando número de boletim.", ephemeral=True
+            )
+        numero_bo = _v18_normalizar_numero_bo(self.numero_bo.value)
+        if not numero_bo:
+            return await interaction.response.send_message("❌ Informe um número válido de boletim.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultado = await asyncio.wait_for(
+                _v18_encaminhar_pericia_ao_bo(registro, numero_bo, interaction),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            return await interaction.edit_original_response(
+                content="❌ O encaminhamento demorou demais e foi cancelado. A perícia continua aberta; tente novamente."
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            return await interaction.edit_original_response(
+                content=f"❌ Não foi possível encaminhar a perícia: `{type(erro).__name__}: {str(erro)[:700]}`\nA perícia continua aberta."
+            )
+
+        destino = resultado.get("destino")
+        registro.update({
+            "status": "CONCLUIDA_COM_BO",
+            "bo_numero": numero_bo,
+            "bo_informado_por_id": interaction.user.id,
+            "bo_informado_por_nome": str(interaction.user),
+            "resultado_por_id": interaction.user.id,
+            "resultado_por_nome": str(interaction.user),
+            "bo_destino_id": int(getattr(destino, "id", 0) or 0),
+            "bo_destino_url": str(getattr(destino, "jump_url", "") or ""),
+            "bo_encaminhado_numero": numero_bo,
+            "bo_encaminhado_em": agora_br(),
+            "bo_anexos_encaminhados": int(resultado.get("anexos") or 0),
+            "bo_mensagens_ids": list(resultado.get("mensagens_ids") or []),
+            "concluida_em": agora_br(),
+        })
+        _pericia_atualizar(registro)
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Perícia Nº **{registro.get('numero')}** encaminhada ao **{numero_bo}**.\n"
+                f"📎 **{int(resultado.get('anexos') or 0)}** arquivo(s) copiado(s). "
+                f"Destino: <#{int(getattr(destino, 'id', 0) or 0)}>"
+            )
+        )
+
+        topico = await _pericia_obter_topico(registro)
+        if topico:
+            await topico.send(
+                "✅ **PERÍCIA ENCAMINHADA E CONCLUÍDA COM BOLETIM**\n"
+                f"**Perícia:** Nº {registro.get('numero')}\n"
+                f"**Boletim de destino:** {numero_bo}\n"
+                f"**Área do boletim:** <#{int(getattr(destino, 'id', 0) or 0)}>\n"
+                f"**Fotos/anexos copiados:** {int(resultado.get('anexos') or 0)}\n"
+                f"**Responsável:** <@{int(registro.get('agente_id') or 0)}>\n"
+                f"**Registrado por:** {interaction.user.mention}\n"
+                f"**Data:** {registro.get('concluida_em')}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        await _pericia_atualizar_painel(registro)
+        if topico:
+            await asyncio.sleep(2)
+            try:
+                await topico.edit(archived=True, locked=True, reason="Perícia encaminhada ao boletim informado")
+            except Exception:
+                traceback.print_exc()
+        await enviar_log(
+            f"✅ Perícia `{registro.get('numero')}` encaminhada ao `{numero_bo}` no canal "
+            f"`{int(getattr(destino, 'id', 0) or 0)}` com `{int(resultado.get('anexos') or 0)}` anexo(s)."
+        )
+
+
+async def _v17_analise_fotos_background() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(3)
+    try:
+        resultado = await asyncio.to_thread(_v17_analisar_fotos_sync)
+        print(
+            f"✅ V18 catálogo: separação documento/indivíduo concluída "
+            f"({resultado['analisados']} analisado(s)).",
+            flush=True,
+        )
+    except Exception as erro:
+        print(f"⚠️ V18 análise de fotos: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    "✅ V18 carregada: catálogo documental ampliado, reclassificação RG/corpo e perícia encaminhada ao BO.",
+    flush=True,
+)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
