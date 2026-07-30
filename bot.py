@@ -46183,7 +46183,7 @@ print(
 # Mantém somente: Editar, Consultar IA, Ver Árvore e Ver RG e Foto.
 # =====================================================
 
-ARVORE_MAX_CONEXOES = max(3, min(15, int(os.getenv("ARVORE_MAX_CONEXOES", "8"))))
+ARVORE_MAX_CONEXOES = 10**9  # sem limite artificial
 ARVORE_ROUPA_EXATA_SOMENTE = os.getenv("ARVORE_ROUPA_EXATA_SOMENTE", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 _ARVORE_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
@@ -46453,7 +46453,7 @@ def _arvore_calcular(individuo_id: int, *, ignorar_cache: bool = False) -> Dict[
                 "roupa_confirmada": info.get("roupa_confirmada"),
             })
         saida.sort(key=lambda x: (-x["score"], -len(x["motivos"]), x["nome"].lower()))
-        resultado={"alvo": alvo, "conexoes": saida[:ARVORE_MAX_CONEXOES], "total": len(saida)}
+        resultado={"alvo": alvo, "conexoes": saida, "total": len(saida)}
         _ARVORE_CACHE[individuo_id]=(agora, resultado)
         return resultado
 
@@ -46477,7 +46477,7 @@ def _arvore_gerar_imagem(resultado: Dict[str, Any]) -> Optional[Path]:
         alvo = dict(resultado.get("alvo") or {})
         conexoes = list(resultado.get("conexoes") or [])
         w, h = 1500, 950
-        img = PILImage.new("RGB", (w, h), (8, 17, 29))
+        img = PILImage.new("RGB", (w, h), (7, 8, 6))
         draw = ImageDraw.Draw(img)
         try:
             font_t = ImageFont.truetype("DejaVuSans-Bold.ttf", 42)
@@ -46486,12 +46486,12 @@ def _arvore_gerar_imagem(resultado: Dict[str, Any]) -> Optional[Path]:
             font_e = ImageFont.truetype("DejaVuSans.ttf", 16)
         except Exception:
             font_t = font_n = font_s = font_e = ImageFont.load_default()
-        draw.rounded_rectangle((25, 20, w-25, h-25), radius=28, outline=(35, 104, 170), width=4)
-        draw.text((55, 45), "ÁRVORE CRIMINAL — DICOR", font=font_t, fill=(235, 242, 250))
-        draw.text((55, 100), "Vínculos calculados somente a partir dos registros armazenados", font=font_s, fill=(145, 174, 202))
+        draw.rounded_rectangle((25, 20, w-25, h-25), radius=28, outline=(215, 169, 61), width=4)
+        draw.text((55, 45), "DICOR — CENTRAL DE VÍNCULOS", font=font_t, fill=(246, 196, 83))
+        draw.text((55, 100), "Vínculos calculados somente a partir dos registros armazenados", font=font_s, fill=(181, 164, 105))
         cx, cy = w//2, h//2 + 55
         raio_c = 115
-        draw.ellipse((cx-raio_c, cy-raio_c, cx+raio_c, cy+raio_c), fill=(18, 76, 128), outline=(102, 180, 240), width=5)
+        draw.ellipse((cx-raio_c, cy-raio_c, cx+raio_c, cy+raio_c), fill=(41, 35, 15), outline=(246, 196, 83), width=5)
         nome_alvo = str(alvo.get("nome") or "INDIVÍDUO")[:26]
         rg_alvo = str(alvo.get("rg") or "")[:20]
         bbox=draw.textbbox((0,0), nome_alvo, font=font_n)
@@ -46505,24 +46505,24 @@ def _arvore_gerar_imagem(resultado: Dict[str, Any]) -> Optional[Path]:
             x=int(cx+rx*math.cos(ang)); y=int(cy+ry*math.sin(ang))
             score=int(c.get("score") or 0)
             # linha e rótulo da principal evidência
-            draw.line((cx,cy,x,y), fill=(67,126,178), width=max(2,min(8,score//3+2)))
+            draw.line((cx,cy,x,y), fill=(112,89,32), width=max(2,min(8,score//3+2)))
             mx,my=(cx+x)//2,(cy+y)//2
             motivo=(c.get("motivos") or ["vínculo"])[0]
-            draw.rounded_rectangle((mx-92,my-17,mx+92,my+17), radius=10, fill=(12,31,49), outline=(51,91,127), width=1)
+            draw.rounded_rectangle((mx-92,my-17,mx+92,my+17), radius=10, fill=(20,22,16), outline=(120,96,34), width=1)
             tb=draw.textbbox((0,0),str(motivo)[:24],font=font_e)
-            draw.text((mx-(tb[2]-tb[0])/2,my-(tb[3]-tb[1])/2-1),str(motivo)[:24],font=font_e,fill=(196,218,236))
+            draw.text((mx-(tb[2]-tb[0])/2,my-(tb[3]-tb[1])/2-1),str(motivo)[:24],font=font_e,fill=(224,204,139))
             r=78
-            cor=(115,62,34) if c.get("roupa_confirmada") else (32,73,104)
-            draw.ellipse((x-r,y-r,x+r,y+r), fill=cor, outline=(223,235,246), width=3)
+            cor=(115,62,34) if c.get("roupa_confirmada") else (20,22,16)
+            draw.ellipse((x-r,y-r,x+r,y+r), fill=cor, outline=(215,169,61), width=3)
             nome=str(c.get("nome") or "Sem nome")[:22]
             rg=str(c.get("rg") or "")[:15]
             tb=draw.textbbox((0,0),nome,font=font_s)
             draw.text((x-(tb[2]-tb[0])/2,y-22),nome,font=font_s,fill=(255,255,255))
             tb=draw.textbbox((0,0),f"RG {rg}",font=font_e)
-            draw.text((x-(tb[2]-tb[0])/2,y+5),f"RG {rg}",font=font_e,fill=(211,226,239))
+            draw.text((x-(tb[2]-tb[0])/2,y+5),f"RG {rg}",font=font_e,fill=(205,191,143))
             tb=draw.textbbox((0,0),f"{_arvore_forca(score)} • {score} pts",font=font_e)
             draw.text((x-(tb[2]-tb[0])/2,y+30),f"{_arvore_forca(score)} • {score} pts",font=font_e,fill=(255,215,140))
-        draw.text((55,h-70),"Marrom: vínculo com vestimenta visual idêntica confirmada • Azul: demais vínculos",font=font_s,fill=(145,174,202))
+        draw.text((55,h-70),"Dourado: vínculos DICOR calculados a partir dos registros oficiais",font=font_s,fill=(145,174,202))
         pasta = Path(DATA_DIR) / "arvores_criminais"
         pasta.mkdir(parents=True, exist_ok=True)
         caminho = pasta / f"arvore_{int(alvo.get('id') or 0)}_{secrets.token_hex(4)}.png"
@@ -46543,7 +46543,7 @@ def _arvore_embed(resultado: Dict[str, Any]) -> discord.Embed:
             f"**Organização atual:** {alvo.get('faccao_atual') or 'Não informada'}\n\n"
             "Os vínculos abaixo foram encontrados automaticamente nos registros do Banco DICOR."
         ),
-        color=discord.Color.from_rgb(21, 83, 138),
+        color=discord.Color.from_rgb(215, 169, 61),
     )
     if not conexoes:
         embed.add_field(name="Nenhuma conexão encontrada", value="Ainda não há registros suficientes para construir a árvore deste indivíduo.", inline=False)
@@ -47337,7 +47337,7 @@ def _arvore_construir(individuo_id: int, usar_cache: bool = True) -> Dict[str, A
 
     conexoes = list(conexoes_mapa.values())
     conexoes.sort(key=lambda x: (-int(x.get("score") or 0), -len(x.get("motivos") or []), str(x.get("nome") or "").lower()))
-    resultado["conexoes"] = conexoes[:ARVORE_MAX_CONEXOES]
+    resultado["conexoes"] = conexoes
     resultado["total"] = len(conexoes)
     _ARVORE_CACHE.pop(int(individuo_id), None)
     return resultado
@@ -47439,6 +47439,94 @@ def _dossie_ia_responder(perfil: Dict[str, Any], pergunta: str) -> discord.Embed
 
 print("✅ Patch V6 ativo: veículos/placas extraídos das perícias, árvore atualizada e IA conversacional ampliada.", flush=True)
 
+
+# =====================================================
+# PATCH DICOR OURO — PLATAFORMA INTERATIVA DE VÍNCULOS
+# =====================================================
+
+def _arvore_url_publica(individuo_id: int) -> str:
+    base = str(CATALOG_PUBLIC_URL or '').strip().rstrip('/')
+    return f"{base}/arvore?id={int(individuo_id or 0)}" if base else f"/arvore?id={int(individuo_id or 0)}"
+
+
+def _arvore_dados_api(individuo_id: int) -> Dict[str, Any]:
+    resultado = _arvore_calcular(int(individuo_id), ignorar_cache=True) or {}
+    alvo = dict(resultado.get('alvo') or {})
+    conexoes = list(resultado.get('conexoes') or [])
+    alvo_id = int(alvo.get('id') or individuo_id)
+    nodes = [{'id': alvo_id, 'nome': str(alvo.get('nome') or 'INDIVÍDUO'), 'rg': str(alvo.get('rg') or ''), 'organizacao': str(alvo.get('faccao_atual') or ''), 'score': 999, 'forca': 'ALVO PRINCIPAL', 'central': True, 'motivos': ['Ficha principal'], 'evidencias': [], 'cor': '#f6c453'}]
+    edges = []
+    for c in conexoes:
+        oid = int(c.get('id') or 0)
+        if not oid:
+            continue
+        score = int(c.get('score') or 0)
+        cor = '#f6c453' if score >= 15 else '#d7a93d' if score >= 9 else '#a9832f' if score >= 5 else '#7d672f'
+        nodes.append({'id': oid, 'nome': str(c.get('nome') or 'Sem nome'), 'rg': str(c.get('rg') or ''), 'organizacao': str(c.get('faccao') or ''), 'score': score, 'forca': _arvore_forca(score), 'central': False, 'motivos': list(c.get('motivos') or []), 'evidencias': list(c.get('evidencias') or []), 'roupa_confirmada': bool(c.get('roupa_confirmada')), 'cor': cor})
+        edges.append({'from': alvo_id, 'to': oid, 'score': score, 'label': str((c.get('motivos') or ['Vínculo'])[0])})
+    return {'ok': bool(alvo), 'alvo_id': alvo_id, 'nodes': nodes, 'edges': edges, 'total': len(conexoes)}
+
+
+async def arvore_api_http(request: web.Request) -> web.Response:
+    try:
+        individuo_id = int(request.match_info.get('individuo_id') or request.query.get('id') or 0)
+    except Exception:
+        individuo_id = 0
+    if individuo_id <= 0:
+        return web.json_response({'ok': False, 'erro': 'ID inválido.'}, status=400)
+    try:
+        dados = await asyncio.to_thread(_arvore_dados_api, individuo_id)
+        return web.json_response(dados, dumps=lambda obj: json.dumps(obj, ensure_ascii=False))
+    except Exception as exc:
+        traceback.print_exc()
+        return web.json_response({'ok': False, 'erro': str(exc)}, status=500)
+
+
+_ARVORE_HTML_DICOR = """<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Central de Vínculos DICOR</title><style>
+:root{--g:#d7a93d;--g2:#f6c453;--bg:#070807;--panel:#11130f;--text:#f4f0df;--muted:#aaa58f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% 0,#252313,#090a08 48%,#050605);color:var(--text);font-family:Segoe UI,Arial,sans-serif;overflow:hidden}header{height:78px;display:flex;align-items:center;justify-content:space-between;padding:0 25px;border-bottom:1px solid #4b3d17;background:#070807ee}.brand{display:flex;align-items:center;gap:14px}.seal{width:48px;height:48px;border:2px solid var(--g);border-radius:50%;display:grid;place-items:center;color:var(--g2);font-weight:900;box-shadow:0 0 24px #d7a93d33}.brand h1{font-size:18px;letter-spacing:2px;margin:0}.brand small{color:var(--muted)}button,input,select{background:#13150f;border:1px solid #54451e;color:var(--text);border-radius:9px;padding:10px 12px}button{cursor:pointer}button:hover{border-color:var(--g);color:var(--g2)}main{height:calc(100vh - 78px);display:grid;grid-template-columns:310px 1fr 350px}.side{background:#0d0f0bee;border-right:1px solid #3f351a;padding:18px;overflow:auto}.right{border-left:1px solid #3f351a;border-right:0}.label{font-size:11px;letter-spacing:1.7px;color:var(--g);font-weight:800;margin:18px 0 8px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}.card{background:#171a14;border:1px solid #393018;border-radius:12px;padding:13px}.card b{display:block;font-size:22px;color:var(--g2)}#stage{position:relative;overflow:hidden;background-image:linear-gradient(#d7a93d08 1px,transparent 1px),linear-gradient(90deg,#d7a93d08 1px,transparent 1px);background-size:32px 32px}svg{width:100%;height:100%;cursor:grab}.edge{stroke:#8b712d;stroke-opacity:.58}.edge-label{fill:#c9b46b;font-size:11px;paint-order:stroke;stroke:#080908;stroke-width:4px}.node{cursor:pointer}.node circle{filter:drop-shadow(0 0 12px #d7a93d33)}.node:hover circle{stroke:#fff1ae;stroke-width:4}.node text{pointer-events:none}.person{display:flex;gap:10px;align-items:center;padding:10px;border:1px solid #332b17;border-radius:10px;margin:7px 0;cursor:pointer}.person:hover{border-color:var(--g)}.dot{width:12px;height:12px;border-radius:50%}.person strong{display:block}.person small,.empty{color:var(--muted)}.badge{display:inline-block;border:1px solid #665323;color:#e4c66f;border-radius:99px;padding:4px 8px;font-size:11px;margin:3px}.detail h2{color:var(--g2)}.detail p{color:#c4bea8;line-height:1.45}.hint{position:absolute;left:15px;bottom:14px;background:#090a08dd;border:1px solid #40351a;border-radius:9px;padding:9px 12px;color:var(--muted);font-size:12px}@media(max-width:1000px){main{grid-template-columns:260px 1fr}.right{display:none}}@media(max-width:700px){main{grid-template-columns:1fr}.side{display:none}.brand small{display:none}}
+</style></head><body><header><div class='brand'><div class='seal'>D</div><div><h1>DICOR • CENTRAL DE VÍNCULOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div><button onclick='fitGraph()'>Centralizar</button> <button onclick=\"location.href='/catalogo'\">Catálogo</button></div></header><main><aside class='side'><input id='search' style='width:100%' placeholder='Pesquisar nome, RG ou organização'><div class='stats'><div class='card'><b id='total'>0</b>Conexões</div><div class='card'><b id='visible'>0</b>Visíveis</div></div><div class='label'>FORÇA MÍNIMA</div><select id='strength' style='width:100%'><option value='0'>Todas</option><option value='5'>Moderada+</option><option value='9'>Forte+</option><option value='15'>Muito forte</option></select><div class='label'>PESSOAS RELACIONADAS</div><div id='list'></div></aside><section id='stage'><svg id='graph'><g id='viewport'></g></svg><div class='hint'>Arraste para mover • Scroll para zoom • Clique para detalhes • Duplo clique para abrir a árvore da pessoa</div></section><aside class='side right'><div class='label'>ANÁLISE DO VÍNCULO</div><div id='detail' class='detail'><div class='empty'>Selecione uma pessoa.</div></div></aside></main><script>
+const q=new URLSearchParams(location.search),id=Number(q.get('id')||0);let D={nodes:[],edges:[]},scale=1,tx=0,ty=0,drag=false,last=[0,0];const svg=document.getElementById('graph'),vp=document.getElementById('viewport');function E(s){return String(s??'').replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}function layout(ns){const c=ns.find(n=>n.central),o=ns.filter(n=>!n.central),p={};if(!c)return p;p[c.id]={x:0,y:0};o.forEach((n,i)=>{const ring=Math.floor(i/14)+1,slot=i%14,count=Math.min(14,o.length-(ring-1)*14),a=-Math.PI/2+2*Math.PI*slot/Math.max(1,count),r=240+(ring-1)*180;p[n.id]={x:Math.cos(a)*r,y:Math.sin(a)*r}});return p}function render(){const term=search.value.toLowerCase(),min=Number(strength.value),ns=D.nodes.filter(n=>n.central||(n.score>=min&&(`${n.nome} ${n.rg} ${n.organizacao}`.toLowerCase().includes(term)))),ids=new Set(ns.map(n=>n.id)),es=D.edges.filter(e=>ids.has(e.to)),p=layout(ns);vp.innerHTML='';es.forEach(e=>{const a=p[e.from],b=p[e.to];if(!a||!b)return;const l=document.createElementNS('http://www.w3.org/2000/svg','line');Object.entries({x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:'edge','stroke-width':Math.max(1.5,Math.min(8,e.score/3))}).forEach(([k,v])=>l.setAttribute(k,v));vp.appendChild(l);const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('x',(a.x+b.x)/2);t.setAttribute('y',(a.y+b.y)/2-6);t.setAttribute('text-anchor','middle');t.setAttribute('class','edge-label');t.textContent=e.label;vp.appendChild(t)});ns.forEach(n=>{const p1=p[n.id],g=document.createElementNS('http://www.w3.org/2000/svg','g');g.setAttribute('class','node');g.setAttribute('transform',`translate(${p1.x},${p1.y})`);const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('r',n.central?72:54);c.setAttribute('fill',n.central?'#2a2410':'#151710');c.setAttribute('stroke',n.cor);c.setAttribute('stroke-width',n.central?5:3);g.appendChild(c);[['-5',n.nome.length>18?n.nome.slice(0,17)+'…':n.nome,'14','700'],['16','RG '+(n.rg||'—'),'11','400']].forEach(x=>{const t=document.createElementNS('http://www.w3.org/2000/svg','text');t.setAttribute('text-anchor','middle');t.setAttribute('y',x[0]);t.setAttribute('fill','#fff7d6');t.setAttribute('font-size',x[2]);t.setAttribute('font-weight',x[3]);t.textContent=x[1];g.appendChild(t)});g.onclick=()=>detail(n);g.ondblclick=()=>{if(!n.central)location.href='/arvore?id='+n.id};vp.appendChild(g)});visible.textContent=Math.max(0,ns.length-1);list.innerHTML=ns.filter(n=>!n.central).map(n=>`<div class='person' onclick='byId(${n.id})'><span class='dot' style='background:${n.cor}'></span><div><strong>${E(n.nome)}</strong><small>RG ${E(n.rg||'—')} • ${E(n.forca)}</small></div></div>`).join('')||'<div class=empty>Nenhuma conexão.</div>';transform()}function byId(id){detail(D.nodes.find(n=>n.id===id))}function detail(n){if(!n)return;document.getElementById('detail').innerHTML=`<h2>${E(n.nome)}</h2><p><b>RG:</b> ${E(n.rg||'Não informado')}<br><b>Organização:</b> ${E(n.organizacao||'Não informada')}<br><b>Força:</b> ${E(n.forca)}${n.central?'':`<br><b>Pontuação:</b> ${n.score}`}</p><div>${(n.motivos||[]).map(x=>`<span class=badge>${E(x)}</span>`).join('')}</div><div class=label>EVIDÊNCIAS</div><p>${(n.evidencias||[]).map(E).join('<br>')||'Nenhuma evidência resumida.'}</p>${n.central?'':`<button onclick=\"location.href='/arvore?id=${n.id}'\">Abrir árvore desta pessoa</button>`}`}function transform(){vp.setAttribute('transform',`translate(${svg.clientWidth/2+tx},${svg.clientHeight/2+ty}) scale(${scale})`)}function fitGraph(){scale=1;tx=0;ty=0;transform()}svg.addEventListener('wheel',e=>{e.preventDefault();scale=Math.max(.25,Math.min(2.6,scale*(e.deltaY<0?1.1:.9)));transform()},{passive:false});svg.onmousedown=e=>{drag=true;last=[e.clientX,e.clientY]};window.onmouseup=()=>drag=false;window.onmousemove=e=>{if(!drag)return;tx+=e.clientX-last[0];ty+=e.clientY-last[1];last=[e.clientX,e.clientY];transform()};search.oninput=render;strength.oninput=render;fetch('/api/arvore/'+id).then(r=>r.json()).then(d=>{if(!d.ok)throw Error(d.erro||'Erro');D=d;total.textContent=d.total;render();detail(d.nodes.find(n=>n.central))}).catch(e=>detail({nome:'Erro',forca:e.message,central:true,motivos:[],evidencias:[]}));window.onresize=transform;
+</script></body></html>"""
+
+
+async def arvore_pagina_http(request: web.Request) -> web.Response:
+    return web.Response(text=_ARVORE_HTML_DICOR, content_type='text/html', charset='utf-8')
+
+
+async def start_web_server():
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+    if _WEB_RUNNER_DICOR is not None:
+        return
+    gerar_catalogo_html()
+    app = web.Application(client_max_size=100 * 1024 * 1024)
+    app.router.add_get('/', pagina_inicial); app.router.add_get('/index.html', pagina_inicial)
+    app.router.add_get('/catalogo', pagina_inicial); app.router.add_get('/catalogo.html', pagina_inicial)
+    app.router.add_get('/arvore', arvore_pagina_http); app.router.add_get('/arvore.html', arvore_pagina_http)
+    app.router.add_get('/api/arvore/{individuo_id}', arvore_api_http)
+    app.router.add_get('/health', healthcheck_http); app.router.add_get('/healthz', healthcheck_http)
+    app.router.add_get('/dossies/{caminho:.+}', baixar_dossie_http); app.router.add_get('/backups/{caminho:.+}', baixar_backup_http)
+    app.router.add_post('/api/catalogo/apagar', api_apagar_procurado)
+    app.router.add_static('/uploads/', path=str(UPLOADS_DIR), show_index=False)
+    porta = int(os.getenv('PORT', str(PORT)) or PORT)
+    runner = web.AppRunner(app, access_log=None); await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=porta); await site.start()
+    _WEB_RUNNER_DICOR = runner; _WEB_SITE_DICOR = site
+    print(f'✅ HTTP DICOR ativo | catálogo /catalogo | árvore dourada /arvore?id=ID', flush=True)
+
+
+_ARVORE_EMBED_AZUL_ANTES = _arvore_embed
+def _arvore_embed(resultado: Dict[str, Any]) -> discord.Embed:
+    alvo = dict(resultado.get('alvo') or {}); conexoes = list(resultado.get('conexoes') or [])
+    url = _arvore_url_publica(int(alvo.get('id') or 0))
+    embed = discord.Embed(title=f"🧬 CENTRAL DE VÍNCULOS DICOR — {str(alvo.get('nome') or 'INDIVÍDUO').upper()}", url=url, description=f"**RG:** `{alvo.get('rg') or 'Não informado'}`\n**Organização:** {alvo.get('faccao_atual') or 'Não informada'}\n**Conexões:** `{len(conexoes)}`\n\n🌐 **[Abrir plataforma interativa completa]({url})**\n\nPesquisa, filtros, zoom e pessoas clicáveis, sem limite artificial de conexões.", color=discord.Color.from_rgb(215,169,61))
+    for c in conexoes[:6]:
+        embed.add_field(name=f"{c.get('nome')} • RG {c.get('rg')} • {_arvore_forca(int(c.get('score') or 0))}", value=(f"**Motivos:** {', '.join(c.get('motivos') or ['registro relacionado'])}\n**Evidências:** {' • '.join(str(x) for x in (c.get('evidencias') or [])[:2]) or 'Sem resumo'}")[:1024], inline=False)
+    if len(conexoes) > 6:
+        embed.add_field(name='Plataforma completa', value=f'Mais **{len(conexoes)-6}** conexão(ões) disponíveis no painel interativo.', inline=False)
+    embed.set_footer(text='DICOR • vínculos investigativos baseados nos registros armazenados')
+    return embed
+
+print('✅ Plataforma profissional dourada da árvore DICOR carregada, sem limite artificial.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
