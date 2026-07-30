@@ -50187,5 +50187,485 @@ print(
 )
 
 
+
+# =====================================================
+# V13 — NÚCLEO DE INTERAÇÕES ESTÁVEL E SEM BLOQUEIO
+# =====================================================
+# Esta camada substitui a inicialização acumulada das versões anteriores.
+# Motivo do problema encontrado no arquivo completo:
+# - 18 redefinições de on_ready;
+# - 20 listeners extras de on_ready;
+# - dezenas de custom_id duplicados em Views antigas;
+# - importações OCR, histórico e manutenção iniciadas junto com o gateway;
+# - o callback chegava ao send_modal depois de o token de 3 segundos expirar,
+#   causando 404 Unknown interaction e "O aplicativo não respondeu".
+#
+# A V13 preserva os fluxos e as classes existentes, mas:
+# 1) remove todos os listeners antigos de inicialização/interação;
+# 2) registra uma única View por custom_id no setup_hook;
+# 3) não inicia varreduras pesadas no on_ready;
+# 4) inclui um roteador de emergência para painéis antigos;
+# 5) sincroniza os comandos antes de abrir o gateway;
+# 6) oferece /repararpaineis e /diagnosticopaineis com resposta imediata.
+
+import types as _v13_types
+
+_V13_PRONTO = False
+_V13_VIEWS: List[View] = []
+_V13_ROTAS: Dict[str, Any] = {}
+_V13_CUSTOM_IDS: set = set()
+_V13_WATCHDOG_TASK: Optional[asyncio.Task] = None
+_V13_REPARO_TASK: Optional[asyncio.Task] = None
+_V13_ULTIMO_LAG = 0.0
+_V13_REGISTRO_ERROS: List[str] = []
+
+
+def _v13_limpar_eventos_antigos() -> None:
+    """Remove listeners acumulados que disputavam ou atrasavam interações."""
+    eventos = getattr(bot, 'extra_events', None)
+    if not isinstance(eventos, dict):
+        return
+    # Os on_ready antigos iniciavam OCR, importações históricas, VACUUM,
+    # sincronizações e novos registros das mesmas Views ao mesmo tempo.
+    eventos['on_ready'] = []
+    # Remove auditorias/roteadores antigos que podiam responder duas vezes.
+    eventos['on_interaction'] = []
+
+
+_v13_limpar_eventos_antigos()
+
+
+def _v13_normalizar(texto: Any) -> str:
+    bruto = unicodedata.normalize('NFKD', str(texto or ''))
+    bruto = ''.join(c for c in bruto if not unicodedata.combining(c))
+    bruto = re.sub(r'[^a-zA-Z0-9]+', ' ', bruto).casefold()
+    return re.sub(r'\s+', ' ', bruto).strip()
+
+
+def _v13_texto_mensagem(msg: discord.Message) -> str:
+    partes = [str(getattr(msg, 'content', '') or '')]
+    for embed in list(getattr(msg, 'embeds', []) or []):
+        partes.append(str(getattr(embed, 'title', '') or ''))
+        partes.append(str(getattr(embed, 'description', '') or ''))
+        for campo in list(getattr(embed, 'fields', []) or []):
+            partes.append(str(getattr(campo, 'name', '') or ''))
+            partes.append(str(getattr(campo, 'value', '') or ''))
+    return '\n'.join(partes)
+
+
+def _v13_remover_views_persistentes() -> None:
+    for view in list(getattr(bot, 'persistent_views', []) or []):
+        try:
+            bot.remove_view(view)
+        except Exception:
+            pass
+    _V13_VIEWS.clear()
+    _V13_ROTAS.clear()
+    _V13_CUSTOM_IDS.clear()
+    _V13_REGISTRO_ERROS.clear()
+
+
+def _v13_factory(nome: str, *args, **kwargs) -> Optional[View]:
+    classe = globals().get(nome)
+    if classe is None:
+        return None
+    try:
+        return classe(*args, **kwargs)
+    except Exception as erro:
+        _V13_REGISTRO_ERROS.append(f'{nome}: {type(erro).__name__}: {erro}')
+        return None
+
+
+def _v13_registrar_view(view: Optional[View], *, prioridade: bool = False) -> bool:
+    if view is None:
+        return False
+    try:
+        if getattr(view, 'timeout', None) is not None:
+            _V13_REGISTRO_ERROS.append(f'{type(view).__name__}: timeout não persistente')
+            return False
+        itens = []
+        ids = []
+        for item in list(getattr(view, 'children', []) or []):
+            cid = str(getattr(item, 'custom_id', '') or '').strip()
+            if not cid:
+                # Botões de URL não possuem custom_id e são válidos.
+                continue
+            ids.append(cid)
+            itens.append((cid, item))
+        if not ids:
+            return False
+        repetidos = [cid for cid in ids if cid in _V13_CUSTOM_IDS]
+        if repetidos:
+            # Uma única rota por custom_id. A lista principal é ordenada para
+            # manter sempre as classes finais dos painéis.
+            _V13_REGISTRO_ERROS.append(
+                f'{type(view).__name__}: ids já registrados: {", ".join(repetidos[:4])}'
+            )
+            return False
+        bot.add_view(view)
+        _V13_VIEWS.append(view)
+        for cid, item in itens:
+            _V13_CUSTOM_IDS.add(cid)
+            callback = getattr(item, 'callback', None)
+            if callable(callback):
+                _V13_ROTAS[cid] = callback
+        return True
+    except Exception as erro:
+        _V13_REGISTRO_ERROS.append(f'{type(view).__name__}: {type(erro).__name__}: {erro}')
+        return False
+
+
+def _v13_registrar_todas_views() -> int:
+    """Registra somente uma implementação por custom_id."""
+    _v13_remover_views_persistentes()
+
+    # Painéis principais primeiro: estes IDs têm prioridade sobre versões antigas.
+    principais: List[Optional[View]] = [
+        _v13_factory('PainelMesasView'),
+        _v13_factory('PainelProcuradosView'),
+        _v13_factory('PainelBoletimView'),
+        _v13_factory('RelatoriosPainelView'),
+        _v13_factory('PainelOrganizacoesView'),
+        _v13_factory('PainelAdministrativoView'),
+        BancoDadosViewV12(),
+        BancoDadosCompatViewV12(),
+    ]
+
+    # Views persistentes dos fluxos. Construtores incompatíveis são ignorados
+    # sem derrubar o bot; o erro fica visível em /diagnosticopaineis.
+    secundarias: List[Optional[View]] = [
+        _v13_factory('IniciarFormularioRelatorioView', tipo='tocaia'),
+        _v13_factory('IniciarFormularioRelatorioView', tipo='olb'),
+        _v13_factory('IniciarFormularioRelatorioView', tipo='pericia_externa'),
+        _v13_factory('IniciarBoletimView'),
+        _v13_factory('InformarRGBoletimView'),
+        _v13_factory('TipoIdentificacaoBoletimView'),
+        _v13_factory('ContinuarVeiculoBoletimView'),
+        _v13_factory('ProvasBoletimView'),
+        _v13_factory('PreviaBoletimView'),
+        _v13_factory('AutorizacaoCentralView'),
+        _v13_factory('PainelMandadosView'),
+        _v13_factory('FinalizarProcuradoView'),
+        _v13_factory('FecharMesaView'),
+        _v13_factory('ReabrirMesaView'),
+        _v13_factory('BoletimAtendimentoView'),
+        _v13_factory('FotoProcuradoBoletimView'),
+        _v13_factory('FinalizarRelatorioFotosView'),
+        _v13_factory('EditarRelatorioView'),
+        _v13_factory('SolicitarAutorizacaoProcuradoComFotosView'),
+        _v13_factory('AutorizacaoBoletimViewV3'),
+        _v13_factory('AutorizacaoOrganizacaoView'),
+        _v13_factory('SolicitarProcuradoSemLimiteFotosView'),
+        _v13_factory('FotoIndividuoProcuradoPainelView'),
+        _v13_factory('FotoRgProcuradoPainelView'),
+        _v13_factory('FotoIndividuoProcuradoBoletimView'),
+        _v13_factory('FotoRgProcuradoBoletimView'),
+        _v13_factory('PesquisaCrimesView'),
+        _v13_factory('GerenciamentoTarefasView'),
+        _v13_factory('TarefaInvestigativaView'),
+        _v13_factory('EditarCrimesPesquisaView'),
+        _v13_factory('BancoOCRReviewView'),
+        _v13_factory('BancoOCRLoteReviewView'),
+        _v13_factory('CentralPendenciasView'),
+        _v13_factory('PericiaAtendimentoView'),
+        _v13_factory('SetSolicitarView'),
+        _v13_factory('SetAprovacaoView'),
+    ]
+
+    total = 0
+    for view in principais + secundarias:
+        if _v13_registrar_view(view):
+            total += 1
+    print(
+        f'✅ V13: {total} Views únicas registradas • '
+        f'{len(_V13_CUSTOM_IDS)} custom_id(s) ativos.',
+        flush=True,
+    )
+    if _V13_REGISTRO_ERROS:
+        print('⚠️ V13 Views ignoradas: ' + ' | '.join(_V13_REGISTRO_ERROS[:18]), flush=True)
+    return total
+
+
+async def _v13_sincronizar_comandos() -> int:
+    try:
+        if int(GUILD_ID or 0) > 0:
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild_obj)
+            comandos = await bot.tree.sync(guild=guild_obj)
+        else:
+            comandos = await bot.tree.sync()
+        print(f'✅ V13: {len(comandos)} comandos sincronizados antes do gateway.', flush=True)
+        return len(comandos)
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ V13 sync: {type(erro).__name__}: {erro}', flush=True)
+        return 0
+
+
+async def _v13_setup_hook(self) -> None:
+    # Não chama os setup_hooks empilhados das versões anteriores.
+    # Os listeners legados já foram removidos no carregamento do módulo.
+    # Não limpamos on_interaction aqui para preservar o roteador V13,
+    # registrado depois da limpeza inicial.
+    _v13_registrar_todas_views()
+    await _v13_sincronizar_comandos()
+
+
+bot.setup_hook = _v13_types.MethodType(_v13_setup_hook, bot)
+
+
+async def _v13_watchdog_event_loop() -> None:
+    global _V13_ULTIMO_LAG
+    loop = asyncio.get_running_loop()
+    esperado = loop.time() + 1.0
+    while not bot.is_closed():
+        await asyncio.sleep(1.0)
+        agora = loop.time()
+        atraso = max(0.0, agora - esperado)
+        esperado = agora + 1.0
+        _V13_ULTIMO_LAG = atraso
+        if atraso >= 2.0:
+            print(
+                f'⚠️ V13 EVENT LOOP ATRASADO: {atraso:.2f}s. '
+                'Uma rotina síncrona bloqueou as interações.',
+                flush=True,
+            )
+
+
+async def _v13_responder_erro(interaction: discord.Interaction, titulo: str, erro: Exception) -> None:
+    traceback.print_exception(type(erro), erro, erro.__traceback__)
+    texto = f'❌ {titulo}\n`{type(erro).__name__}: {str(erro)[:350]}`'
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(texto, ephemeral=True)
+        else:
+            await interaction.response.send_message(texto, ephemeral=True)
+    except Exception:
+        pass
+
+
+def _v13_view_para_painel(texto: str) -> Optional[View]:
+    t = _v13_normalizar(texto)
+    if 'central de fichas' in t or 'banco de dados dicor' in t:
+        return BancoDadosViewV12()
+    if 'sistema de mesas' in t or 'painel de mesas' in t:
+        return _v13_factory('PainelMesasView')
+    if 'sistema de procurados' in t or 'painel de procurados' in t:
+        return _v13_factory('PainelProcuradosView')
+    if 'painel de boletins' in t or 'sistema de boletins' in t:
+        return _v13_factory('PainelBoletimView')
+    if 'painel de relatorios' in t or 'relatorios operacionais' in t:
+        return _v13_factory('RelatoriosPainelView')
+    if 'painel administrativo' in t or 'central administrativa' in t:
+        return _v13_factory('PainelAdministrativoView')
+    if 'painel de organizacoes' in t or 'sistema de organizacoes' in t:
+        return _v13_factory('PainelOrganizacoesView')
+    if 'pericia externa' in t and ('painel' in t or 'atendimento' in t):
+        return _v13_factory('PericiaAtendimentoView')
+    return None
+
+
+async def _v13_reparar_paineis_core(interaction: discord.Interaction) -> Dict[str, int]:
+    """Edita fisicamente os painéis antigos sem bloquear a resposta do comando."""
+    resultado = {'views': 0, 'canais': 0, 'mensagens': 0, 'erros': 0}
+    resultado['views'] = _v13_registrar_todas_views()
+    guild = interaction.guild or bot.get_guild(int(GUILD_ID or 0))
+    if guild is None:
+        return resultado
+
+    palavras = ('banco', 'mesa', 'procur', 'bolet', 'relatorio', 'pericia', 'organiz', 'administr')
+    canais = [
+        canal for canal in list(getattr(guild, 'text_channels', []) or [])
+        if any(p in _v13_normalizar(getattr(canal, 'name', '')) for p in palavras)
+    ]
+
+    semaforo = asyncio.Semaphore(4)
+
+    async def revisar(canal) -> None:
+        local = 0
+        async with semaforo:
+            try:
+                async for msg in canal.history(limit=100, oldest_first=False):
+                    if int(getattr(getattr(msg, 'author', None), 'id', 0) or 0) != int(getattr(bot.user, 'id', 0) or 0):
+                        continue
+                    if not list(getattr(msg, 'components', []) or []):
+                        continue
+                    view = _v13_view_para_painel(_v13_texto_mensagem(msg))
+                    if view is None:
+                        continue
+                    try:
+                        await msg.edit(view=view)
+                        local += 1
+                        await asyncio.sleep(0.08)
+                    except (discord.Forbidden, discord.NotFound):
+                        resultado['erros'] += 1
+                    except Exception:
+                        resultado['erros'] += 1
+                        traceback.print_exc()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                resultado['erros'] += 1
+            except Exception:
+                resultado['erros'] += 1
+                traceback.print_exc()
+        if local:
+            resultado['canais'] += 1
+            resultado['mensagens'] += local
+
+    await asyncio.gather(*(revisar(c) for c in canais), return_exceptions=True)
+    print(
+        f"✅ V13 reparo: {resultado['mensagens']} painel(is), "
+        f"{resultado['canais']} canal(is), {resultado['erros']} erro(s).",
+        flush=True,
+    )
+    return resultado
+
+
+# Substitui os comandos antigos para evitar comandos visíveis sem callback atual.
+try:
+    bot.tree.remove_command('repararpaineis')
+except Exception:
+    pass
+try:
+    bot.tree.remove_command('diagnosticopaineis')
+except Exception:
+    pass
+
+
+async def _v13_permissao_reparo(interaction: discord.Interaction) -> bool:
+    try:
+        return bool(
+            isinstance(interaction.user, discord.Member)
+            and (usuario_pode_painel_adm(interaction.user) or usuario_e_administrador(interaction.user))
+        )
+    except Exception:
+        return False
+
+
+async def _v13_comando_reparar_core(interaction: discord.Interaction) -> None:
+    if interaction.response.is_done():
+        return
+    if not await _v13_permissao_reparo(interaction):
+        await interaction.response.send_message('❌ Apenas Inspetor+ pode reparar os painéis.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        resultado = await _v13_reparar_paineis_core(interaction)
+        await interaction.followup.send(
+            '✅ **PAINÉIS DICOR RECARREGADOS**\n'
+            f'Views únicas: `{resultado["views"]}`\n'
+            f'Custom IDs ativos: `{len(_V13_CUSTOM_IDS)}`\n'
+            f'Mensagens atualizadas: `{resultado["mensagens"]}`\n'
+            f'Canais revisados: `{resultado["canais"]}`\n'
+            f'Erros: `{resultado["erros"]}`',
+            ephemeral=True,
+        )
+    except Exception as erro:
+        await _v13_responder_erro(interaction, 'Falha ao reparar os painéis.', erro)
+
+
+@bot.tree.command(name='repararpaineis', description='Recarrega imediatamente todos os painéis DICOR.')
+async def reparar_paineis_v13(interaction: discord.Interaction):
+    await _v13_comando_reparar_core(interaction)
+
+
+@bot.tree.command(name='diagnosticopaineis', description='Mostra o estado real das interações e Views DICOR.')
+async def diagnostico_paineis_v13(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    try:
+        texto_erros = '\n'.join(f'• {x}' for x in _V13_REGISTRO_ERROS[:8]) or 'Nenhum erro de registro.'
+        await interaction.followup.send(
+            '🧪 **DIAGNÓSTICO DOS PAINÉIS V13**\n'
+            f'Bot: `{bot.user}`\n'
+            f'Views persistentes: `{len(list(getattr(bot, "persistent_views", []) or []))}`\n'
+            f'Custom IDs roteados: `{len(_V13_CUSTOM_IDS)}`\n'
+            f'Último atraso do event loop: `{_V13_ULTIMO_LAG:.2f}s`\n'
+            f'Inicialização pesada automática: `DESATIVADA`\n\n'
+            f'**Avisos de registro:**\n{texto_erros}'[:1900],
+            ephemeral=True,
+        )
+    except Exception as erro:
+        await _v13_responder_erro(interaction, 'Falha no diagnóstico.', erro)
+
+
+async def _v13_fallback_componente(interaction: discord.Interaction, custom_id: str) -> None:
+    """Executa o callback quando uma mensagem antiga não foi ligada pela ViewStore."""
+    await asyncio.sleep(0.35)
+    if interaction.response.is_done():
+        return
+    callback = _V13_ROTAS.get(custom_id)
+    if not callable(callback):
+        return
+    try:
+        await callback(interaction)
+        print(f'🛟 V13 fallback executado para `{custom_id}`.', flush=True)
+    except discord.InteractionResponded:
+        pass
+    except discord.NotFound as erro:
+        print(
+            f'❌ Interação `{custom_id}` expirou antes da resposta. '
+            f'Lag atual: {_V13_ULTIMO_LAG:.2f}s | {erro}',
+            flush=True,
+        )
+    except Exception as erro:
+        await _v13_responder_erro(interaction, f'Falha no botão `{custom_id}`.', erro)
+
+
+@bot.listen('on_interaction')
+async def _v13_roteador_emergencia(interaction: discord.Interaction) -> None:
+    try:
+        tipo = getattr(interaction, 'type', None)
+        dados = dict(getattr(interaction, 'data', {}) or {})
+        if tipo == discord.InteractionType.component:
+            custom_id = str(dados.get('custom_id') or '')
+            if custom_id in _V13_ROTAS:
+                asyncio.create_task(
+                    _v13_fallback_componente(interaction, custom_id),
+                    name=f'v13-fallback-{interaction.id}',
+                )
+        elif tipo == discord.InteractionType.application_command:
+            nome = str(dados.get('name') or '').casefold()
+            if nome == 'repararpaineis':
+                async def fallback_comando():
+                    await asyncio.sleep(0.50)
+                    if not interaction.response.is_done():
+                        await _v13_comando_reparar_core(interaction)
+                asyncio.create_task(fallback_comando(), name=f'v13-cmd-fallback-{interaction.id}')
+    except Exception:
+        traceback.print_exc()
+
+
+async def _v13_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    await _v13_responder_erro(interaction, 'O comando apresentou uma falha.', error)
+
+
+bot.tree.on_error = _v13_types.MethodType(_v13_tree_error, bot.tree)
+
+
+@bot.event
+async def on_ready() -> None:
+    global _V13_PRONTO, _V13_WATCHDOG_TASK
+    # Reforça o registro sem disparar qualquer varredura pesada.
+    if not _V13_CUSTOM_IDS:
+        _v13_registrar_todas_views()
+    print(
+        f'✅ BOT DICOR V13 ONLINE: {bot.user} • '
+        f'{len(_V13_CUSTOM_IDS)} botões ativos • inicialização pesada desativada.',
+        flush=True,
+    )
+    if _V13_PRONTO:
+        return
+    _V13_PRONTO = True
+    if _V13_WATCHDOG_TASK is None or _V13_WATCHDOG_TASK.done():
+        _V13_WATCHDOG_TASK = asyncio.create_task(
+            _v13_watchdog_event_loop(), name='v13-watchdog-event-loop'
+        )
+
+
+print(
+    '✅ V13 carregada: listeners antigos removidos, Views únicas, comandos sincronizados '
+    'no setup_hook, fallback de painéis antigos e watchdog de event loop.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
