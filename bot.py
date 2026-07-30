@@ -51150,5 +51150,200 @@ async def reparar_banco_v16(interaction: discord.Interaction):
 
 print('✅ V16 carregada: banco isolado, catálogo robusto e árvore premium sem alterar mecânicas.', flush=True)
 
+
+# =====================================================
+# V17 — CATÁLOGO INSTANTÂNEO + ANÁLISE DE FOTOS EM SEGUNDO PLANO
+# =====================================================
+# O catálogo nunca executa OCR durante uma requisição HTTP. A página é montada
+# diretamente do JSON e fica em cache na memória. A análise RG/corpo continua,
+# mas roda separadamente em uma thread, sem segurar o navegador ou o Discord.
+
+_V17_CATALOGO_RENDER_LOCK = asyncio.Lock()
+_V17_CATALOGO_CACHE_HTML: str = ""
+_V17_CATALOGO_CACHE_KEY: Tuple[Any, ...] = tuple()
+_V17_ANALISE_FOTOS_TASK: Optional[asyncio.Task] = None
+
+
+def _v17_catalogo_key() -> Tuple[Any, ...]:
+    try:
+        st = CATALOGO_JSON.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except Exception:
+        try:
+            dados = carregar_procurados() or []
+            return (len(dados), hash(tuple((str(x.get('rg')), str(x.get('status')), str(x.get('foto_individuo')), str(x.get('foto_rg'))) for x in dados)))
+        except Exception:
+            return (0, 0)
+
+
+def _v17_texto_html(valor: Any) -> str:
+    return escape(str(valor or "")).replace("\r\n", "<br>").replace("\n", "<br>")
+
+
+def _v17_foto_url(valor: Any) -> str:
+    try:
+        url = str(_catalogo_url_foto(valor) or "").strip()
+    except Exception:
+        url = ""
+    return url
+
+
+def _v17_foto_html(valor: Any, alt: str, tipo: str) -> str:
+    url = _v17_foto_url(valor)
+    if not url:
+        return f'<div class="photo-empty"><span>SEM IMAGEM</span><small>{escape(tipo)}</small></div>'
+    return (
+        f'<img loading="lazy" decoding="async" src="{escape(url)}" alt="{escape(alt)}" '
+        'onclick="openPhoto(this.src,this.alt)" '
+        f'onerror="this.outerHTML=\'<div class=&quot;photo-empty&quot;><span>IMAGEM INDISPONÍVEL</span><small>{escape(tipo)}</small></div>\'">'
+    )
+
+
+def _v17_catalogo_card(registro: Dict[str, Any]) -> str:
+    status = str(registro.get("status") or "A PROCURAR").upper().strip()
+    retirado = status == "RETIRADO"
+    classe = "retired" if retirado else "wanted"
+    nome = str(registro.get("nome") or "Nome não informado")
+    rg = str(registro.get("rg") or "NÃO INFORMADO")
+    crimes = str(valor_crimes_registro(registro) or "Não informado")
+    caso = str(registro.get("caso") or registro.get("id") or "SEM NÚMERO")
+    boletim = str(registro.get("numero_boletim") or registro.get("boletim") or "Não informado")
+    data = str(registro.get("data") or registro.get("criado_em") or "Não informada")
+    avistamento = str(registro.get("ultimo_avistamento") or "Não informado")
+    busca = escape(f"{nome} {rg} {crimes} {caso} {boletim}".lower())
+    return f'''<article class="wanted-card {classe}" data-search="{busca}">
+      <div class="case-top">
+        <div><span>CASO</span><strong>{escape(caso)}</strong></div>
+        <div><span>DATA</span><strong>{escape(data)}</strong></div>
+        <em>{escape(status)}</em>
+      </div>
+      <div class="wanted-body">
+        <div class="media-grid">
+          <figure class="person-photo"><figcaption>FOTO DO INDIVÍDUO</figcaption>{_v17_foto_html(registro.get('foto_individuo'), 'Foto do indivíduo', 'FOTO DO INDIVÍDUO')}</figure>
+          <figure class="document-photo"><figcaption>DOCUMENTO / RG</figcaption>{_v17_foto_html(registro.get('foto_rg'), 'Foto do RG', 'DOCUMENTO / RG')}</figure>
+        </div>
+        <div class="wanted-info">
+          <div class="identity"><small>IDENTIFICAÇÃO</small><h2>{escape(nome)}</h2><div class="rg">RG • {escape(rg)}</div></div>
+          <div class="info-box danger"><span>CRIMES REGISTRADOS</span><p>{_v17_texto_html(crimes)}</p></div>
+          <div class="info-box"><span>ÚLTIMO AVISTAMENTO</span><p>{_v17_texto_html(avistamento)}</p></div>
+          <div class="details"><div><span>BOLETIM</span><b>{escape(boletim)}</b></div><div><span>SITUAÇÃO</span><b>{escape(status)}</b></div></div>
+        </div>
+      </div>
+    </article>'''
+
+
+_V17_CATALOGO_TEMPLATE = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Catálogo de Procurados • DICOR</title><style>
+:root{--gold:#d7a93d;--gold2:#f2d47d;--bg:#060705;--panel:#10120d;--line:#3b321a;--text:#f7f1db;--muted:#99937f;--red:#a6342f}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 50% -10%,#3a2d0c55,transparent 36%),var(--bg);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;min-height:100vh}.top{min-height:112px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:14px 5vw;background:#080906ed;position:sticky;top:0;z-index:10;backdrop-filter:blur(13px)}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:76px;height:76px;object-fit:contain;border:1px solid #8b712d;border-radius:18px;background:#050604;padding:5px;box-shadow:0 0 35px #d7a93d2b}.brand h1{margin:0;font-size:20px;letter-spacing:2.3px}.brand small{color:var(--gold);letter-spacing:1.5px}.top-actions{justify-self:end;display:flex;gap:9px}.top-actions a{color:var(--text);text-decoration:none;border:1px solid #54451f;border-radius:9px;padding:10px 13px}.top-actions a:hover{border-color:var(--gold);color:var(--gold2)}main{max-width:1440px;margin:0 auto;padding:38px 22px 70px}.intro{text-align:center;margin:15px auto 31px}.intro span{color:var(--gold);font-size:10px;letter-spacing:2.4px}.intro h2{font-size:42px;margin:10px 0 7px}.intro p{color:var(--muted)}.toolbar{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin-bottom:28px}.toolbar input{width:min(520px,100%);background:#10120d;border:1px solid #4b3d1c;color:#fff;border-radius:10px;padding:13px 15px;font-size:15px}.toolbar input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px #d7a93d18}.tabs{display:flex;gap:8px}.tabs button{background:#11130e;border:1px solid #4b3d1c;color:var(--text);border-radius:10px;padding:12px 16px;cursor:pointer;font-weight:800}.tabs button.active{background:linear-gradient(135deg,var(--gold2),var(--gold));color:#161207}.tab{display:none}.tab.active{display:grid;gap:20px}.wanted-card{border:1px solid #393018;border-radius:20px;background:linear-gradient(150deg,#15170f,#0b0c09);overflow:hidden;box-shadow:0 18px 55px #0005}.case-top{min-height:66px;display:grid;grid-template-columns:1fr 1fr auto;align-items:center;gap:20px;padding:13px 20px;border-bottom:1px solid #393018;background:#0c0e0a}.case-top span,.details span,.info-box span,.identity small{display:block;color:var(--gold);font-size:9px;letter-spacing:1.6px;margin-bottom:4px}.case-top strong{font-size:13px}.case-top em{font-style:normal;color:#ffccc8;border:1px solid #79342f;background:#341411;border-radius:99px;padding:7px 11px;font-size:10px;letter-spacing:1.2px}.retired .case-top em{color:#d0cab7;border-color:#575346;background:#24231e}.wanted-body{display:grid;grid-template-columns:minmax(410px,.95fr) 1.05fr}.media-grid{display:grid;grid-template-columns:1.5fr .8fr;min-height:410px;background:#050604;border-right:1px solid #393018}.media-grid figure{margin:0;position:relative;min-width:0;overflow:hidden;border-right:1px solid #2e2818}.media-grid figure:last-child{border-right:0}.media-grid figcaption{position:absolute;z-index:2;left:12px;top:12px;background:#070806e8;border:1px solid #54451f;color:var(--gold2);padding:6px 8px;border-radius:7px;font-size:9px;letter-spacing:1.3px}.media-grid img{width:100%;height:100%;object-fit:cover;cursor:zoom-in;transition:.25s}.document-photo img{object-fit:contain;background:#090a07}.media-grid img:hover{transform:scale(1.018)}.photo-empty{height:100%;min-height:320px;display:grid;align-content:center;justify-items:center;gap:8px;color:#6b6658;background:radial-gradient(circle,#2c250e40,transparent 55%);font-size:11px;letter-spacing:1.4px}.photo-empty span{color:#8e8468;font-weight:800}.photo-empty small{font-size:9px}.wanted-info{padding:29px;display:flex;flex-direction:column;gap:15px}.identity h2{font-size:30px;margin:5px 0 9px}.rg{display:inline-flex;border:1px solid #6b5522;background:#201b0d;color:var(--gold2);border-radius:8px;padding:8px 11px;font-weight:900}.info-box{border:1px solid #332b17;border-radius:12px;background:#11130e;padding:15px}.info-box p{margin:7px 0 0;color:#c5bea8;line-height:1.55}.info-box.danger{border-color:#5d2925;background:#1c0e0c}.info-box.danger span{color:#ee8077}.details{display:grid;grid-template-columns:1fr 1fr;gap:10px}.details div{border:1px solid #332b17;border-radius:10px;padding:13px}.empty-state{text-align:center;border:1px dashed #4a3d1c;border-radius:20px;padding:65px;color:var(--muted)}.empty-state img{width:100px}.lightbox{display:none;position:fixed;inset:0;background:#000e;z-index:99;align-items:center;justify-content:center;padding:25px}.lightbox.open{display:flex}.lightbox img{max-width:94vw;max-height:90vh;object-fit:contain;border:1px solid #8b712d;border-radius:12px}.lightbox button{position:absolute;right:25px;top:20px;background:#111;color:#fff;border:1px solid #765f2a;border-radius:9px;padding:10px 13px;cursor:pointer}@media(max-width:900px){.top{grid-template-columns:auto 1fr;height:auto}.brand{grid-column:1;justify-self:start}.brand img{width:58px;height:58px}.top-actions{grid-column:2}.brand small{display:none}.wanted-body{grid-template-columns:1fr}.media-grid{border-right:0;border-bottom:1px solid #393018}.intro h2{font-size:34px}}@media(max-width:600px){.top-actions a:first-child{display:none}.brand h1{font-size:15px}.media-grid{grid-template-columns:1fr;min-height:650px}.media-grid figure{min-height:320px;border-right:0;border-bottom:1px solid #2e2818}.case-top{grid-template-columns:1fr auto}.case-top>div:nth-child(2){display:none}.details{grid-template-columns:1fr}}
+</style></head><body><header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"><div><h1>DICOR • CATÁLOGO DE PROCURADOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><nav class="top-actions"><a href="/">Central DICOR</a><a href="/acesso?next=/arvore">Área restrita</a></nav></header><main><section class="intro"><span>CONSULTA PÚBLICA OFICIAL</span><h2>Indivíduos procurados</h2><p>Registros divulgados pela DICOR para consulta operacional.</p></section><div class="toolbar"><input id="search" autocomplete="off" placeholder="Pesquisar por nome, RG, crime ou número do caso"><div class="tabs"><button id="btn-active" class="active" onclick="tab('active')">PROCURADOS (__COUNT_ACTIVE__)</button><button id="btn-retired" onclick="tab('retired')">RETIRADOS (__COUNT_RETIRED__)</button></div></div><section id="active" class="tab active">__CARDS_ACTIVE__</section><section id="retired" class="tab">__CARDS_RETIRED__</section></main><div id="lightbox" class="lightbox" onclick="closePhoto()"><button onclick="closePhoto()">FECHAR</button><img id="lightbox-image"></div><script>let current='active';function tab(name){current=name;document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(name).classList.add('active');document.getElementById('btn-'+name).classList.add('active');filter()}function filter(){const q=document.getElementById('search').value.toLowerCase().trim();document.querySelectorAll('#'+current+' .wanted-card').forEach(c=>c.style.display=c.dataset.search.includes(q)?'block':'none')}document.getElementById('search').addEventListener('input',filter);function openPhoto(src,alt){document.getElementById('lightbox-image').src=src;document.getElementById('lightbox-image').alt=alt||'';document.getElementById('lightbox').classList.add('open')}function closePhoto(){document.getElementById('lightbox').classList.remove('open')}document.addEventListener('keydown',e=>{if(e.key==='Escape')closePhoto()});</script></body></html>'''
+
+
+def _v17_render_catalogo_sync() -> str:
+    global _V17_CATALOGO_CACHE_HTML, _V17_CATALOGO_CACHE_KEY
+    key = _v17_catalogo_key()
+    if _V17_CATALOGO_CACHE_HTML and key == _V17_CATALOGO_CACHE_KEY:
+        return _V17_CATALOGO_CACHE_HTML
+    procurados = carregar_procurados() or []
+    if not isinstance(procurados, list):
+        procurados = []
+    visiveis = [p for p in procurados if str(p.get('status') or 'A PROCURAR').upper() != 'APAGADO']
+    ativos = [p for p in visiveis if str(p.get('status') or 'A PROCURAR').upper() != 'RETIRADO']
+    retirados = [p for p in visiveis if str(p.get('status') or '').upper() == 'RETIRADO']
+    cards_ativos = ''.join(_v17_catalogo_card(x) for x in ativos) or '<div class="empty-state"><img src="/central/brasao-dicor.png"><h2>Nenhum procurado ativo</h2><p>Os novos registros aparecerão automaticamente.</p></div>'
+    cards_retirados = ''.join(_v17_catalogo_card(x) for x in retirados) or '<div class="empty-state"><img src="/central/brasao-dicor.png"><h2>Nenhum registro retirado</h2></div>'
+    pagina = (_V17_CATALOGO_TEMPLATE
+        .replace('__COUNT_ACTIVE__', str(len(ativos)))
+        .replace('__COUNT_RETIRED__', str(len(retirados)))
+        .replace('__CARDS_ACTIVE__', cards_ativos)
+        .replace('__CARDS_RETIRED__', cards_retirados))
+    _V17_CATALOGO_CACHE_HTML = pagina
+    _V17_CATALOGO_CACHE_KEY = key
+    return pagina
+
+
+def gerar_catalogo_html() -> None:
+    """Geração rápida e atômica; nunca executa OCR."""
+    pagina = _v17_render_catalogo_sync()
+    CATALOGO_HTML.parent.mkdir(parents=True, exist_ok=True)
+    temporario = CATALOGO_HTML.with_suffix(CATALOGO_HTML.suffix + '.tmp')
+    temporario.write_text(pagina, encoding='utf-8')
+    os.replace(str(temporario), str(CATALOGO_HTML))
+
+
+async def pagina_inicial(request: web.Request) -> web.StreamResponse:
+    """Entrega o catálogo imediatamente, sem depender de arquivo pré-gerado."""
+    try:
+        async with _V17_CATALOGO_RENDER_LOCK:
+            pagina = await asyncio.wait_for(asyncio.to_thread(_v17_render_catalogo_sync), timeout=5)
+        return web.Response(
+            text=pagina,
+            content_type='text/html',
+            charset='utf-8',
+            headers={'Cache-Control': 'no-cache, must-revalidate', 'X-DICOR-Catalog': 'V17-fast'},
+        )
+    except Exception as erro:
+        print(f'❌ V17 catálogo imediato: {type(erro).__name__}: {erro}', flush=True)
+        return web.Response(
+            text=_v16_catalogo_fallback_html().replace('está sendo atualizado', 'não pôde ser montado agora'),
+            content_type='text/html', charset='utf-8', status=500,
+            headers={'Cache-Control': 'no-store'},
+        )
+
+
+def _v17_analisar_fotos_sync() -> Dict[str, int]:
+    """Executa a classificação RG/corpo fora da rota pública."""
+    global _V17_CATALOGO_CACHE_HTML, _V17_CATALOGO_CACHE_KEY
+    procurados = carregar_procurados() or []
+    if not isinstance(procurados, list):
+        return {'analisados': 0, 'alterados': 0}
+    pendentes = 0
+    for registro in procurados:
+        foto_corpo = str(registro.get('foto_individuo') or '')
+        foto_rg = str(registro.get('foto_rg') or '')
+        if foto_corpo and foto_rg and foto_corpo != foto_rg and not registro.get('foto_analise_assinatura'):
+            pendentes += 1
+    if not pendentes:
+        gerar_catalogo_html()
+        return {'analisados': 0, 'alterados': 0}
+    antes = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    alterou = bool(_catalogo_classificar_e_corrigir_fotos(procurados))
+    depois = json.dumps(procurados, ensure_ascii=False, sort_keys=True, default=str)
+    if antes != depois:
+        try:
+            pasta_backup = DATA_DIR / 'backups_catalogo_fotos'
+            pasta_backup.mkdir(parents=True, exist_ok=True)
+            backup = pasta_backup / f"procurados-v17-antes-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            backup.write_text(antes, encoding='utf-8')
+        except Exception as erro:
+            print(f'⚠️ V17 backup de fotos: {erro}', flush=True)
+        salvar_procurados(procurados)
+    _V17_CATALOGO_CACHE_HTML = ''
+    _V17_CATALOGO_CACHE_KEY = tuple()
+    gerar_catalogo_html()
+    return {'analisados': pendentes, 'alterados': 1 if alterou else 0}
+
+
+async def _v17_analise_fotos_background() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(12)
+    try:
+        resultado = await asyncio.to_thread(_v17_analisar_fotos_sync)
+        print(f"✅ V17 catálogo: análise de fotos em segundo plano concluída ({resultado['analisados']} pendente(s)).", flush=True)
+    except Exception as erro:
+        print(f'⚠️ V17 análise de fotos em segundo plano: {type(erro).__name__}: {erro}', flush=True)
+
+
+@bot.listen('on_ready')
+async def _v17_on_ready_catalogo() -> None:
+    global _V17_ANALISE_FOTOS_TASK
+    try:
+        await asyncio.to_thread(gerar_catalogo_html)
+    except Exception as erro:
+        print(f'⚠️ V17 pré-geração rápida do catálogo: {type(erro).__name__}: {erro}', flush=True)
+    if _V17_ANALISE_FOTOS_TASK is None or _V17_ANALISE_FOTOS_TASK.done():
+        _V17_ANALISE_FOTOS_TASK = asyncio.create_task(_v17_analise_fotos_background(), name='v17-catalogo-fotos-bg')
+
+
+print('✅ V17 carregada: catálogo instantâneo; OCR de fotos isolado em segundo plano.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
