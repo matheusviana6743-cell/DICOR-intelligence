@@ -50918,285 +50918,65 @@ print(
 )
 
 # =====================================================
-# V15 — PERFORMANCE INTERNA + ÁRVORE DICOR PREMIUM
+# V16 — RESTAURAÇÃO ESTÁVEL: BANCO + CATÁLOGO + ÁRVORE
 # =====================================================
-# Não altera botões, permissões, canais, fluxos ou dados.
-# Otimizações transparentes:
-# - cache invalidado automaticamente quando SQLite/perícias mudam;
-# - hash de imagens por mtime/tamanho, sem reler arquivos iguais;
-# - índices SQLite para consultas já existentes;
-# - respostas web compactadas e renderização SVG mais leve;
-# - árvore escura/dourada sem círculos brancos e sem textos sobrepostos.
+# Baseada na V14, mantendo os fluxos que já estavam funcionando.
 
-import copy as _v15_copy
-import threading as _v15_threading
-
-_V15_LOCK = _v15_threading.RLock()
-_V15_CACHE_BUSCA: Dict[Any, Any] = {}
-_V15_CACHE_FICHA: Dict[Any, Any] = {}
-_V15_CACHE_PERICIAS_ARQUIVO: Dict[Any, Any] = {}
-_V15_CACHE_PERICIAS_PESSOA: Dict[Any, Any] = {}
-_V15_CACHE_HASH_IMAGEM: Dict[Any, Any] = {}
-_V15_CACHE_ROUPAS: Dict[Any, Any] = {}
-_V15_CACHE_ARVORE: Dict[Any, Any] = {}
-_V15_CACHE_ARVORE_FINAL: Dict[Any, Any] = {}
-_V15_LAST_SIGNATURE: Any = None
+_V16_PAINEL_TASK: Optional[asyncio.Task] = None
+_V16_CATALOGO_LOCK = asyncio.Lock()
 
 
-def _v15_stat_signature(caminho: Any) -> Tuple[int, int]:
+def _v16_catalogo_url() -> str:
+    base = str(CATALOG_PUBLIC_URL or '').strip().rstrip('/')
+    if not base:
+        return '/catalogo'
+    if base.endswith('/catalogo') or base.endswith('/catalogo.html'):
+        return base
+    return base + '/catalogo'
+
+
+def _v16_catalogo_fallback_html() -> str:
     try:
-        p = Path(caminho)
-        st = p.stat()
-        return int(st.st_mtime_ns), int(st.st_size)
+        quantidade = len([x for x in (carregar_procurados() or []) if str(x.get('status') or 'A PROCURAR').upper() == 'A PROCURAR'])
     except Exception:
-        return 0, 0
+        quantidade = 0
+    return f"""<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Catálogo DICOR</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#070806;color:#f7f1db;font-family:Arial}}.box{{max-width:620px;margin:25px;padding:38px;border:1px solid #4b3d1c;border-radius:20px;background:#11130e;text-align:center}}img{{width:120px}}h1{{color:#f2d47d}}p{{color:#aaa38d;line-height:1.6}}a{{display:inline-block;margin-top:15px;padding:11px 15px;border-radius:9px;background:#d7a93d;color:#111;text-decoration:none;font-weight:bold}}</style></head><body><div class='box'><img src='/central/brasao-dicor.png'><h1>Catálogo de Procurados</h1><p>O catálogo principal está sendo atualizado. Existem <b>{quantidade}</b> procurado(s) ativo(s) no banco.</p><a href='/catalogo'>Tentar novamente</a> <a href='/'>Voltar à Central</a></div></body></html>"""
 
 
-def _v15_data_signature() -> Tuple[Any, ...]:
-    banco = Path(BANCO_DADOS_SQLITE)
-    wal = Path(str(banco) + '-wal')
-    shm = Path(str(banco) + '-shm')
-    pericias = Path(globals().get('PERICIA_ATENDIMENTOS_JSON', Path(DATA_DIR) / 'pericias_atendimentos.json'))
-    return (
-        _v15_stat_signature(banco),
-        _v15_stat_signature(wal),
-        _v15_stat_signature(shm),
-        _v15_stat_signature(pericias),
-    )
-
-
-def _v15_prepare_signature() -> Tuple[Any, ...]:
-    global _V15_LAST_SIGNATURE
-    assinatura = _v15_data_signature()
-    with _V15_LOCK:
-        if _V15_LAST_SIGNATURE is not None and assinatura != _V15_LAST_SIGNATURE:
-            _V15_CACHE_BUSCA.clear()
-            _V15_CACHE_FICHA.clear()
-            _V15_CACHE_PERICIAS_PESSOA.clear()
-            _V15_CACHE_ROUPAS.clear()
-            _V15_CACHE_ARVORE.clear()
-            _V15_CACHE_ARVORE_FINAL.clear()
-        _V15_LAST_SIGNATURE = assinatura
-    return assinatura
-
-
-def _v15_cache_set(cache: Dict[Any, Any], chave: Any, valor: Any, limite: int = 160) -> None:
-    with _V15_LOCK:
-        if len(cache) >= limite:
-            # Dicionários mantêm ordem de inserção; remove os 25% mais antigos.
-            for antiga in list(cache.keys())[: max(1, limite // 4)]:
-                cache.pop(antiga, None)
-        cache[chave] = _v15_copy.deepcopy(valor)
-
-
-def _v15_criar_indices() -> None:
-    comandos = (
-        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_nome ON individuos(nome COLLATE NOCASE)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_rg ON individuos(rg)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_faccao ON individuos(faccao_atual COLLATE NOCASE)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_individuos_status ON individuos(status)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_fontes_individuo ON fontes_ficha_individuo(individuo_id)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_fontes_mensagem ON fontes_ficha_individuo(mensagem_id)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_vinculos_individuo ON vinculos_individuo_veiculo(individuo_id, ativo)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_vinculos_veiculo ON vinculos_individuo_veiculo(veiculo_id, ativo)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_historico_individuo ON historico_prisoes(individuo_id)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_arquivos_individuo ON arquivos_ficha_geral(individuo_id)",
-        "CREATE INDEX IF NOT EXISTS idx_v15_identificadores_valor ON identificadores_ficha(valor)",
-    )
+async def pagina_inicial(request: web.Request) -> web.StreamResponse:
+    """Rota pública robusta; gera o catálogo sob demanda sem derrubar o site."""
     try:
-        inicializar_banco_dicor()
-        with _banco_conexao() as db:
+        precisa_gerar = not CATALOGO_HTML.exists() or CATALOGO_HTML.stat().st_size < 200
+    except Exception:
+        precisa_gerar = True
+    if precisa_gerar:
+        async with _V16_CATALOGO_LOCK:
             try:
-                db.execute('PRAGMA synchronous=NORMAL')
-                db.execute('PRAGMA temp_store=MEMORY')
-                db.execute('PRAGMA cache_size=-32768')
-                db.execute('PRAGMA mmap_size=134217728')
+                precisa_gerar = not CATALOGO_HTML.exists() or CATALOGO_HTML.stat().st_size < 200
             except Exception:
-                pass
-            for comando in comandos:
+                precisa_gerar = True
+            if precisa_gerar:
                 try:
-                    db.execute(comando)
-                except Exception:
-                    # Instalações antigas podem ainda não ter alguma tabela opcional.
-                    pass
-    except Exception as erro:
-        print(f'⚠️ V15 não conseguiu preparar todos os índices: {erro}', flush=True)
-
-
-# Cache transparente da leitura de perícias.
-_PERICIA_CARREGAR_ANTES_V15 = _pericia_carregar
-
-
-def _pericia_carregar() -> List[Dict[str, Any]]:
-    caminho = Path(globals().get('PERICIA_ATENDIMENTOS_JSON', Path(DATA_DIR) / 'pericias_atendimentos.json'))
-    chave = _v15_stat_signature(caminho)
-    with _V15_LOCK:
-        cached = _V15_CACHE_PERICIAS_ARQUIVO.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = list(_PERICIA_CARREGAR_ANTES_V15() or [])
-    with _V15_LOCK:
-        _V15_CACHE_PERICIAS_ARQUIVO.clear()
-    _v15_cache_set(_V15_CACHE_PERICIAS_ARQUIVO, chave, resultado, limite=4)
-    return _v15_copy.deepcopy(resultado)
-
-
-_DICOR_PERICIAS_PESSOA_ANTES_V15 = _dicor_pericias_do_individuo
-
-
-def _dicor_pericias_do_individuo(individuo: Dict[str, Any]) -> List[Dict[str, Any]]:
-    assinatura = _v15_prepare_signature()
-    chave = (
-        assinatura,
-        int((individuo or {}).get('id') or 0),
-        _banco_normalizar_rg((individuo or {}).get('rg')),
-        _arvore_normalizar((individuo or {}).get('nome')),
-    )
-    with _V15_LOCK:
-        cached = _V15_CACHE_PERICIAS_PESSOA.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = list(_DICOR_PERICIAS_PESSOA_ANTES_V15(individuo) or [])
-    _v15_cache_set(_V15_CACHE_PERICIAS_PESSOA, chave, resultado, limite=320)
-    return _v15_copy.deepcopy(resultado)
-
-
-# Hash visual persistente em memória enquanto o arquivo não mudar.
-_ARVORE_HASH_IMAGEM_ANTES_V15 = _arvore_hash_imagem
-
-
-def _arvore_hash_imagem(caminho: Any) -> Optional[Dict[str, Any]]:
-    p = Path(str(caminho or ''))
-    assinatura = _v15_stat_signature(p)
-    chave = (str(p), assinatura)
-    with _V15_LOCK:
-        if chave in _V15_CACHE_HASH_IMAGEM:
-            valor = _V15_CACHE_HASH_IMAGEM[chave]
-            return _v15_copy.deepcopy(valor) if valor is not None else None
-    resultado = _ARVORE_HASH_IMAGEM_ANTES_V15(caminho)
-    _v15_cache_set(_V15_CACHE_HASH_IMAGEM, chave, resultado, limite=1200)
-    return _v15_copy.deepcopy(resultado) if resultado is not None else None
-
-
-_ARVORE_ROUPAS_ANTES_V15 = _arvore_roupas_por_individuo
-
-
-def _arvore_roupas_por_individuo(db: sqlite3.Connection) -> Dict[int, List[Dict[str, Any]]]:
-    assinatura = _v15_prepare_signature()
-    chave = ('roupas', assinatura)
-    with _V15_LOCK:
-        cached = _V15_CACHE_ROUPAS.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = dict(_ARVORE_ROUPAS_ANTES_V15(db) or {})
-    _v15_cache_set(_V15_CACHE_ROUPAS, chave, resultado, limite=8)
-    return _v15_copy.deepcopy(resultado)
-
-
-# Pesquisa e abertura de ficha: cache invalidado assim que o banco/perícias mudarem.
-_BANCO_BUSCAR_ANTES_V15 = banco_buscar
-
-
-def banco_buscar(consulta: str) -> Dict[str, List[Dict[str, Any]]]:
-    assinatura = _v15_prepare_signature()
-    chave = (assinatura, _arvore_normalizar(consulta))
-    with _V15_LOCK:
-        cached = _V15_CACHE_BUSCA.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = dict(_BANCO_BUSCAR_ANTES_V15(consulta) or {})
-    _v15_cache_set(_V15_CACHE_BUSCA, chave, resultado, limite=180)
-    return _v15_copy.deepcopy(resultado)
-
-
-_BANCO_FICHA_CARREGAR_ANTES_V15 = _banco_ficha_geral_carregar
-
-
-def _banco_ficha_geral_carregar(tipo: str, registro_id: int) -> Dict[str, Any]:
-    assinatura = _v15_prepare_signature()
-    chave = (assinatura, str(tipo or '').lower(), int(registro_id or 0))
-    with _V15_LOCK:
-        cached = _V15_CACHE_FICHA.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = dict(_BANCO_FICHA_CARREGAR_ANTES_V15(tipo, registro_id) or {})
-    _v15_cache_set(_V15_CACHE_FICHA, chave, resultado, limite=220)
-    return _v15_copy.deepcopy(resultado)
-
-
-# Árvore completa: mantém todos os vínculos e usa assinatura dos dados como invalidação.
-_ARVORE_CALCULAR_ANTES_V15 = _arvore_calcular
-
-
-def _arvore_calcular(individuo_id: int, *, ignorar_cache: bool = False) -> Dict[str, Any]:
-    assinatura = _v15_prepare_signature()
-    chave = (assinatura, int(individuo_id or 0))
-    with _V15_LOCK:
-        cached = _V15_CACHE_ARVORE.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = dict(_ARVORE_CALCULAR_ANTES_V15(individuo_id, ignorar_cache=True) or {})
-    _v15_cache_set(_V15_CACHE_ARVORE, chave, resultado, limite=120)
-    return _v15_copy.deepcopy(resultado)
-
-
-_ARVORE_CONSTRUIR_ANTES_V15 = _arvore_construir
-
-
-def _arvore_construir(individuo_id: int, usar_cache: bool = True) -> Dict[str, Any]:
-    assinatura = _v15_prepare_signature()
-    chave = (assinatura, int(individuo_id or 0))
-    with _V15_LOCK:
-        cached = _V15_CACHE_ARVORE_FINAL.get(chave)
-    if cached is not None:
-        return _v15_copy.deepcopy(cached)
-    resultado = dict(_ARVORE_CONSTRUIR_ANTES_V15(individuo_id, usar_cache=False) or {})
-    _v15_cache_set(_V15_CACHE_ARVORE_FINAL, chave, resultado, limite=120)
-    return _v15_copy.deepcopy(resultado)
-
-
-_ARVORE_DADOS_API_ANTES_V15 = _arvore_dados_api
-
-
-def _arvore_dados_api(chave: Any) -> Dict[str, Any]:
-    # O resolvedor e todos os vínculos continuam exatamente os mesmos.
-    return _ARVORE_DADOS_API_ANTES_V15(chave)
-
-
-async def arvore_api_http(request: web.Request) -> web.Response:
-    chave = str(request.match_info.get('individuo_id') or request.query.get('id') or '').strip()
-    if not chave:
-        return web.json_response({'ok': False, 'erro': 'Informe um RG, nome ou ID.'}, status=400)
+                    await asyncio.wait_for(asyncio.to_thread(gerar_catalogo_html), timeout=30)
+                except Exception as erro:
+                    print(f'⚠️ V16 catálogo principal: {type(erro).__name__}: {erro}', flush=True)
     try:
-        dados = await asyncio.to_thread(_arvore_dados_api, chave)
-        status = 200 if dados.get('ok') else 404
-        resposta = web.Response(
-            text=json.dumps(dados, ensure_ascii=False, separators=(',', ':')),
-            status=status,
-            content_type='application/json',
-            charset='utf-8',
-            headers={'Cache-Control': 'private, max-age=20'},
-        )
-        resposta.enable_compression()
-        return resposta
-    except Exception as exc:
-        traceback.print_exc()
-        return web.json_response({'ok': False, 'erro': f'{type(exc).__name__}: {exc}'}, status=500)
+        if CATALOGO_HTML.exists() and CATALOGO_HTML.stat().st_size >= 200:
+            resposta = web.FileResponse(CATALOGO_HTML)
+            resposta.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+            return resposta
+    except Exception as erro:
+        print(f'⚠️ V16 ao servir catálogo: {type(erro).__name__}: {erro}', flush=True)
+    return web.Response(
+        text=_v16_catalogo_fallback_html(),
+        content_type='text/html',
+        charset='utf-8',
+        headers={'Cache-Control': 'no-cache, no-store, must-revalidate'},
+    )
 
 
-_ARVORE_HTML_DICOR = r'''<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Central de Vínculos • DICOR</title>
-<style>
-:root{--gold:#d8aa3d;--gold2:#f4d77c;--gold3:#8f6d22;--bronze:#725622;--bg:#050604;--panel:#0a0c08;--panel2:#10130d;--line:#302819;--text:#eee7cf;--muted:#8f8a78;--danger:#b86f3c}*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:radial-gradient(circle at 50% -15%,#44340f55,transparent 38%),#050604;color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif;overflow:hidden}header{height:98px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 24px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0b0c08f7,#070805f3);position:relative;z-index:4}.header-center{grid-column:2;justify-self:center;display:flex;align-items:center;gap:14px}.crest{width:66px;height:66px;border:1px solid #7d6428;border-radius:18px;background:#050604;display:grid;place-items:center;box-shadow:0 0 35px #d8aa3d24,inset 0 0 24px #d8aa3d0b;overflow:hidden}.crest img{width:100%;height:100%;object-fit:contain;padding:5px}.header-center h1{margin:0;font-size:18px;letter-spacing:2.4px}.header-center small{color:var(--gold);letter-spacing:1.25px}.actions{justify-self:end;display:flex;gap:8px}button,input,select{border:1px solid #4b3d20;background:#11140d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}input:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px #d8aa3d14}button{cursor:pointer;font-weight:750;transition:.16s}button:hover{border-color:var(--gold);color:var(--gold2);transform:translateY(-1px)}main{height:calc(100vh - 98px);display:grid;grid-template-columns:318px minmax(0,1fr) 354px}.side{background:linear-gradient(180deg,#0b0d09f7,#080a07f7);border-right:1px solid var(--line);padding:18px;overflow:auto;scrollbar-width:thin;scrollbar-color:#5b4720 transparent}.right{border-left:1px solid var(--line);border-right:0}.lookup{display:grid;grid-template-columns:1fr auto;gap:7px}.lookup input{width:100%}.label{font-size:10px;letter-spacing:1.9px;color:var(--gold);font-weight:900;margin:18px 0 8px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.card{background:linear-gradient(150deg,#15180f,#0e100b);border:1px solid #342c1a;border-radius:13px;padding:13px}.card b{display:block;font-size:22px;color:var(--gold2)}#stage{position:relative;overflow:hidden;background:radial-gradient(circle at center,#2d250d30,transparent 38%),linear-gradient(#d8aa3d06 1px,transparent 1px),linear-gradient(90deg,#d8aa3d06 1px,transparent 1px),#060704;background-size:auto,34px 34px,34px 34px}svg{width:100%;height:100%;cursor:grab;user-select:none}.edge{fill:none;stroke-linecap:round;transition:opacity .15s,stroke-width .15s}.edge.weak{stroke:#665226;opacity:.46}.edge.medium{stroke:#9a772b;opacity:.62}.edge.strong{stroke:#d2a436;opacity:.76}.edge.selected{stroke:#f2d878;opacity:1;filter:drop-shadow(0 0 5px #d8aa3d66)}.node{cursor:pointer;outline:none}.node .halo{opacity:.18;transition:.18s}.node .body{transition:.18s;filter:drop-shadow(0 7px 12px #000b)}.node:hover .halo,.node.active .halo{opacity:.55}.node:hover .body,.node.active .body{filter:drop-shadow(0 0 16px #d8aa3d55)}.node .title{fill:#f0d782;font-size:13px;font-weight:800;letter-spacing:.2px;pointer-events:none}.node .sub{fill:#938760;font-size:10px;pointer-events:none}.node.central .title{fill:#f7dfa0;font-size:15px}.node.central .sub{fill:#c9ab58}.node .strength{fill:#0c0e09;stroke-width:1.5}.node .strength-text{font-size:8px;font-weight:900;letter-spacing:.8px;pointer-events:none}.relation-label{display:none}.person{display:grid;grid-template-columns:12px 1fr auto;gap:10px;align-items:center;padding:10px;border:1px solid #302919;border-radius:11px;margin:7px 0;cursor:pointer;background:#0e110b;transition:.15s}.person:hover,.person.active{border-color:#8d6f29;background:#15170f}.dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 8px currentColor}.person strong{display:block;font-size:13px}.person small,.empty{color:var(--muted);font-size:11px}.score{color:#c9ad5e;font-size:10px}.badge{display:inline-block;border:1px solid #5b4921;color:#d7bd6a;background:#18150c;border-radius:99px;padding:5px 8px;font-size:10px;margin:3px}.detail h2{color:var(--gold2);margin-bottom:7px}.detail p{color:#beb7a0;line-height:1.55}.detail .open-person{margin-top:12px}.welcome,.loading{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:30px}.welcome{pointer-events:none}.welcome>div,.loading>div{max-width:500px}.welcome img{width:120px;height:120px;object-fit:contain;filter:drop-shadow(0 0 28px #d8aa3d42)}.welcome h2{color:var(--gold2);font-size:29px;margin:12px}.welcome p,.loading p{color:var(--muted);line-height:1.6}.loading{display:none;background:#050604b8;backdrop-filter:blur(3px);z-index:3}.spinner{width:42px;height:42px;margin:0 auto 15px;border:3px solid #4d3d1c;border-top-color:var(--gold2);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.hint{position:absolute;left:15px;bottom:14px;background:#090a08e8;border:1px solid #3d321b;border-radius:10px;padding:9px 12px;color:var(--muted);font-size:11px}.legend{position:absolute;right:15px;bottom:14px;display:flex;gap:9px;background:#090a08e8;border:1px solid #3d321b;border-radius:10px;padding:8px 10px;color:var(--muted);font-size:10px}.legend span:before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--c)}@media(max-width:1060px){main{grid-template-columns:285px 1fr}.right{display:none}}@media(max-width:760px){header{grid-template-columns:1fr auto;height:82px}.header-center{grid-column:1;justify-self:start}.header-center small{display:none}.crest{width:52px;height:52px}.actions{grid-column:2}.actions button:nth-child(2),.actions button:nth-child(3){display:none}main{height:calc(100vh - 82px);grid-template-columns:1fr}.side{display:none}}
-</style></head>
-<body><header><div></div><div class="header-center"><div class="crest"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"></div><div><h1>DICOR • CENTRAL DE VÍNCULOS</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="actions"><button onclick="fitGraph()">Centralizar</button><button onclick="location.href='/'">Central</button><button onclick="location.href='/catalogo'">Catálogo</button></div></header>
-<main><aside class="side"><div class="label">LOCALIZAR FICHA PRINCIPAL</div><div class="lookup"><input id="lookup" placeholder="RG, nome ou ID interno"><button id="open">ABRIR</button></div><div class="stats"><div class="card"><b id="total">0</b>Conexões</div><div class="card"><b id="visible">0</b>Visíveis</div></div><div class="label">FILTRAR ESTA ÁRVORE</div><input id="filter" style="width:100%" placeholder="Nome, RG ou organização"><div class="label">FORÇA MÍNIMA</div><select id="strength" style="width:100%"><option value="0">Todas</option><option value="5">Moderada+</option><option value="9">Forte+</option><option value="15">Muito forte</option></select><div class="label">PESSOAS RELACIONADAS</div><div id="list"><div class="empty">Pesquise uma ficha para começar.</div></div></aside>
-<section id="stage"><svg id="graph"><defs><radialGradient id="nodeGrad" cx="35%" cy="25%"><stop offset="0" stop-color="#24271a"/><stop offset="1" stop-color="#0b0d09"/></radialGradient><radialGradient id="centralGrad" cx="35%" cy="20%"><stop offset="0" stop-color="#463915"/><stop offset=".55" stop-color="#1d1a0d"/><stop offset="1" stop-color="#090a07"/></radialGradient></defs><g id="viewport"></g></svg><div id="welcome" class="welcome"><div><img src="/central/brasao-dicor.png"><h2>Mapa de vínculos DICOR</h2><p>Consulte uma ficha para visualizar todas as conexões registradas. O grafo permanece completo, mas os rótulos ficam organizados no painel lateral para evitar sobreposição.</p></div></div><div id="loading" class="loading"><div><div class="spinner"></div><b>Montando análise de vínculos</b><p>A primeira abertura pode levar alguns segundos. As próximas consultas usam cache automático.</p></div></div><div class="hint">Arraste para mover • Scroll para zoom • Clique para analisar • Duplo clique para abrir outra árvore</div><div class="legend"><span style="--c:#755f2a">Fraca</span><span style="--c:#aa812d">Moderada</span><span style="--c:#e1b443">Forte</span></div></section>
-<aside class="side right"><div class="label">ANÁLISE DO VÍNCULO</div><div id="detail" class="detail"><div class="empty">Selecione uma pessoa.</div></div></aside></main>
-<script>
-const NS='http://www.w3.org/2000/svg',q=new URLSearchParams(location.search),initial=(q.get('id')||q.get('rg')||q.get('q')||'').trim();let D={nodes:[],edges:[]},scale=1,tx=0,ty=0,drag=false,last=[0,0],selected=null,positions={};const svg=document.getElementById('graph'),vp=document.getElementById('viewport'),lookup=document.getElementById('lookup'),filter=document.getElementById('filter'),strength=document.getElementById('strength'),welcome=document.getElementById('welcome'),loading=document.getElementById('loading'),list=document.getElementById('list'),total=document.getElementById('total'),visible=document.getElementById('visible');lookup.value=initial;function E(s){return String(s??'').replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[m]))}function openTree(){const v=lookup.value.trim();if(v)location.href='/arvore?id='+encodeURIComponent(v)}document.getElementById('open').onclick=openTree;lookup.addEventListener('keydown',e=>{if(e.key==='Enter')openTree()});function nodeColor(n){return n.score>=15?'#e6b946':n.score>=9?'#c99832':n.score>=5?'#997329':'#675329'}function strengthClass(s){return s>=9?'strong':s>=5?'medium':'weak'}function layout(ns){const c=ns.find(n=>n.central),others=ns.filter(n=>!n.central).sort((a,b)=>b.score-a.score||a.nome.localeCompare(b.nome)),p={};if(!c)return p;p[c.id]={x:0,y:0};let used=0,ring=1;while(used<others.length){const radius=245+(ring-1)*170,capacity=Math.max(10,Math.floor(2*Math.PI*radius/145)),count=Math.min(capacity,others.length-used);for(let i=0;i<count;i++){const n=others[used+i],offset=(ring%2?-.5:0),angle=-Math.PI/2+2*Math.PI*(i+offset)/Math.max(1,count);p[n.id]={x:Math.cos(angle)*radius,y:Math.sin(angle)*radius}}used+=count;ring++}return p}function svgEl(tag,attrs={}){const e=document.createElementNS(NS,tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,String(v));return e}function render(){const term=filter.value.trim().toLowerCase(),min=Number(strength.value),ns=D.nodes.filter(n=>n.central||(n.score>=min&&(`${n.nome} ${n.rg} ${n.organizacao}`.toLowerCase().includes(term)))),ids=new Set(ns.map(n=>n.id)),es=D.edges.filter(e=>ids.has(e.from)&&ids.has(e.to));positions=layout(ns);const frag=document.createDocumentFragment();for(const e of es){const a=positions[e.from],b=positions[e.to];if(!a||!b)continue;const path=svgEl('path',{d:`M ${a.x} ${a.y} Q ${(a.x+b.x)/2} ${(a.y+b.y)/2-18} ${b.x} ${b.y}`,class:`edge ${strengthClass(e.score)}${selected===e.to?' selected':''}`,'stroke-width':Math.max(1.2,Math.min(5.5,1+e.score/5))});path.dataset.to=e.to;frag.appendChild(path)}for(const n of ns){const p=positions[n.id];if(!p)continue;const radius=n.central?74:Math.max(42,Math.min(57,43+n.score*.6)),color=n.central?'#e4b746':nodeColor(n),g=svgEl('g',{class:`node${n.central?' central':''}${selected===n.id?' active':''}`,transform:`translate(${p.x},${p.y})`,tabindex:'0'});g.dataset.id=n.id;g.appendChild(svgEl('circle',{class:'halo',r:radius+10,fill:'none',stroke:color,'stroke-width':8}));g.appendChild(svgEl('circle',{class:'body',r:radius,fill:n.central?'url(#centralGrad)':'url(#nodeGrad)',stroke:color,'stroke-width':n.central?4:2.5}));if(n.central){const image=svgEl('image',{href:'/central/brasao-dicor.png',x:-27,y:-54,width:54,height:54,preserveAspectRatio:'xMidYMid meet'});g.appendChild(image)}const title=svgEl('text',{class:'title','text-anchor':'middle',y:n.central?18:-7});title.textContent=n.nome.length>20?n.nome.slice(0,19)+'…':n.nome;g.appendChild(title);const sub=svgEl('text',{class:'sub','text-anchor':'middle',y:n.central?37:13});sub.textContent='RG '+(n.rg||'—');g.appendChild(sub);if(!n.central){const pill=svgEl('rect',{class:'strength',x:-29,y:24,width:58,height:17,rx:8,fill:'#0b0d08',stroke:color});g.appendChild(pill);const st=svgEl('text',{class:'strength-text','text-anchor':'middle',y:36,fill:color});st.textContent=n.forca==='MUITO FORTE'?'M. FORTE':n.forca;g.appendChild(st)}g.addEventListener('click',()=>selectNode(n.id));g.addEventListener('dblclick',()=>{if(!n.central)location.href='/arvore?id='+encodeURIComponent(n.rg||n.id)});frag.appendChild(g)}vp.replaceChildren(frag);visible.textContent=Math.max(0,ns.length-1);list.innerHTML=ns.filter(n=>!n.central).map(n=>`<div class="person${selected===n.id?' active':''}" onclick="selectNode(${n.id})"><span class="dot" style="color:${nodeColor(n)};background:${nodeColor(n)}"></span><div><strong>${E(n.nome)}</strong><small>RG ${E(n.rg||'—')} • ${E(n.forca)}</small></div><span class="score">${n.score} pts</span></div>`).join('')||'<div class="empty">Nenhuma conexão registrada para estes filtros.</div>';transform()}function selectNode(id){selected=id;const n=D.nodes.find(x=>x.id===id);detail(n);render()}function detail(n){if(!n)return;document.getElementById('detail').innerHTML=`<h2>${E(n.nome)}</h2><p><b>RG:</b> ${E(n.rg||'Não informado')}<br><b>Organização:</b> ${E(n.organizacao||'Não informada')}<br><b>Força:</b> ${E(n.forca)}${n.central?'':`<br><b>Pontuação:</b> ${n.score}`}</p><div>${(n.motivos||[]).map(x=>`<span class="badge">${E(x)}</span>`).join('')}</div><div class="label">EVIDÊNCIAS</div><p>${(n.evidencias||[]).map(E).join('<br>')||'Nenhuma evidência resumida.'}</p>${n.central?'':`<button class="open-person" onclick="location.href='/arvore?id=${encodeURIComponent(n.rg||n.id)}'">Abrir árvore desta pessoa</button>`}`}function transform(){vp.setAttribute('transform',`translate(${svg.clientWidth/2+tx},${svg.clientHeight/2+ty}) scale(${scale})`)}function fitGraph(){const ns=D.nodes;if(!ns.length){scale=1;tx=0;ty=0;transform();return}const ps=Object.values(positions);if(!ps.length)return;const xs=ps.map(p=>p.x),ys=ps.map(p=>p.y),w=Math.max(...xs)-Math.min(...xs)+210,h=Math.max(...ys)-Math.min(...ys)+210;scale=Math.max(.18,Math.min(1.15,Math.min(svg.clientWidth/w,svg.clientHeight/h)));tx=-(Math.max(...xs)+Math.min(...xs))/2*scale;ty=-(Math.max(...ys)+Math.min(...ys))/2*scale;transform()}svg.addEventListener('wheel',e=>{e.preventDefault();scale=Math.max(.15,Math.min(3.2,scale*(e.deltaY<0?1.09:.91)));transform()},{passive:false});svg.addEventListener('mousedown',e=>{drag=true;last=[e.clientX,e.clientY];svg.style.cursor='grabbing'});window.addEventListener('mouseup',()=>{drag=false;svg.style.cursor='grab'});window.addEventListener('mousemove',e=>{if(!drag)return;tx+=e.clientX-last[0];ty+=e.clientY-last[1];last=[e.clientX,e.clientY];transform()});let renderTimer=0;function scheduleRender(){clearTimeout(renderTimer);renderTimer=setTimeout(render,70)}filter.addEventListener('input',scheduleRender);strength.addEventListener('input',render);async function load(v){if(!v)return;welcome.style.display='none';loading.style.display='grid';try{const r=await fetch('/api/arvore/'+encodeURIComponent(v),{headers:{Accept:'application/json'}}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.erro||'Erro ao montar a árvore');D=d;selected=d.alvo_id;total.textContent=d.total;render();detail(d.nodes.find(n=>n.central));requestAnimationFrame(()=>requestAnimationFrame(fitGraph))}catch(e){D={nodes:[],edges:[]};vp.replaceChildren();total.textContent='0';visible.textContent='0';list.innerHTML='<div class="empty">Nenhuma ficha carregada.</div>';welcome.style.display='grid';document.getElementById('detail').innerHTML=`<h2>Ficha não localizada</h2><p>${E(e.message)}</p>`}finally{loading.style.display='none'}}if(initial)load(initial);window.addEventListener('resize',()=>requestAnimationFrame(fitGraph));
-</script></body></html>'''
+# Árvore premium somente no navegador; não altera banco, OCR ou interações.
+_ARVORE_HTML_DICOR = base64.b64decode('PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9InB0LUJSIj48aGVhZD48bWV0YSBjaGFyc2V0PSJ1dGYtOCI+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0aWFsLXNjYWxlPTEiPgo8dGl0bGU+Q2VudHJhbCBkZSBWw61uY3Vsb3Mg4oCiIERJQ09SPC90aXRsZT4KPHN0eWxlPgo6cm9vdHstLWdvbGQ6I2Q4YWEzZDstLWdvbGQyOiNmNGQ3N2M7LS1nb2xkMzojOGY2ZDIyOy0tYnJvbnplOiM3MjU2MjI7LS1iZzojMDUwNjA0Oy0tcGFuZWw6IzBhMGMwODstLXBhbmVsMjojMTAxMzBkOy0tbGluZTojMzAyODE5Oy0tdGV4dDojZWVlN2NmOy0tbXV0ZWQ6IzhmOGE3ODstLWRhbmdlcjojYjg2ZjNjfSp7Ym94LXNpemluZzpib3JkZXItYm94fWh0bWwsYm9keXtoZWlnaHQ6MTAwJX1ib2R5e21hcmdpbjowO2JhY2tncm91bmQ6cmFkaWFsLWdyYWRpZW50KGNpcmNsZSBhdCA1MCUgLTE1JSwjNDQzNDBmNTUsdHJhbnNwYXJlbnQgMzglKSwjMDUwNjA0O2NvbG9yOnZhcigtLXRleHQpO2ZvbnQtZmFtaWx5OkludGVyLFNlZ29lIFVJLEFyaWFsLHNhbnMtc2VyaWY7b3ZlcmZsb3c6aGlkZGVufWhlYWRlcntoZWlnaHQ6OThweDtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciBhdXRvIDFmcjthbGlnbi1pdGVtczpjZW50ZXI7cGFkZGluZzowIDI0cHg7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgdmFyKC0tbGluZSk7YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoMTgwZGVnLCMwYjBjMDhmNywjMDcwODA1ZjMpO3Bvc2l0aW9uOnJlbGF0aXZlO3otaW5kZXg6NH0uaGVhZGVyLWNlbnRlcntncmlkLWNvbHVtbjoyO2p1c3RpZnktc2VsZjpjZW50ZXI7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTRweH0uY3Jlc3R7d2lkdGg6NjZweDtoZWlnaHQ6NjZweDtib3JkZXI6MXB4IHNvbGlkICM3ZDY0Mjg7Ym9yZGVyLXJhZGl1czoxOHB4O2JhY2tncm91bmQ6IzA1MDYwNDtkaXNwbGF5OmdyaWQ7cGxhY2UtaXRlbXM6Y2VudGVyO2JveC1zaGFkb3c6MCAwIDM1cHggI2Q4YWEzZDI0LGluc2V0IDAgMCAyNHB4ICNkOGFhM2QwYjtvdmVyZmxvdzpoaWRkZW59LmNyZXN0IGltZ3t3aWR0aDoxMDAlO2hlaWdodDoxMDAlO29iamVjdC1maXQ6Y29udGFpbjtwYWRkaW5nOjVweH0uaGVhZGVyLWNlbnRlciBoMXttYXJnaW46MDtmb250LXNpemU6MThweDtsZXR0ZXItc3BhY2luZzoyLjRweH0uaGVhZGVyLWNlbnRlciBzbWFsbHtjb2xvcjp2YXIoLS1nb2xkKTtsZXR0ZXItc3BhY2luZzoxLjI1cHh9LmFjdGlvbnN7anVzdGlmeS1zZWxmOmVuZDtkaXNwbGF5OmZsZXg7Z2FwOjhweH1idXR0b24saW5wdXQsc2VsZWN0e2JvcmRlcjoxcHggc29saWQgIzRiM2QyMDtiYWNrZ3JvdW5kOiMxMTE0MGQ7Y29sb3I6dmFyKC0tdGV4dCk7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6MTBweCAxMnB4O291dGxpbmU6bm9uZX1pbnB1dDpmb2N1cyxzZWxlY3Q6Zm9jdXN7Ym9yZGVyLWNvbG9yOnZhcigtLWdvbGQpO2JveC1zaGFkb3c6MCAwIDAgM3B4ICNkOGFhM2QxNH1idXR0b257Y3Vyc29yOnBvaW50ZXI7Zm9udC13ZWlnaHQ6NzUwO3RyYW5zaXRpb246LjE2c31idXR0b246aG92ZXJ7Ym9yZGVyLWNvbG9yOnZhcigtLWdvbGQpO2NvbG9yOnZhcigtLWdvbGQyKTt0cmFuc2Zvcm06dHJhbnNsYXRlWSgtMXB4KX1tYWlue2hlaWdodDpjYWxjKDEwMHZoIC0gOThweCk7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczozMThweCBtaW5tYXgoMCwxZnIpIDM1NHB4fS5zaWRle2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDE4MGRlZywjMGIwZDA5ZjcsIzA4MGEwN2Y3KTtib3JkZXItcmlnaHQ6MXB4IHNvbGlkIHZhcigtLWxpbmUpO3BhZGRpbmc6MThweDtvdmVyZmxvdzphdXRvO3Njcm9sbGJhci13aWR0aDp0aGluO3Njcm9sbGJhci1jb2xvcjojNWI0NzIwIHRyYW5zcGFyZW50fS5yaWdodHtib3JkZXItbGVmdDoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJpZ2h0OjB9Lmxvb2t1cHtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciBhdXRvO2dhcDo3cHh9Lmxvb2t1cCBpbnB1dHt3aWR0aDoxMDAlfS5sYWJlbHtmb250LXNpemU6MTBweDtsZXR0ZXItc3BhY2luZzoxLjlweDtjb2xvcjp2YXIoLS1nb2xkKTtmb250LXdlaWdodDo5MDA7bWFyZ2luOjE4cHggMCA4cHh9LnN0YXRze2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyIDFmcjtnYXA6OHB4O21hcmdpbi10b3A6MTBweH0uY2FyZHtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxNTBkZWcsIzE1MTgwZiwjMGUxMDBiKTtib3JkZXI6MXB4IHNvbGlkICMzNDJjMWE7Ym9yZGVyLXJhZGl1czoxM3B4O3BhZGRpbmc6MTNweH0uY2FyZCBie2Rpc3BsYXk6YmxvY2s7Zm9udC1zaXplOjIycHg7Y29sb3I6dmFyKC0tZ29sZDIpfSNzdGFnZXtwb3NpdGlvbjpyZWxhdGl2ZTtvdmVyZmxvdzpoaWRkZW47YmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoY2lyY2xlIGF0IGNlbnRlciwjMmQyNTBkMzAsdHJhbnNwYXJlbnQgMzglKSxsaW5lYXItZ3JhZGllbnQoI2Q4YWEzZDA2IDFweCx0cmFuc3BhcmVudCAxcHgpLGxpbmVhci1ncmFkaWVudCg5MGRlZywjZDhhYTNkMDYgMXB4LHRyYW5zcGFyZW50IDFweCksIzA2MDcwNDtiYWNrZ3JvdW5kLXNpemU6YXV0bywzNHB4IDM0cHgsMzRweCAzNHB4fXN2Z3t3aWR0aDoxMDAlO2hlaWdodDoxMDAlO2N1cnNvcjpncmFiO3VzZXItc2VsZWN0Om5vbmV9LmVkZ2V7ZmlsbDpub25lO3N0cm9rZS1saW5lY2FwOnJvdW5kO3RyYW5zaXRpb246b3BhY2l0eSAuMTVzLHN0cm9rZS13aWR0aCAuMTVzfS5lZGdlLndlYWt7c3Ryb2tlOiM2NjUyMjY7b3BhY2l0eTouNDZ9LmVkZ2UubWVkaXVte3N0cm9rZTojOWE3NzJiO29wYWNpdHk6LjYyfS5lZGdlLnN0cm9uZ3tzdHJva2U6I2QyYTQzNjtvcGFjaXR5Oi43Nn0uZWRnZS5zZWxlY3RlZHtzdHJva2U6I2YyZDg3ODtvcGFjaXR5OjE7ZmlsdGVyOmRyb3Atc2hhZG93KDAgMCA1cHggI2Q4YWEzZDY2KX0ubm9kZXtjdXJzb3I6cG9pbnRlcjtvdXRsaW5lOm5vbmV9Lm5vZGUgLmhhbG97b3BhY2l0eTouMTg7dHJhbnNpdGlvbjouMThzfS5ub2RlIC5ib2R5e3RyYW5zaXRpb246LjE4cztmaWx0ZXI6ZHJvcC1zaGFkb3coMCA3cHggMTJweCAjMDAwYil9Lm5vZGU6aG92ZXIgLmhhbG8sLm5vZGUuYWN0aXZlIC5oYWxve29wYWNpdHk6LjU1fS5ub2RlOmhvdmVyIC5ib2R5LC5ub2RlLmFjdGl2ZSAuYm9keXtmaWx0ZXI6ZHJvcC1zaGFkb3coMCAwIDE2cHggI2Q4YWEzZDU1KX0ubm9kZSAudGl0bGV7ZmlsbDojZjBkNzgyO2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjgwMDtsZXR0ZXItc3BhY2luZzouMnB4O3BvaW50ZXItZXZlbnRzOm5vbmV9Lm5vZGUgLnN1YntmaWxsOiM5Mzg3NjA7Zm9udC1zaXplOjEwcHg7cG9pbnRlci1ldmVudHM6bm9uZX0ubm9kZS5jZW50cmFsIC50aXRsZXtmaWxsOiNmN2RmYTA7Zm9udC1zaXplOjE1cHh9Lm5vZGUuY2VudHJhbCAuc3Vie2ZpbGw6I2M5YWI1OH0ubm9kZSAuc3RyZW5ndGh7ZmlsbDojMGMwZTA5O3N0cm9rZS13aWR0aDoxLjV9Lm5vZGUgLnN0cmVuZ3RoLXRleHR7Zm9udC1zaXplOjhweDtmb250LXdlaWdodDo5MDA7bGV0dGVyLXNwYWNpbmc6LjhweDtwb2ludGVyLWV2ZW50czpub25lfS5yZWxhdGlvbi1sYWJlbHtkaXNwbGF5Om5vbmV9LnBlcnNvbntkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjEycHggMWZyIGF1dG87Z2FwOjEwcHg7YWxpZ24taXRlbXM6Y2VudGVyO3BhZGRpbmc6MTBweDtib3JkZXI6MXB4IHNvbGlkICMzMDI5MTk7Ym9yZGVyLXJhZGl1czoxMXB4O21hcmdpbjo3cHggMDtjdXJzb3I6cG9pbnRlcjtiYWNrZ3JvdW5kOiMwZTExMGI7dHJhbnNpdGlvbjouMTVzfS5wZXJzb246aG92ZXIsLnBlcnNvbi5hY3RpdmV7Ym9yZGVyLWNvbG9yOiM4ZDZmMjk7YmFja2dyb3VuZDojMTUxNzBmfS5kb3R7d2lkdGg6MTBweDtoZWlnaHQ6MTBweDtib3JkZXItcmFkaXVzOjUwJTtib3gtc2hhZG93OjAgMCA4cHggY3VycmVudENvbG9yfS5wZXJzb24gc3Ryb25ne2Rpc3BsYXk6YmxvY2s7Zm9udC1zaXplOjEzcHh9LnBlcnNvbiBzbWFsbCwuZW1wdHl7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZToxMXB4fS5zY29yZXtjb2xvcjojYzlhZDVlO2ZvbnQtc2l6ZToxMHB4fS5iYWRnZXtkaXNwbGF5OmlubGluZS1ibG9jaztib3JkZXI6MXB4IHNvbGlkICM1YjQ5MjE7Y29sb3I6I2Q3YmQ2YTtiYWNrZ3JvdW5kOiMxODE1MGM7Ym9yZGVyLXJhZGl1czo5OXB4O3BhZGRpbmc6NXB4IDhweDtmb250LXNpemU6MTBweDttYXJnaW46M3B4fS5kZXRhaWwgaDJ7Y29sb3I6dmFyKC0tZ29sZDIpO21hcmdpbi1ib3R0b206N3B4fS5kZXRhaWwgcHtjb2xvcjojYmViN2EwO2xpbmUtaGVpZ2h0OjEuNTV9LmRldGFpbCAub3Blbi1wZXJzb257bWFyZ2luLXRvcDoxMnB4fS53ZWxjb21lLC5sb2FkaW5ne3Bvc2l0aW9uOmFic29sdXRlO2luc2V0OjA7ZGlzcGxheTpncmlkO3BsYWNlLWl0ZW1zOmNlbnRlcjt0ZXh0LWFsaWduOmNlbnRlcjtwYWRkaW5nOjMwcHh9LndlbGNvbWV7cG9pbnRlci1ldmVudHM6bm9uZX0ud2VsY29tZT5kaXYsLmxvYWRpbmc+ZGl2e21heC13aWR0aDo1MDBweH0ud2VsY29tZSBpbWd7d2lkdGg6MTIwcHg7aGVpZ2h0OjEyMHB4O29iamVjdC1maXQ6Y29udGFpbjtmaWx0ZXI6ZHJvcC1zaGFkb3coMCAwIDI4cHggI2Q4YWEzZDQyKX0ud2VsY29tZSBoMntjb2xvcjp2YXIoLS1nb2xkMik7Zm9udC1zaXplOjI5cHg7bWFyZ2luOjEycHh9LndlbGNvbWUgcCwubG9hZGluZyBwe2NvbG9yOnZhcigtLW11dGVkKTtsaW5lLWhlaWdodDoxLjZ9LmxvYWRpbmd7ZGlzcGxheTpub25lO2JhY2tncm91bmQ6IzA1MDYwNGI4O2JhY2tkcm9wLWZpbHRlcjpibHVyKDNweCk7ei1pbmRleDozfS5zcGlubmVye3dpZHRoOjQycHg7aGVpZ2h0OjQycHg7bWFyZ2luOjAgYXV0byAxNXB4O2JvcmRlcjozcHggc29saWQgIzRkM2QxYztib3JkZXItdG9wLWNvbG9yOnZhcigtLWdvbGQyKTtib3JkZXItcmFkaXVzOjUwJTthbmltYXRpb246c3BpbiAuOHMgbGluZWFyIGluZmluaXRlfUBrZXlmcmFtZXMgc3Bpbnt0b3t0cmFuc2Zvcm06cm90YXRlKDM2MGRlZyl9fS5oaW50e3Bvc2l0aW9uOmFic29sdXRlO2xlZnQ6MTVweDtib3R0b206MTRweDtiYWNrZ3JvdW5kOiMwOTBhMDhlODtib3JkZXI6MXB4IHNvbGlkICMzZDMyMWI7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6OXB4IDEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZToxMXB4fS5sZWdlbmR7cG9zaXRpb246YWJzb2x1dGU7cmlnaHQ6MTVweDtib3R0b206MTRweDtkaXNwbGF5OmZsZXg7Z2FwOjlweDtiYWNrZ3JvdW5kOiMwOTBhMDhlODtib3JkZXI6MXB4IHNvbGlkICMzZDMyMWI7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6OHB4IDEwcHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZToxMHB4fS5sZWdlbmQgc3BhbjpiZWZvcmV7Y29udGVudDonJztkaXNwbGF5OmlubGluZS1ibG9jazt3aWR0aDo4cHg7aGVpZ2h0OjhweDtib3JkZXItcmFkaXVzOjUwJTttYXJnaW4tcmlnaHQ6NXB4O2JhY2tncm91bmQ6dmFyKC0tYyl9QG1lZGlhKG1heC13aWR0aDoxMDYwcHgpe21haW57Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjI4NXB4IDFmcn0ucmlnaHR7ZGlzcGxheTpub25lfX1AbWVkaWEobWF4LXdpZHRoOjc2MHB4KXtoZWFkZXJ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciBhdXRvO2hlaWdodDo4MnB4fS5oZWFkZXItY2VudGVye2dyaWQtY29sdW1uOjE7anVzdGlmeS1zZWxmOnN0YXJ0fS5oZWFkZXItY2VudGVyIHNtYWxse2Rpc3BsYXk6bm9uZX0uY3Jlc3R7d2lkdGg6NTJweDtoZWlnaHQ6NTJweH0uYWN0aW9uc3tncmlkLWNvbHVtbjoyfS5hY3Rpb25zIGJ1dHRvbjpudGgtY2hpbGQoMiksLmFjdGlvbnMgYnV0dG9uOm50aC1jaGlsZCgzKXtkaXNwbGF5Om5vbmV9bWFpbntoZWlnaHQ6Y2FsYygxMDB2aCAtIDgycHgpO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9LnNpZGV7ZGlzcGxheTpub25lfX0KPC9zdHlsZT48L2hlYWQ+Cjxib2R5PjxoZWFkZXI+PGRpdj48L2Rpdj48ZGl2IGNsYXNzPSJoZWFkZXItY2VudGVyIj48ZGl2IGNsYXNzPSJjcmVzdCI+PGltZyBzcmM9Ii9jZW50cmFsL2JyYXNhby1kaWNvci5wbmciIGFsdD0iQnJhc8OjbyBESUNPUiI+PC9kaXY+PGRpdj48aDE+RElDT1Ig4oCiIENFTlRSQUwgREUgVsONTkNVTE9TPC9oMT48c21hbGw+SU5URUxJR8OKTkNJQSBFIENPTUJBVEUgQU8gQ1JJTUUgT1JHQU5JWkFETzwvc21hbGw+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iYWN0aW9ucyI+PGJ1dHRvbiBvbmNsaWNrPSJmaXRHcmFwaCgpIj5DZW50cmFsaXphcjwvYnV0dG9uPjxidXR0b24gb25jbGljaz0ibG9jYXRpb24uaHJlZj0nLyciPkNlbnRyYWw8L2J1dHRvbj48YnV0dG9uIG9uY2xpY2s9ImxvY2F0aW9uLmhyZWY9Jy9jYXRhbG9nbyciPkNhdMOhbG9nbzwvYnV0dG9uPjwvZGl2PjwvaGVhZGVyPgo8bWFpbj48YXNpZGUgY2xhc3M9InNpZGUiPjxkaXYgY2xhc3M9ImxhYmVsIj5MT0NBTElaQVIgRklDSEEgUFJJTkNJUEFMPC9kaXY+PGRpdiBjbGFzcz0ibG9va3VwIj48aW5wdXQgaWQ9Imxvb2t1cCIgcGxhY2Vob2xkZXI9IlJHLCBub21lIG91IElEIGludGVybm8iPjxidXR0b24gaWQ9Im9wZW4iPkFCUklSPC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0ic3RhdHMiPjxkaXYgY2xhc3M9ImNhcmQiPjxiIGlkPSJ0b3RhbCI+MDwvYj5Db25leMO1ZXM8L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIj48YiBpZD0idmlzaWJsZSI+MDwvYj5WaXPDrXZlaXM8L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJsYWJlbCI+RklMVFJBUiBFU1RBIMOBUlZPUkU8L2Rpdj48aW5wdXQgaWQ9ImZpbHRlciIgc3R5bGU9IndpZHRoOjEwMCUiIHBsYWNlaG9sZGVyPSJOb21lLCBSRyBvdSBvcmdhbml6YcOnw6NvIj48ZGl2IGNsYXNzPSJsYWJlbCI+Rk9Sw4dBIE3DjU5JTUE8L2Rpdj48c2VsZWN0IGlkPSJzdHJlbmd0aCIgc3R5bGU9IndpZHRoOjEwMCUiPjxvcHRpb24gdmFsdWU9IjAiPlRvZGFzPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iNSI+TW9kZXJhZGErPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iOSI+Rm9ydGUrPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iMTUiPk11aXRvIGZvcnRlPC9vcHRpb24+PC9zZWxlY3Q+PGRpdiBjbGFzcz0ibGFiZWwiPlBFU1NPQVMgUkVMQUNJT05BREFTPC9kaXY+PGRpdiBpZD0ibGlzdCI+PGRpdiBjbGFzcz0iZW1wdHkiPlBlc3F1aXNlIHVtYSBmaWNoYSBwYXJhIGNvbWXDp2FyLjwvZGl2PjwvZGl2PjwvYXNpZGU+CjxzZWN0aW9uIGlkPSJzdGFnZSI+PHN2ZyBpZD0iZ3JhcGgiPjxkZWZzPjxyYWRpYWxHcmFkaWVudCBpZD0ibm9kZUdyYWQiIGN4PSIzNSUiIGN5PSIyNSUiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzI0MjcxYSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzBiMGQwOSIvPjwvcmFkaWFsR3JhZGllbnQ+PHJhZGlhbEdyYWRpZW50IGlkPSJjZW50cmFsR3JhZCIgY3g9IjM1JSIgY3k9IjIwJSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjNDYzOTE1Ii8+PHN0b3Agb2Zmc2V0PSIuNTUiIHN0b3AtY29sb3I9IiMxZDFhMGQiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiMwOTBhMDciLz48L3JhZGlhbEdyYWRpZW50PjwvZGVmcz48ZyBpZD0idmlld3BvcnQiPjwvZz48L3N2Zz48ZGl2IGlkPSJ3ZWxjb21lIiBjbGFzcz0id2VsY29tZSI+PGRpdj48aW1nIHNyYz0iL2NlbnRyYWwvYnJhc2FvLWRpY29yLnBuZyI+PGgyPk1hcGEgZGUgdsOtbmN1bG9zIERJQ09SPC9oMj48cD5Db25zdWx0ZSB1bWEgZmljaGEgcGFyYSB2aXN1YWxpemFyIHRvZGFzIGFzIGNvbmV4w7VlcyByZWdpc3RyYWRhcy4gTyBncmFmbyBwZXJtYW5lY2UgY29tcGxldG8sIG1hcyBvcyByw7N0dWxvcyBmaWNhbSBvcmdhbml6YWRvcyBubyBwYWluZWwgbGF0ZXJhbCBwYXJhIGV2aXRhciBzb2JyZXBvc2nDp8Ojby48L3A+PC9kaXY+PC9kaXY+PGRpdiBpZD0ibG9hZGluZyIgY2xhc3M9ImxvYWRpbmciPjxkaXY+PGRpdiBjbGFzcz0ic3Bpbm5lciI+PC9kaXY+PGI+TW9udGFuZG8gYW7DoWxpc2UgZGUgdsOtbmN1bG9zPC9iPjxwPkEgcHJpbWVpcmEgYWJlcnR1cmEgcG9kZSBsZXZhciBhbGd1bnMgc2VndW5kb3MuIEFzIHByw7N4aW1hcyBjb25zdWx0YXMgdXNhbSBjYWNoZSBhdXRvbcOhdGljby48L3A+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iaGludCI+QXJyYXN0ZSBwYXJhIG1vdmVyIOKAoiBTY3JvbGwgcGFyYSB6b29tIOKAoiBDbGlxdWUgcGFyYSBhbmFsaXNhciDigKIgRHVwbG8gY2xpcXVlIHBhcmEgYWJyaXIgb3V0cmEgw6Fydm9yZTwvZGl2PjxkaXYgY2xhc3M9ImxlZ2VuZCI+PHNwYW4gc3R5bGU9Ii0tYzojNzU1ZjJhIj5GcmFjYTwvc3Bhbj48c3BhbiBzdHlsZT0iLS1jOiNhYTgxMmQiPk1vZGVyYWRhPC9zcGFuPjxzcGFuIHN0eWxlPSItLWM6I2UxYjQ0MyI+Rm9ydGU8L3NwYW4+PC9kaXY+PC9zZWN0aW9uPgo8YXNpZGUgY2xhc3M9InNpZGUgcmlnaHQiPjxkaXYgY2xhc3M9ImxhYmVsIj5BTsOBTElTRSBETyBWw41OQ1VMTzwvZGl2PjxkaXYgaWQ9ImRldGFpbCIgY2xhc3M9ImRldGFpbCI+PGRpdiBjbGFzcz0iZW1wdHkiPlNlbGVjaW9uZSB1bWEgcGVzc29hLjwvZGl2PjwvZGl2PjwvYXNpZGU+PC9tYWluPgo8c2NyaXB0Pgpjb25zdCBOUz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnLHE9bmV3IFVSTFNlYXJjaFBhcmFtcyhsb2NhdGlvbi5zZWFyY2gpLGluaXRpYWw9KHEuZ2V0KCdpZCcpfHxxLmdldCgncmcnKXx8cS5nZXQoJ3EnKXx8JycpLnRyaW0oKTtsZXQgRD17bm9kZXM6W10sZWRnZXM6W119LHNjYWxlPTEsdHg9MCx0eT0wLGRyYWc9ZmFsc2UsbGFzdD1bMCwwXSxzZWxlY3RlZD1udWxsLHBvc2l0aW9ucz17fTtjb25zdCBzdmc9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2dyYXBoJyksdnA9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3ZpZXdwb3J0JyksbG9va3VwPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdsb29rdXAnKSxmaWx0ZXI9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2ZpbHRlcicpLHN0cmVuZ3RoPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzdHJlbmd0aCcpLHdlbGNvbWU9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3dlbGNvbWUnKSxsb2FkaW5nPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdsb2FkaW5nJyksbGlzdD1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbGlzdCcpLHRvdGFsPWRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd0b3RhbCcpLHZpc2libGU9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Zpc2libGUnKTtsb29rdXAudmFsdWU9aW5pdGlhbDtmdW5jdGlvbiBFKHMpe3JldHVybiBTdHJpbmcocz8/JycpLnJlcGxhY2UoL1smPD5cIl0vZyxtPT4oeycmJzonJmFtcDsnLCc8JzonJmx0OycsJz4nOicmZ3Q7JywnXCInOicmcXVvdDsnfVttXSkpfWZ1bmN0aW9uIG9wZW5UcmVlKCl7Y29uc3Qgdj1sb29rdXAudmFsdWUudHJpbSgpO2lmKHYpbG9jYXRpb24uaHJlZj0nL2Fydm9yZT9pZD0nK2VuY29kZVVSSUNvbXBvbmVudCh2KX1kb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnb3BlbicpLm9uY2xpY2s9b3BlblRyZWU7bG9va3VwLmFkZEV2ZW50TGlzdGVuZXIoJ2tleWRvd24nLGU9PntpZihlLmtleT09PSdFbnRlcicpb3BlblRyZWUoKX0pO2Z1bmN0aW9uIG5vZGVDb2xvcihuKXtyZXR1cm4gbi5zY29yZT49MTU/JyNlNmI5NDYnOm4uc2NvcmU+PTk/JyNjOTk4MzInOm4uc2NvcmU+PTU/JyM5OTczMjknOicjNjc1MzI5J31mdW5jdGlvbiBzdHJlbmd0aENsYXNzKHMpe3JldHVybiBzPj05PydzdHJvbmcnOnM+PTU/J21lZGl1bSc6J3dlYWsnfWZ1bmN0aW9uIGxheW91dChucyl7Y29uc3QgYz1ucy5maW5kKG49Pm4uY2VudHJhbCksb3RoZXJzPW5zLmZpbHRlcihuPT4hbi5jZW50cmFsKS5zb3J0KChhLGIpPT5iLnNjb3JlLWEuc2NvcmV8fGEubm9tZS5sb2NhbGVDb21wYXJlKGIubm9tZSkpLHA9e307aWYoIWMpcmV0dXJuIHA7cFtjLmlkXT17eDowLHk6MH07bGV0IHVzZWQ9MCxyaW5nPTE7d2hpbGUodXNlZDxvdGhlcnMubGVuZ3RoKXtjb25zdCByYWRpdXM9MjQ1KyhyaW5nLTEpKjE3MCxjYXBhY2l0eT1NYXRoLm1heCgxMCxNYXRoLmZsb29yKDIqTWF0aC5QSSpyYWRpdXMvMTQ1KSksY291bnQ9TWF0aC5taW4oY2FwYWNpdHksb3RoZXJzLmxlbmd0aC11c2VkKTtmb3IobGV0IGk9MDtpPGNvdW50O2krKyl7Y29uc3Qgbj1vdGhlcnNbdXNlZCtpXSxvZmZzZXQ9KHJpbmclMj8tLjU6MCksYW5nbGU9LU1hdGguUEkvMisyKk1hdGguUEkqKGkrb2Zmc2V0KS9NYXRoLm1heCgxLGNvdW50KTtwW24uaWRdPXt4Ok1hdGguY29zKGFuZ2xlKSpyYWRpdXMseTpNYXRoLnNpbihhbmdsZSkqcmFkaXVzfX11c2VkKz1jb3VudDtyaW5nKyt9cmV0dXJuIHB9ZnVuY3Rpb24gc3ZnRWwodGFnLGF0dHJzPXt9KXtjb25zdCBlPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnROUyhOUyx0YWcpO2Zvcihjb25zdFtrLHZdb2YgT2JqZWN0LmVudHJpZXMoYXR0cnMpKWUuc2V0QXR0cmlidXRlKGssU3RyaW5nKHYpKTtyZXR1cm4gZX1mdW5jdGlvbiByZW5kZXIoKXtjb25zdCB0ZXJtPWZpbHRlci52YWx1ZS50cmltKCkudG9Mb3dlckNhc2UoKSxtaW49TnVtYmVyKHN0cmVuZ3RoLnZhbHVlKSxucz1ELm5vZGVzLmZpbHRlcihuPT5uLmNlbnRyYWx8fChuLnNjb3JlPj1taW4mJihgJHtuLm5vbWV9ICR7bi5yZ30gJHtuLm9yZ2FuaXphY2FvfWAudG9Mb3dlckNhc2UoKS5pbmNsdWRlcyh0ZXJtKSkpKSxpZHM9bmV3IFNldChucy5tYXAobj0+bi5pZCkpLGVzPUQuZWRnZXMuZmlsdGVyKGU9Pmlkcy5oYXMoZS5mcm9tKSYmaWRzLmhhcyhlLnRvKSk7cG9zaXRpb25zPWxheW91dChucyk7Y29uc3QgZnJhZz1kb2N1bWVudC5jcmVhdGVEb2N1bWVudEZyYWdtZW50KCk7Zm9yKGNvbnN0IGUgb2YgZXMpe2NvbnN0IGE9cG9zaXRpb25zW2UuZnJvbV0sYj1wb3NpdGlvbnNbZS50b107aWYoIWF8fCFiKWNvbnRpbnVlO2NvbnN0IHBhdGg9c3ZnRWwoJ3BhdGgnLHtkOmBNICR7YS54fSAke2EueX0gUSAkeyhhLngrYi54KS8yfSAkeyhhLnkrYi55KS8yLTE4fSAke2IueH0gJHtiLnl9YCxjbGFzczpgZWRnZSAke3N0cmVuZ3RoQ2xhc3MoZS5zY29yZSl9JHtzZWxlY3RlZD09PWUudG8/JyBzZWxlY3RlZCc6Jyd9YCwnc3Ryb2tlLXdpZHRoJzpNYXRoLm1heCgxLjIsTWF0aC5taW4oNS41LDErZS5zY29yZS81KSl9KTtwYXRoLmRhdGFzZXQudG89ZS50bztmcmFnLmFwcGVuZENoaWxkKHBhdGgpfWZvcihjb25zdCBuIG9mIG5zKXtjb25zdCBwPXBvc2l0aW9uc1tuLmlkXTtpZighcCljb250aW51ZTtjb25zdCByYWRpdXM9bi5jZW50cmFsPzc0Ok1hdGgubWF4KDQyLE1hdGgubWluKDU3LDQzK24uc2NvcmUqLjYpKSxjb2xvcj1uLmNlbnRyYWw/JyNlNGI3NDYnOm5vZGVDb2xvcihuKSxnPXN2Z0VsKCdnJyx7Y2xhc3M6YG5vZGUke24uY2VudHJhbD8nIGNlbnRyYWwnOicnfSR7c2VsZWN0ZWQ9PT1uLmlkPycgYWN0aXZlJzonJ31gLHRyYW5zZm9ybTpgdHJhbnNsYXRlKCR7cC54fSwke3AueX0pYCx0YWJpbmRleDonMCd9KTtnLmRhdGFzZXQuaWQ9bi5pZDtnLmFwcGVuZENoaWxkKHN2Z0VsKCdjaXJjbGUnLHtjbGFzczonaGFsbycscjpyYWRpdXMrMTAsZmlsbDonbm9uZScsc3Ryb2tlOmNvbG9yLCdzdHJva2Utd2lkdGgnOjh9KSk7Zy5hcHBlbmRDaGlsZChzdmdFbCgnY2lyY2xlJyx7Y2xhc3M6J2JvZHknLHI6cmFkaXVzLGZpbGw6bi5jZW50cmFsPyd1cmwoI2NlbnRyYWxHcmFkKSc6J3VybCgjbm9kZUdyYWQpJyxzdHJva2U6Y29sb3IsJ3N0cm9rZS13aWR0aCc6bi5jZW50cmFsPzQ6Mi41fSkpO2lmKG4uY2VudHJhbCl7Y29uc3QgaW1hZ2U9c3ZnRWwoJ2ltYWdlJyx7aHJlZjonL2NlbnRyYWwvYnJhc2FvLWRpY29yLnBuZycseDotMjcseTotNTQsd2lkdGg6NTQsaGVpZ2h0OjU0LHByZXNlcnZlQXNwZWN0UmF0aW86J3hNaWRZTWlkIG1lZXQnfSk7Zy5hcHBlbmRDaGlsZChpbWFnZSl9Y29uc3QgdGl0bGU9c3ZnRWwoJ3RleHQnLHtjbGFzczondGl0bGUnLCd0ZXh0LWFuY2hvcic6J21pZGRsZScseTpuLmNlbnRyYWw/MTg6LTd9KTt0aXRsZS50ZXh0Q29udGVudD1uLm5vbWUubGVuZ3RoPjIwP24ubm9tZS5zbGljZSgwLDE5KSsn4oCmJzpuLm5vbWU7Zy5hcHBlbmRDaGlsZCh0aXRsZSk7Y29uc3Qgc3ViPXN2Z0VsKCd0ZXh0Jyx7Y2xhc3M6J3N1YicsJ3RleHQtYW5jaG9yJzonbWlkZGxlJyx5Om4uY2VudHJhbD8zNzoxM30pO3N1Yi50ZXh0Q29udGVudD0nUkcgJysobi5yZ3x8J+KAlCcpO2cuYXBwZW5kQ2hpbGQoc3ViKTtpZighbi5jZW50cmFsKXtjb25zdCBwaWxsPXN2Z0VsKCdyZWN0Jyx7Y2xhc3M6J3N0cmVuZ3RoJyx4Oi0yOSx5OjI0LHdpZHRoOjU4LGhlaWdodDoxNyxyeDo4LGZpbGw6JyMwYjBkMDgnLHN0cm9rZTpjb2xvcn0pO2cuYXBwZW5kQ2hpbGQocGlsbCk7Y29uc3Qgc3Q9c3ZnRWwoJ3RleHQnLHtjbGFzczonc3RyZW5ndGgtdGV4dCcsJ3RleHQtYW5jaG9yJzonbWlkZGxlJyx5OjM2LGZpbGw6Y29sb3J9KTtzdC50ZXh0Q29udGVudD1uLmZvcmNhPT09J01VSVRPIEZPUlRFJz8nTS4gRk9SVEUnOm4uZm9yY2E7Zy5hcHBlbmRDaGlsZChzdCl9Zy5hZGRFdmVudExpc3RlbmVyKCdjbGljaycsKCk9PnNlbGVjdE5vZGUobi5pZCkpO2cuYWRkRXZlbnRMaXN0ZW5lcignZGJsY2xpY2snLCgpPT57aWYoIW4uY2VudHJhbClsb2NhdGlvbi5ocmVmPScvYXJ2b3JlP2lkPScrZW5jb2RlVVJJQ29tcG9uZW50KG4ucmd8fG4uaWQpfSk7ZnJhZy5hcHBlbmRDaGlsZChnKX12cC5yZXBsYWNlQ2hpbGRyZW4oZnJhZyk7dmlzaWJsZS50ZXh0Q29udGVudD1NYXRoLm1heCgwLG5zLmxlbmd0aC0xKTtsaXN0LmlubmVySFRNTD1ucy5maWx0ZXIobj0+IW4uY2VudHJhbCkubWFwKG49PmA8ZGl2IGNsYXNzPSJwZXJzb24ke3NlbGVjdGVkPT09bi5pZD8nIGFjdGl2ZSc6Jyd9IiBvbmNsaWNrPSJzZWxlY3ROb2RlKCR7bi5pZH0pIj48c3BhbiBjbGFzcz0iZG90IiBzdHlsZT0iY29sb3I6JHtub2RlQ29sb3Iobil9O2JhY2tncm91bmQ6JHtub2RlQ29sb3Iobil9Ij48L3NwYW4+PGRpdj48c3Ryb25nPiR7RShuLm5vbWUpfTwvc3Ryb25nPjxzbWFsbD5SRyAke0Uobi5yZ3x8J+KAlCcpfSDigKIgJHtFKG4uZm9yY2EpfTwvc21hbGw+PC9kaXY+PHNwYW4gY2xhc3M9InNjb3JlIj4ke24uc2NvcmV9IHB0czwvc3Bhbj48L2Rpdj5gKS5qb2luKCcnKXx8JzxkaXYgY2xhc3M9ImVtcHR5Ij5OZW5odW1hIGNvbmV4w6NvIHJlZ2lzdHJhZGEgcGFyYSBlc3RlcyBmaWx0cm9zLjwvZGl2Pic7dHJhbnNmb3JtKCl9ZnVuY3Rpb24gc2VsZWN0Tm9kZShpZCl7c2VsZWN0ZWQ9aWQ7Y29uc3Qgbj1ELm5vZGVzLmZpbmQoeD0+eC5pZD09PWlkKTtkZXRhaWwobik7cmVuZGVyKCl9ZnVuY3Rpb24gZGV0YWlsKG4pe2lmKCFuKXJldHVybjtkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZGV0YWlsJykuaW5uZXJIVE1MPWA8aDI+JHtFKG4ubm9tZSl9PC9oMj48cD48Yj5SRzo8L2I+ICR7RShuLnJnfHwnTsOjbyBpbmZvcm1hZG8nKX08YnI+PGI+T3JnYW5pemHDp8Ojbzo8L2I+ICR7RShuLm9yZ2FuaXphY2FvfHwnTsOjbyBpbmZvcm1hZGEnKX08YnI+PGI+Rm9yw6dhOjwvYj4gJHtFKG4uZm9yY2EpfSR7bi5jZW50cmFsPycnOmA8YnI+PGI+UG9udHVhw6fDo286PC9iPiAke24uc2NvcmV9YH08L3A+PGRpdj4keyhuLm1vdGl2b3N8fFtdKS5tYXAoeD0+YDxzcGFuIGNsYXNzPSJiYWRnZSI+JHtFKHgpfTwvc3Bhbj5gKS5qb2luKCcnKX08L2Rpdj48ZGl2IGNsYXNzPSJsYWJlbCI+RVZJRMOKTkNJQVM8L2Rpdj48cD4keyhuLmV2aWRlbmNpYXN8fFtdKS5tYXAoRSkuam9pbignPGJyPicpfHwnTmVuaHVtYSBldmlkw6puY2lhIHJlc3VtaWRhLid9PC9wPiR7bi5jZW50cmFsPycnOmA8YnV0dG9uIGNsYXNzPSJvcGVuLXBlcnNvbiIgb25jbGljaz0ibG9jYXRpb24uaHJlZj0nL2Fydm9yZT9pZD0ke2VuY29kZVVSSUNvbXBvbmVudChuLnJnfHxuLmlkKX0nIj5BYnJpciDDoXJ2b3JlIGRlc3RhIHBlc3NvYTwvYnV0dG9uPmB9YH1mdW5jdGlvbiB0cmFuc2Zvcm0oKXt2cC5zZXRBdHRyaWJ1dGUoJ3RyYW5zZm9ybScsYHRyYW5zbGF0ZSgke3N2Zy5jbGllbnRXaWR0aC8yK3R4fSwke3N2Zy5jbGllbnRIZWlnaHQvMit0eX0pIHNjYWxlKCR7c2NhbGV9KWApfWZ1bmN0aW9uIGZpdEdyYXBoKCl7Y29uc3QgbnM9RC5ub2RlcztpZighbnMubGVuZ3RoKXtzY2FsZT0xO3R4PTA7dHk9MDt0cmFuc2Zvcm0oKTtyZXR1cm59Y29uc3QgcHM9T2JqZWN0LnZhbHVlcyhwb3NpdGlvbnMpO2lmKCFwcy5sZW5ndGgpcmV0dXJuO2NvbnN0IHhzPXBzLm1hcChwPT5wLngpLHlzPXBzLm1hcChwPT5wLnkpLHc9TWF0aC5tYXgoLi4ueHMpLU1hdGgubWluKC4uLnhzKSsyMTAsaD1NYXRoLm1heCguLi55cyktTWF0aC5taW4oLi4ueXMpKzIxMDtzY2FsZT1NYXRoLm1heCguMTgsTWF0aC5taW4oMS4xNSxNYXRoLm1pbihzdmcuY2xpZW50V2lkdGgvdyxzdmcuY2xpZW50SGVpZ2h0L2gpKSk7dHg9LShNYXRoLm1heCguLi54cykrTWF0aC5taW4oLi4ueHMpKS8yKnNjYWxlO3R5PS0oTWF0aC5tYXgoLi4ueXMpK01hdGgubWluKC4uLnlzKSkvMipzY2FsZTt0cmFuc2Zvcm0oKX1zdmcuYWRkRXZlbnRMaXN0ZW5lcignd2hlZWwnLGU9PntlLnByZXZlbnREZWZhdWx0KCk7c2NhbGU9TWF0aC5tYXgoLjE1LE1hdGgubWluKDMuMixzY2FsZSooZS5kZWx0YVk8MD8xLjA5Oi45MSkpKTt0cmFuc2Zvcm0oKX0se3Bhc3NpdmU6ZmFsc2V9KTtzdmcuYWRkRXZlbnRMaXN0ZW5lcignbW91c2Vkb3duJyxlPT57ZHJhZz10cnVlO2xhc3Q9W2UuY2xpZW50WCxlLmNsaWVudFldO3N2Zy5zdHlsZS5jdXJzb3I9J2dyYWJiaW5nJ30pO3dpbmRvdy5hZGRFdmVudExpc3RlbmVyKCdtb3VzZXVwJywoKT0+e2RyYWc9ZmFsc2U7c3ZnLnN0eWxlLmN1cnNvcj0nZ3JhYid9KTt3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcignbW91c2Vtb3ZlJyxlPT57aWYoIWRyYWcpcmV0dXJuO3R4Kz1lLmNsaWVudFgtbGFzdFswXTt0eSs9ZS5jbGllbnRZLWxhc3RbMV07bGFzdD1bZS5jbGllbnRYLGUuY2xpZW50WV07dHJhbnNmb3JtKCl9KTtsZXQgcmVuZGVyVGltZXI9MDtmdW5jdGlvbiBzY2hlZHVsZVJlbmRlcigpe2NsZWFyVGltZW91dChyZW5kZXJUaW1lcik7cmVuZGVyVGltZXI9c2V0VGltZW91dChyZW5kZXIsNzApfWZpbHRlci5hZGRFdmVudExpc3RlbmVyKCdpbnB1dCcsc2NoZWR1bGVSZW5kZXIpO3N0cmVuZ3RoLmFkZEV2ZW50TGlzdGVuZXIoJ2lucHV0JyxyZW5kZXIpO2FzeW5jIGZ1bmN0aW9uIGxvYWQodil7aWYoIXYpcmV0dXJuO3dlbGNvbWUuc3R5bGUuZGlzcGxheT0nbm9uZSc7bG9hZGluZy5zdHlsZS5kaXNwbGF5PSdncmlkJzt0cnl7Y29uc3Qgcj1hd2FpdCBmZXRjaCgnL2FwaS9hcnZvcmUvJytlbmNvZGVVUklDb21wb25lbnQodikse2hlYWRlcnM6e0FjY2VwdDonYXBwbGljYXRpb24vanNvbid9fSksZD1hd2FpdCByLmpzb24oKTtpZighci5va3x8IWQub2spdGhyb3cgRXJyb3IoZC5lcnJvfHwnRXJybyBhbyBtb250YXIgYSDDoXJ2b3JlJyk7RD1kO3NlbGVjdGVkPWQuYWx2b19pZDt0b3RhbC50ZXh0Q29udGVudD1kLnRvdGFsO3JlbmRlcigpO2RldGFpbChkLm5vZGVzLmZpbmQobj0+bi5jZW50cmFsKSk7cmVxdWVzdEFuaW1hdGlvbkZyYW1lKCgpPT5yZXF1ZXN0QW5pbWF0aW9uRnJhbWUoZml0R3JhcGgpKX1jYXRjaChlKXtEPXtub2RlczpbXSxlZGdlczpbXX07dnAucmVwbGFjZUNoaWxkcmVuKCk7dG90YWwudGV4dENvbnRlbnQ9JzAnO3Zpc2libGUudGV4dENvbnRlbnQ9JzAnO2xpc3QuaW5uZXJIVE1MPSc8ZGl2IGNsYXNzPSJlbXB0eSI+TmVuaHVtYSBmaWNoYSBjYXJyZWdhZGEuPC9kaXY+Jzt3ZWxjb21lLnN0eWxlLmRpc3BsYXk9J2dyaWQnO2RvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdkZXRhaWwnKS5pbm5lckhUTUw9YDxoMj5GaWNoYSBuw6NvIGxvY2FsaXphZGE8L2gyPjxwPiR7RShlLm1lc3NhZ2UpfTwvcD5gfWZpbmFsbHl7bG9hZGluZy5zdHlsZS5kaXNwbGF5PSdub25lJ319aWYoaW5pdGlhbClsb2FkKGluaXRpYWwpO3dpbmRvdy5hZGRFdmVudExpc3RlbmVyKCdyZXNpemUnLCgpPT5yZXF1ZXN0QW5pbWF0aW9uRnJhbWUoZml0R3JhcGgpKTsKPC9zY3JpcHQ+PC9ib2R5PjwvaHRtbD4=').decode('utf-8')
 
 
 async def arvore_pagina_http(request: web.Request) -> web.Response:
@@ -51210,16 +50990,165 @@ async def arvore_pagina_http(request: web.Request) -> web.Response:
     return resposta
 
 
-# Prepara os índices sem bloquear o gateway do Discord por muito tempo.
-try:
-    _v15_criar_indices()
-except Exception:
-    traceback.print_exc()
+class BancoDadosViewV16(View):
+    """View exclusiva para evitar disputa com versões antigas do painel."""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-print(
-    '✅ V15 carregada: cache invalidado por alteração dos dados, índices SQLite e árvore DICOR premium sem alterar funcionalidades.',
-    flush=True,
-)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _banco_prof_equipe(interaction):
+            return True
+        if not interaction.response.is_done():
+            await interaction.response.send_message('❌ Apenas a equipe DICOR pode usar esta central.', ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        if _v14_erro_interacao_duplicada(error):
+            return
+        await _v12_enviar_erro_interacao(interaction, 'A Central de Fichas apresentou uma falha.', error)
+
+    @discord.ui.button(label='Criar ficha', emoji='📋', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_criar_ficha_v16', row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_criar(interaction)
+
+    @discord.ui.button(label='Pesquisar fichas', emoji='🔎', style=discord.ButtonStyle.secondary,
+                       custom_id='dicor_banco_consultar_v16', row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_pesquisar(interaction)
+
+    @discord.ui.button(label='Importar painel', emoji='🏴', style=discord.ButtonStyle.primary,
+                       custom_id='dicor_banco_importar_painel_v16', row=0)
+    async def importar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Sincronizar dados', emoji='🔄', style=discord.ButtonStyle.success,
+                       custom_id='dicor_banco_sync_tudo_v16', row=0)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v12_banco_sync(interaction)
+
+
+BancoDadosView = BancoDadosViewV16
+
+
+async def _v16_atualizar_paineis_banco() -> int:
+    atualizados = 0
+    try:
+        await asyncio.wait_for(_banco_prof_atualizar_painel(), timeout=20)
+    except Exception as erro:
+        print(f'⚠️ V16 atualização direta do banco: {type(erro).__name__}: {erro}', flush=True)
+
+    canais: List[Any] = []
+    canal_id = int(os.getenv('BANCO_DADOS_CHANNEL_ID', '0') or 0)
+    for guild in bot.guilds:
+        if canal_id:
+            canal = guild.get_channel(canal_id)
+            if canal is not None:
+                canais.append(canal)
+        for canal in getattr(guild, 'text_channels', []):
+            nome = unicodedata.normalize('NFKD', str(getattr(canal, 'name', '') or ''))
+            nome = ''.join(c for c in nome if not unicodedata.combining(c)).lower()
+            if 'banco-de-dados' in nome and canal not in canais:
+                canais.append(canal)
+    for canal in canais[:8]:
+        try:
+            async for msg in canal.history(limit=80):
+                if not bot.user or msg.author.id != bot.user.id:
+                    continue
+                titulos = ' '.join(str(e.title or '') for e in msg.embeds).upper()
+                if 'CENTRAL DE FICHAS' not in titulos:
+                    continue
+                await msg.edit(view=BancoDadosViewV16())
+                atualizados += 1
+                break
+        except Exception as erro:
+            print(f'⚠️ V16 painel no canal {getattr(canal, "id", 0)}: {erro}', flush=True)
+    return atualizados
+
+
+async def _v16_tarefa_pos_ready() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(2)
+    try:
+        atualizados = await _v16_atualizar_paineis_banco()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(gerar_catalogo_html), timeout=35)
+        except Exception as erro:
+            print(f'⚠️ V16 geração do catálogo: {type(erro).__name__}: {erro}', flush=True)
+        print(f'✅ V16 pronta: {atualizados} painel(is) do banco atualizado(s); /catalogo ativo.', flush=True)
+    except Exception:
+        traceback.print_exc()
+
+
+@bot.listen('on_ready')
+async def _v16_on_ready() -> None:
+    global _V16_PAINEL_TASK
+    if _V16_PAINEL_TASK is None or _V16_PAINEL_TASK.done():
+        _V16_PAINEL_TASK = asyncio.create_task(_v16_tarefa_pos_ready(), name='v16-banco-catalogo')
+
+
+_V16_SETUP_ANTERIOR = bot.setup_hook
+async def _v16_setup_hook(self) -> None:
+    await _V16_SETUP_ANTERIOR()
+    try:
+        bot.add_view(BancoDadosViewV16())
+    except Exception as erro:
+        print(f'⚠️ V16 registro da View do banco: {type(erro).__name__}: {erro}', flush=True)
+    print('✅ V16: View exclusiva do banco registrada antes das interações.', flush=True)
+bot.setup_hook = _v13_types.MethodType(_v16_setup_hook, bot)
+
+
+# Redefinição final do painel de procurados com URL pública correta.
+class PainelProcuradosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Novo Procurado', emoji='➕', style=discord.ButtonStyle.danger, custom_id='dic_novo_procurado')
+    async def novo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(NovoProcuradoModal())
+
+    @discord.ui.button(label='Lista de Procurados', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_lista_procurados')
+    async def lista(self, interaction: discord.Interaction, button: Button):
+        procurados = carregar_procurados()
+        ativos = [p for p in procurados if p.get('status', 'A PROCURAR') == 'A PROCURAR']
+        texto = 'Nenhum procurado ativo cadastrado.' if not ativos else '\n'.join(
+            f"• **{p.get('nome','Sem nome')}** — RG: `{p.get('rg','')}`\n  📍 **Último avistamento:** {p.get('ultimo_avistamento') or 'Não informado'}"
+            for p in ativos[:20]
+        )
+        await interaction.response.send_message(
+            f'📋 **Procurados ativos:**\n{texto}\n\n🔗 {_v16_catalogo_url()}', ephemeral=True
+        )
+
+    @discord.ui.button(label='Registrar captura', emoji='🚔', style=discord.ButtonStyle.gray, custom_id='dic_retirar_procurado')
+    async def retirar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(RetirarProcuradoModal())
+
+    @discord.ui.button(label='Modificar Procurado', emoji='✏️', style=discord.ButtonStyle.primary,
+                       custom_id='dic_modificar_procurado', row=1)
+    async def modificar(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.', ephemeral=True)
+            return
+        await interaction.response.send_modal(BuscarModificarProcuradoModal())
+
+    @discord.ui.button(label='Abrir Catálogo', emoji='📄', style=discord.ButtonStyle.green, custom_id='dic_abrir_catalogo')
+    async def abrir_catalogo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            f'📄 **Catálogo de Procurados:**\n{_v16_catalogo_url()}', ephemeral=True
+        )
+
+
+@bot.tree.command(name='repararbanco', description='Recarrega somente o painel da Central de Fichas.')
+async def reparar_banco_v16(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not usuario_tem_admin(interaction.user):
+        await interaction.response.send_message('❌ Apenas Inspetor+ pode reparar o painel.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    quantidade = await _v16_atualizar_paineis_banco()
+    await interaction.edit_original_response(content=f'✅ Central de Fichas recarregada. Painéis atualizados: `{quantidade}`.')
+
+
+print('✅ V16 carregada: banco isolado, catálogo robusto e árvore premium sem alterar mecânicas.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
