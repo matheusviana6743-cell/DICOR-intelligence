@@ -45550,22 +45550,54 @@ def _dossie_ia_fontes(perfil: Dict[str, Any]) -> List[str]:
     return urls[:12]
 
 
+def _dossie_ia_dict(valor: Any) -> Dict[str, Any]:
+    """Converte estruturas conhecidas em dict sem lançar ValueError."""
+    if isinstance(valor, dict):
+        return dict(valor)
+    return {}
+
+
+def _dossie_ia_lista_flex(valor: Any) -> List[Any]:
+    if isinstance(valor, list):
+        return list(valor)
+    if isinstance(valor, tuple):
+        return list(valor)
+    if isinstance(valor, dict):
+        return [dict(valor)]
+    if valor in (None, "", [], {}):
+        return []
+    return [valor]
+
+
+def _dossie_ia_primeiro(*valores: Any, padrao: str = "Não informado") -> str:
+    for valor in valores:
+        if valor not in (None, "", [], {}):
+            return str(valor)
+    return padrao
+
+
 def _dossie_ia_resumo_contexto(perfil: Dict[str, Any]) -> Dict[str, Any]:
-    ind = dict(perfil.get("individuo") or {})
-    veiculos = _dossie_ia_lista(perfil.get("veiculos"))
-    prisoes = _dossie_ia_lista(perfil.get("historico_prisoes")) or _dossie_ia_lista(perfil.get("prisoes"))
-    fontes = _dossie_ia_lista(perfil.get("fontes_documentais"))
-    itens = dict(perfil.get("itens_ilegais_acumulados") or perfil.get("itens_ilegais") or {})
-    evidencias = _dossie_ia_lista(perfil.get("evidencias_mochila"))
-    arquivos = _dossie_ia_lista(perfil.get("arquivos"))
+    perfil = _dossie_ia_dict(perfil)
+    ind = _dossie_ia_dict(perfil.get("individuo"))
+    veiculos = _dossie_ia_lista_flex(perfil.get("veiculos"))
+    prisoes = _dossie_ia_lista_flex(perfil.get("historico_prisoes")) or _dossie_ia_lista_flex(perfil.get("prisoes"))
+    fontes = _dossie_ia_lista_flex(perfil.get("fontes_documentais"))
+    itens = _dossie_ia_dict(perfil.get("itens_ilegais_acumulados") or perfil.get("itens_ilegais"))
+    evidencias = _dossie_ia_lista_flex(perfil.get("evidencias_mochila"))
+    arquivos = _dossie_ia_lista_flex(perfil.get("arquivos"))
+    criminal = _dossie_ia_dict(perfil.get("perfil_criminal_automatico"))
+    procurados = _dossie_ia_lista_flex(perfil.get("procurados") or perfil.get("historico_procurados"))
+    pericias = _dossie_ia_lista_flex(perfil.get("pericias") or perfil.get("historico_pericias"))
+    boletins = _dossie_ia_lista_flex(perfil.get("boletins") or perfil.get("historico_boletins"))
+    mandados = _dossie_ia_lista_flex(perfil.get("mandados") or perfil.get("comparecimentos"))
     return {
-        "nome": str(ind.get("nome") or _banco_ficha_geral_titulo(perfil) or "Não informado"),
-        "rg": str(ind.get("rg") or "Não informado"),
-        "apelido": str(ind.get("apelido") or "Não informado"),
-        "telefone": str(ind.get("telefone") or "Não informado"),
-        "faccao": str(ind.get("faccao_atual") or perfil.get("organizacao_nome") or "Não informada"),
-        "cargo": str(ind.get("cargo_faccao") or "Não informado"),
-        "status": str(ind.get("status") or "CADASTRADO"),
+        "nome": _dossie_ia_primeiro(ind.get("nome"), _banco_ficha_geral_titulo(perfil)),
+        "rg": _dossie_ia_primeiro(ind.get("rg"), ind.get("passaporte")),
+        "apelido": _dossie_ia_primeiro(ind.get("apelido")),
+        "telefone": _dossie_ia_primeiro(ind.get("telefone"), ind.get("celular")),
+        "faccao": _dossie_ia_primeiro(ind.get("faccao_atual"), perfil.get("organizacao_nome"), padrao="Não informada"),
+        "cargo": _dossie_ia_primeiro(ind.get("cargo_faccao")),
+        "status": _dossie_ia_primeiro(ind.get("status"), padrao="CADASTRADO"),
         "observacoes": str(ind.get("observacoes") or ""),
         "veiculos": veiculos,
         "prisoes": prisoes,
@@ -45573,164 +45605,247 @@ def _dossie_ia_resumo_contexto(perfil: Dict[str, Any]) -> Dict[str, Any]:
         "itens": itens,
         "evidencias": evidencias,
         "arquivos": arquivos,
+        "criminal": criminal,
+        "procurados": procurados,
+        "pericias": pericias,
+        "boletins": boletins,
+        "mandados": mandados,
         "perfil": perfil,
     }
 
 
-def _dossie_ia_formatar_itens(itens: Dict[str, Any], filtro: str = "") -> List[str]:
-    linhas: List[str] = []
-    nf = _dossie_ia_normalizar(filtro)
-    for grupo, conteudo in itens.items():
-        if not isinstance(conteudo, dict):
-            continue
-        itens_grupo = []
-        for nome, quantidade in conteudo.items():
-            if nf and nf not in _dossie_ia_normalizar(grupo) and nf not in _dossie_ia_normalizar(nome):
+def _dossie_ia_texto_curto(valor: Any, limite: int = 250) -> str:
+    if isinstance(valor, dict):
+        partes=[]
+        for k,v in valor.items():
+            if v in (None, "", [], {}):
                 continue
-            try:
-                qtd = int(quantidade)
-            except Exception:
-                qtd = quantidade
-            itens_grupo.append(f"• **{nome}:** {qtd}")
-        if itens_grupo:
-            linhas.append(f"\n**{grupo}**\n" + "\n".join(itens_grupo))
-    return linhas
+            if isinstance(v, (dict, list, tuple)):
+                continue
+            partes.append(f"{str(k).replace('_',' ').title()}: {v}")
+        texto=" • ".join(partes) or str(valor)
+    elif isinstance(valor, (list, tuple)):
+        texto=", ".join(str(x) for x in valor[:8])
+    else:
+        texto=str(valor)
+    return texto[:limite]
 
 
-def _dossie_ia_busca_textual(perfil: Dict[str, Any], termos: List[str]) -> List[Tuple[str, str]]:
-    achados: List[Tuple[str, str]] = []
-    termos_n = [_dossie_ia_normalizar(t) for t in termos if t]
-    def visitar(obj: Any, caminho: str = "registro") -> None:
-        if len(achados) >= 20:
-            return
+def _dossie_ia_valor_registro(registro: Any, *chaves: str, padrao: str = "Não informado") -> str:
+    if isinstance(registro, dict):
+        for chave in chaves:
+            valor=registro.get(chave)
+            if valor not in (None, "", [], {}):
+                return str(valor)
+    elif registro not in (None, ""):
+        return str(registro)
+    return padrao
+
+
+def _dossie_ia_achados_por_score(perfil: Dict[str, Any], termos: List[str], limite: int = 12) -> List[Tuple[int, str, str]]:
+    stop={"que","qual","quais","como","essa","esse","isso","sobre","dele","dela","tem","teve","foi","com","para","uma","uns","das","dos","por","ele","ela","me","mostre","fale"}
+    termos_n=[]
+    for termo in termos:
+        nt=_dossie_ia_normalizar(termo)
+        if len(nt)>=2 and nt not in stop and nt not in termos_n:
+            termos_n.append(nt)
+    achados=[]
+    vistos=set()
+    def visitar(obj: Any, caminho: str="registro") -> None:
         if isinstance(obj, dict):
-            for k, v in obj.items():
+            for k,v in obj.items():
                 visitar(v, f"{caminho} › {k}")
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
+        elif isinstance(obj, (list,tuple)):
+            for i,v in enumerate(obj):
                 visitar(v, f"{caminho} › item {i+1}")
-        elif obj not in (None, "", [], {}):
-            valor = str(obj)
-            nv = _dossie_ia_normalizar(valor)
-            if all(t in nv or t in _dossie_ia_normalizar(caminho) for t in termos_n):
-                par = (caminho, valor)
-                if par not in achados:
-                    achados.append(par)
+        elif obj not in (None,"",[],{}):
+            valor=str(obj)
+            base=_dossie_ia_normalizar(caminho+" "+valor)
+            score=sum(1 for t in termos_n if t in base)
+            if score:
+                chave=(caminho,valor)
+                if chave not in vistos:
+                    vistos.add(chave)
+                    achados.append((score,caminho,valor))
     visitar(perfil)
-    return achados
+    achados.sort(key=lambda x:(-x[0],len(x[2])))
+    return achados[:limite]
+
+
+def _dossie_ia_intencao(q: str) -> str:
+    grupos={
+        "resumo": ("resumo","resuma","quem e","fale sobre","visao geral","dossie"),
+        "veiculos": ("veiculo","veiculos","carro","carros","automovel","placa","dirige","moto","caminhao"),
+        "prisoes": ("prisao","prisoes","prisional","preso","detido","detencao","quantas vezes"),
+        "armas": ("arma","armas","armado","armamento","pistola","fuzil","rifle","municao","revolver","metralhadora","bomba","explosivo","faca"),
+        "drogas": ("droga","drogas","rape","farinha","balinha","erva","skunk","lanca","meta","oxxy","heroina","cocaina"),
+        "itens": ("item","itens","mochila","inventario","portava","portando","apreendido","apreensao","material ilegal"),
+        "fontes": ("foto","fotos","imagem","imagens","prova","provas","evidencia","evidencias","fonte","fontes","anexo","arquivo"),
+        "organizacao": ("organizacao","faccao","familia","grupo","comunidade","cargo","membro"),
+        "contato": ("telefone","numero","celular","contato","radio","frequencia"),
+        "identificacao": ("nome","rg","passaporte","documento","apelido","identidade"),
+        "procurado": ("procurado","mandado de prisao","captura","mandado ativo"),
+        "pericias": ("pericia","pericias","laudo","laudos"),
+        "boletins": ("boletim","boletins","b.o","ocorrencia","ocorrencias"),
+        "mandados": ("mandado","comparecimento","intimacao","convocacao"),
+        "crimes": ("crime","crimes","artigo","artigos","reincidencia","antecedente","padrao criminal"),
+        "maior": ("maior apreens","maior quantidade","mais apreendido","maior registro"),
+        "quantidade": ("quanto","quantos","quantas","total","quantidade"),
+    }
+    # Prioridades específicas evitam que "quantas prisões" vire apenas quantidade.
+    prioridade=("maior","veiculos","prisoes","armas","drogas","itens","fontes","organizacao","contato","identificacao","procurado","pericias","boletins","mandados","crimes","resumo","quantidade")
+    for nome in prioridade:
+        if any(t in q for t in grupos[nome]):
+            return nome
+    return "busca"
 
 
 def _dossie_ia_responder(perfil: Dict[str, Any], pergunta: str) -> discord.Embed:
     ctx = _dossie_ia_resumo_contexto(perfil)
+    pergunta = str(pergunta or "").strip()
     q = _dossie_ia_normalizar(pergunta)
-    embed = discord.Embed(
-        title="🧠 RESPOSTA DO DOSSIÊ INTELIGENTE",
-        color=discord.Color.from_rgb(24, 91, 158),
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
-    )
-    embed.add_field(name="❓ Pergunta", value=str(pergunta)[:1024], inline=False)
+    intencao = _dossie_ia_intencao(q)
     resposta = ""
 
-    palavras_armas = ("armado", "arma", "armamento", "pistola", "fuzil", "municao")
-    palavras_drogas = ("droga", "rape", "farinha", "balinha", "erva", "skunk", "lanca", "meta", "oxxy", "heroina")
-
-    if any(x in q for x in ("resumo", "resuma", "quem e", "fale sobre", "dossie")):
-        resposta = (
+    if intencao == "resumo":
+        resposta=(
             f"**{ctx['nome']}** — RG `{ctx['rg']}`\n"
             f"**Status:** {ctx['status']}\n"
+            f"**Apelido:** {ctx['apelido']}\n"
             f"**Organização:** {ctx['faccao']}\n"
             f"**Cargo:** {ctx['cargo']}\n"
             f"**Veículos vinculados:** {len(ctx['veiculos'])}\n"
-            f"**Registros prisionais localizados:** {len(ctx['prisoes'])}\n"
+            f"**Prisões:** {len(ctx['prisoes'])}\n"
+            f"**Perícias:** {len(ctx['pericias'])}\n"
+            f"**Boletins:** {len(ctx['boletins'])}\n"
+            f"**Registros de procurado:** {len(ctx['procurados'])}\n"
             f"**Evidências de mochila:** {len(ctx['evidencias'])}"
         )
         if ctx["observacoes"]:
             resposta += f"\n\n**Observações:** {ctx['observacoes'][:700]}"
-    elif any(x in q for x in palavras_armas):
-        linhas = []
-        for filtro in ("armamento", "arma", "municao", "bombas", "armas brancas"):
-            linhas.extend(_dossie_ia_formatar_itens(ctx["itens"], filtro))
-        # remove duplicados preservando ordem
-        linhas = list(dict.fromkeys(linhas))
-        resposta = "Foram encontrados os seguintes registros relacionados a armamentos:\n" + "\n".join(linhas) if linhas else "Não localizei armamentos confirmados nos dados atuais desta ficha."
-    elif any(x in q for x in palavras_drogas):
-        linhas = _dossie_ia_formatar_itens(ctx["itens"], "droga")
+
+    elif intencao == "identificacao":
+        resposta=(f"**Nome:** {ctx['nome']}\n**RG/Passaporte:** `{ctx['rg']}`\n"
+                  f"**Apelido:** {ctx['apelido']}\n**Status:** {ctx['status']}")
+
+    elif intencao == "contato":
+        achados=_dossie_ia_achados_por_score(perfil,["telefone","celular","contato","radio","frequencia"],10)
+        linhas=[]
+        if ctx['telefone'] != 'Não informado':
+            linhas.append(f"• **Telefone:** {ctx['telefone']}")
+        for _,c,v in achados:
+            linha=f"• **{c.split('›')[-1].strip().replace('_',' ').title()}:** {_dossie_ia_texto_curto(v,180)}"
+            if linha not in linhas: linhas.append(linha)
+        resposta="Contatos e comunicações localizados:\n"+"\n".join(linhas[:10]) if linhas else "Não localizei telefone, rádio ou frequência confirmados nesta ficha."
+
+    elif intencao == "veiculos":
+        linhas=[]
+        for v in ctx['veiculos'][:15]:
+            placa=_dossie_ia_valor_registro(v,'placa','plate',padrao='SEM PLACA')
+            modelo=_dossie_ia_valor_registro(v,'modelo','veiculo','nome','model',padrao='Modelo não informado')
+            cor=_dossie_ia_valor_registro(v,'cor','color',padrao='cor não informada')
+            status=_dossie_ia_valor_registro(v,'status_veiculo','status',padrao='')
+            extra=f" • {status}" if status else ""
+            linhas.append(f"• `{placa}` — **{modelo}**, {cor}{extra}")
         if not linhas:
-            for termo in palavras_drogas[1:]:
-                linhas.extend(_dossie_ia_formatar_itens(ctx["itens"], termo))
-        linhas = list(dict.fromkeys(linhas))
-        resposta = "Registros de drogas ilícitas encontrados:\n" + "\n".join(linhas) if linhas else "Não localizei drogas ilícitas confirmadas nos dados atuais desta ficha."
-    elif "maior apreens" in q or "maior quantidade" in q:
-        maiores: List[Tuple[int, str, str]] = []
-        for grupo, conteudo in ctx["itens"].items():
-            if isinstance(conteudo, dict):
-                for nome, qtd in conteudo.items():
-                    try:
-                        maiores.append((int(qtd), str(nome), str(grupo)))
-                    except Exception:
-                        pass
-        maiores.sort(reverse=True)
+            achados=_dossie_ia_achados_por_score(perfil,["placa","modelo","veiculo","carro"],10)
+            linhas=[f"• **{c.split('›')[-1].strip().replace('_',' ').title()}:** {_dossie_ia_texto_curto(v)}" for _,c,v in achados]
+        resposta="Veículos vinculados ou citados:\n"+"\n".join(linhas[:15]) if linhas else "Nenhum veículo ou placa está vinculado aos registros atuais desta ficha."
+
+    elif intencao == "prisoes":
+        resposta=f"Localizei **{len(ctx['prisoes'])} registro(s) prisional(is)** vinculado(s) à ficha."
+        detalhes=[]
+        for p in ctx['prisoes'][:10]:
+            data=_dossie_ia_valor_registro(p,'data','data_prisao','criado_em','created_at')
+            ref=_dossie_ia_valor_registro(p,'numero','id','referencia','prisional',padrao='sem número')
+            crimes=_dossie_ia_valor_registro(p,'crimes','motivo','artigos',padrao='')
+            url=_dossie_ia_valor_registro(p,'mensagem_url','url','link',padrao='')
+            linha=f"• **{data}** — registro `{ref}`"
+            if crimes: linha+=f" — {crimes[:160]}"
+            if url.startswith('http'): linha+=f" — [abrir]({url})"
+            detalhes.append(linha)
+        if detalhes: resposta += "\n\n"+"\n".join(detalhes)
+
+    elif intencao in ("armas","drogas","itens"):
+        filtros={"armas":("armamento","arma","municao","bomba","explosivo","armas brancas","faca"),
+                 "drogas":("droga","rape","farinha","balinha","erva","skunk","lanca","meta","oxxy","heroina","cocaina"),
+                 "itens":("",)}[intencao]
+        linhas=[]
+        for filtro in filtros:
+            linhas.extend(_dossie_ia_formatar_itens(ctx['itens'],filtro))
+        linhas=list(dict.fromkeys(linhas))
+        rotulo={"armas":"armamentos e munições","drogas":"drogas ilícitas","itens":"itens ilegais"}[intencao]
+        resposta=f"Registros confirmados de {rotulo}:\n"+"\n".join(linhas) if linhas else f"Não localizei {rotulo} confirmados nos dados atuais desta ficha."
+
+    elif intencao == "maior":
+        maiores=[]
+        for grupo,conteudo in ctx['itens'].items():
+            if isinstance(conteudo,dict):
+                for nome,qtd in conteudo.items():
+                    try: numero=int(float(str(qtd).replace(',','.')))
+                    except Exception: continue
+                    maiores.append((numero,str(nome),str(grupo)))
+        maiores.sort(key=lambda x:x[0],reverse=True)
         if maiores:
-            qtd, nome, grupo = maiores[0]
-            resposta = f"A maior quantidade acumulada registrada é **{qtd}× {nome}**, no grupo **{grupo}**."
+            resposta="Maiores quantidades acumuladas:\n"+"\n".join(f"• **{qtd}× {nome}** — {grupo}" for qtd,nome,grupo in maiores[:8])
         else:
-            resposta = "Não há quantidades de apreensão suficientes para fazer essa comparação."
-    elif any(x in q for x in ("quantas vezes preso", "quantas prisoes", "foi preso", "prisional", "prisao")):
-        resposta = f"Localizei **{len(ctx['prisoes'])} registro(s) prisional(is)** vinculado(s) à ficha."
-        if ctx["prisoes"]:
-            detalhes=[]
-            for p in ctx["prisoes"][:8]:
-                if isinstance(p, dict):
-                    data=p.get("data") or p.get("criado_em") or p.get("data_prisao") or "Data não informada"
-                    ref=p.get("numero") or p.get("id") or p.get("referencia") or "sem número"
-                    url=p.get("mensagem_url") or p.get("url") or ""
-                    linha=f"• **{data}** — registro `{ref}`"
-                    if str(url).startswith("http"):
-                        linha += f" — [abrir]({url})"
-                    detalhes.append(linha)
-            if detalhes:
-                resposta += "\n\n" + "\n".join(detalhes)
-    elif any(x in q for x in ("veiculo", "carro", "placa")):
-        if ctx["veiculos"]:
-            linhas=[]
-            for v in ctx["veiculos"][:12]:
-                placa=v.get("placa") or "SEM PLACA"
-                modelo=v.get("modelo") or "Modelo não informado"
-                cor=v.get("cor") or "cor não informada"
-                linhas.append(f"• `{placa}` — **{modelo}**, {cor}")
-            resposta="Veículos vinculados:\n"+"\n".join(linhas)
-        else:
-            resposta="Nenhum veículo está vinculado à ficha."
-    elif any(x in q for x in ("foto", "imagem", "prova", "evidencia", "fonte")):
-        urls=_dossie_ia_fontes(perfil)
-        resposta = "Fontes e imagens localizadas:\n" + "\n".join(f"• [Abrir fonte {i+1}]({u})" for i,u in enumerate(urls)) if urls else "Não encontrei links de imagens ou fontes acessíveis nesta ficha."
-    elif any(x in q for x in ("organizacao", "faccao", "familia", "grupo")):
+            resposta="Não há quantidades estruturadas suficientes para calcular a maior apreensão."
+
+    elif intencao == "organizacao":
         resposta=f"A organização atualmente registrada é **{ctx['faccao']}**. Cargo informado: **{ctx['cargo']}**."
-        outras=_dossie_ia_lista(perfil.get("outras_fichas_organizacao"))
+        outras=_dossie_ia_lista_flex(perfil.get('outras_fichas_organizacao'))
         if outras:
-            resposta += "\n\n**Outras fichas da mesma organização:**\n" + "\n".join(
-                f"• **{x.get('nome') or 'Sem nome'}** — RG `{x.get('rg') or 'N/I'}`" for x in outras[:10] if isinstance(x, dict)
-            )
-    elif any(x in q for x in ("item", "portava", "portando", "apreendido", "apreensao", "mochila")):
-        linhas=_dossie_ia_formatar_itens(ctx["itens"])
-        resposta="Itens ilegais acumulados na ficha:\n"+"\n".join(linhas) if linhas else "Não há itens ilegais confirmados registrados nesta ficha."
+            membros=[]
+            for x in outras[:12]:
+                membros.append(f"• **{_dossie_ia_valor_registro(x,'nome',padrao='Sem nome')}** — RG `{_dossie_ia_valor_registro(x,'rg','passaporte',padrao='N/I')}`")
+            resposta += "\n\n**Outras fichas da mesma organização:**\n"+"\n".join(membros)
+
+    elif intencao == "fontes":
+        urls=_dossie_ia_fontes(perfil)
+        resposta="Fontes, fotos e documentos localizados:\n"+"\n".join(f"• [Abrir fonte {i+1}]({u})" for i,u in enumerate(urls)) if urls else "Não encontrei links acessíveis de fotos, provas ou documentos nesta ficha."
+
+    elif intencao in ("procurado","pericias","boletins","mandados"):
+        dados={"procurado":ctx['procurados'],"pericias":ctx['pericias'],"boletins":ctx['boletins'],"mandados":ctx['mandados']}[intencao]
+        titulo={"procurado":"registros de procurado","pericias":"perícias","boletins":"boletins de ocorrência","mandados":"mandados/comparecimentos"}[intencao]
+        linhas=[]
+        for reg in dados[:12]:
+            linhas.append(f"• {_dossie_ia_texto_curto(reg,320)}")
+        if not linhas:
+            termos={"procurado":["procurado","captura"],"pericias":["pericia","laudo"],"boletins":["boletim","ocorrencia"],"mandados":["mandado","comparecimento"]}[intencao]
+            achados=_dossie_ia_achados_por_score(perfil,termos,10)
+            linhas=[f"• **{c.split('›')[-1].strip().replace('_',' ').title()}:** {_dossie_ia_texto_curto(v)}" for _,c,v in achados]
+        resposta=f"Localizei **{len(linhas)}** resultado(s) relacionado(s) a {titulo}."
+        if linhas: resposta += "\n\n"+"\n".join(linhas)
+
+    elif intencao == "crimes":
+        criminal=ctx['criminal']
+        if criminal:
+            resposta="Análise criminal registrada:\n"+"\n".join(f"• **{str(k).replace('_',' ').title()}:** {_dossie_ia_texto_curto(v,500)}" for k,v in list(criminal.items())[:12] if v not in (None,'',[],{}))
+        else:
+            achados=_dossie_ia_achados_por_score(perfil,["crime","artigo","reincidencia","antecedente"],12)
+            resposta="Crimes e antecedentes localizados:\n"+"\n".join(f"• **{c.split('›')[-1].strip().replace('_',' ').title()}:** {_dossie_ia_texto_curto(v)}" for _,c,v in achados) if achados else "Não localizei crimes ou antecedentes estruturados nos registros atuais."
+
     else:
-        palavras=[p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9.-]+", pergunta) if len(p)>=3 and _dossie_ia_normalizar(p) not in {"que","qual","quais","como","essa","esse","sobre","dele","dela","tem","teve","foi","com"}]
-        achados=_dossie_ia_busca_textual(perfil, palavras[:4])
+        palavras=re.findall(r"[a-zA-ZÀ-ÿ0-9.-]+",pergunta)
+        achados=_dossie_ia_achados_por_score(perfil,palavras,12)
         if achados:
             resposta="Encontrei estas informações relacionadas à pergunta:\n"+"\n".join(
-                f"• **{caminho.split('›')[-1].strip().replace('_',' ').title()}:** {valor[:350]}" for caminho,valor in achados[:10]
+                f"• **{c.split('›')[-1].strip().replace('_',' ').title()}:** {_dossie_ia_texto_curto(v,330)}" for _,c,v in achados
             )
         else:
-            resposta=(
-                "Não encontrei uma resposta confirmável nos registros desta ficha. "
-                "Tente perguntar sobre prisões, armamentos, drogas, mochila, veículos, organização, fotos, fontes ou solicitar um resumo."
-            )
+            resposta=("Não encontrei uma resposta confirmável nos registros vinculados. Você pode perguntar sobre identificação, telefone, rádio, veículos, placas, prisões, crimes, armas, drogas, mochila, perícias, boletins, procurados, mandados, organização, fotos, arquivos, quantidades ou solicitar um resumo.")
 
-    embed.add_field(name="📋 Análise", value=str(resposta)[:4000], inline=False)
-    urls = _dossie_ia_fontes(perfil)
-    if urls and not any(x in q for x in ("foto", "imagem", "fonte", "evidencia")):
-        embed.add_field(name="🔗 Fontes disponíveis", value="\n".join(f"• [Fonte {i+1}]({u})" for i,u in enumerate(urls[:5]))[:1024], inline=False)
+    embed=discord.Embed(
+        title="🧠 RESPOSTA DO DOSSIÊ INTELIGENTE",
+        description=str(resposta)[:4000] or "Nenhuma informação disponível.",
+        color=discord.Color.from_rgb(24,91,158),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="❓ Pergunta",value=pergunta[:1024],inline=False)
+    embed.add_field(name="🎯 Interpretação",value=intencao.replace('_',' ').title()[:1024],inline=True)
+    urls=_dossie_ia_fontes(perfil)
+    if urls and intencao != 'fontes':
+        embed.add_field(name="🔗 Fontes disponíveis",value="\n".join(f"• [Fonte {i+1}]({u})" for i,u in enumerate(urls[:5]))[:1024],inline=False)
     embed.set_footer(text="DICOR • Resposta baseada somente nos registros vinculados à ficha • Confirme dados relevantes")
     return embed
 
@@ -45758,7 +45873,8 @@ class DossieIAPerguntaModal(Modal, title="Perguntar ao Dossiê Inteligente"):
             await interaction.followup.send(embed=embed)
         except Exception as erro:
             traceback.print_exc()
-            await interaction.followup.send(f"❌ Não foi possível analisar a pergunta: `{type(erro).__name__}`", ephemeral=True)
+            print(f"❌ Dossiê IA | canal {self.canal_id} | {type(erro).__name__}: {erro}", flush=True)
+            await interaction.followup.send(f"❌ Não foi possível analisar a pergunta: `{type(erro).__name__}: {str(erro)[:180]}`", ephemeral=True)
 
 
 class DossieIAChannelView(View):
