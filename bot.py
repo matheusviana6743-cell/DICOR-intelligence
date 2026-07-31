@@ -10644,7 +10644,72 @@ async def escolher_agente_rodizio(guild: discord.Guild, numero: str) -> Optional
     await enviar_log(f"🔁 **Rodízio de boletim**\nBoletim: `{numero}`\nAgente escolhido: {escolhido.mention} (`{escolhido.id}`)")
     return escolhido
 
+# =====================================================
+# V26 — PROTEÇÃO DE ARMAZENAMENTO
+# Evita preencher o volume ao sincronizar históricos antigos repetidamente.
+# =====================================================
+_V26_STORAGE_ALERTADO = False
+
+def _v26_storage_tem_espaco(pasta: Path, minimo_livre_mb: int = 384) -> bool:
+    try:
+        import shutil
+        alvo = Path(pasta)
+        alvo.mkdir(parents=True, exist_ok=True)
+        uso = shutil.disk_usage(str(alvo))
+        return uso.free >= int(minimo_livre_mb) * 1024 * 1024
+    except Exception:
+        return True
+
+def _v26_limpar_cache_midias(limite_mb: int = 1200) -> int:
+    """Remove somente mídias antigas geradas pela Central, nunca JSONs ou banco."""
+    pastas = [
+        globals().get('CENTRAL_BO_MEDIA_DIR'),
+        globals().get('CENTRAL_PERICIAS_MEDIA_DIR'),
+        globals().get('CENTRAL_DOSSIES_PREVIEW_DIR'),
+        globals().get('BOLETIM_ARQUIVOS_DIR'),
+    ]
+    arquivos = []
+    total = 0
+    for pasta in pastas:
+        if not pasta:
+            continue
+        p = Path(pasta)
+        if not p.exists():
+            continue
+        for arq in p.rglob('*'):
+            try:
+                if arq.is_file():
+                    st = arq.stat(); total += st.st_size; arquivos.append((st.st_mtime, st.st_size, arq))
+            except Exception:
+                pass
+    limite = max(128, int(os.getenv('DICOR_MEDIA_CACHE_MAX_MB', str(limite_mb)) or limite_mb)) * 1024 * 1024
+    removidos = 0
+    if total <= limite:
+        return removidos
+    for _, tamanho, arq in sorted(arquivos):
+        if total <= limite:
+            break
+        try:
+            arq.unlink(); total -= tamanho; removidos += 1
+        except Exception:
+            pass
+    return removidos
+
 async def baixar_anexo_persistente(anexo: discord.Attachment, pasta: Path, prefixo: str) -> Optional[Path]:
+    global _V26_STORAGE_ALERTADO
+    pasta = Path(pasta)
+    try:
+        _v26_limpar_cache_midias()
+    except Exception:
+        pass
+    if not _v26_storage_tem_espaco(pasta):
+        if not _V26_STORAGE_ALERTADO:
+            _V26_STORAGE_ALERTADO = True
+            try:
+                await enviar_log('⚠️ Sincronização de mídias pausada: armazenamento quase cheio. O bot continuará funcionando sem repetir centenas de erros. Libere espaço no Volume do Railway ou aumente `DICOR_MEDIA_CACHE_MAX_MB`.')
+            except Exception:
+                pass
+        return None
     """Baixa um anexo e confirma que bytes reais foram gravados no volume.
 
     A ordem de tentativa é: leitura pelo cache do Discord, leitura pela URL
@@ -10724,10 +10789,15 @@ async def baixar_anexo_persistente(anexo: discord.Attachment, pasta: Path, prefi
     except Exception:
         pass
 
-    await enviar_log(
-        f"⚠️ Falha ao baixar anexo `{getattr(anexo, 'filename', 'arquivo')}` "
-        f"(`{getattr(anexo, 'id', 'sem-id')}`): {ultimo_erro or 'arquivo sem dados'}"
-    )
+    if 'No space left on device' in str(ultimo_erro) or 'Errno 28' in str(ultimo_erro):
+        if not _V26_STORAGE_ALERTADO:
+            _V26_STORAGE_ALERTADO = True
+            await enviar_log('⚠️ Armazenamento do Railway cheio. Downloads de anexos foram pausados para impedir spam e travamentos. O bot continuará online.')
+    else:
+        await enviar_log(
+            f"⚠️ Falha ao baixar anexo `{getattr(anexo, 'filename', 'arquivo')}` "
+            f"(`{getattr(anexo, 'id', 'sem-id')}`): {ultimo_erro or 'arquivo sem dados'}"
+        )
     return None
 
 async def arquivos_para_reenvio_de_mensagens(mensagens: List[discord.Message], pasta: Path, prefixo: str) -> List[Path]:
@@ -53224,11 +53294,9 @@ async def _v24_ia_chat_canal(message:discord.Message):
 print('✅ V24 carregada: layout clássico com brasão, dados adicionais internos, perícias sem URLs brutas e IA pelo chat com acesso solicitante + Inspetor+.',flush=True)
 
 
-if __name__ == '__main__':
-    asyncio.run(main())
 
 # =====================================================
-# V25 — CORREÇÃO DA CENTRAL DE FICHAS + PORTAL CLÁSSICO
+# V26 — CENTRAL DE FICHAS + PORTAL CLÁSSICO + ROTAS ANTES DO START
 # =====================================================
 
 def _v25_escape(v):
@@ -53280,4 +53348,17 @@ async def central_portal_http(request:web.Request)->web.Response:
     css='''*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -18%,#6f56152f,transparent 38%),#070806;color:#f7f1db;font-family:Inter,Arial;min-height:100vh}header{height:110px;border-bottom:1px solid #4b3b1c;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07ef}.brand{grid-column:2;display:flex;align-items:center;gap:16px}.seal{width:76px;height:76px;border-radius:17px;border:1px solid #8b712d;background:#080906;display:grid;place-items:center}.seal img{width:100%;height:100%;object-fit:contain;padding:5px}.brand h1{font-size:19px;letter-spacing:2.2px;margin:0}.brand small{display:block;color:#d7a93d;margin-top:4px}.status{justify-self:end;color:#89836f;font-size:10px}.wrap{max-width:1280px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:38px;align-items:center;margin-bottom:58px}.eyebrow,.section-title{font-size:11px;letter-spacing:2px;color:#d7a93d;margin-bottom:15px}.hero h2{font-family:Georgia,serif;font-size:54px;line-height:1.04;margin:0 0 18px}.hero h2 span{color:#f0d276}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.hero-mark{height:290px;border:1px solid #493b1d;border-radius:29px;background:linear-gradient(145deg,#17190f,#0a0c08);display:grid;place-items:center}.hero-mark img{width:195px;height:195px;object-fit:contain}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{min-height:225px;padding:27px;border:1px solid #302919;border-radius:19px;background:linear-gradient(155deg,#15170f,#0b0d09);position:relative}.card h3{margin:20px 0 9px}.card p{color:#9d9783;line-height:1.55;min-height:52px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,#f0d276,#d7a93d);padding:11px 15px;border-radius:9px;font-weight:900}.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}footer{text-align:center;color:#625f52;font-size:11px;padding:48px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.grid{grid-template-columns:1fr 1fr}.status{display:none}}@media(max-width:620px){.grid{grid-template-columns:1fr}.hero h2{font-size:39px}}'''
     return web.Response(text=f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>{css}</style></head><body><header><div></div><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main class="wrap"><section class="hero"><div><div class="eyebrow">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Consulta pública de procurados e acesso integrado às ferramentas internas de fichas, vínculos, boletins, perícias e dossiês.</p></div><div class="hero-mark"><img src="/central/brasao-dicor.png"></div></section><div class="section-title">MÓDULOS DISPONÍVEIS</div><section class="grid">{cards}</section></main><footer>DICOR • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>''', content_type='text/html', charset='utf-8')
 
-print('✅ V25 carregada: Central de Fichas corrigida e portal clássico restaurado.', flush=True)
+print('✅ V26 carregada antes do start: fichas, portal clássico e rotas corrigidas; proteção de armazenamento ativa.', flush=True)
+
+
+@bot.listen('on_ready')
+async def _v26_limpeza_inicial_storage():
+    try:
+        removidos = await asyncio.to_thread(_v26_limpar_cache_midias)
+        if removidos:
+            print(f'✅ V26 armazenamento: {removidos} mídia(s) antigas removidas do cache.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V26 limpeza de cache: {type(erro).__name__}: {erro}', flush=True)
+
+if __name__ == '__main__':
+    asyncio.run(main())
