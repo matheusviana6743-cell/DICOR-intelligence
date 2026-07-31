@@ -53441,5 +53441,97 @@ async def _v26_limpeza_inicial_storage():
     except Exception as erro:
         print(f'⚠️ V26 limpeza de cache: {type(erro).__name__}: {erro}', flush=True)
 
+
+
+# =====================================================
+# V28 — CENTRAL DE BOLETINS COM BUSCA E LAYOUT DE PERÍCIA
+# =====================================================
+
+def _v28_limpar_markdown_bo(texto: str) -> str:
+    texto = str(texto or '').replace('\r\n', '\n')
+    texto = re.sub(r'(?m)^\s*[•·]\s*$', '', texto)
+    texto = re.sub(r'https?://(?:cdn\.|media\.)?discord(?:app)?\.com/attachments/\S+', '', texto, flags=re.I)
+    texto = re.sub(r'\n{3,}', '\n\n', texto).strip()
+    return texto
+
+
+def _v19_boletins_html() -> str:
+    payload = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    registros = payload.get('boletins', []) if isinstance(payload, dict) else []
+    abertos, concluidos = [], []
+
+    for idx, bo in enumerate(registros):
+        if not isinstance(bo, dict):
+            continue
+        numero = str(bo.get('numero') or 'Sem número')
+        status = str(bo.get('status') or 'EM ABERTO')
+        texto_original = _v28_limpar_markdown_bo(bo.get('texto') or 'Conteúdo não informado.')
+        corpo = html.escape(texto_original).replace('\n', '<br>')
+        busca = html.escape(f"{numero} {status} {texto_original}".lower(), quote=True)
+
+        urls=[]
+        for item in bo.get('midias', []) or []:
+            u=_v21_midia_url(item)
+            if u and u not in urls:
+                urls.append(u)
+
+        imagens=[]
+        arquivos=[]
+        for u in urls:
+            ext=u.split('?')[0].lower()
+            safe=html.escape(u, quote=True)
+            if ext.endswith(('.png','.jpg','.jpeg','.webp','.gif','.bmp')) or u.startswith('http'):
+                imagens.append(f'<button class="photo" type="button" onclick="openPhoto(\'{safe}\')"><img src="{safe}" loading="lazy" alt="Prova do {html.escape(numero)}"></button>')
+            else:
+                arquivos.append(f'<a class="file" href="{safe}" target="_blank" rel="noopener">📎 Abrir anexo</a>')
+
+        media = f'<div class="media">{"".join(imagens)}</div>' if imagens else '<p class="muted empty">Nenhuma foto anexada ao boletim.</p>'
+        files = f'<div class="files">{"".join(arquivos)}</div>' if arquivos else ''
+        card_id=f'bo-{idx}'
+        card=f'''<article class="bo" data-search="{busca}">
+          <div class="head"><div><small>BOLETIM</small><h2>{html.escape(numero)}</h2></div><span>{html.escape(status)}</span></div>
+          <div id="{card_id}" class="texto collapsed">{corpo}</div>
+          <button class="expand" type="button" onclick="toggleBo('{card_id}',this)">Ver boletim completo</button>
+          {media}{files}
+          <p class="source">Fonte: canal oficial de boletins • consulta somente leitura.</p>
+        </article>'''
+        (concluidos if _v19_status_bo_final(status) else abertos).append(card)
+
+    css='''
+    :root{--gold:#d9ad3f;--gold2:#f4dc83;--bg:#060704;--panel:#10120d;--line:#423719;--muted:#aaa28b}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 50% -10%,#6b53152d,transparent 35%),var(--bg);color:#f7f1dc;font-family:Inter,Arial,sans-serif}
+    .top{height:108px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw;background:#080906ee;position:sticky;top:0;z-index:20;backdrop-filter:blur(14px)}
+    .brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:72px;height:72px;object-fit:contain}.brand h1{margin:0;font-size:18px;letter-spacing:2px}.brand small,.ey{color:var(--gold);letter-spacing:1.4px}.nav{justify-self:end}.nav a{color:var(--gold2);text-decoration:none;margin-left:15px}
+    .wrap{max-width:1420px;margin:0 auto;padding:42px 22px 70px}.hero{text-align:center}.hero h2{font-family:Georgia,serif;font-size:42px;margin:8px}.hero p{color:var(--muted)}
+    .toolbar{max-width:940px;margin:27px auto 18px;display:grid;grid-template-columns:1fr auto;gap:10px}.search{width:100%;padding:15px 17px;border-radius:12px;border:1px solid #5b4820;background:#0c0e09;color:#fff;font-size:15px;outline:none}.search:focus{border-color:var(--gold)}.count{display:grid;place-items:center;min-width:120px;border:1px solid var(--line);border-radius:12px;color:var(--gold2);font-weight:800;background:#0d0f0a}
+    .tabs{display:flex;justify-content:center;gap:10px;margin:18px 0 28px}.tabs button{background:#11130e;color:#eee4c8;border:1px solid var(--line);border-radius:10px;padding:11px 17px;font-weight:900;cursor:pointer}.tabs button.active{background:linear-gradient(135deg,#785907,var(--gold));color:#080906}
+    .panel{display:none}.panel.active{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.bo{background:linear-gradient(145deg,#12140f,#0c0e0a);border:1px solid var(--line);border-radius:18px;padding:23px;box-shadow:0 18px 45px #0005;align-self:start}.bo.hidden{display:none}.head{display:flex;justify-content:space-between;gap:15px;border-bottom:1px solid #3b321c;padding-bottom:13px}.head small{color:#d5cba9;letter-spacing:1px}.head h2{margin:5px 0 0;color:var(--gold2);font-family:Georgia,serif}.head span{border:1px solid #6c5825;border-radius:99px;padding:7px 11px;height:max-content;color:#ead27b;white-space:nowrap}
+    .texto{color:#ddd6c2;line-height:1.62;padding-top:16px;white-space:normal;word-break:break-word;position:relative}.texto.collapsed{max-height:285px;overflow:hidden}.texto.collapsed:after{content:'';position:absolute;left:0;right:0;bottom:0;height:80px;background:linear-gradient(transparent,#10120d)}.expand{margin:13px 0 2px;background:transparent;color:var(--gold2);border:1px solid #5a4922;border-radius:9px;padding:9px 12px;font-weight:800;cursor:pointer}.expand:hover{background:#1a170d}
+    .media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:15px}.photo{padding:0;border:1px solid #4b3d1d;border-radius:11px;overflow:hidden;background:#050604;cursor:zoom-in}.photo img{display:block;width:100%;height:210px;object-fit:contain}.files{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.file{color:var(--gold2);border:1px solid var(--line);padding:8px 10px;border-radius:8px;text-decoration:none}.muted,.source{color:var(--muted);font-size:13px}.empty{margin-top:17px}.source{border-top:1px dashed #302a19;padding-top:12px;margin-bottom:0}
+    .no-results{display:none;text-align:center;color:var(--muted);padding:45px}.viewer{display:none;position:fixed;inset:0;background:#000e;z-index:60;align-items:center;justify-content:center;padding:28px}.viewer.open{display:flex}.viewer img{max-width:95vw;max-height:90vh;object-fit:contain;border:1px solid #7a642d;border-radius:14px;background:#050604}.viewer button{position:absolute;top:22px;right:26px;width:42px;height:42px;border-radius:50%;border:0;background:var(--gold);font-size:23px;cursor:pointer}
+    @media(max-width:900px){.panel.active{grid-template-columns:1fr}.nav{display:none}.top{grid-template-columns:1fr}.brand{grid-column:1}.toolbar{grid-template-columns:1fr}.count{min-height:44px}.media{grid-template-columns:1fr}}
+    '''
+    body_open=''.join(abertos) or '<p class="muted">Nenhum boletim em aberto.</p>'
+    body_done=''.join(concluidos) or '<p class="muted">Nenhum boletim concluído.</p>'
+    js='''
+    const q=document.getElementById('q'), counter=document.getElementById('counter');
+    function tab(id,b){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');b.classList.add('active');filterCards()}
+    function filterCards(){const term=(q.value||'').trim().toLowerCase();let visible=0;document.querySelectorAll('.panel.active .bo').forEach(card=>{const ok=!term||card.dataset.search.includes(term);card.classList.toggle('hidden',!ok);if(ok)visible++});counter.textContent=visible+' resultado'+(visible===1?'':'s');document.getElementById('none').style.display=visible?'none':'block'}
+    function toggleBo(id,b){const el=document.getElementById(id);const closed=el.classList.toggle('collapsed');b.textContent=closed?'Ver boletim completo':'Recolher boletim'}
+    function openPhoto(url){const v=document.getElementById('viewer');document.getElementById('viewerImg').src=url;v.classList.add('open')}
+    function closePhoto(){document.getElementById('viewer').classList.remove('open');document.getElementById('viewerImg').src=''}
+    q.addEventListener('input',filterCards);document.getElementById('viewer').addEventListener('click',e=>{if(e.target.id==='viewer')closePhoto()});filterCards();
+    '''
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Boletins • Central DICOR</title><style>{css}</style></head><body>
+    <header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>DICOR • CENTRAL DE BOLETINS</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/fichas">Fichas</a><a href="/arvore">Vínculos</a></nav></header>
+    <main class="wrap"><section class="hero"><div class="ey">PLATAFORMA OPERACIONAL</div><h2>Boletins de Ocorrência</h2><p>Pesquise por número do B.O., nome, RG, placa, local, crime ou qualquer informação presente no relatório.</p></section>
+    <div class="toolbar"><input id="q" class="search" placeholder="Pesquisar: BO-DICOR-001, placa, RG, nome, local..."><div id="counter" class="count">0 resultados</div></div>
+    <div class="tabs"><button class="active" onclick="tab('open',this)">EM ABERTO ({len(abertos)})</button><button onclick="tab('done',this)">CONCLUÍDOS ({len(concluidos)})</button></div>
+    <section id="open" class="panel active">{body_open}</section><section id="done" class="panel">{body_done}</section><div id="none" class="no-results">Nenhum boletim encontrado com essa pesquisa.</div></main>
+    <div id="viewer" class="viewer"><button onclick="closePhoto()">×</button><img id="viewerImg" alt="Prova ampliada"></div><script>{js}</script></body></html>'''
+
+print('✅ V28 carregada: Central de Boletins com busca por número, RG, placa, nome e layout compacto inspirado nas perícias.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
