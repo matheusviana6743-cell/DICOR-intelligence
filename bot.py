@@ -53533,5 +53533,176 @@ def _v19_boletins_html() -> str:
 print('✅ V28 carregada: Central de Boletins com busca por número, RG, placa, nome e layout compacto inspirado nas perícias.', flush=True)
 
 
+# =====================================================
+# V29 — OVERLAY PRIVADO PARA OBS + SINCRONIZAÇÃO FIVEM
+# Rota propositalmente não exibida no portal da Central.
+# =====================================================
+
+LIVE_OVERLAY_PATH = '/' + os.getenv('LIVE_OVERLAY_PATH', 'ops/live-dicor-7f3a').strip().strip('/')
+LIVE_OVERLAY_API_PATH = '/' + os.getenv('LIVE_OVERLAY_API_PATH', 'api/ops/live-dicor').strip().strip('/')
+LIVE_OVERLAY_STATE_PATH = '/' + os.getenv('LIVE_OVERLAY_STATE_PATH', 'api/ops/live-dicor-state').strip().strip('/')
+LIVE_OVERLAY_TOKEN = os.getenv('LIVE_OVERLAY_TOKEN', '').strip()
+LIVE_OVERLAY_VIEW_TOKEN = os.getenv('LIVE_OVERLAY_VIEW_TOKEN', '').strip()
+LIVE_OVERLAY_TIMEOUT_SECONDS = max(5, min(300, int(os.getenv('LIVE_OVERLAY_TIMEOUT_SECONDS', '45') or 45)))
+LIVE_OVERLAY_LOCK = asyncio.Lock()
+LIVE_OVERLAY_STATE = {
+    'visible': False, 'tipo': 'ficha', 'titulo': 'Consulta operacional',
+    'nome': '', 'rg': '', 'status': '', 'organizacao': '',
+    'boletins': 0, 'pericias': 0, 'veiculos': 0,
+    'foto': '', 'mensagem': '', 'updated_at': 0.0,
+    'expires_at': 0.0, 'revision': 0,
+}
+
+
+def _v29_texto(valor, limite=120):
+    texto = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(valor or '')).strip()
+    return texto[:limite]
+
+
+def _v29_int(valor, minimo=0, maximo=9999):
+    try:
+        return max(minimo, min(maximo, int(valor or 0)))
+    except Exception:
+        return minimo
+
+
+def _v29_bearer_valido(request: web.Request) -> bool:
+    if not LIVE_OVERLAY_TOKEN:
+        return False
+    recebido = str(request.headers.get('Authorization') or '')
+    esperado = f'Bearer {LIVE_OVERLAY_TOKEN}'
+    return hmac.compare_digest(recebido.encode(), esperado.encode())
+
+
+def _v29_view_valida(request: web.Request) -> bool:
+    if not LIVE_OVERLAY_VIEW_TOKEN:
+        return False
+    recebido = str(request.query.get('key') or request.headers.get('X-Overlay-Key') or '')
+    return hmac.compare_digest(recebido.encode(), LIVE_OVERLAY_VIEW_TOKEN.encode())
+
+
+async def live_overlay_update_http(request: web.Request) -> web.Response:
+    if not _v29_bearer_valido(request):
+        return web.json_response({'ok': False, 'erro': 'Token inválido.'}, status=401)
+    try:
+        dados = await request.json()
+    except Exception:
+        return web.json_response({'ok': False, 'erro': 'JSON inválido.'}, status=400)
+    if not isinstance(dados, dict):
+        return web.json_response({'ok': False, 'erro': 'Payload inválido.'}, status=400)
+
+    agora = time.time()
+    acao = _v29_texto(dados.get('acao') or ('abrir' if dados.get('visible', True) else 'fechar'), 20).lower()
+    async with LIVE_OVERLAY_LOCK:
+        if acao in {'fechar', 'close', 'hide', 'ocultar'}:
+            LIVE_OVERLAY_STATE['visible'] = False
+            LIVE_OVERLAY_STATE['expires_at'] = 0.0
+        else:
+            LIVE_OVERLAY_STATE.update({
+                'visible': True,
+                'tipo': _v29_texto(dados.get('tipo') or 'ficha', 32),
+                'titulo': _v29_texto(dados.get('titulo') or 'Consulta operacional', 80),
+                'nome': _v29_texto(dados.get('nome'), 90),
+                'rg': _v29_texto(dados.get('rg'), 30),
+                'status': _v29_texto(dados.get('status'), 40),
+                'organizacao': _v29_texto(dados.get('organizacao'), 70),
+                'boletins': _v29_int(dados.get('boletins')),
+                'pericias': _v29_int(dados.get('pericias')),
+                'veiculos': _v29_int(dados.get('veiculos')),
+                'foto': _v29_texto(dados.get('foto'), 500),
+                'mensagem': _v29_texto(dados.get('mensagem'), 180),
+                'expires_at': agora + LIVE_OVERLAY_TIMEOUT_SECONDS,
+            })
+        LIVE_OVERLAY_STATE['updated_at'] = agora
+        LIVE_OVERLAY_STATE['revision'] = int(LIVE_OVERLAY_STATE.get('revision') or 0) + 1
+        resposta = dict(LIVE_OVERLAY_STATE)
+    return web.json_response({'ok': True, 'state': resposta}, headers={'Cache-Control': 'no-store'})
+
+
+async def live_overlay_state_http(request: web.Request) -> web.Response:
+    if not _v29_view_valida(request):
+        return web.json_response({'ok': False, 'erro': 'Visualização não autorizada.'}, status=401)
+    async with LIVE_OVERLAY_LOCK:
+        if LIVE_OVERLAY_STATE.get('visible') and float(LIVE_OVERLAY_STATE.get('expires_at') or 0) and time.time() >= float(LIVE_OVERLAY_STATE['expires_at']):
+            LIVE_OVERLAY_STATE['visible'] = False
+            LIVE_OVERLAY_STATE['revision'] = int(LIVE_OVERLAY_STATE.get('revision') or 0) + 1
+        estado = dict(LIVE_OVERLAY_STATE)
+    return web.json_response(estado, headers={'Cache-Control': 'no-store, no-cache, must-revalidate'})
+
+
+_V29_OVERLAY_HTML = r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DICOR Live</title><style>
+:root{--gold:#dcb64d;--gold2:#fff0aa;--panel:rgba(9,11,8,.94);--line:rgba(220,182,77,.58)}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:transparent;font-family:Inter,Arial,sans-serif}body{pointer-events:none}
+.overlay{position:absolute;right:55px;bottom:55px;width:510px;opacity:0;transform:translateX(70px) scale(.97);filter:blur(3px);transition:opacity .32s ease,transform .42s cubic-bezier(.2,.8,.2,1),filter .32s ease}.overlay.show{opacity:1;transform:translateX(0) scale(1);filter:blur(0)}
+.card{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,rgba(18,21,15,.97),var(--panel));box-shadow:0 24px 70px rgba(0,0,0,.62),inset 0 1px rgba(255,255,255,.04)}.card:before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 90% 0,rgba(220,182,77,.17),transparent 34%);pointer-events:none}.bar{height:4px;background:linear-gradient(90deg,#71530b,var(--gold2),#71530b)}
+.head{display:flex;align-items:center;gap:14px;padding:18px 21px 13px;border-bottom:1px solid rgba(220,182,77,.22)}.seal{width:58px;height:58px;object-fit:contain;filter:drop-shadow(0 7px 16px #000)}.ey{color:var(--gold);font-size:10px;font-weight:900;letter-spacing:2.2px}h1{margin:5px 0 0;color:#fff8dd;font-family:Georgia,serif;font-size:22px;line-height:1.1}.live{margin-left:auto;border:1px solid rgba(220,182,77,.42);border-radius:999px;padding:6px 9px;color:var(--gold2);font-size:9px;font-weight:900;letter-spacing:1px}
+.content{display:grid;grid-template-columns:110px 1fr;gap:18px;padding:18px 21px 20px}.photo{width:110px;height:135px;border:1px solid rgba(220,182,77,.34);border-radius:13px;background:#050604;overflow:hidden;display:grid;place-items:center}.photo img{width:100%;height:100%;object-fit:cover;display:none}.photo span{font-size:9px;color:#82795f;text-align:center;padding:8px}.name{color:#fff7da;font-size:24px;font-weight:900;line-height:1.1;margin-bottom:8px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}.item small{display:block;color:#948c76;font-size:9px;letter-spacing:1px}.item b{display:block;color:#eee6cf;font-size:13px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stats{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:7px}.stat{border:1px solid rgba(220,182,77,.2);background:rgba(0,0,0,.18);border-radius:10px;padding:8px;text-align:center}.stat strong{display:block;color:var(--gold2);font-size:17px}.stat span{color:#9f9781;font-size:8px;letter-spacing:.8px}.msg{grid-column:1/-1;color:#c9c1ac;font-size:11px;line-height:1.45;border-top:1px dashed rgba(220,182,77,.2);padding-top:10px;display:none}.msg.on{display:block}.privacy{position:absolute;right:17px;bottom:10px;color:rgba(220,182,77,.34);font-size:7px;letter-spacing:1px}
+</style></head><body><section id="overlay" class="overlay"><div class="card"><div class="bar"></div><header class="head"><img class="seal" src="/central/brasao-dicor.png"><div><div class="ey">DICOR • CENTRAL DE INTELIGÊNCIA</div><h1 id="title">Consulta operacional</h1></div><div class="live">PAINEL RP</div></header><div class="content"><div class="photo"><img id="photo"><span id="photoFallback">REGISTRO<br>OPERACIONAL</span></div><div><div id="name" class="name">—</div><div class="meta"><div class="item"><small>RG</small><b id="rg">—</b></div><div class="item"><small>STATUS</small><b id="status">—</b></div><div class="item" style="grid-column:1/-1"><small>ORGANIZAÇÃO</small><b id="org">—</b></div><div class="stats"><div class="stat"><strong id="bos">0</strong><span>BOLETINS</span></div><div class="stat"><strong id="pers">0</strong><span>PERÍCIAS</span></div><div class="stat"><strong id="cars">0</strong><span>VEÍCULOS</span></div></div><div id="msg" class="msg"></div></div></div><div class="privacy">EXIBIÇÃO CONTROLADA • DADOS DO RP</div></div></section><script>
+const key=__VIEW_KEY__,statePath=__STATE_PATH__;let revision=-1,failures=0;const el=id=>document.getElementById(id),overlay=el('overlay');function val(v,f='—'){return(v===undefined||v===null||String(v).trim()==='')?f:String(v)}function render(d){if(Number(d.revision||0)===revision)return;revision=Number(d.revision||0);el('title').textContent=val(d.titulo,'Consulta operacional');el('name').textContent=val(d.nome,'Registro consultado');el('rg').textContent=val(d.rg);el('status').textContent=val(d.status,'Em análise');el('org').textContent=val(d.organizacao,'Não informada');el('bos').textContent=Number(d.boletins||0);el('pers').textContent=Number(d.pericias||0);el('cars').textContent=Number(d.veiculos||0);const msg=el('msg');msg.textContent=val(d.mensagem,'');msg.classList.toggle('on',!!String(d.mensagem||'').trim());const img=el('photo'),fb=el('photoFallback');if(String(d.foto||'').startsWith('http')){img.src=d.foto;img.style.display='block';fb.style.display='none'}else{img.removeAttribute('src');img.style.display='none';fb.style.display='block'}overlay.classList.toggle('show',!!d.visible)}async function sync(){try{const r=await fetch(statePath+'?key='+encodeURIComponent(key)+'&_='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);render(await r.json());failures=0}catch(e){failures++;if(failures>8)overlay.classList.remove('show')}}sync();setInterval(sync,500);
+</script></body></html>'''
+
+
+def _v29_overlay_html(chave: str) -> str:
+    return (_V29_OVERLAY_HTML
+            .replace('__VIEW_KEY__', json.dumps(chave))
+            .replace('__STATE_PATH__', json.dumps(LIVE_OVERLAY_STATE_PATH)))
+
+
+async def live_overlay_page_http(request: web.Request) -> web.Response:
+    if not _v29_view_valida(request):
+        raise web.HTTPNotFound(text='Página não encontrada.')
+    return web.Response(text=_v29_overlay_html(str(request.query.get('key') or '')), content_type='text/html', charset='utf-8', headers={'Cache-Control': 'no-store'})
+
+
+@web.middleware
+async def central_auth_middleware(request: web.Request, handler):
+    caminho = request.path
+    overlay_publico = caminho in {LIVE_OVERLAY_PATH, LIVE_OVERLAY_API_PATH, LIVE_OVERLAY_STATE_PATH}
+    publicos = (caminho == '/' or caminho == '/index.html' or caminho.startswith('/catalogo') or caminho.startswith('/uploads/') or caminho.startswith('/central/') or caminho in {'/acesso', '/sair', '/health', '/healthz'} or overlay_publico)
+    if publicos or _central_token_valido(request):
+        return await handler(request)
+    if caminho.startswith('/api/'):
+        return web.json_response({'ok': False, 'erro': 'Acesso restrito. Autorize este dispositivo.'}, status=401)
+    destino = quote(str(request.rel_url), safe='/?=&')
+    raise web.HTTPFound(f'/acesso?next={destino}')
+
+
+async def start_web_server():
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+    if _WEB_RUNNER_DICOR is not None:
+        return
+    for pasta in (DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, DOSSIES_DIR, PUBLIC_BACKUPS_DIR, CENTRAL_BO_MEDIA_DIR, CENTRAL_PERICIAS_MEDIA_DIR, CENTRAL_DOSSIES_PREVIEW_DIR):
+        Path(pasta).mkdir(parents=True, exist_ok=True)
+    app = web.Application(client_max_size=100 * 1024 * 1024, middlewares=[central_auth_middleware])
+    app.router.add_get('/', central_portal_http); app.router.add_get('/index.html', central_portal_http)
+    app.router.add_get('/central/brasao-dicor.png', central_brasao_dicor_http)
+    app.router.add_get('/acesso', central_login_get); app.router.add_post('/acesso', central_login_post); app.router.add_get('/sair', central_logout_http)
+    app.router.add_get('/catalogo', pagina_inicial); app.router.add_get('/catalogo.html', pagina_inicial)
+    app.router.add_get('/arvore', arvore_pagina_http); app.router.add_get('/arvore.html', arvore_pagina_http); app.router.add_get('/api/arvore/{individuo_id}', arvore_api_http)
+    app.router.add_get('/fichas', central_fichas_http)
+    app.router.add_get('/boletins', central_boletins_http); app.router.add_get('/boletins.html', central_boletins_http)
+    app.router.add_get('/pericias', central_pericias_http); app.router.add_get('/pericias.html', central_pericias_http)
+    app.router.add_get('/dossies-central', central_dossies_http)
+    app.router.add_get(LIVE_OVERLAY_PATH, live_overlay_page_http)
+    app.router.add_get(LIVE_OVERLAY_STATE_PATH, live_overlay_state_http)
+    app.router.add_post(LIVE_OVERLAY_API_PATH, live_overlay_update_http)
+    app.router.add_get('/health', healthcheck_http); app.router.add_get('/healthz', healthcheck_http)
+    app.router.add_get('/dossies/{caminho:.+}', baixar_dossie_http); app.router.add_get('/backups/{caminho:.+}', baixar_backup_http)
+    app.router.add_post('/api/catalogo/apagar', api_apagar_procurado)
+    app.router.add_static('/uploads/', path=str(UPLOADS_DIR), show_index=False)
+    app.router.add_static('/central-bo-media/', path=str(CENTRAL_BO_MEDIA_DIR), show_index=False)
+    app.router.add_static('/central-pericias-media/', path=str(CENTRAL_PERICIAS_MEDIA_DIR), show_index=False)
+    app.router.add_static('/central-dossies-preview/', path=str(CENTRAL_DOSSIES_PREVIEW_DIR), show_index=False)
+    porta = int(os.getenv('PORT', str(PORT)) or PORT)
+    runner = web.AppRunner(app, access_log=None); await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=porta); await site.start()
+    _WEB_RUNNER_DICOR = runner; _WEB_SITE_DICOR = site
+    asyncio.create_task(asyncio.to_thread(gerar_catalogo_html))
+    estado = 'CONFIGURADO' if LIVE_OVERLAY_TOKEN and LIVE_OVERLAY_VIEW_TOKEN else 'AGUARDANDO TOKENS'
+    print(f'✅ V29 Central + overlay OBS ativo ({estado}) | rota privada não exibida no portal.', flush=True)
+
+
+print('✅ V29 carregada: overlay OBS/FiveM automático, privado, temporário e não listado na Central.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
