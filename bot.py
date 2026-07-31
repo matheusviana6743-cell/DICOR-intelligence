@@ -318,6 +318,61 @@ for pasta in [DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, BACKUP_DIR, PUBLIC_BACKUPS_DIR,
     pasta.mkdir(exist_ok=True, parents=True)
 
 # =====================================================
+# V27 — LIMPEZA DE EMERGÊNCIA ANTES DE ABRIR O SQLITE
+# Executa ainda durante a importação, antes dos painéis e da Central acessarem o banco.
+# Remove SOMENTE cópias de mídia/cache recriáveis; nunca JSONs, SQLite, dossiês ou backups.
+# =====================================================
+def _v27_liberar_espaco_antes_do_banco(minimo_livre_mb: int = 768, alvo_livre_mb: int = 1280) -> int:
+    try:
+        import shutil as _v27_shutil
+        base = Path(DATA_DIR)
+        uso = _v27_shutil.disk_usage(str(base))
+        if uso.free >= minimo_livre_mb * 1024 * 1024:
+            return 0
+        nomes_cache = {
+            "central_boletins_media", "central_pericias_media", "central_dossies_preview",
+            "catalogo_cache", "ocr_cache", "temp", "tmp", "cache"
+        }
+        pastas = []
+        for raiz in (Path(DATA_DIR), Path(PUBLIC_DIR)):
+            if not raiz.exists():
+                continue
+            for p in raiz.rglob('*'):
+                try:
+                    if p.is_dir() and (p.name.lower() in nomes_cache or p.name.lower().endswith('_cache')):
+                        pastas.append(p)
+                except Exception:
+                    pass
+        arquivos = []
+        for pasta in pastas:
+            for arq in pasta.rglob('*'):
+                try:
+                    if arq.is_file():
+                        st = arq.stat()
+                        arquivos.append((st.st_mtime, st.st_size, arq))
+                except Exception:
+                    pass
+        removidos = 0
+        for _, _, arq in sorted(arquivos):
+            try:
+                arq.unlink(missing_ok=True)
+                removidos += 1
+            except Exception:
+                continue
+            try:
+                if _v27_shutil.disk_usage(str(base)).free >= alvo_livre_mb * 1024 * 1024:
+                    break
+            except Exception:
+                break
+        print(f"✅ V27 pré-limpeza: {removidos} arquivo(s) de cache removido(s) antes do banco.", flush=True)
+        return removidos
+    except Exception as erro:
+        print(f"⚠️ V27 pré-limpeza não executada: {type(erro).__name__}: {erro}", flush=True)
+        return 0
+
+_v27_liberar_espaco_antes_do_banco()
+
+# =====================================================
 # BOT
 # =====================================================
 
@@ -25770,15 +25825,38 @@ def _banco_limpar_texto(valor: Any, limite: int = 500) -> str:
 @contextmanager
 def _banco_conexao():
     BANCO_DADOS_SQLITE.parent.mkdir(parents=True, exist_ok=True)
+    # Tenta liberar cache antes de qualquer abertura do banco quando o volume estiver crítico.
+    try:
+        if not _v26_storage_tem_espaco(BANCO_DADOS_SQLITE.parent, minimo_livre_mb=128):
+            _v27_liberar_espaco_antes_do_banco(128, 512)
+    except Exception:
+        pass
     conexao = sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=30)
     conexao.row_factory = sqlite3.Row
     conexao.execute("PRAGMA foreign_keys = ON")
-    conexao.execute("PRAGMA journal_mode = WAL")
+    conexao.execute("PRAGMA busy_timeout = 30000")
+    conexao.execute("PRAGMA temp_store = MEMORY")
+    # WAL cria arquivos -wal/-shm e pode falhar em volume lotado. Usa DELETE como fallback seguro.
+    try:
+        conexao.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError as erro:
+        if "disk i/o" not in str(erro).lower() and "full" not in str(erro).lower():
+            conexao.close()
+            raise
+        try:
+            conexao.execute("PRAGMA journal_mode = DELETE")
+            conexao.execute("PRAGMA synchronous = NORMAL")
+        except Exception:
+            conexao.close()
+            raise
     try:
         yield conexao
         conexao.commit()
     except Exception:
-        conexao.rollback()
+        try:
+            conexao.rollback()
+        except Exception:
+            pass
         raise
     finally:
         conexao.close()
@@ -52295,10 +52373,8 @@ async def _v21_salvar_anexo_bo(anexo: discord.Attachment, numero: str) -> str:
         if salvo and Path(salvo).exists():
             caminho = Path(salvo)
         else:
-            try:
-                await anexo.save(str(caminho), use_cached=True)
-            except TypeError:
-                await anexo.save(str(caminho))
+            # Não tenta uma segunda gravação direta quando o protetor recusou por falta de espaço.
+            return ""
     return str(caminho) if caminho.exists() and caminho.stat().st_size > 0 else ""
 
 
@@ -52904,12 +52980,17 @@ def _v23_pericia_inicio(texto: str) -> bool:
 
 async def _v23_baixar_attachment(att: Any, prefixo: str) -> str:
     try:
-        nome=re.sub(r'[^A-Za-z0-9._-]+','_',str(getattr(att,'filename','arquivo')))[-150:]
-        destino=CENTRAL_PERICIAS_MEDIA_DIR / f"{prefixo}_{int(getattr(att,'id',0) or time.time()*1000)}_{nome}"
-        await att.save(destino)
-        return '/central-pericias-media/'+quote(destino.name)
-    except Exception:
-        traceback.print_exc(); return ''
+        if not _v26_storage_tem_espaco(CENTRAL_PERICIAS_MEDIA_DIR, minimo_livre_mb=256):
+            return ''
+        salvo = await baixar_anexo_persistente(att, CENTRAL_PERICIAS_MEDIA_DIR, prefixo)
+        if salvo and Path(salvo).exists():
+            return '/central-pericias-media/' + quote(Path(salvo).name)
+        return ''
+    except Exception as erro:
+        # Falha de mídia não derruba a página e não despeja traceback repetido no Railway.
+        if not isinstance(erro, OSError) or getattr(erro, 'errno', None) != 28:
+            print(f"⚠️ V27 perícia sem mídia: {type(erro).__name__}: {erro}", flush=True)
+        return ''
 
 
 async def _v23_sincronizar_pericias() -> Dict[str,int]:
@@ -53348,7 +53429,7 @@ async def central_portal_http(request:web.Request)->web.Response:
     css='''*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -18%,#6f56152f,transparent 38%),#070806;color:#f7f1db;font-family:Inter,Arial;min-height:100vh}header{height:110px;border-bottom:1px solid #4b3b1c;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07ef}.brand{grid-column:2;display:flex;align-items:center;gap:16px}.seal{width:76px;height:76px;border-radius:17px;border:1px solid #8b712d;background:#080906;display:grid;place-items:center}.seal img{width:100%;height:100%;object-fit:contain;padding:5px}.brand h1{font-size:19px;letter-spacing:2.2px;margin:0}.brand small{display:block;color:#d7a93d;margin-top:4px}.status{justify-self:end;color:#89836f;font-size:10px}.wrap{max-width:1280px;margin:0 auto;padding:64px 24px}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:38px;align-items:center;margin-bottom:58px}.eyebrow,.section-title{font-size:11px;letter-spacing:2px;color:#d7a93d;margin-bottom:15px}.hero h2{font-family:Georgia,serif;font-size:54px;line-height:1.04;margin:0 0 18px}.hero h2 span{color:#f0d276}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.hero-mark{height:290px;border:1px solid #493b1d;border-radius:29px;background:linear-gradient(145deg,#17190f,#0a0c08);display:grid;place-items:center}.hero-mark img{width:195px;height:195px;object-fit:contain}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{min-height:225px;padding:27px;border:1px solid #302919;border-radius:19px;background:linear-gradient(155deg,#15170f,#0b0d09);position:relative}.card h3{margin:20px 0 9px}.card p{color:#9d9783;line-height:1.55;min-height:52px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,#f0d276,#d7a93d);padding:11px 15px;border-radius:9px;font-weight:900}.private:after{content:'ACESSO RESTRITO';position:absolute;right:16px;top:16px;color:#bfa85d;font-size:9px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}footer{text-align:center;color:#625f52;font-size:11px;padding:48px}@media(max-width:900px){.hero{grid-template-columns:1fr}.hero-mark{display:none}.grid{grid-template-columns:1fr 1fr}.status{display:none}}@media(max-width:620px){.grid{grid-template-columns:1fr}.hero h2{font-size:39px}}'''
     return web.Response(text=f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>{css}</style></head><body><header><div></div><div class="brand"><div class="seal"><img src="/central/brasao-dicor.png"></div><div><h1>CENTRAL DICOR</h1><small>INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</small></div></div><div class="status">CAPITAL MORADA DO VALLEY • SISTEMA INTEGRADO</div></header><main class="wrap"><section class="hero"><div><div class="eyebrow">PLATAFORMA OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Consulta pública de procurados e acesso integrado às ferramentas internas de fichas, vínculos, boletins, perícias e dossiês.</p></div><div class="hero-mark"><img src="/central/brasao-dicor.png"></div></section><div class="section-title">MÓDULOS DISPONÍVEIS</div><section class="grid">{cards}</section></main><footer>DICOR • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>''', content_type='text/html', charset='utf-8')
 
-print('✅ V26 carregada antes do start: fichas, portal clássico e rotas corrigidas; proteção de armazenamento ativa.', flush=True)
+print('✅ V27 carregada: limpeza pré-SQLite, fallback de journal e downloads protegidos contra volume cheio.', flush=True)
 
 
 @bot.listen('on_ready')
