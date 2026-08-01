@@ -54473,51 +54473,226 @@ def _pf_rel_salvar(dados: Dict[str,Any], usuario_id: int) -> Dict[str,int]:
 
 
 class PFRelatorioPreviewView(View):
-    def __init__(self, autor_id:int, chave:str):
-        super().__init__(timeout=900); self.autor_id=int(autor_id); self.chave=chave; self.processando=False
+    def __init__(self, autor_id:int, chave:str, canal_temporario_id:int=0):
+        super().__init__(timeout=900)
+        self.autor_id=int(autor_id)
+        self.chave=chave
+        self.canal_temporario_id=int(canal_temporario_id or 0)
+        self.processando=False
+
     async def interaction_check(self,interaction):
-        if interaction.user.id==self.autor_id: return True
-        await interaction.response.send_message("❌ Esta importação pertence a outro agente.",ephemeral=True); return False
+        if interaction.user.id==self.autor_id:
+            return True
+        await interaction.response.send_message("❌ Esta importação pertence a outro agente.",ephemeral=True)
+        return False
+
+    async def _apagar_canal(self, interaction):
+        if not self.canal_temporario_id:
+            return
+        try:
+            canal=interaction.guild.get_channel(self.canal_temporario_id) if interaction.guild else None
+            if canal:
+                await canal.delete(reason="Importação de relatório finalizada")
+        except Exception:
+            pass
+
     @discord.ui.button(label="Confirmar importação",emoji="✅",style=discord.ButtonStyle.success)
     async def confirmar(self,interaction,button):
-        if self.processando: return await interaction.response.send_message("⏳ Importação em andamento.",ephemeral=True)
-        self.processando=True; await interaction.response.defer(ephemeral=True,thinking=True)
+        if self.processando:
+            return await interaction.response.send_message("⏳ Importação em andamento.",ephemeral=True)
+        self.processando=True
+        await interaction.response.defer(ephemeral=True,thinking=True)
         dados=_PF_RELATORIO_IMPORTACOES.get(self.chave)
-        if not dados: return await interaction.followup.send("❌ A prévia expirou.",ephemeral=True)
+        if not dados:
+            self.processando=False
+            return await interaction.followup.send("❌ A prévia expirou.",ephemeral=True)
         try:
             r=await asyncio.to_thread(_pf_rel_salvar,dados,int(interaction.user.id))
             _PF_RELATORIO_IMPORTACOES.pop(self.chave,None)
-            await interaction.edit_original_response(content=(f"✅ **Relatório importado.**\n• Fichas criadas: **{r['criadas']}**\n• Fichas atualizadas: **{r['atualizadas']}**\n• Veículos salvos: **{r['veiculos']}**\n• Vínculos registrados: **{r['vinculos']}**"),embed=None,view=None)
-            try: await _banco_prof_atualizar_painel()
-            except Exception: pass
+            await interaction.followup.send(
+                f"✅ **Relatório importado.**\n"
+                f"• Fichas criadas: **{r['criadas']}**\n"
+                f"• Fichas atualizadas: **{r['atualizadas']}**\n"
+                f"• Veículos salvos: **{r['veiculos']}**\n"
+                f"• Vínculos registrados: **{r['vinculos']}**",
+                ephemeral=True,
+            )
+            try:
+                await _banco_prof_atualizar_painel()
+            except Exception:
+                pass
+            await self._apagar_canal(interaction)
         except Exception as e:
-            self.processando=False; traceback.print_exc(); await interaction.followup.send(f"❌ Falha: `{type(e).__name__}: {e}`",ephemeral=True)
+            self.processando=False
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Falha: `{type(e).__name__}: {e}`",ephemeral=True)
+
     @discord.ui.button(label="Cancelar",emoji="✖️",style=discord.ButtonStyle.danger)
     async def cancelar(self,interaction,button):
-        _PF_RELATORIO_IMPORTACOES.pop(self.chave,None); await interaction.response.edit_message(content="✖️ Importação cancelada. Nenhum dado foi salvo.",embed=None,view=None)
+        _PF_RELATORIO_IMPORTACOES.pop(self.chave,None)
+        await interaction.response.send_message("✖️ Importação cancelada. Nenhum dado foi salvo.",ephemeral=True)
+        await self._apagar_canal(interaction)
+
+
+class PFRelatorioColetaView(View):
+    def __init__(self, autor_id:int, canal_id:int):
+        super().__init__(timeout=1200)
+        self.autor_id=int(autor_id)
+        self.canal_id=int(canal_id)
+        self.processando=False
+
+    async def interaction_check(self,interaction):
+        if interaction.user.id==self.autor_id:
+            return True
+        await interaction.response.send_message("❌ Esta sala pertence a outro agente.",ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Processar relatório",emoji="🔎",style=discord.ButtonStyle.success,row=0)
+    async def processar(self,interaction,button):
+        if self.processando:
+            return await interaction.response.send_message("⏳ O relatório já está sendo processado.",ephemeral=True)
+        self.processando=True
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        canal=interaction.guild.get_channel(self.canal_id) if interaction.guild else None
+        if not isinstance(canal,discord.TextChannel):
+            self.processando=False
+            return await interaction.followup.send("❌ A sala temporária não foi encontrada.",ephemeral=True)
+
+        textos=[]
+        anexos=[]
+        mensagens_usuario=[]
+        try:
+            async for msg in canal.history(limit=300,oldest_first=True):
+                if msg.author.id!=self.autor_id:
+                    continue
+                mensagens_usuario.append(msg)
+                if str(msg.content or "").strip():
+                    textos.append(str(msg.content))
+                anexos.extend(list(msg.attachments))
+
+            if not textos and not anexos:
+                self.processando=False
+                return await interaction.followup.send(
+                    "⚠️ Envie o texto e/ou as imagens nesta sala antes de processar.",ephemeral=True
+                )
+
+            texto="\n\n".join(textos)
+            arquivos=[]
+            for a in anexos[:30]:
+                try:
+                    arq=await _banco_v3_salvar_anexo(a,self.autor_id)
+                    arquivos.append(arq)
+                    nome=str(getattr(a,"filename","") or "").lower()
+                    if nome.endswith((".txt",".md",".csv",".log")):
+                        try:
+                            bruto=await a.read()
+                            texto += "\n" + bruto.decode("utf-8",errors="ignore")
+                        except Exception:
+                            pass
+                    if arq.get("imagem") and BANCO_OCR_ATIVO and RapidOCR is not None:
+                        try:
+                            linhas=await asyncio.to_thread(_banco_ocr_ler_imagem_sync,arq["path"])
+                            texto += "\n" + "\n".join(linhas)
+                        except Exception:
+                            pass
+                except Exception:
+                    traceback.print_exc()
+
+            dados=_pf_rel_extrair(texto)
+            dados["arquivos_fonte"]=arquivos
+            dados["texto_original"]=texto[:200000]
+            dados["fonte_id"]="REL-"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S")+"-"+secrets.token_hex(2).upper()
+            chave=secrets.token_urlsafe(8)
+            _PF_RELATORIO_IMPORTACOES[chave]=dados
+
+            await canal.send(
+                embed=_pf_rel_preview(dados),
+                view=PFRelatorioPreviewView(self.autor_id,chave,self.canal_id),
+            )
+            await interaction.followup.send("✅ Análise concluída. Confira a prévia na sala temporária.",ephemeral=True)
+            for item in self.children:
+                item.disabled=True
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+        except Exception as e:
+            self.processando=False
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Erro ao processar: `{type(e).__name__}: {e}`",ephemeral=True)
+
+    @discord.ui.button(label="Cancelar e apagar sala",emoji="🗑️",style=discord.ButtonStyle.danger,row=0)
+    async def cancelar(self,interaction,button):
+        await interaction.response.send_message("🗑️ Sala cancelada.",ephemeral=True)
+        try:
+            canal=interaction.guild.get_channel(self.canal_id) if interaction.guild else None
+            if canal:
+                await canal.delete(reason="Importação cancelada")
+        except Exception:
+            pass
 
 
 async def _pf_fluxo_relatorio_inteligencia(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send("📥 **IMPORTAR RELATÓRIO DE INTELIGÊNCIA**\nEnvie em uma única mensagem o texto completo e, se houver, anexe as imagens do ranking, RG, placa ou cupom. O bot apagará a mensagem e mostrará uma prévia. Tempo: **10 minutos**.",ephemeral=True)
-    uid=interaction.user.id; cid=interaction.channel.id
-    def check(m): return m.author.id==uid and m.channel.id==cid and not m.author.bot and (bool(m.content.strip()) or bool(m.attachments))
-    try: msg=await bot.wait_for("message",check=check,timeout=600)
-    except asyncio.TimeoutError: return await interaction.followup.send("⌛ Tempo esgotado.",ephemeral=True)
-    texto=str(msg.content or "")
-    arquivos=[]
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ Esta função só pode ser usada dentro do servidor.",ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True,thinking=True)
+    guild=interaction.guild
+    usuario=interaction.user
+    categoria=getattr(interaction.channel,"category",None)
+
+    overwrites={
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        usuario: discord.PermissionOverwrite(
+            view_channel=True,send_messages=True,read_message_history=True,
+            attach_files=True,embed_links=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,send_messages=True,read_message_history=True,
+            manage_channels=True,manage_messages=True,attach_files=True,embed_links=True
+        ),
+    }
+    for cargo_id in CARGOS_ADMIN_IDS:
+        cargo=guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo]=discord.PermissionOverwrite(view_channel=True,read_message_history=True,send_messages=True)
+
+    nome_base=normalizar_busca(getattr(usuario,"display_name",str(usuario)))[:35].replace(" ","-") or str(usuario.id)
     try:
-        for a in list(msg.attachments)[:10]:
-            arq=await _banco_v3_salvar_anexo(a,uid); arquivos.append(arq)
-            if arq.get("imagem") and BANCO_OCR_ATIVO and RapidOCR is not None:
-                try: texto += "\n" + "\n".join(await asyncio.to_thread(_banco_ocr_ler_imagem_sync,arq["path"]))
-                except Exception: pass
-    finally:
-        try: await msg.delete()
-        except Exception: pass
-    dados=_pf_rel_extrair(texto); dados["arquivos_fonte"]=arquivos; dados["fonte_id"]="REL-"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S")+"-"+secrets.token_hex(2).upper()
-    chave=secrets.token_urlsafe(8); _PF_RELATORIO_IMPORTACOES[chave]=dados
-    await interaction.followup.send(embed=_pf_rel_preview(dados),view=PFRelatorioPreviewView(uid,chave),ephemeral=True)
+        canal=await guild.create_text_channel(
+            name=f"📥-importacao-{nome_base}",
+            category=categoria,
+            overwrites=overwrites,
+            reason=f"Importação de relatório por {usuario}",
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return await interaction.followup.send(f"❌ Não consegui criar a sala temporária: `{e}`",ephemeral=True)
+
+    embed=discord.Embed(
+        title="📥 IMPORTAÇÃO DE RELATÓRIO DE INTELIGÊNCIA",
+        description=(
+            "Envie nesta sala **quantas mensagens forem necessárias**. Você também pode anexar imagens, "
+            "arquivos `.txt`, rankings, RGs, placas e cupons.\n\n"
+            "Quando terminar, clique em **Processar relatório**. O bot reunirá tudo, mostrará uma prévia e "
+            "só salvará após sua confirmação."
+        ),
+        color=discord.Color.from_rgb(30,88,140),
+    )
+    embed.add_field(name="✅ Aceita",value="Texto longo dividido em várias mensagens\nAté 30 anexos\nImagens e arquivos de texto",inline=True)
+    embed.add_field(name="⏳ Expiração",value="A sala fica disponível por 20 minutos ou até você concluir/cancelar.",inline=True)
+    await canal.send(content=usuario.mention,embed=embed,view=PFRelatorioColetaView(usuario.id,canal.id))
+    await interaction.followup.send(f"✅ Sala criada: {canal.mention}",ephemeral=True)
+
+    async def expirar():
+        await asyncio.sleep(1200)
+        try:
+            atual=guild.get_channel(canal.id)
+            if atual:
+                await atual.delete(reason="Sala de importação expirada")
+        except Exception:
+            pass
+    asyncio.create_task(expirar())
 
 
 class PFCriarFichaEscolhaView(View):
