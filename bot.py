@@ -53962,5 +53962,615 @@ async def autoteste_v37(interaction: discord.Interaction, modo: app_commands.Cho
 
 print('✅ Patch V37 carregado: mandados PNG, Central limpa/separada e /autoteste completo reversível.', flush=True)
 
+
+# =====================================================
+# V38 — BANCO PF: CENTRAL DE EVIDÊNCIAS + IA INVESTIGADORA
+# =====================================================
+# Mantém todos os fluxos existentes e acrescenta dois módulos gerais ao painel.
+
+PF_CARGOS_IDS = set(_ids_env("CARGOS_PF_IDS")) | set(CARGOS_EQUIPE_IDS) | set(CARGOS_AUTORIZADORES)
+PF_IA_CATEGORY_ID = env_int("PF_IA_CATEGORY_ID", DOSSIE_IA_CATEGORY_ID)
+_PF_IA_SESSOES: Dict[int, Dict[str, Any]] = {}
+
+
+def _pf_usuario_autorizado(usuario: Any) -> bool:
+    if not isinstance(usuario, discord.Member):
+        return False
+    if usuario.guild_permissions.administrator:
+        return True
+    return any(int(getattr(c, "id", 0) or 0) in PF_CARGOS_IDS for c in getattr(usuario, "roles", []))
+
+
+def _pf_limpar_texto(valor: Any, limite: int = 700) -> str:
+    texto = re.sub(r"\s+", " ", str(valor or "")).strip()
+    return texto[:limite]
+
+
+def _pf_extrair_urls(obj: Any, limite: int = 5) -> List[str]:
+    encontrados: List[str] = []
+    def andar(x: Any):
+        if len(encontrados) >= limite:
+            return
+        if isinstance(x, dict):
+            for v in x.values(): andar(v)
+        elif isinstance(x, (list, tuple, set)):
+            for v in x: andar(v)
+        else:
+            s = str(x or "")
+            for url in re.findall(r"https?://[^\s<>\]\[\)\(\"']+", s):
+                if url not in encontrados:
+                    encontrados.append(url.rstrip(".,;"))
+                    if len(encontrados) >= limite: break
+    andar(obj)
+    return encontrados
+
+
+def _pf_json_fontes() -> List[Tuple[str, Path]]:
+    candidatos = {
+        "Boletins": BOLETINS_JSON,
+        "Boletins pendentes": BOLETINS_PENDENTES_JSON,
+        "Procurados": CATALOGO_JSON,
+        "Procurados pendentes": PROCURADOS_PENDENTES_JSON,
+        "Mesas": MESAS_JSON,
+        "Organizações": ORGANIZACOES_JSON,
+        "Histórico de organizações": HISTORICO_ORGANIZACOES_JSON,
+        "Dossiês": DOSSIES_JSON,
+        "Comparecimentos": COMPARECIMENTOS_JSON,
+        "Atendimentos": BOLETIM_ATENDIMENTOS_JSON,
+    }
+    return [(nome, Path(path)) for nome, path in candidatos.items() if path]
+
+
+def _pf_evidencias_buscar(consulta: str, limite: int = 40) -> List[Dict[str, Any]]:
+    q = normalizar_busca(str(consulta or "")).strip()
+    if not q:
+        return []
+    resultados: List[Dict[str, Any]] = []
+
+    # Banco SQLite: pesquisa geral nas tabelas existentes, sem depender de esquema fixo.
+    try:
+        with _banco_conexao() as db:
+            tabelas = [str(x[0]) for x in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()]
+            prioritarias = [
+                "individuos", "veiculos", "faccoes", "faccao_membros", "evidencias_banco",
+                "banco_arquivos", "pericias_importadas", "historico_prisional", "apreensoes_ilegais"
+            ]
+            tabelas = sorted(tabelas, key=lambda x: (x not in prioritarias, x))[:30]
+            for tabela in tabelas:
+                if len(resultados) >= limite:
+                    break
+                try:
+                    cols = db.execute(f'PRAGMA table_info("{tabela}")').fetchall()
+                    nomes = [str(c[1]) for c in cols]
+                    if not nomes:
+                        continue
+                    texto_cols = [n for n in nomes if any(k in n.lower() for k in (
+                        "nome", "rg", "placa", "texto", "descricao", "observ", "crime", "item",
+                        "modelo", "faccao", "url", "arquivo", "foto", "conteudo", "telefone", "radio"
+                    ))]
+                    if not texto_cols:
+                        texto_cols = nomes[:8]
+                    where = " OR ".join([f'CAST("{c}" AS TEXT) LIKE ? COLLATE NOCASE' for c in texto_cols])
+                    rows = db.execute(f'SELECT * FROM "{tabela}" WHERE {where} LIMIT 12', tuple([f"%{consulta}%"]*len(texto_cols))).fetchall()
+                    for row in rows:
+                        item = dict(row)
+                        urls = _pf_extrair_urls(item)
+                        resumo = "; ".join(f"{k}: {_pf_limpar_texto(v, 150)}" for k, v in item.items() if v not in (None, ""))
+                        resultados.append({"origem": f"Banco • {tabela}", "resumo": resumo[:900], "urls": urls, "dados": item})
+                        if len(resultados) >= limite: break
+                except Exception:
+                    continue
+    except Exception:
+        traceback.print_exc()
+
+    # JSONs principais: encontra registros antigos que ainda não foram migrados ao SQLite.
+    for nome, path in _pf_json_fontes():
+        if len(resultados) >= limite:
+            break
+        try:
+            if not path.exists():
+                continue
+            dados = json.loads(path.read_text(encoding="utf-8") or "[]")
+            pilha = list(dados.values()) if isinstance(dados, dict) else list(dados if isinstance(dados, list) else [dados])
+            vistos = 0
+            while pilha and len(resultados) < limite and vistos < 4000:
+                atual = pilha.pop(0); vistos += 1
+                if isinstance(atual, list):
+                    pilha.extend(atual); continue
+                if not isinstance(atual, dict):
+                    continue
+                bruto = normalizar_busca(json.dumps(atual, ensure_ascii=False, default=str))
+                if q in bruto:
+                    urls = _pf_extrair_urls(atual)
+                    resumo = "; ".join(f"{k}: {_pf_limpar_texto(v, 160)}" for k, v in atual.items() if not isinstance(v, (dict, list)) and v not in (None, ""))
+                    resultados.append({"origem": nome, "resumo": resumo[:900] or _pf_limpar_texto(bruto, 900), "urls": urls, "dados": atual})
+                for v in atual.values():
+                    if isinstance(v, (dict, list)): pilha.append(v)
+        except Exception:
+            continue
+    return resultados[:limite]
+
+
+def _pf_evidencias_embeds(consulta: str, resultados: List[Dict[str, Any]]) -> List[discord.Embed]:
+    if not resultados:
+        return [discord.Embed(title="📦 CENTRAL DE EVIDÊNCIAS", description=f"Nenhuma evidência localizada para `{consulta}`.", color=discord.Color.orange())]
+    embeds: List[discord.Embed] = []
+    for bloco_inicio in range(0, len(resultados), 5):
+        bloco = resultados[bloco_inicio:bloco_inicio+5]
+        embed = discord.Embed(
+            title="📦 CENTRAL DE EVIDÊNCIAS" if bloco_inicio == 0 else "📦 Evidências — continuação",
+            description=f"Consulta: `{consulta}` • {len(resultados)} resultado(s) localizado(s).",
+            color=discord.Color.from_rgb(35, 105, 180),
+        )
+        for idx, r in enumerate(bloco, start=bloco_inicio+1):
+            links = "\n".join(f"[Abrir evidência {i+1}]({u})" for i, u in enumerate(r.get("urls") or []))
+            valor = _pf_limpar_texto(r.get("resumo"), 760)
+            if links: valor += "\n" + links
+            embed.add_field(name=f"{idx}. {r.get('origem','Registro')}", value=valor[:1024] or "Registro localizado.", inline=False)
+        embeds.append(embed)
+    return embeds[:10]
+
+
+class PFEvidenciasModal(Modal, title="Pesquisar na Central de Evidências"):
+    consulta = TextInput(
+        label="Nome, RG, placa, item, BO, organização...",
+        placeholder="Ex.: 18053, Tec9, ABC1D23, BO 019",
+        min_length=2,
+        max_length=150,
+    )
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultados = await asyncio.to_thread(_pf_evidencias_buscar, str(self.consulta.value), 40)
+            await interaction.followup.send(embeds=_pf_evidencias_embeds(str(self.consulta.value), resultados), ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Não foi possível pesquisar as evidências: `{type(erro).__name__}: {erro}`", ephemeral=True)
+
+
+def _pf_ia_contexto(pergunta: str) -> Tuple[str, List[Dict[str, Any]]]:
+    palavras = [x for x in re.findall(r"[A-Za-zÀ-ÿ0-9_-]{3,}", pergunta) if x.lower() not in {
+        "qual","quais","quem","como","onde","isso","essa","esse","dele","dela","sobre","pode","analise","investigue"
+    }]
+    consultas = []
+    for p in palavras[:5]:
+        consultas.extend(_pf_evidencias_buscar(p, 12))
+    unicos=[]; vistos=set()
+    for r in consultas:
+        chave=(r.get("origem"), r.get("resumo"))
+        if chave not in vistos:
+            vistos.add(chave); unicos.append(r)
+    contexto="\n".join(f"[{i+1}] {r.get('origem')}: {r.get('resumo')} URLs: {' '.join(r.get('urls') or [])}" for i,r in enumerate(unicos[:25]))
+    return contexto[:24000], unicos[:25]
+
+
+async def _pf_ia_responder(sessao: Dict[str, Any], pergunta: str) -> discord.Embed:
+    contexto, fontes = await asyncio.to_thread(_pf_ia_contexto, pergunta)
+    historico = list(sessao.get("historico") or [])[-8:]
+    if DOSSIE_IA_OPENAI_API_KEY:
+        instrucoes = (
+            "Você é a IA Investigadora da Polícia Federal em um servidor fictício de GTA RP. "
+            "Responda somente com base no CONTEXTO DO BANCO fornecido. Separe claramente FATOS CONFIRMADOS, "
+            "HIPÓTESES e EVIDÊNCIAS UTILIZADAS. Hipóteses nunca podem ser apresentadas como fatos. "
+            "Quando os dados forem insuficientes, diga exatamente o que falta. Entenda perguntas livres, erros de escrita, "
+            "comparações, padrões, vínculos entre pessoas, veículos, placas, organizações, itens, BOs, prisões e perícias."
+        )
+        entrada = "\n".join([f"{h.get('papel')}: {h.get('texto')}" for h in historico])
+        entrada += f"\nPERGUNTA ATUAL: {pergunta}\n\nCONTEXTO DO BANCO:\n{contexto or 'Nenhum registro relevante localizado.'}"
+        payload={"model":DOSSIE_IA_OPENAI_MODEL,"instructions":instrucoes,"input":entrada,"max_output_tokens":1200}
+        timeout=ClientTimeout(total=75)
+        async with ClientSession(timeout=timeout) as s:
+            async with s.post('https://api.openai.com/v1/responses', headers={'Authorization':f'Bearer {DOSSIE_IA_OPENAI_API_KEY}','Content-Type':'application/json'}, json=payload) as r:
+                bruto=await r.text()
+                if r.status>=400: raise RuntimeError(f"OpenAI HTTP {r.status}: {bruto[:300]}")
+                data=json.loads(bruto)
+        resposta=str(data.get('output_text') or '').strip()
+        if not resposta:
+            partes=[]
+            for o in data.get('output') or []:
+                for c in o.get('content') or []:
+                    if c.get('type') in {'output_text','text'} and c.get('text'): partes.append(str(c['text']))
+            resposta='\n'.join(partes).strip()
+    else:
+        if fontes:
+            resposta = "**FATOS LOCALIZADOS**\n" + "\n".join(f"• {r.get('origem')}: {_pf_limpar_texto(r.get('resumo'), 300)}" for r in fontes[:8])
+            resposta += "\n\n**HIPÓTESE**\nSem a integração GPT configurada, o bot não cria hipótese avançada. Os registros acima são as correspondências objetivas encontradas."
+        else:
+            resposta = "Não foram encontrados registros suficientes no banco para responder com segurança."
+    sessao.setdefault("historico", []).extend([{"papel":"usuário","texto":pergunta},{"papel":"assistente","texto":resposta[:3000]}])
+    embed=discord.Embed(title="🧠 IA INVESTIGADORA PF", description=resposta[:4000], color=discord.Color.from_rgb(31, 125, 95))
+    embed.set_footer(text=f"Fontes internas localizadas: {len(fontes)} • hipóteses devem ser confirmadas por um agente")
+    return embed
+
+
+class PFInvestigadoraPerguntaModal(Modal, title="Perguntar à IA Investigadora"):
+    pergunta = TextInput(label="Pergunta ou análise", placeholder="Ex.: quem pode estar ligado a esta placa?", style=discord.TextStyle.paragraph, min_length=3, max_length=1000)
+    def __init__(self, canal_id: int):
+        super().__init__(timeout=600); self.canal_id=int(canal_id); self.add_item(self.pergunta)
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
+        sessao=_PF_IA_SESSOES.get(self.canal_id)
+        if not sessao:
+            return await interaction.followup.send("❌ Esta sessão foi encerrada.", ephemeral=True)
+        try:
+            embed=await _pf_ia_responder(sessao, str(self.pergunta.value))
+            await interaction.followup.send(embed=embed)
+        except Exception as erro:
+            traceback.print_exc(); await interaction.followup.send(f"❌ Falha na análise: `{type(erro).__name__}: {erro}`")
+
+
+class PFInvestigadoraView(View):
+    def __init__(self, canal_id: int):
+        super().__init__(timeout=None); self.canal_id=int(canal_id)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _pf_usuario_autorizado(interaction.user): return True
+        await interaction.response.send_message("❌ Você não possui acesso à IA Investigadora.", ephemeral=True); return False
+    @discord.ui.button(label="Fazer pergunta", emoji="🧠", style=discord.ButtonStyle.success, custom_id="pf_ia_investigadora_perguntar", row=0)
+    async def perguntar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(PFInvestigadoraPerguntaModal(self.canal_id))
+    @discord.ui.button(label="Encerrar", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="pf_ia_investigadora_encerrar", row=0)
+    async def encerrar(self, interaction: discord.Interaction, button: Button):
+        canal=interaction.channel; _PF_IA_SESSOES.pop(self.canal_id,None)
+        await interaction.response.send_message("🔒 Sessão encerrada. O canal será apagado em 5 segundos.")
+        await asyncio.sleep(5)
+        try: await canal.delete(reason=f"IA Investigadora encerrada por {interaction.user}")
+        except Exception: pass
+
+
+async def _pf_abrir_ia_investigadora(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild=interaction.guild
+    categoria=guild.get_channel(PF_IA_CATEGORY_ID) if guild else None
+    if categoria is None and guild:
+        try: categoria=await guild.fetch_channel(PF_IA_CATEGORY_ID)
+        except Exception: categoria=None
+    if not isinstance(categoria, discord.CategoryChannel):
+        return await interaction.followup.send(f"❌ Categoria da IA Investigadora `{PF_IA_CATEGORY_ID}` não encontrada.", ephemeral=True)
+    overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=False), interaction.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)}
+    for cargo in guild.roles:
+        if int(cargo.id) in PF_CARGOS_IDS:
+            overwrites[cargo]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
+    nome=f"ia-pf-{slugify(_nome_rp_usuario(interaction.user))[:35]}-{secrets.token_hex(2)}"
+    canal=await guild.create_text_channel(nome, category=categoria, overwrites=overwrites, reason="Consulta à IA Investigadora PF")
+    _PF_IA_SESSOES[canal.id]={"autor_id":interaction.user.id,"historico":[],"criado_em":agora_br()}
+    embed=discord.Embed(title="🧠 IA INVESTIGADORA — POLÍCIA FEDERAL", description=(
+        "Faça perguntas livres sobre todo o banco: pessoas, RGs, placas, veículos, organizações, BOs, perícias, prisões, "
+        "procurados, apreensões e evidências.\n\nA resposta separa **fatos**, **hipóteses** e **fontes utilizadas**."
+    ), color=discord.Color.from_rgb(31,125,95))
+    await canal.send(content=interaction.user.mention, embed=embed, view=PFInvestigadoraView(canal.id))
+    await interaction.followup.send(f"✅ IA Investigadora aberta em {canal.mention}.", ephemeral=True)
+
+
+class BancoDadosViewV38(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _pf_usuario_autorizado(interaction.user): return True
+        await interaction.response.send_message("❌ Apenas integrantes autorizados da Polícia Federal podem usar esta central.", ephemeral=True); return False
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        if _v14_erro_interacao_duplicada(error): return
+        await _v12_enviar_erro_interacao(interaction, "A Central de Dados da PF apresentou uma falha.", error)
+    @discord.ui.button(label='Criar ficha', emoji='📋', style=discord.ButtonStyle.primary, custom_id='pf_banco_criar_ficha_v38', row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button): await _v12_banco_criar(interaction)
+    @discord.ui.button(label='Pesquisar fichas', emoji='🔎', style=discord.ButtonStyle.secondary, custom_id='pf_banco_consultar_v38', row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button): await _v12_banco_pesquisar(interaction)
+    @discord.ui.button(label='Central de Evidências', emoji='📦', style=discord.ButtonStyle.primary, custom_id='pf_banco_evidencias_v38', row=0)
+    async def evidencias(self, interaction: discord.Interaction, button: discord.ui.Button): await interaction.response.send_modal(PFEvidenciasModal())
+    @discord.ui.button(label='IA Investigadora', emoji='🧠', style=discord.ButtonStyle.success, custom_id='pf_banco_ia_v38', row=0)
+    async def ia(self, interaction: discord.Interaction, button: discord.ui.Button): await _pf_abrir_ia_investigadora(interaction)
+    @discord.ui.button(label='Importar painel', emoji='🏴', style=discord.ButtonStyle.secondary, custom_id='pf_banco_importar_painel_v38', row=1)
+    async def importar(self, interaction: discord.Interaction, button: discord.ui.Button): await _v12_banco_importar(interaction)
+    @discord.ui.button(label='Sincronizar dados', emoji='🔄', style=discord.ButtonStyle.secondary, custom_id='pf_banco_sync_tudo_v38', row=1)
+    async def sincronizar(self, interaction: discord.Interaction, button: discord.ui.Button): await _v12_banco_sync(interaction)
+
+
+BancoDadosView = BancoDadosViewV38
+_BANCO_EMBED_PAINEL_V38_ANTERIOR = banco_embed_painel
+def banco_embed_painel() -> discord.Embed:
+    embed=_BANCO_EMBED_PAINEL_V38_ANTERIOR()
+    embed.title="🏛️ CENTRAL DE DADOS — POLÍCIA FEDERAL"
+    embed.description=(
+        "Consulta integrada de fichas, veículos, organizações, perícias e registros da Polícia Federal.\n"
+        "Use a **Central de Evidências** para localizar provas e anexos, ou a **IA Investigadora** para cruzar dados e formular hipóteses fundamentadas."
+    )
+    embed.set_footer(text="Polícia Federal • acesso controlado por cargos • dados persistentes em /data")
+    return embed
+
+
+async def _v38_atualizar_paineis() -> int:
+    atualizados=0
+    try: await _banco_prof_atualizar_painel()
+    except Exception: pass
+    for guild in bot.guilds:
+        for canal in getattr(guild,'text_channels',[]):
+            nome=normalizar_busca(getattr(canal,'name',''))
+            if 'banco-de-dados' not in nome and 'central-de-dados' not in nome: continue
+            try:
+                async for msg in canal.history(limit=100):
+                    if bot.user and msg.author.id==bot.user.id and any(('BANCO DE DADOS' in str(e.title or '').upper() or 'CENTRAL DE DADOS' in str(e.title or '').upper() or 'CENTRAL DE FICHAS' in str(e.title or '').upper()) for e in msg.embeds):
+                        await msg.edit(embed=banco_embed_painel(),view=BancoDadosViewV38()); atualizados+=1; break
+            except Exception: continue
+    return atualizados
+
+
+_V38_SETUP_ANTERIOR = bot.setup_hook
+async def _v38_setup_hook(self):
+    await _V38_SETUP_ANTERIOR()
+    try: bot.add_view(BancoDadosViewV38())
+    except Exception: pass
+bot.setup_hook = _v13_types.MethodType(_v38_setup_hook, bot)
+
+@bot.listen('on_ready')
+async def _v38_on_ready():
+    try:
+        await asyncio.sleep(3)
+        n=await _v38_atualizar_paineis()
+        print(f"✅ V38 PF: Central de Evidências e IA Investigadora ativas; {n} painel(is) atualizado(s).", flush=True)
+    except Exception: traceback.print_exc()
+
+print("✅ V38 carregada: Banco PF com Central de Evidências e IA Investigadora + Hipóteses.", flush=True)
+
+
+# =====================================================
+# V39 — CRIAÇÃO INTELIGENTE DE FICHAS
+# Duas opções: imagem/documento e relatório de inteligência
+# =====================================================
+
+_PF_RELATORIO_IMPORTACOES: Dict[str, Dict[str, Any]] = {}
+
+
+def _pf_rel_limpo(valor: Any, limite: int = 300) -> str:
+    return re.sub(r"\s+", " ", str(valor or "")).strip()[:limite]
+
+
+def _pf_rel_placa(valor: Any) -> str:
+    return _banco_normalizar_placa(str(valor or ""))
+
+
+def _pf_rel_rg(valor: Any) -> str:
+    return _banco_normalizar_rg(str(valor or ""))
+
+
+def _pf_rel_extrair(texto: str) -> Dict[str, Any]:
+    bruto=str(texto or "").replace("\r", "")
+    pessoas: Dict[str, Dict[str, Any]] = {}
+    veiculos: List[Dict[str, Any]] = []
+    alteracoes: List[Dict[str, Any]] = []
+    duplas: List[Dict[str, Any]] = []
+    conflitos: List[str] = []
+
+    def pessoa(rg: str, nome: str = "", **extras):
+        rg=_pf_rel_rg(rg)
+        nome=_pf_rel_limpo(nome,120).upper()
+        if not rg: return None
+        atual=pessoas.setdefault(rg,{"rg":rg,"nome":nome,"aliases":[],"extras":{},"fontes":[]})
+        if nome and not atual.get("nome"): atual["nome"]=nome
+        elif nome and atual.get("nome") and normalizar_busca(nome)!=normalizar_busca(atual["nome"]):
+            if nome not in atual["aliases"]: atual["aliases"].append(nome)
+        for k,v in extras.items():
+            if v not in (None,""): atual["extras"][k]=v
+        return atual
+
+    # Registros de veículos estruturados.
+    blocos=re.split(r"(?im)(?=^\s*(?:\d+\.?\s*)?Registro(?:\s+\d+)?\s*$)", bruto)
+    for bloco in blocos:
+        if not re.search(r"(?im)^\s*Placa\s*:", bloco): continue
+        def campo(nome):
+            m=re.search(rf"(?im)^\s*{nome}\s*:\s*(.+?)\s*$", bloco)
+            return _pf_rel_limpo(m.group(1),180) if m else ""
+        placa=_pf_rel_placa(campo("Placa"))
+        nome=campo("Proprietário|Proprietario")
+        rg=_pf_rel_rg(campo("Passaporte|RG"))
+        tel=campo("Telefone")
+        modelo=campo("Modelo")
+        cor=campo("Coloração|Coloracao|Cor")
+        if placa:
+            veiculos.append({"placa":placa,"nome":nome,"rg":rg,"telefone":tel,"modelo":modelo,"cor":cor,"fonte":"Relatório de inteligência"})
+        if rg: pessoa(rg,nome,telefone=tel)
+
+    # Mudanças de nome: RG: Nome A / Nome B
+    sec=re.search(r"(?is)TROCARAM\s+DE\s+NOME\s*:(.*?)(?:RANK\s+MAIS\s+PRIS|DUPLAS\s+RECORRENTES|\Z)", bruto)
+    if sec:
+        for rg,n1,n2 in re.findall(r"(?m)^\s*(\d{2,})\s*:\s*([^/\n]+?)\s*/\s*([^\n]+?)\s*$", sec.group(1)):
+            item=pessoa(rg,n1)
+            if item and _pf_rel_limpo(n2,120).upper() not in item["aliases"]: item["aliases"].append(_pf_rel_limpo(n2,120).upper())
+            alteracoes.append({"rg":_pf_rel_rg(rg),"nomes":[_pf_rel_limpo(n1,120),_pf_rel_limpo(n2,120)]})
+
+    # Ranking: NOME + RG, quantidade opcional no fim.
+    rank=re.search(r"(?is)RANK\s+MAIS\s+PRIS(?:ÕES|OES)(.*?)(?:DUPLAS\s+RECORRENTES|\Z)", bruto)
+    if rank:
+        for linha in rank.group(1).splitlines():
+            linha=_pf_rel_limpo(linha,240)
+            m=re.match(r"^([A-ZÀ-Ü][A-ZÀ-Ü' .-]{2,}?)\s+(\d{2,})(?:\s+(\d+))?$", linha, re.I)
+            if not m: continue
+            nome,rg,qtd=m.groups(); item=pessoa(rg,nome)
+            if item and qtd: item["extras"]["prisoes_30_dias"]=int(qtd)
+
+    # Pessoas citadas em qualquer linha no formato NOME RG.
+    for nome,rg in re.findall(r"(?m)^\s*([A-ZÀ-Ü][A-ZÀ-Ü' .-]{2,}?)\s{2,}(\d{2,})\s*$", bruto, re.I):
+        pessoa(rg,nome)
+
+    # Duplas recorrentes: lados separados por uma linha contendo apenas x.
+    dsec=re.search(r"(?is)DUPLAS\s+RECORRENTES\s*:(.*)$", bruto)
+    if dsec:
+        lados=re.split(r"(?im)^\s*x\s*$", dsec.group(1),maxsplit=1)
+        if len(lados)==2:
+            def lista(lado):
+                out=[]
+                for nome,rg in re.findall(r"(?m)^\s*([A-ZÀ-Ü][A-ZÀ-Ü' .-]{2,}?)\s{2,}(\d{2,})\s*$", lado, re.I):
+                    out.append({"nome":_pf_rel_limpo(nome,120),"rg":_pf_rel_rg(rg)}); pessoa(rg,nome)
+                return out
+            a,b=lista(lados[0]),lista(lados[1])
+            if len(a)!=len(b): conflitos.append(f"Duplas recorrentes com lados diferentes: {len(a)} × {len(b)}.")
+            for x,y in zip(a,b): duplas.append({"a":x,"b":y,"tipo":"prisões recorrentes","quantidade_minima":2})
+
+    # Detectar conflitos internos RG -> nomes muito diferentes.
+    for rg,p in pessoas.items():
+        nomes=[p.get("nome","")]+list(p.get("aliases") or [])
+        nomes=[n for n in nomes if n]
+        if len(nomes)>1 and not alteracoes:
+            conflitos.append(f"RG {rg} aparece com nomes diferentes: {', '.join(nomes[:4])}.")
+
+    return {"pessoas":list(pessoas.values()),"veiculos":veiculos,"alteracoes":alteracoes,"duplas":duplas,"conflitos":conflitos,"texto_bruto":bruto}
+
+
+def _pf_rel_conflitos_banco(dados: Dict[str,Any]) -> List[str]:
+    conflitos=list(dados.get("conflitos") or [])
+    try:
+        with _banco_conexao() as db:
+            for p in dados.get("pessoas",[]):
+                row=db.execute("SELECT nome FROM individuos WHERE rg=?",(p.get("rg"),)).fetchone()
+                if row and p.get("nome") and normalizar_busca(row["nome"])!=normalizar_busca(p["nome"]):
+                    conflitos.append(f"RG {p['rg']}: banco possui '{row['nome']}', relatório informa '{p['nome']}'.")
+            for v in dados.get("veiculos",[]):
+                row=db.execute("SELECT proprietario_rg, proprietario_nome FROM veiculos WHERE placa=?",(v.get("placa"),)).fetchone()
+                if row and v.get("rg") and str(row["proprietario_rg"] or "") not in ("",v.get("rg")):
+                    conflitos.append(f"Placa {v['placa']}: proprietário no banco difere do relatório.")
+    except Exception as e:
+        conflitos.append(f"Não foi possível comparar com o banco: {type(e).__name__}.")
+    return list(dict.fromkeys(conflitos))[:20]
+
+
+def _pf_rel_preview(dados: Dict[str,Any]) -> discord.Embed:
+    conflitos=_pf_rel_conflitos_banco(dados); dados["conflitos_banco"]=conflitos
+    e=discord.Embed(title="📥 PRÉVIA — RELATÓRIO DE INTELIGÊNCIA",color=discord.Color.from_rgb(28,82,120))
+    e.description="Nenhum dado foi salvo ainda. Confira a prévia e confirme a importação."
+    e.add_field(name="📊 Detectado",value=(f"**Pessoas:** {len(dados.get('pessoas',[]))}\n**Veículos:** {len(dados.get('veiculos',[]))}\n**Mudanças de nome:** {len(dados.get('alteracoes',[]))}\n**Duplas recorrentes:** {len(dados.get('duplas',[]))}"),inline=True)
+    amostras=[f"• {p.get('nome') or 'NOME NÃO INFORMADO'} — RG {p.get('rg')}" for p in dados.get('pessoas',[])[:8]]
+    e.add_field(name="👥 Amostra de fichas",value="\n".join(amostras) or "Nenhuma",inline=False)
+    veic=[f"• {v.get('placa')} — {v.get('modelo') or 'modelo não informado'} — {v.get('nome') or 'sem proprietário'}" for v in dados.get('veiculos',[])[:8]]
+    e.add_field(name="🚗 Amostra de veículos",value="\n".join(veic) or "Nenhum",inline=False)
+    if conflitos:
+        e.add_field(name="⚠️ Revisão necessária",value="\n".join(f"• {x}" for x in conflitos[:8])[:1024],inline=False)
+    e.set_footer(text="A fonte original será preservada em cada ficha e vínculo criado.")
+    return e
+
+
+def _pf_rel_salvar(dados: Dict[str,Any], usuario_id: int) -> Dict[str,int]:
+    criadas=atualizadas=veic_salvos=vinculos=0
+    fonte_id=str(dados.get("fonte_id") or "REL-"+secrets.token_hex(4)).upper()
+    with _banco_conexao() as db:
+        for p in dados.get("pessoas",[]):
+            rg=p.get("rg"); existente=db.execute("SELECT id FROM individuos WHERE rg=?",(rg,)).fetchone()
+            extras=dict(p.get("extras") or {}); extras.update({"aliases":p.get("aliases",[]),"fonte_relatorio":fonte_id})
+            banco_upsert_individuo(nome=p.get("nome") or "NOME NÃO INFORMADO",rg=rg,observacoes=f"Importado do relatório de inteligência {fonte_id}.",origem="relatorio_inteligencia",criado_por_id=usuario_id,dados_extras=extras,db=db)
+            if existente: atualizadas+=1
+            else: criadas+=1
+        for v in dados.get("veiculos",[]):
+            banco_upsert_veiculo(placa=v.get("placa"),proprietario_nome=v.get("nome"),proprietario_rg=v.get("rg"),modelo=v.get("modelo"),cor=v.get("cor"),telefone_proprietario=v.get("telefone"),origem_tipo="relatorio_inteligencia",criado_por_id=usuario_id,dados_extras={"fonte_relatorio":fonte_id},db=db)
+            veic_salvos+=1
+        # Guardar vínculos recorrentes em histórico/auditoria; a árvore pode ler a fonte sem inventar vínculo.
+        for d in dados.get("duplas",[]):
+            try:
+                _banco_historico("VINCULO_RELATORIO",f"{d['a']['rg']}:{d['b']['rg']}","DUPLA_RECORRENTE",f"{d['a']['nome']} + {d['b']['nome']} | fonte {fonte_id}",usuario_id,db); vinculos+=1
+            except Exception: pass
+        try:
+            _banco_historico("RELATORIO_INTELIGENCIA",fonte_id,"IMPORTADO",f"Pessoas={len(dados.get('pessoas',[]))}; veículos={len(dados.get('veiculos',[]))}; duplas={len(dados.get('duplas',[]))}",usuario_id,db)
+        except Exception: pass
+    return {"criadas":criadas,"atualizadas":atualizadas,"veiculos":veic_salvos,"vinculos":vinculos}
+
+
+class PFRelatorioPreviewView(View):
+    def __init__(self, autor_id:int, chave:str):
+        super().__init__(timeout=900); self.autor_id=int(autor_id); self.chave=chave; self.processando=False
+    async def interaction_check(self,interaction):
+        if interaction.user.id==self.autor_id: return True
+        await interaction.response.send_message("❌ Esta importação pertence a outro agente.",ephemeral=True); return False
+    @discord.ui.button(label="Confirmar importação",emoji="✅",style=discord.ButtonStyle.success)
+    async def confirmar(self,interaction,button):
+        if self.processando: return await interaction.response.send_message("⏳ Importação em andamento.",ephemeral=True)
+        self.processando=True; await interaction.response.defer(ephemeral=True,thinking=True)
+        dados=_PF_RELATORIO_IMPORTACOES.get(self.chave)
+        if not dados: return await interaction.followup.send("❌ A prévia expirou.",ephemeral=True)
+        try:
+            r=await asyncio.to_thread(_pf_rel_salvar,dados,int(interaction.user.id))
+            _PF_RELATORIO_IMPORTACOES.pop(self.chave,None)
+            await interaction.edit_original_response(content=(f"✅ **Relatório importado.**\n• Fichas criadas: **{r['criadas']}**\n• Fichas atualizadas: **{r['atualizadas']}**\n• Veículos salvos: **{r['veiculos']}**\n• Vínculos registrados: **{r['vinculos']}**"),embed=None,view=None)
+            try: await _banco_prof_atualizar_painel()
+            except Exception: pass
+        except Exception as e:
+            self.processando=False; traceback.print_exc(); await interaction.followup.send(f"❌ Falha: `{type(e).__name__}: {e}`",ephemeral=True)
+    @discord.ui.button(label="Cancelar",emoji="✖️",style=discord.ButtonStyle.danger)
+    async def cancelar(self,interaction,button):
+        _PF_RELATORIO_IMPORTACOES.pop(self.chave,None); await interaction.response.edit_message(content="✖️ Importação cancelada. Nenhum dado foi salvo.",embed=None,view=None)
+
+
+async def _pf_fluxo_relatorio_inteligencia(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send("📥 **IMPORTAR RELATÓRIO DE INTELIGÊNCIA**\nEnvie em uma única mensagem o texto completo e, se houver, anexe as imagens do ranking, RG, placa ou cupom. O bot apagará a mensagem e mostrará uma prévia. Tempo: **10 minutos**.",ephemeral=True)
+    uid=interaction.user.id; cid=interaction.channel.id
+    def check(m): return m.author.id==uid and m.channel.id==cid and not m.author.bot and (bool(m.content.strip()) or bool(m.attachments))
+    try: msg=await bot.wait_for("message",check=check,timeout=600)
+    except asyncio.TimeoutError: return await interaction.followup.send("⌛ Tempo esgotado.",ephemeral=True)
+    texto=str(msg.content or "")
+    arquivos=[]
+    try:
+        for a in list(msg.attachments)[:10]:
+            arq=await _banco_v3_salvar_anexo(a,uid); arquivos.append(arq)
+            if arq.get("imagem") and BANCO_OCR_ATIVO and RapidOCR is not None:
+                try: texto += "\n" + "\n".join(await asyncio.to_thread(_banco_ocr_ler_imagem_sync,arq["path"]))
+                except Exception: pass
+    finally:
+        try: await msg.delete()
+        except Exception: pass
+    dados=_pf_rel_extrair(texto); dados["arquivos_fonte"]=arquivos; dados["fonte_id"]="REL-"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S")+"-"+secrets.token_hex(2).upper()
+    chave=secrets.token_urlsafe(8); _PF_RELATORIO_IMPORTACOES[chave]=dados
+    await interaction.followup.send(embed=_pf_rel_preview(dados),view=PFRelatorioPreviewView(uid,chave),ephemeral=True)
+
+
+class PFCriarFichaEscolhaView(View):
+    def __init__(self,autor_id:int): super().__init__(timeout=300); self.autor_id=int(autor_id)
+    async def interaction_check(self,interaction):
+        if interaction.user.id==self.autor_id: return True
+        await interaction.response.send_message("❌ Este menu pertence a outro agente.",ephemeral=True); return False
+    @discord.ui.button(label="Criar por imagem",emoji="📷",style=discord.ButtonStyle.primary,row=0)
+    async def imagem(self,interaction,button):
+        await interaction.response.defer(ephemeral=True); asyncio.create_task(_banco_v3_fluxo_criar_ficha(interaction))
+    @discord.ui.button(label="Importar relatório",emoji="📥",style=discord.ButtonStyle.success,row=0)
+    async def relatorio(self,interaction,button): await _pf_fluxo_relatorio_inteligencia(interaction)
+    @discord.ui.button(label="Cancelar",emoji="✖️",style=discord.ButtonStyle.secondary,row=1)
+    async def cancelar(self,interaction,button): await interaction.response.edit_message(content="Menu encerrado.",embed=None,view=None)
+
+
+class BancoDadosViewV39(BancoDadosViewV38):
+    def __init__(self):
+        super().__init__()
+        # Substitui apenas o botão Criar ficha, preservando todos os demais controles do V38.
+        for item in list(self.children):
+            if getattr(item,"custom_id",None)=="pf_banco_criar_ficha_v38": self.remove_item(item)
+        botao=Button(label="Criar ficha",emoji="📋",style=discord.ButtonStyle.primary,custom_id="pf_banco_criar_ficha_v39",row=0)
+        async def callback(interaction):
+            embed=discord.Embed(title="📋 CRIAR OU IMPORTAR FICHA",description="Escolha como os dados serão enviados. Nenhuma informação é salva sem prévia e confirmação.",color=discord.Color.from_rgb(30,88,140))
+            embed.add_field(name="📷 Criar por imagem",value="Envie RG, placa, cupom, COPOM, documento ou várias imagens. O bot lê e monta uma ficha.",inline=False)
+            embed.add_field(name="📥 Importar relatório",value="Cole um relato completo com rankings, veículos, mudanças de nome e duplas recorrentes.",inline=False)
+            await interaction.response.send_message(embed=embed,view=PFCriarFichaEscolhaView(interaction.user.id),ephemeral=True)
+        botao.callback=callback; self.add_item(botao)
+
+BancoDadosView=BancoDadosViewV39
+
+_V39_SETUP_ANTERIOR=bot.setup_hook
+async def _v39_setup_hook(self):
+    await _V39_SETUP_ANTERIOR()
+    try: bot.add_view(BancoDadosViewV39())
+    except Exception: pass
+bot.setup_hook=_v13_types.MethodType(_v39_setup_hook,bot)
+
+@bot.listen('on_ready')
+async def _v39_on_ready():
+    try:
+        await asyncio.sleep(5)
+        for guild in bot.guilds:
+            for canal in guild.text_channels:
+                if 'banco-de-dados' not in normalizar_busca(canal.name) and 'central-de-dados' not in normalizar_busca(canal.name): continue
+                async for msg in canal.history(limit=80):
+                    if bot.user and msg.author.id==bot.user.id and msg.embeds and ('CENTRAL DE DADOS' in str(msg.embeds[0].title or '').upper() or 'CENTRAL DE FICHAS' in str(msg.embeds[0].title or '').upper()):
+                        await msg.edit(embed=banco_embed_painel(),view=BancoDadosViewV39()); break
+        print('✅ V39: Criar por imagem + Importar relatório de inteligência ativos.',flush=True)
+    except Exception: traceback.print_exc()
+
+print('✅ V39 carregada: criação inteligente de fichas com prévia e conflitos.',flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
