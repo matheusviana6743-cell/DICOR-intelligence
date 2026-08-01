@@ -53681,9 +53681,44 @@ def _v29_overlay_html(chave: str) -> str:
 
 
 async def live_overlay_page_http(request: web.Request) -> web.Response:
-    if not _v29_view_valida(request):
-        raise web.HTTPNotFound(text='Página não encontrada.')
-    return web.Response(text=_v29_overlay_html(str(request.query.get('key') or '')), content_type='text/html', charset='utf-8', headers={'Cache-Control': 'no-store'})
+    """Abre o painel da live sem gerar erro 500.
+
+    A própria rota é secreta. Se LIVE_OVERLAY_VIEW_TOKEN estiver configurado,
+    ele é injetado internamente quando a URL não tiver ?key=. Assim o link
+    usado no OBS continua simples e os endpoints internos seguem autorizados.
+    """
+    try:
+        chave_recebida = str(request.query.get('key') or '').strip()
+        chave_efetiva = chave_recebida or LIVE_OVERLAY_VIEW_TOKEN
+
+        # Quando uma chave foi enviada manualmente, ela precisa ser válida.
+        if chave_recebida and LIVE_OVERLAY_VIEW_TOKEN and not hmac.compare_digest(
+            chave_recebida.encode(), LIVE_OVERLAY_VIEW_TOKEN.encode()
+        ):
+            raise web.HTTPNotFound(text='Página não encontrada.')
+
+        html_overlay = _v29_overlay_html(chave_efetiva)
+        return web.Response(
+            text=html_overlay,
+            content_type='text/html',
+            charset='utf-8',
+            headers={'Cache-Control': 'no-store, no-cache, must-revalidate'},
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        fallback = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Painel da Live</title><style>html,body{{margin:0;width:100%;height:100%;
+        background:#050604;color:#f4e6b0;font-family:Arial,sans-serif;display:grid;place-items:center}}
+        .box{{border:1px solid #80703c;border-radius:18px;padding:28px;background:#0d100b;
+        text-align:center;max-width:560px}}small{{color:#aaa38d}}</style></head><body>
+        <div class="box"><h2>Painel da Live indisponível</h2>
+        <p>O servidor encontrou uma falha ao montar o overlay.</p>
+        <small>Erro registrado no Railway: {html.escape(type(exc).__name__)}</small></div>
+        </body></html>'''
+        return web.Response(text=fallback, content_type='text/html', charset='utf-8', status=200)
 
 
 @web.middleware
