@@ -55527,21 +55527,46 @@ def _v45_ultimos_bo_cards(limite: int = 6) -> str:
 
 
 async def central_portal_http(request: web.Request) -> web.Response:
+    # V48: layout visual aprovado e fixo da Central de Boletins.
     qtd_bo = len(_v44_boletins_ativos_snapshot())
     qtd_procurados = len(_v43_procurados_ativos())
     pericias = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
     if isinstance(pericias, dict):
-        pericias = pericias.get('pericias') or pericias.get('registros') or []
+        pericias = pericias.get("pericias") or pericias.get("registros") or []
     qtd_pericias = len([x for x in pericias if isinstance(x, dict) and _v44_pericia_pendente(x)])
-    cards_bo = _v45_ultimos_bo_cards(6)
+    cards_bo = _v45_ultimos_bo_cards(8)
     css = """
-:root{--bg:#080906;--panel:#10120e;--panel2:#0d0f0b;--gold:#d8ad3e;--gold2:#f1d476;--line:#4a3b1d;--text:#f5f0dd;--muted:#aaa28d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#4d3c1238,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:106px;border-bottom:1px solid var(--line);background:#090a07ee;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;position:sticky;top:0;z-index:10}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:58px;height:70px;object-fit:contain}.brand h1{font-size:20px;letter-spacing:2px;margin:0}.brand small{display:block;color:var(--gold);letter-spacing:1.5px;margin-top:5px}.nav{justify-self:end;display:flex;gap:17px}.nav a{color:#e5d59c;text-decoration:none;font-size:14px}.wrap{max-width:1300px;margin:auto;padding:42px 22px 80px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;margin-bottom:24px}.ey{color:var(--gold);font-size:11px;letter-spacing:2px}.hero h2{font-size:38px;margin:8px 0}.hero p{color:var(--muted);margin:0}.stats{display:flex;gap:10px;flex-wrap:wrap}.stat{min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:13px 15px;text-decoration:none;color:var(--text)}.stat b{display:block;color:var(--gold2);font-size:25px}.stat span{font-size:12px;color:var(--muted)}.section-head{display:flex;justify-content:space-between;align-items:center;margin:32px 0 14px}.section-head a{color:var(--gold2);text-decoration:none;border:1px solid #6a5528;border-radius:9px;padding:9px 12px;font-size:12px}.bo-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px}.bo-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:17px;padding:21px;min-height:300px}.bo-top{display:flex;justify-content:space-between;border-bottom:1px solid #343020;padding-bottom:13px}.bo-top h3{font-family:Georgia,serif;color:var(--gold2);font-size:23px;margin:5px 0}.bo-top span{border:1px solid #725f29;border-radius:999px;padding:7px 10px;color:#f3d876;font-size:12px;height:max-content}.bo-preview{color:#e4dfcf;line-height:1.55;min-height:125px;max-height:210px;overflow:hidden;padding:15px 0}.mini-open{display:inline-block;color:#f2d47d;text-decoration:none;border:1px solid #71602f;border-radius:9px;padding:9px 12px;font-weight:700}.source{border-top:1px dashed #373326;margin-top:16px;padding-top:12px;color:#99917d;font-size:11px}.empty{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:24px;color:var(--muted)}@media(max-width:900px){header{grid-template-columns:1fr;height:auto;padding:18px}.brand{grid-column:1}.nav{justify-self:start;margin-top:14px;flex-wrap:wrap}.hero{align-items:start;flex-direction:column}.bo-grid{grid-template-columns:1fr}}
+:root{--bg:#090a06;--panel:#11130e;--panel2:#0d0f0b;--gold:#d8ad3e;--gold2:#f2d675;--line:#4a3b1d;--text:#f5f0dd;--muted:#aaa28d}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 50% -18%,#4e3b1038,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}
+.top{height:108px;border-bottom:1px solid var(--line);background:#090a07f5;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;position:sticky;top:0;z-index:10}
+.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:66px;height:76px;object-fit:contain;filter:drop-shadow(0 0 16px #d8ad3e44)}.brand h1{font-size:19px;letter-spacing:2px;margin:0}.brand small{display:block;color:var(--gold);letter-spacing:1.4px;margin-top:5px}
+.nav{justify-self:end;display:flex;gap:18px}.nav a{color:#e4d49a;text-decoration:none;font-size:13px}.nav a:hover{color:#fff2b7}
+.wrap{max-width:1280px;margin:auto;padding:34px 22px 80px}.intro{text-align:center;margin:8px 0 22px}.intro span{color:var(--gold);font-size:10px;letter-spacing:2px}.intro h2{font-family:Georgia,serif;font-size:34px;margin:8px 0}.intro p{color:var(--muted);margin:0}
+.tabs{display:flex;justify-content:center;gap:10px;margin:22px 0 26px}.tabs a{min-width:180px;text-align:center;text-decoration:none;color:#f5e7af;background:#12140e;border:1px solid var(--line);border-radius:10px;padding:11px 16px;font-weight:800;font-size:12px}.tabs a.active{background:linear-gradient(180deg,#c59b31,#9b741b);color:#fff;border-color:#d8ad3e}
+.section-head{display:flex;justify-content:space-between;align-items:center;margin:16px 0 14px}.section-head h3{font-size:15px;letter-spacing:.8px}.section-head a{color:var(--gold2);text-decoration:none;border:1px solid #6d5727;border-radius:9px;padding:9px 12px;font-size:12px}
+.bo-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px}.bo-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:17px;padding:21px;min-height:300px;box-shadow:0 12px 35px #0003}.bo-top{display:flex;justify-content:space-between;border-bottom:1px solid #343020;padding-bottom:13px}.bo-top small{color:#cfc5a1;letter-spacing:1px}.bo-top h3{font-family:Georgia,serif;color:var(--gold2);font-size:23px;margin:5px 0}.bo-top span{border:1px solid #725f29;border-radius:999px;padding:7px 10px;color:#f3d876;font-size:11px;height:max-content}.bo-preview{color:#e4dfcf;line-height:1.55;min-height:125px;max-height:210px;overflow:hidden;padding:15px 0}.mini-open{display:inline-block;color:#f2d47d;text-decoration:none;border:1px solid #71602f;border-radius:9px;padding:9px 12px;font-weight:700}.source{border-top:1px dashed #373326;margin-top:16px;padding-top:12px;color:#99917d;font-size:11px}.empty{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:24px;color:var(--muted)}
+@media(max-width:900px){.top{grid-template-columns:1fr;height:auto;padding:17px}.brand{grid-column:1;justify-self:start}.nav{justify-self:start;margin-top:12px;flex-wrap:wrap}.bo-grid{grid-template-columns:1fr}.tabs{flex-wrap:wrap}.tabs a{min-width:145px}}
 """
-    page = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central Operacional • Polícia Federal</title><style>{css}</style></head><body><header><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>POLÍCIA FEDERAL • CENTRAL OPERACIONAL</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a><a href="/pericias">Perícias</a></nav></header><main class="wrap"><section class="hero"><div><div class="ey">PAINEL OPERACIONAL</div><h2>Registros que exigem atuação</h2><p>Consulta rápida dos boletins, procurados e perícias ainda ativos.</p></div><div class="stats"><a class="stat" href="/boletins"><b>{qtd_bo}</b><span>Boletins ativos</span></a><a class="stat" href="/catalogo"><b>{qtd_procurados}</b><span>Procurados ativos</span></a><a class="stat" href="/pericias"><b>{qtd_pericias}</b><span>Perícias pendentes</span></a></div></section><div class="section-head"><h3>ÚLTIMOS BOLETINS ATIVOS</h3><a href="/boletins">VER TODOS</a></div><section class="bo-grid">{cards_bo}</section></main></body></html>'''
-    return web.Response(text=page, content_type='text/html', charset='utf-8')
+    page = (
+        '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>DICOR • Central de Boletins</title><style>' + css + '</style></head><body>'
+        '<header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR">'
+        '<div><h1>DICOR • CENTRAL DE BOLETINS</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div>'
+        '<nav class="nav"><a href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a><a href="/pericias">Perícias</a></nav></header>'
+        '<main class="wrap"><section class="intro"><span>PAINEL OPERACIONAL</span><h2>Central de Boletins</h2>'
+        '<p>Registros ativos da Polícia Federal, preservando o modelo visual aprovado.</p></section>'
+        f'<nav class="tabs"><a class="active" href="/boletins">EM ABERTO ({qtd_bo})</a>'
+        f'<a href="/catalogo">PROCURADOS ({qtd_procurados})</a>'
+        f'<a href="/pericias">PERÍCIAS ({qtd_pericias})</a></nav>'
+        '<div class="section-head"><h3>ÚLTIMOS BOLETINS ATIVOS</h3><a href="/boletins">VER TODOS</a></div>'
+        f'<section class="bo-grid">{cards_bo}</section></main></body></html>'
+    )
+    return web.Response(text=page, content_type="text/html", charset="utf-8")
 
 print('✅ V45 carregada: layout clássico restaurado e rotas operacionais sem loop de login.', flush=True)
 print('✅ V47 carregada: autenticação da Central e painel da live corrigidos.', flush=True)
+print('✅ V48 carregada: layout aprovado da Central restaurado e fixado.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
