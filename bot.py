@@ -54749,3 +54749,275 @@ print('✅ V39 carregada: criação inteligente de fichas com prévia e conflito
 
 if __name__ == '__main__':
     asyncio.run(main())
+
+# =====================================================
+# V41 — CORREÇÃO ROBUSTA DO IMPORTADOR DE RELATÓRIOS
+# =====================================================
+
+def _pf_rel_extrair(texto: str) -> Dict[str, Any]:
+    bruto = str(texto or "").replace("\r", "")
+    bruto = bruto.replace("\u200b", "").replace("\ufeff", "")
+    bruto = re.sub(r"[*_`~]", "", bruto)
+    pessoas: Dict[str, Dict[str, Any]] = {}
+    veiculos: List[Dict[str, Any]] = []
+    alteracoes: List[Dict[str, Any]] = []
+    duplas: List[Dict[str, Any]] = []
+    conflitos: List[str] = []
+
+    def pessoa(rg: str, nome: str = "", **extras):
+        rg = _pf_rel_rg(rg)
+        nome = _pf_rel_limpo(nome, 120).strip(" :-").upper()
+        if not rg or len(rg) < 2:
+            return None
+        atual = pessoas.setdefault(rg, {"rg": rg, "nome": nome, "aliases": [], "extras": {}, "fontes": []})
+        if nome and not atual.get("nome"):
+            atual["nome"] = nome
+        elif nome and atual.get("nome") and normalizar_busca(nome) != normalizar_busca(atual["nome"]):
+            if nome not in atual["aliases"]:
+                atual["aliases"].append(nome)
+        for k, v in extras.items():
+            if v not in (None, ""):
+                atual["extras"][k] = v
+        return atual
+
+    # Veículos: procura qualquer bloco iniciado por Placa, sem depender de "Registro" isolado.
+    placa_matches = list(re.finditer(r"(?im)^\s*Placa\s*:\s*([^\n]+)", bruto))
+    for idx, match in enumerate(placa_matches):
+        inicio = match.start()
+        fim = placa_matches[idx + 1].start() if idx + 1 < len(placa_matches) else min(len(bruto), inicio + 1800)
+        bloco = bruto[inicio:fim]
+
+        def campo(rotulos: str) -> str:
+            m = re.search(rf"(?im)^\s*(?:{rotulos})\s*:\s*([^\n]+)", bloco)
+            return _pf_rel_limpo(m.group(1), 180) if m else ""
+
+        placa = _pf_rel_placa(match.group(1))
+        nome = campo(r"Propriet[aá]rio|Dono")
+        rg = _pf_rel_rg(campo(r"Passaporte|RG"))
+        tel = campo(r"Telefone|Celular")
+        modelo = campo(r"Modelo|Ve[ií]culo|Carro")
+        cor = campo(r"Colora[cç][aã]o|Cor")
+        if placa:
+            veiculos.append({
+                "placa": placa, "nome": nome, "rg": rg, "telefone": tel,
+                "modelo": modelo, "cor": cor, "fonte": "Relatório de inteligência"
+            })
+        if rg:
+            pessoa(rg, nome, telefone=tel)
+
+    # Formatos Nome/RG explícitos em texto corrido ou em linhas separadas.
+    for m in re.finditer(
+        r"(?is)(?:Nome|Propriet[aá]rio)\s*:\s*([^\n]{2,100}).{0,160}?(?:RG|Passaporte)\s*:\s*(\d{2,})",
+        bruto,
+    ):
+        pessoa(m.group(2), m.group(1))
+
+    # Mudanças de nome: aceita texto corrido e linhas com RG: Nome A / Nome B.
+    sec = re.search(r"(?is)TROCARAM\s+DE\s+NOME\s*:?(.*?)(?:RANK\s+MAIS\s+PRIS|DUPLAS\s+RECORRENTES|\Z)", bruto)
+    if sec:
+        for rg, n1, n2 in re.findall(r"(?im)(\d{2,})\s*:\s*([^/\n;]+?)\s*/\s*([^\n;]+)", sec.group(1)):
+            n1, n2 = _pf_rel_limpo(n1, 120), _pf_rel_limpo(n2, 120)
+            item = pessoa(rg, n1)
+            n2u = n2.upper()
+            if item and n2u and n2u not in item["aliases"]:
+                item["aliases"].append(n2u)
+            alteracoes.append({"rg": _pf_rel_rg(rg), "nomes": [n1, n2]})
+
+    def extrair_linhas_pessoa(trecho: str) -> List[Dict[str, str]]:
+        saida: List[Dict[str, str]] = []
+        for linha in trecho.splitlines():
+            linha = re.sub(r"\s+", " ", linha).strip(" •>-|\t")
+            if not linha or ":" in linha and not re.search(r"\d{2,}\s*$", linha):
+                continue
+            # Nome RG [quantidade], aceitando um único espaço.
+            m = re.match(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ' .-]{1,90}?)\s+(\d{2,})(?:\s+(\d{1,3}))?$", linha)
+            if not m:
+                continue
+            nome, rg, qtd = m.groups()
+            # Evita capturar títulos ou datas como pessoas.
+            if normalizar_busca(nome) in {"registro", "placa", "telefone", "modelo", "passaporte", "rg"}:
+                continue
+            saida.append({"nome": _pf_rel_limpo(nome, 120), "rg": _pf_rel_rg(rg), "qtd": qtd or ""})
+        return saida
+
+    # Ranking.
+    rank = re.search(r"(?is)RANK\s+MAIS\s+PRIS(?:ÕES|OES)?[^\n]*\n?(.*?)(?:DUPLAS\s+RECORRENTES|\Z)", bruto)
+    if rank:
+        for reg in extrair_linhas_pessoa(rank.group(1)):
+            item = pessoa(reg["rg"], reg["nome"])
+            if item and reg["qtd"].isdigit():
+                item["extras"]["prisoes_30_dias"] = int(reg["qtd"])
+
+    # Fallback global para listas simples NOME RG, inclusive relatório colado sem cabeçalhos perfeitos.
+    for reg in extrair_linhas_pessoa(bruto):
+        pessoa(reg["rg"], reg["nome"])
+
+    # Duplas recorrentes: pares por posição nos dois lados da linha "x".
+    dsec = re.search(r"(?is)DUPLAS\s+RECORRENTES\s*:?(.*)$", bruto)
+    if dsec:
+        lados = re.split(r"(?im)^\s*[xX×]\s*$", dsec.group(1), maxsplit=1)
+        if len(lados) == 2:
+            a, b = extrair_linhas_pessoa(lados[0]), extrair_linhas_pessoa(lados[1])
+            if len(a) != len(b):
+                conflitos.append(f"Duplas recorrentes com lados diferentes: {len(a)} × {len(b)}.")
+            for x, y in zip(a, b):
+                pessoa(x["rg"], x["nome"]); pessoa(y["rg"], y["nome"])
+                duplas.append({"a": {"nome": x["nome"], "rg": x["rg"]}, "b": {"nome": y["nome"], "rg": y["rg"]}, "tipo": "prisões recorrentes", "quantidade_minima": 2})
+
+    # Conflitos RG/nome no próprio relatório.
+    alteracoes_rgs = {a.get("rg") for a in alteracoes}
+    for rg, p in pessoas.items():
+        nomes = [p.get("nome", "")] + list(p.get("aliases") or [])
+        nomes = list(dict.fromkeys(n for n in nomes if n))
+        if len(nomes) > 1 and rg not in alteracoes_rgs:
+            conflitos.append(f"RG {rg} aparece com nomes diferentes: {', '.join(nomes[:4])}.")
+
+    return {
+        "pessoas": list(pessoas.values()), "veiculos": veiculos,
+        "alteracoes": alteracoes, "duplas": duplas,
+        "conflitos": list(dict.fromkeys(conflitos)), "texto_bruto": bruto,
+        "diagnostico": {"caracteres": len(bruto), "linhas": len(bruto.splitlines()), "placas_brutas": len(placa_matches)},
+    }
+
+# Acrescenta diagnóstico visível na prévia para detectar falhas de coleta/OCR.
+_PF_REL_PREVIEW_V41_ANTERIOR = _pf_rel_preview
+def _pf_rel_preview(dados: Dict[str, Any]) -> discord.Embed:
+    embed = _PF_REL_PREVIEW_V41_ANTERIOR(dados)
+    diag = dados.get("diagnostico") or {}
+    embed.add_field(
+        name="🧪 Dados recebidos",
+        value=(
+            f"Mensagens: **{int(dados.get('mensagens_recebidas') or 0)}**\n"
+            f"Anexos: **{int(dados.get('anexos_recebidos') or 0)}**\n"
+            f"Caracteres analisados: **{int(diag.get('caracteres') or 0)}**\n"
+            f"Linhas analisadas: **{int(diag.get('linhas') or 0)}**"
+        ),
+        inline=True,
+    )
+    if not dados.get("pessoas") and not dados.get("veiculos"):
+        embed.color = discord.Color.orange()
+        embed.description = (
+            "⚠️ O bot recebeu o material, mas não reconheceu dados estruturados. "
+            "Confira o diagnóstico abaixo; não confirme uma importação zerada."
+        )
+    return embed
+
+# Substitui apenas o callback de coleta por versão com diagnóstico e leitura de mensagens editadas.
+class PFRelatorioColetaViewV41(PFRelatorioColetaView):
+    @discord.ui.button(label="Processar relatório", emoji="🔎", style=discord.ButtonStyle.success, row=0, custom_id="pf_relatorio_processar_v41")
+    async def processar_v41(self, interaction, button):
+        if self.processando:
+            return await interaction.response.send_message("⏳ O relatório já está sendo processado.", ephemeral=True)
+        self.processando = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        canal = interaction.guild.get_channel(self.canal_id) if interaction.guild else None
+        if not isinstance(canal, discord.TextChannel):
+            self.processando = False
+            return await interaction.followup.send("❌ A sala temporária não foi encontrada.", ephemeral=True)
+        try:
+            textos, anexos, mensagens_usuario = [], [], []
+            async for msg in canal.history(limit=None, oldest_first=True):
+                if int(msg.author.id) != self.autor_id:
+                    continue
+                mensagens_usuario.append(msg)
+                conteudo = str(msg.content or "").strip()
+                if conteudo:
+                    textos.append(conteudo)
+                anexos.extend(list(msg.attachments))
+            if not textos and not anexos:
+                self.processando = False
+                return await interaction.followup.send("⚠️ Envie o texto e/ou as imagens nesta sala antes de processar.", ephemeral=True)
+
+            texto = "\n\n".join(textos)
+            arquivos = []
+            for a in anexos[:30]:
+                try:
+                    arq = await _banco_v3_salvar_anexo(a, self.autor_id)
+                    arquivos.append(arq)
+                    nome = str(getattr(a, "filename", "") or "").lower()
+                    if nome.endswith((".txt", ".md", ".csv", ".log")):
+                        bruto_arq = await a.read()
+                        texto += "\n" + bruto_arq.decode("utf-8", errors="ignore")
+                    if arq.get("imagem") and BANCO_OCR_ATIVO and RapidOCR is not None:
+                        try:
+                            linhas = await asyncio.to_thread(_banco_ocr_ler_imagem_sync, arq["path"])
+                            texto += "\n" + "\n".join(linhas)
+                        except Exception:
+                            traceback.print_exc()
+                except Exception:
+                    traceback.print_exc()
+
+            dados = _pf_rel_extrair(texto)
+            dados.update({
+                "arquivos_fonte": arquivos,
+                "texto_original": texto[:200000],
+                "fonte_id": "REL-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2).upper(),
+                "mensagens_recebidas": len(mensagens_usuario),
+                "anexos_recebidos": len(anexos),
+            })
+            chave = secrets.token_urlsafe(8)
+            _PF_RELATORIO_IMPORTACOES[chave] = dados
+            await canal.send(embed=_pf_rel_preview(dados), view=PFRelatorioPreviewView(self.autor_id, chave, self.canal_id))
+            await interaction.followup.send("✅ Análise concluída. Confira a nova prévia.", ephemeral=True)
+            for item in self.children:
+                item.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+        except Exception as e:
+            self.processando = False
+            traceback.print_exc()
+            await interaction.followup.send(f"❌ Erro ao processar: `{type(e).__name__}: {e}`", ephemeral=True)
+
+# Remove o botão herdado duplicado da view e preserva cancelar.
+_orig_v41_init = PFRelatorioColetaViewV41.__init__
+def _v41_coleta_init(self, autor_id: int, canal_id: int):
+    _orig_v41_init(self, autor_id, canal_id)
+    for item in list(self.children):
+        if getattr(item, "label", "") == "Processar relatório" and getattr(item, "custom_id", "") != "pf_relatorio_processar_v41":
+            self.remove_item(item)
+PFRelatorioColetaViewV41.__init__ = _v41_coleta_init
+
+_PF_FLUXO_RELATORIO_V41_ANTERIOR = _pf_fluxo_relatorio_inteligencia
+async def _pf_fluxo_relatorio_inteligencia(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ Esta função só pode ser usada dentro do servidor.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild, usuario = interaction.guild, interaction.user
+    categoria = getattr(interaction.channel, "category", None)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        usuario: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True, attach_files=True, embed_links=True),
+    }
+    for cargo_id in CARGOS_ADMIN_IDS:
+        cargo = guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True)
+    nome_base = normalizar_busca(getattr(usuario, "display_name", str(usuario)))[:35].replace(" ", "-") or str(usuario.id)
+    try:
+        canal = await guild.create_text_channel(name=f"📥-importacao-{nome_base}", category=categoria, overwrites=overwrites, reason=f"Importação de relatório por {usuario}")
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Não consegui criar a sala temporária: `{e}`", ephemeral=True)
+    embed = discord.Embed(
+        title="📥 IMPORTAÇÃO DE RELATÓRIO DE INTELIGÊNCIA — V41",
+        description=(
+            "Envie quantas mensagens forem necessárias e anexe imagens/arquivos. "
+            "Quando terminar, clique em **Processar relatório**.\n\n"
+            "O leitor agora reconhece rankings, veículos, placas, passaportes, mudanças de nome e duplas mesmo com formatação irregular."
+        ), color=discord.Color.from_rgb(30, 88, 140),
+    )
+    await canal.send(content=usuario.mention, embed=embed, view=PFRelatorioColetaViewV41(usuario.id, canal.id))
+    await interaction.followup.send(f"✅ Sala criada: {canal.mention}", ephemeral=True)
+    async def expirar():
+        await asyncio.sleep(1200)
+        try:
+            atual = guild.get_channel(canal.id)
+            if atual:
+                await atual.delete(reason="Sala de importação expirada")
+        except Exception:
+            pass
+    asyncio.create_task(expirar())
+
+print("✅ V41 carregada: importador robusto de relatórios e diagnóstico de coleta.", flush=True)
