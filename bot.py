@@ -55436,5 +55436,59 @@ async def _v44_ready():
 print('✅ V44 carregada: Central operacional e numeração dos boletins corrigidas.', flush=True)
 
 
+# =====================================================
+# V45 — RESTAURAÇÃO DO LAYOUT CLÁSSICO + ACESSO OPERACIONAL SEM LOOP DE LOGIN
+# =====================================================
+
+@web.middleware
+async def central_auth_middleware(request: web.Request, handler):
+    caminho = request.path or '/'
+    publicos = (
+        caminho in {'/', '/index.html', '/boletins', '/boletins.html', '/pericias', '/pericias.html', '/catalogo', '/catalogo.html', '/acesso', '/sair', '/health', '/healthz'}
+        or caminho.startswith('/catalogo') or caminho.startswith('/uploads/')
+        or caminho.startswith('/central/') or caminho.startswith('/public/')
+        or caminho.startswith('/assets/')
+    )
+    if publicos or _central_cookie_valido(request):
+        return await handler(request)
+    destino = quote(str(request.rel_url), safe='/?:=&%')
+    raise web.HTTPFound(f'/acesso?next={destino}')
+
+
+def _v45_ultimos_bo_cards(limite: int = 6) -> str:
+    cards = []
+    for boletim in _v44_boletins_ativos_snapshot()[:max(0, int(limite))]:
+        numero = _v44_numero_canonico(boletim.get('numero') or boletim.get('texto'))
+        texto_limpo = _v37_limpar_texto_central(str(boletim.get('texto') or 'Conteúdo não informado.'))
+        linhas = [linha.strip() for linha in texto_limpo.splitlines() if linha.strip()]
+        resumo = '\n'.join(linhas[:8])
+        if len(resumo) > 650:
+            resumo = resumo[:647] + '...'
+        resumo_html = html.escape(resumo).replace('\n', '<br>')
+        jump = str(boletim.get('mensagem_url') or boletim.get('jump_url') or '')
+        botao = f'<a class="mini-open" href="{html.escape(jump)}" target="_blank">Ver boletim completo</a>' if jump else '<a class="mini-open" href="/boletins">Ver boletim completo</a>'
+        cards.append('<article class="bo-card"><div class="bo-top"><div><small>BOLETIM</small>'
+                     f'<h3>{html.escape(numero)}</h3></div><span>EM ABERTO</span></div>'
+                     f'<div class="bo-preview">{resumo_html or "Sem resumo disponível."}</div>{botao}'
+                     '<div class="source">Fonte: canal oficial de boletins • consulta somente leitura.</div></article>')
+    return ''.join(cards) or '<div class="empty">Nenhum boletim ativo no momento.</div>'
+
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    qtd_bo = len(_v44_boletins_ativos_snapshot())
+    qtd_procurados = len(_v43_procurados_ativos())
+    pericias = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(pericias, dict):
+        pericias = pericias.get('pericias') or pericias.get('registros') or []
+    qtd_pericias = len([x for x in pericias if isinstance(x, dict) and _v44_pericia_pendente(x)])
+    cards_bo = _v45_ultimos_bo_cards(6)
+    css = """
+:root{--bg:#080906;--panel:#10120e;--panel2:#0d0f0b;--gold:#d8ad3e;--gold2:#f1d476;--line:#4a3b1d;--text:#f5f0dd;--muted:#aaa28d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#4d3c1238,transparent 42%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}header{height:106px;border-bottom:1px solid var(--line);background:#090a07ee;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;position:sticky;top:0;z-index:10}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:58px;height:70px;object-fit:contain}.brand h1{font-size:20px;letter-spacing:2px;margin:0}.brand small{display:block;color:var(--gold);letter-spacing:1.5px;margin-top:5px}.nav{justify-self:end;display:flex;gap:17px}.nav a{color:#e5d59c;text-decoration:none;font-size:14px}.wrap{max-width:1300px;margin:auto;padding:42px 22px 80px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;margin-bottom:24px}.ey{color:var(--gold);font-size:11px;letter-spacing:2px}.hero h2{font-size:38px;margin:8px 0}.hero p{color:var(--muted);margin:0}.stats{display:flex;gap:10px;flex-wrap:wrap}.stat{min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:13px 15px;text-decoration:none;color:var(--text)}.stat b{display:block;color:var(--gold2);font-size:25px}.stat span{font-size:12px;color:var(--muted)}.section-head{display:flex;justify-content:space-between;align-items:center;margin:32px 0 14px}.section-head a{color:var(--gold2);text-decoration:none;border:1px solid #6a5528;border-radius:9px;padding:9px 12px;font-size:12px}.bo-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px}.bo-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:17px;padding:21px;min-height:300px}.bo-top{display:flex;justify-content:space-between;border-bottom:1px solid #343020;padding-bottom:13px}.bo-top h3{font-family:Georgia,serif;color:var(--gold2);font-size:23px;margin:5px 0}.bo-top span{border:1px solid #725f29;border-radius:999px;padding:7px 10px;color:#f3d876;font-size:12px;height:max-content}.bo-preview{color:#e4dfcf;line-height:1.55;min-height:125px;max-height:210px;overflow:hidden;padding:15px 0}.mini-open{display:inline-block;color:#f2d47d;text-decoration:none;border:1px solid #71602f;border-radius:9px;padding:9px 12px;font-weight:700}.source{border-top:1px dashed #373326;margin-top:16px;padding-top:12px;color:#99917d;font-size:11px}.empty{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:24px;color:var(--muted)}@media(max-width:900px){header{grid-template-columns:1fr;height:auto;padding:18px}.brand{grid-column:1}.nav{justify-self:start;margin-top:14px;flex-wrap:wrap}.hero{align-items:start;flex-direction:column}.bo-grid{grid-template-columns:1fr}}
+"""
+    page = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central Operacional • Polícia Federal</title><style>{css}</style></head><body><header><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>POLÍCIA FEDERAL • CENTRAL OPERACIONAL</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a><a href="/pericias">Perícias</a></nav></header><main class="wrap"><section class="hero"><div><div class="ey">PAINEL OPERACIONAL</div><h2>Registros que exigem atuação</h2><p>Consulta rápida dos boletins, procurados e perícias ainda ativos.</p></div><div class="stats"><a class="stat" href="/boletins"><b>{qtd_bo}</b><span>Boletins ativos</span></a><a class="stat" href="/catalogo"><b>{qtd_procurados}</b><span>Procurados ativos</span></a><a class="stat" href="/pericias"><b>{qtd_pericias}</b><span>Perícias pendentes</span></a></div></section><div class="section-head"><h3>ÚLTIMOS BOLETINS ATIVOS</h3><a href="/boletins">VER TODOS</a></div><section class="bo-grid">{cards_bo}</section></main></body></html>'''
+    return web.Response(text=page, content_type='text/html', charset='utf-8')
+
+print('✅ V45 carregada: layout clássico restaurado e rotas operacionais sem loop de login.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
