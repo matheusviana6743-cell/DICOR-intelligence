@@ -45248,6 +45248,20 @@ async def _rg_auto_enviar_ficha(message: discord.Message, rg: str, individuo: Di
 async def _rg_auto_processar_mensagem(message: discord.Message) -> None:
     if message.guild is None:
         return
+    # A consulta automática só funciona nas mesas de investigação e em canais de chat.
+    # Salas temporárias de importação, banco de dados, boletins, perícias etc. são ignoradas.
+    canal = message.channel
+    if not isinstance(canal, (discord.TextChannel, discord.Thread)):
+        return
+    nome_canal = normalizar_busca(getattr(canal, 'name', '') or '')
+    nome_categoria = normalizar_busca(getattr(getattr(canal, 'category', None), 'name', '') or '')
+    categoria_id = int(getattr(getattr(canal, 'category', None), 'id', 0) or 0)
+    em_mesa = categoria_id in {int(CATEGORIA_MESAS_ABERTAS_ID), int(CATEGORIA_MESAS_FECHADAS_ID)} or 'mesa de investigacao' in nome_categoria
+    em_chat = any(chave in nome_canal for chave in ('chat', 'investigacao', 'inteligencia'))
+    if nome_canal.startswith('importacao-') or 'importacao' in nome_canal:
+        return
+    if not (em_mesa or em_chat):
+        return
     if bot.user is not None and int(getattr(message.author, "id", 0) or 0) == int(bot.user.id):
         return
     mensagem_id = int(getattr(message, "id", 0) or 0)
@@ -54747,9 +54761,6 @@ async def _v39_on_ready():
 
 print('✅ V39 carregada: criação inteligente de fichas com prévia e conflitos.',flush=True)
 
-if __name__ == '__main__':
-    asyncio.run(main())
-
 # =====================================================
 # V41 — CORREÇÃO ROBUSTA DO IMPORTADOR DE RELATÓRIOS
 # =====================================================
@@ -55021,3 +55032,47 @@ async def _pf_fluxo_relatorio_inteligencia(interaction: discord.Interaction):
     asyncio.create_task(expirar())
 
 print("✅ V41 carregada: importador robusto de relatórios e diagnóstico de coleta.", flush=True)
+
+
+# =====================================================
+# V42 — FINALIZAÇÃO DA IMPORTAÇÃO + CANCELAMENTO SEGURO
+# =====================================================
+
+# Corrige o botão de encerramento para sempre reconhecer/deferir a interação
+# antes de apagar o canal, evitando "A interação falhou".
+async def _pf_v42_cancelar_sala(self, interaction: discord.Interaction, button: discord.ui.Button):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+    canal = interaction.guild.get_channel(int(getattr(self, "canal_id", 0) or 0)) if interaction.guild else None
+    try:
+        await interaction.followup.send("🗑️ Encerrando e apagando a sala de importação...", ephemeral=True)
+    except Exception:
+        pass
+    await asyncio.sleep(0.5)
+    if canal:
+        try:
+            await canal.delete(reason=f"Importação cancelada por {interaction.user}")
+        except Exception as erro:
+            try:
+                await interaction.followup.send(f"❌ Não consegui apagar a sala: `{type(erro).__name__}: {erro}`", ephemeral=True)
+            except Exception:
+                pass
+
+# Substitui o callback do botão herdado após a montagem da View.
+_PF_V42_COLETA_INIT_ANTERIOR = PFRelatorioColetaViewV41.__init__
+def _pf_v42_coleta_init(self, autor_id: int, canal_id: int):
+    _PF_V42_COLETA_INIT_ANTERIOR(self, autor_id, canal_id)
+    for item in self.children:
+        if "Cancelar" in str(getattr(item, "label", "")) or "apagar sala" in str(getattr(item, "label", "")).lower():
+            async def _callback(interaction, _item=item):
+                return await _pf_v42_cancelar_sala(self, interaction, _item)
+            item.callback = _callback
+PFRelatorioColetaViewV41.__init__ = _pf_v42_coleta_init
+
+print("✅ V42 carregada: importador ativo antes do start, cancelamento seguro e auto-ficha somente em mesas/chats.", flush=True)
+
+if __name__ == '__main__':
+    asyncio.run(main())
