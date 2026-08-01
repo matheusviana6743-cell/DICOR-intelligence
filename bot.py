@@ -55074,5 +55074,367 @@ PFRelatorioColetaViewV41.__init__ = _pf_v42_coleta_init
 
 print("✅ V42 carregada: importador ativo antes do start, cancelamento seguro e auto-ficha somente em mesas/chats.", flush=True)
 
+
+# =====================================================
+# V43 — SOMENTE PROCURADOS E BOLETINS ATIVOS + LISTA COMPLETA
+# =====================================================
+
+def _v43_canal_id_registro(registro: Dict[str, Any]) -> int:
+    for chave in ("canal_id", "publicacao_canal_id", "mensagem_canal_id"):
+        try:
+            valor = int(registro.get(chave) or 0)
+            if valor:
+                return valor
+        except Exception:
+            pass
+    for chave in ("mensagem_url", "publicacao_url", "jump_url"):
+        achado = re.search(r"/channels/\d+/(\d+)/(\d+)", str(registro.get(chave) or ""))
+        if achado:
+            try:
+                return int(achado.group(1))
+            except Exception:
+                pass
+    return 0
+
+
+def _v43_procurado_esta_no_canal_ativo(registro: Dict[str, Any]) -> bool:
+    if not isinstance(registro, dict):
+        return False
+    canal_id = _v43_canal_id_registro(registro)
+    if canal_id:
+        return canal_id == int(PROCURADOS_CHANNEL_ID)
+    status = str(registro.get("status") or "").upper().strip()
+    possui_publicacao_ativa = bool(registro.get("mensagem_id")) and not bool(
+        registro.get("mensagem_arquivada_id") or registro.get("mensagem_arquivada_url")
+    )
+    return possui_publicacao_ativa and status not in {"RETIRADO", "ARQUIVADO", "CAPTURADO", "PEGO", "APAGADO"}
+
+
+def _v43_procurados_ativos() -> List[Dict[str, Any]]:
+    registros = carregar_procurados() or []
+    unicos: Dict[str, Dict[str, Any]] = {}
+    for registro in registros if isinstance(registros, list) else []:
+        if not _v43_procurado_esta_no_canal_ativo(registro):
+            continue
+        chave = limpar_rg(registro.get("rg", "")) or str(registro.get("mensagem_id") or registro.get("id") or "")
+        if chave:
+            unicos[chave] = registro
+    return sorted(unicos.values(), key=lambda x: normalizar_busca(str(x.get("nome") or "")))
+
+
+def _v17_render_catalogo_sync() -> str:
+    global _V17_CATALOGO_CACHE_HTML, _V17_CATALOGO_CACHE_KEY
+    ativos = _v43_procurados_ativos()
+    key = tuple((str(x.get("rg") or ""), int(x.get("mensagem_id") or 0), str(x.get("status") or "")) for x in ativos)
+    if _V17_CATALOGO_CACHE_HTML and key == _V17_CATALOGO_CACHE_KEY:
+        return _V17_CATALOGO_CACHE_HTML
+    cards = ''.join(_v17_catalogo_card(x) for x in ativos) or (
+        '<div class="empty-state"><img src="/central/brasao-dicor.png">'
+        '<h2>Nenhum procurado ativo</h2><p>Somente registros do canal oficial ativo aparecem aqui.</p></div>'
+    )
+    pagina = (_V17_CATALOGO_TEMPLATE
+        .replace('__COUNT_ACTIVE__', str(len(ativos)))
+        .replace('__COUNT_RETIRED__', '0')
+        .replace('__CARDS_ACTIVE__', cards)
+        .replace('__CARDS_RETIRED__', ''))
+    pagina = re.sub(r'<button id="btn-retired"[^>]*>.*?</button>', '', pagina, flags=re.I|re.S)
+    pagina = re.sub(r'<section id="retired".*?</section>', '', pagina, flags=re.I|re.S)
+    pagina = pagina.replace('Indivíduos procurados', 'Procurados ativos')
+    _V17_CATALOGO_CACHE_HTML = pagina
+    _V17_CATALOGO_CACHE_KEY = key
+    return pagina
+
+
+def _v19_boletins_html() -> str:
+    payload = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    registros = payload.get("boletins", []) if isinstance(payload, dict) else []
+    cards: List[str] = []
+    for bo in registros:
+        if not isinstance(bo, dict):
+            continue
+        status = str(bo.get("status") or "EM ABERTO")
+        if _v19_status_bo_final(status):
+            continue
+        numero = str(bo.get("numero") or "Sem número")
+        corpo = html.escape(_v37_limpar_texto_central(str(bo.get("texto") or "Conteúdo não informado."))).replace("\n", "<br>")
+        urls: List[str] = []
+        for item in bo.get("midias", []) or []:
+            u = _v21_midia_url(item)
+            if u and u not in urls:
+                urls.append(u)
+        imagens = ''.join(f'<a href="{html.escape(u)}" target="_blank"><img src="{html.escape(u)}" loading="lazy"></a>' for u in urls)
+        cards.append(
+            f'<article class="bo"><div class="head"><div><small>BOLETIM ATIVO</small><h2>{html.escape(numero)}</h2></div><span>EM ABERTO</span></div>'
+            f'<div class="texto">{corpo}</div>'
+            + (f'<div class="media">{imagens}</div>' if imagens else '<p class="muted">Nenhuma foto anexada.</p>')
+            + '<p class="muted">Fonte: canal oficial de boletins ativos.</p></article>'
+        )
+    css = ':root{--g:#d7a93d;--g2:#f4d77c;--bg:#070806;--p:#10120e;--line:#433719;--mut:#a59e88}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#3a2d0c55,transparent 35%),var(--bg);color:#f7f1db;font-family:Inter,Arial,sans-serif}.top{height:105px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 5vw}.brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:70px;height:70px;object-fit:contain;border:1px solid #806a2d;border-radius:16px;padding:5px}.brand h1{margin:0;font-size:18px;letter-spacing:2px}.brand small,.ey{color:var(--g);letter-spacing:1.5px}.nav{justify-self:end}.nav a{color:var(--g2);text-decoration:none;margin-left:15px}.wrap{max-width:1450px;margin:45px auto;padding:0 22px}.hero{text-align:center;margin-bottom:30px}.hero h2{font-size:38px;margin:8px}.panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:18px}.bo{background:var(--p);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 20px 50px #0005}.head{display:flex;justify-content:space-between;gap:15px}.head h2{margin:5px 0;color:var(--g2)}.head span{border:1px solid #675321;border-radius:99px;padding:7px 11px;height:max-content;color:#e8cf7b}.texto{color:#d7d0bb;line-height:1.55;max-height:420px;overflow:auto;border-top:1px solid #292515;padding-top:15px}.media{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:16px}.media img{width:100%;height:260px;object-fit:contain;background:#050604;border:1px solid #4c3e1d;border-radius:10px}.muted{color:var(--mut);font-size:13px}@media(max-width:650px){.top{grid-template-columns:1fr}.brand{grid-column:1}.nav{display:none}.panel{grid-template-columns:1fr}.media{grid-template-columns:1fr}}'
+    conteudo = ''.join(cards) or '<p class="muted">Nenhum boletim ativo.</p>'
+    return f"""<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Boletins ativos - Central DICOR</title><style>{css}</style></head><body><header class='top'><div></div><div class='brand'><img src='/central/brasao-dicor.png'><div><h1>DICOR - BOLETINS ATIVOS</h1><small>FONTE: CANAL OFICIAL - SOMENTE LEITURA</small></div></div><nav class='nav'><a href='/'>Central</a><a href='/arvore'>Vínculos</a><a href='/sair'>Sair</a></nav></header><main class='wrap'><section class='hero'><div class='ey'>PLATAFORMA OPERACIONAL</div><h2>Boletins em andamento</h2><p class='muted'>São exibidos somente os boletins que continuam ativos.</p></section><section class='panel'>{conteudo}</section></main></body></html>"""
+
+
+class PainelProcuradosView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Novo Procurado', emoji='➕', style=discord.ButtonStyle.danger, custom_id='dic_novo_procurado')
+    async def novo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(NovoProcuradoModal())
+
+    @discord.ui.button(label='Lista de Procurados', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_lista_procurados')
+    async def lista(self, interaction: discord.Interaction, button: Button):
+        ativos = _v43_procurados_ativos()
+        if not ativos:
+            return await interaction.response.send_message(f'📋 **Procurados ativos**\nNenhum registro localizado no canal <#{int(PROCURADOS_CHANNEL_ID)}>.', ephemeral=True)
+        paginas = [ativos[i:i+15] for i in range(0, len(ativos), 15)]
+        primeira = True
+        for indice, pagina in enumerate(paginas, 1):
+            embed = discord.Embed(title=f'📋 PROCURADOS ATIVOS — {indice}/{len(paginas)}', description=f'Fonte exclusiva: <#{int(PROCURADOS_CHANNEL_ID)}> • Total: **{len(ativos)}**', color=discord.Color.red())
+            for registro in pagina:
+                nome = str(registro.get('nome') or 'Nome não informado')
+                rg = str(registro.get('rg') or 'Não informado')
+                crimes = str(valor_crimes_registro(registro) or 'Não informado')
+                url = str(registro.get('mensagem_url') or '')
+                valor = f'**RG:** `{rg}`\n**Crimes:** {crimes[:350]}'
+                if url:
+                    valor += f'\n[🔗 Abrir publicação]({url})'
+                embed.add_field(name=f'🚨 {nome}', value=valor, inline=False)
+            if primeira:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                primeira = False
+            else:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label='Registrar captura', emoji='🚔', style=discord.ButtonStyle.gray, custom_id='dic_retirar_procurado')
+    async def retirar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(RetirarProcuradoModal())
+
+    @discord.ui.button(label='Modificar Procurado', emoji='✏️', style=discord.ButtonStyle.primary, custom_id='dic_modificar_procurado', row=1)
+    async def modificar(self, interaction: discord.Interaction, button: Button):
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            return await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.', ephemeral=True)
+        await interaction.response.send_modal(BuscarModificarProcuradoModal())
+
+    @discord.ui.button(label='Abrir Catálogo', emoji='📄', style=discord.ButtonStyle.green, custom_id='dic_abrir_catalogo')
+    async def abrir_catalogo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(f'📄 **Catálogo dos procurados ativos:**\n{_v16_catalogo_url()}', ephemeral=True)
+
+
+@bot.listen('on_ready')
+async def _v43_ativos_ready():
+    await asyncio.sleep(4)
+    global _V17_CATALOGO_CACHE_HTML, _V17_CATALOGO_CACHE_KEY
+    _V17_CATALOGO_CACHE_HTML = ''
+    _V17_CATALOGO_CACHE_KEY = tuple()
+    try:
+        await asyncio.to_thread(gerar_catalogo_html)
+    except Exception:
+        traceback.print_exc()
+    try:
+        bot.add_view(PainelProcuradosView())
+    except Exception:
+        pass
+
+print('✅ V43 carregada: procurados apenas do canal ativo, boletins somente ativos e lista completa de procurados.', flush=True)
+
+# =====================================================
+# V44 — CENTRAL OPERACIONAL PF + NUMERAÇÃO ROBUSTA DOS BOLETINS
+# =====================================================
+
+def _v44_numero_inteiro_bo(valor: Any) -> int:
+    texto = str(valor or '').upper().strip()
+    for padrao in (
+        r'BO[-_\s]*DICOR[-_\s]*(\d{1,8})',
+        r'BO(?:LETIM)?(?:\s+DE\s+OCORR[EÊ]NCIA)?\s*(?:N[º°O.]*)?\s*[-:#]?\s*(\d{1,8})',
+        r'(\d{1,8})\s*$',
+    ):
+        achado = re.search(padrao, texto, re.I)
+        if achado:
+            try:
+                return int(achado.group(1))
+            except Exception:
+                pass
+    return 0
+
+
+def _v44_numero_canonico(valor: Any) -> str:
+    numero = _v44_numero_inteiro_bo(valor)
+    return f'BO-DICOR-{numero:03d}' if numero else str(valor or 'SEM NÚMERO').strip()
+
+
+def _v44_iter_registros(fonte: Any):
+    if isinstance(fonte, dict):
+        return list(fonte.values())
+    if isinstance(fonte, list):
+        return fonte
+    return []
+
+
+def _v44_coletar_maior_numero_local() -> int:
+    maior = 0
+    fontes = [
+        carregar_boletins() or [],
+        carregar_json(BOLETIM_ATENDIMENTOS_JSON, {}) or {},
+        carregar_json(BOLETINS_PENDENTES_JSON, {}) or {},
+    ]
+    snapshot = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    if isinstance(snapshot, dict):
+        fontes.append(snapshot.get('boletins') or [])
+    for fonte in fontes:
+        for item in _v44_iter_registros(fonte):
+            if not isinstance(item, dict):
+                continue
+            for chave in ('numero', 'numero_boletim', 'boletim', 'titulo', 'texto'):
+                maior = max(maior, _v44_numero_inteiro_bo(item.get(chave)))
+    contador = carregar_json(BOLETINS_CONTADOR_JSON, {})
+    if isinstance(contador, dict):
+        try:
+            maior = max(maior, int(contador.get('ultimo') or 0))
+        except Exception:
+            pass
+    return maior
+
+
+def gerar_numero_boletim() -> str:
+    ultimo = _v44_coletar_maior_numero_local() + 1
+    salvar_json(BOLETINS_CONTADOR_JSON, {
+        'ultimo': ultimo,
+        'modelo': 'global_crescente_v44',
+        'atualizado_em': agora_br(),
+    })
+    return f'BO-DICOR-{ultimo:03d}'
+
+
+async def _v44_reconciliar_numeracao_canal() -> int:
+    maior = _v44_coletar_maior_numero_local()
+    for guild in list(getattr(bot, 'guilds', []) or []):
+        canal = guild.get_channel(int(BOLETINS_CHANNEL_ID))
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(int(BOLETINS_CHANNEL_ID))
+            except Exception:
+                canal = None
+        if canal and hasattr(canal, 'history'):
+            try:
+                async for mensagem in canal.history(limit=None, oldest_first=True):
+                    partes = [str(mensagem.content or '')]
+                    for embed in mensagem.embeds:
+                        partes.extend([str(embed.title or ''), str(embed.description or '')])
+                        partes.extend(f'{campo.name} {campo.value}' for campo in embed.fields)
+                    maior = max(maior, _v44_numero_inteiro_bo('\n'.join(partes)))
+            except Exception:
+                traceback.print_exc()
+    salvar_json(BOLETINS_CONTADOR_JSON, {
+        'ultimo': maior,
+        'modelo': 'global_crescente_v44',
+        'reconciliado_em': agora_br(),
+    })
+    return maior
+
+
+def _v44_boletins_ativos_snapshot() -> List[Dict[str, Any]]:
+    payload = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    registros = payload.get('boletins', []) if isinstance(payload, dict) else []
+    unicos: Dict[str, Dict[str, Any]] = {}
+    sem_numero: List[Dict[str, Any]] = []
+    for boletim in registros if isinstance(registros, list) else []:
+        if not isinstance(boletim, dict):
+            continue
+        if _v19_status_bo_final(str(boletim.get('status') or 'EM ABERTO')):
+            continue
+        numero = _v44_numero_inteiro_bo(boletim.get('numero') or boletim.get('texto') or boletim.get('titulo'))
+        copia = dict(boletim)
+        if numero:
+            copia['numero'] = f'BO-DICOR-{numero:03d}'
+            chave = str(numero)
+            antigo = unicos.get(chave)
+            score_novo = len(str(copia.get('texto') or '')) + len(copia.get('midias') or []) * 500
+            score_antigo = len(str((antigo or {}).get('texto') or '')) + len((antigo or {}).get('midias') or []) * 500
+            if antigo is None or score_novo >= score_antigo:
+                unicos[chave] = copia
+        else:
+            sem_numero.append(copia)
+    return sorted(unicos.values(), key=lambda x: _v44_numero_inteiro_bo(x.get('numero')), reverse=True) + sem_numero
+
+
+def _v19_boletins_html() -> str:
+    cards = []
+    for boletim in _v44_boletins_ativos_snapshot():
+        numero = _v44_numero_canonico(boletim.get('numero') or boletim.get('texto'))
+        texto = html.escape(_v37_limpar_texto_central(str(boletim.get('texto') or 'Conteúdo não informado.'))).replace('\n', '<br>')
+        urls = []
+        for item in boletim.get('midias', []) or []:
+            url = _v21_midia_url(item)
+            if url and url not in urls:
+                urls.append(url)
+        imagens = ''.join(f'<a href="{html.escape(url)}" target="_blank"><img src="{html.escape(url)}" loading="lazy"></a>' for url in urls)
+        jump = str(boletim.get('mensagem_url') or boletim.get('jump_url') or '')
+        abrir = f'<a class="open" href="{html.escape(jump)}" target="_blank">Abrir BO no Discord</a>' if jump else ''
+        cards.append(
+            '<article class="bo">'
+            f'<div class="head"><div><small>BOLETIM ATIVO</small><h2>{html.escape(numero)}</h2></div><span>EM ABERTO</span></div>'
+            f'<div class="texto">{texto}</div>'
+            + (f'<div class="media">{imagens}</div>' if imagens else '')
+            + abrir + '</article>'
+        )
+    css = """*{box-sizing:border-box}body{margin:0;background:#070806;color:#f7f1db;font-family:Inter,Arial}.top{padding:24px 5vw;border-bottom:1px solid #4b3b1c;display:flex;justify-content:space-between;align-items:center}.top a,.open{color:#f0d276}.wrap{max-width:1400px;margin:auto;padding:42px 22px}.hero{text-align:center}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:30px}.bo{background:#10120e;border:1px solid #433719;border-radius:18px;padding:23px}.head{display:flex;justify-content:space-between;border-bottom:1px solid #302919}.head h2{color:#f0d276}.head span{color:#d7a93d}.texto{line-height:1.55;padding-top:15px;max-height:420px;overflow:auto}.media{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:14px}.media img{width:100%;height:230px;object-fit:contain;background:#050604}.open{display:inline-block;margin-top:15px;border:1px solid #6b5726;padding:9px 12px;border-radius:9px;text-decoration:none}@media(max-width:800px){.grid{grid-template-columns:1fr}}"""
+    corpo = ''.join(cards) or '<p>Nenhum boletim ativo.</p>'
+    return f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Boletins ativos</title><style>{css}</style></head><body><header class="top"><b>POLÍCIA FEDERAL • BOLETINS ATIVOS</b><a href="/">Voltar</a></header><main class="wrap"><section class="hero"><h1>Boletins em andamento</h1><p>Numeração reconciliada e ordenada. Encerrados não aparecem.</p></section><section class="grid">{corpo}</section></main></body></html>'
+
+
+def _v44_pericia_pendente(registro: Dict[str, Any]) -> bool:
+    texto = ' '.join(str(registro.get(chave) or '') for chave in ('status', 'situacao', 'texto', 'titulo')).lower()
+    finais = ('concluída', 'concluida', 'finalizada', 'finalizado', 'encerrada', 'encerrado', 'arquivada', 'arquivado', 'resolvida', 'resolvido', 'capturado')
+    return not any(palavra in texto for palavra in finais)
+
+
+def _v23_pericias_html() -> str:
+    registros = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(registros, dict):
+        registros = registros.get('pericias') or registros.get('registros') or []
+    pendentes = [x for x in registros if isinstance(x, dict) and _v44_pericia_pendente(x)]
+    cards = []
+    for pericia in pendentes:
+        numero = str(pericia.get('numero') or pericia.get('id') or 'S/N')
+        titulo = str(pericia.get('titulo') or pericia.get('tipo') or 'Perícia pendente')
+        texto = html.escape(_v37_limpar_texto_central(str(pericia.get('texto') or pericia.get('descricao') or 'Sem descrição.'))).replace('\n', '<br>')
+        url = str(pericia.get('mensagem_url') or pericia.get('jump_url') or '')
+        abrir = f'<a href="{html.escape(url)}" target="_blank">Abrir perícia</a>' if url else ''
+        cards.append(f'<article><small>PERÍCIA PENDENTE</small><h2>{html.escape(titulo)}</h2><b>Nº {html.escape(numero)}</b><p>{texto}</p>{abrir}</article>')
+    css = """*{box-sizing:border-box}body{margin:0;background:#070806;color:#f7f1db;font-family:Inter,Arial}.top{padding:24px 5vw;border-bottom:1px solid #4b3b1c;display:flex;justify-content:space-between}.top a,article a{color:#f0d276}.wrap{max-width:1300px;margin:auto;padding:42px 22px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}article{background:#10120e;border:1px solid #433719;border-radius:18px;padding:23px}article small{color:#d7a93d}article p{color:#d7d0bb;line-height:1.55;max-height:300px;overflow:auto}@media(max-width:800px){.grid{grid-template-columns:1fr}}"""
+    corpo = ''.join(cards) or '<p>Nenhuma perícia pendente.</p>'
+    return f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Perícias pendentes</title><style>{css}</style></head><body><header class="top"><b>POLÍCIA FEDERAL • PERÍCIAS PENDENTES</b><a href="/">Voltar</a></header><main class="wrap"><h1>Perícias que exigem acompanhamento</h1><section class="grid">{corpo}</section></main></body></html>'
+
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    quantidade_bo = len(_v44_boletins_ativos_snapshot())
+    quantidade_procurados = len(_v43_procurados_ativos())
+    pericias = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(pericias, dict):
+        pericias = pericias.get('pericias') or pericias.get('registros') or []
+    quantidade_pericias = len([x for x in pericias if isinstance(x, dict) and _v44_pericia_pendente(x)])
+    cards = (
+        f'<a class="card" href="/boletins"><div>📄</div><h2>Boletins Ativos</h2><strong>{quantidade_bo}</strong><p>Somente ocorrências ainda em andamento.</p></a>'
+        f'<a class="card" href="/catalogo"><div>🎯</div><h2>Procurados Ativos</h2><strong>{quantidade_procurados}</strong><p>Fonte exclusiva: canal oficial de procurados ativos.</p></a>'
+        f'<a class="card" href="/pericias"><div>🧪</div><h2>Perícias Pendentes</h2><strong>{quantidade_pericias}</strong><p>Somente perícias ainda não concluídas.</p></a>'
+    )
+    css = """*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#5d48152d,transparent 38%),#070806;color:#f7f1db;font-family:Inter,Arial}.top{height:110px;border-bottom:1px solid #4b3b1c;display:grid;place-items:center}.top h1{letter-spacing:2px}.wrap{max-width:1150px;margin:auto;padding:70px 22px}.hero{text-align:center;margin-bottom:40px}.hero h2{font-size:44px;margin:8px}.hero p{color:#aaa28b}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card{background:#10120e;border:1px solid #433719;border-radius:20px;padding:28px;color:#f7f1db;text-decoration:none;min-height:245px}.card div{font-size:34px}.card h2{color:#f0d276}.card strong{font-size:44px;color:#d7a93d}.card p{color:#aaa28b;line-height:1.5}@media(max-width:850px){.grid{grid-template-columns:1fr}}"""
+    pagina = f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central Operacional PF</title><style>{css}</style></head><body><header class="top"><h1>CENTRAL OPERACIONAL • POLÍCIA FEDERAL</h1></header><main class="wrap"><section class="hero"><small>PAINEL OPERACIONAL</small><h2>Acompanhamento em tempo real</h2><p>Somente registros que exigem atuação.</p></section><section class="grid">{cards}</section></main></body></html>'
+    return web.Response(text=pagina, content_type='text/html', charset='utf-8')
+
+
+@bot.listen('on_ready')
+async def _v44_ready():
+    await asyncio.sleep(6)
+    try:
+        maior = await _v44_reconciliar_numeracao_canal()
+        print(f'✅ V44: contador de boletins reconciliado em {maior}.', flush=True)
+    except Exception:
+        traceback.print_exc()
+
+print('✅ V44 carregada: Central operacional e numeração dos boletins corrigidas.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
