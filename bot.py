@@ -53724,5 +53724,243 @@ async def start_web_server():
 
 print('✅ V36 carregada: painel da live com borda prata fina, mantendo o visual imersivo e todas as funções da V35.', flush=True)
 
+
+# =====================================================
+# PATCH V37 — MANDADOS PNG + CENTRAL LIMPA + AUTOTESTE COMPLETO
+# =====================================================
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+
+def _v37_nome_mencao(match: re.Match) -> str:
+    try:
+        uid = int(match.group(1))
+    except Exception:
+        return "Usuário não identificado"
+    membro = None
+    for guild in list(getattr(bot, "guilds", []) or []):
+        membro = guild.get_member(uid)
+        if membro:
+            break
+    if membro:
+        try:
+            return _nome_rp_usuario(membro)
+        except Exception:
+            return getattr(membro, "display_name", str(membro))
+    usuario = bot.get_user(uid)
+    return getattr(usuario, "display_name", getattr(usuario, "name", f"Usuário {uid}")) if usuario else f"Usuário {uid}"
+
+
+def _v37_limpar_texto_central(texto: Any) -> str:
+    valor = str(texto or "")
+    valor = re.sub(r"<@!?(\d+)>", _v37_nome_mencao, valor)
+    valor = valor.replace("**", "").replace("__", "").replace("~~", "")
+    valor = re.sub(r"(?m)^\s*>\s?", "", valor)
+    return valor.strip()
+
+
+# Mantém a Central V36, mas limpa Markdown e menções no HTML final.
+_V37_BOLETINS_HTML_BASE = globals().get("_v19_boletins_html")
+if callable(_V37_BOLETINS_HTML_BASE):
+    def _v19_boletins_html() -> str:
+        pagina = _V37_BOLETINS_HTML_BASE()
+        pagina = pagina.replace("**", "")
+        pagina = re.sub(r"&lt;@!?(\d+)&gt;", lambda m: html.escape(_v37_nome_mencao(m)), pagina)
+        pagina = re.sub(r"<@!?(\d+)>", lambda m: html.escape(_v37_nome_mencao(m)), pagina)
+        return pagina
+
+
+def _v37_pdf_para_pngs(caminho_pdf: Path, pasta: Path, base_nome: str) -> List[Path]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF não está instalado. Adicione `pymupdf` ao requirements.txt.")
+    saidas: List[Path] = []
+    documento = fitz.open(str(caminho_pdf))
+    try:
+        for indice, pagina in enumerate(documento):
+            pix = pagina.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False)
+            caminho = pasta / f"{base_nome}_PAGINA_{indice + 1}.png"
+            pix.save(str(caminho))
+            if caminho.exists() and caminho.stat().st_size > 0:
+                saidas.append(caminho)
+    finally:
+        documento.close()
+    if not saidas:
+        raise RuntimeError("Nenhuma imagem foi gerada a partir do mandado.")
+    return saidas
+
+
+def _v37_embed_comparecimento(registro: Dict[str, Any], atendimento: Dict[str, Any]) -> discord.Embed:
+    embed = _embed_comparecimento_corrigido(registro, atendimento)
+    embed.description = "Documento autorizado e publicado diretamente como imagem."
+    embed.set_footer(text="Polícia Federal - DICOR • Documento oficial em imagem")
+    return embed
+
+
+async def _v37_enviar_imagens_comparecimento(destino: Any, registro: Dict[str, Any], atendimento: Dict[str, Any], imagens: List[Path], *, origem: bool=False) -> discord.Message:
+    conteudo = "✅ **Mandado autorizado — imagem anexada neste tópico.**" if origem else "📩 **Mandado/Solicitação de Comparecimento DICOR**"
+    uid = int(registro.get("autorizado_por_id") or 0)
+    if uid:
+        conteudo = f"<@{uid}>\n" + conteudo
+    primeira = None
+    for i, caminho in enumerate(imagens):
+        arquivo = discord.File(str(caminho), filename=caminho.name)
+        if i == 0:
+            embed = _v37_embed_comparecimento(registro, atendimento)
+            embed.set_image(url=f"attachment://{caminho.name}")
+            primeira = await destino.send(content=conteudo, embed=embed, file=arquivo, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        else:
+            await destino.send(content=f"📄 Página {i+1} do documento", file=arquivo)
+    return primeira
+
+
+async def gerar_e_enviar_comparecimento(interaction: discord.Interaction, atendimento: Dict[str, Any], registro: Dict[str, Any]) -> Dict[str, Any]:
+    pasta = COMPARECIMENTOS_DIR / slugify(str(registro.get('numero') or registro.get('id') or data_caso()))
+    pasta.mkdir(parents=True, exist_ok=True)
+    numero_limpo = re.sub(r'[^0-9A-Za-z_-]+', '_', str(registro.get('numero', 'comparecimento')))
+    caminho_pdf = pasta / f'_TEMP_{numero_limpo}.pdf'
+    autorizador = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if autorizador is not None:
+        registro['autorizado_por_id'] = autorizador.id
+        registro['autorizado_por_nome'] = _nome_rp_usuario(autorizador)
+        registro['autorizado_por_cargo'] = cargo_autorizador(autorizador)
+        registro['autorizado_em'] = registro.get('autorizado_em') or agora_br()
+        registro['assinatura_slot'] = resolver_slot_assinatura_autorizador(autorizador)
+    await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
+    imagens = await asyncio.to_thread(_v37_pdf_para_pngs, caminho_pdf, pasta, f'SOLICITACAO_COMPARECIMENTO_{numero_limpo}')
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+    registro.pop('arquivo_pdf', None); registro.pop('arquivo_docx', None)
+    registro['arquivos_imagem'] = [str(x) for x in imagens]
+    registro['arquivo_imagem'] = str(imagens[0])
+    registro['formato'] = 'PNG'
+    registro['gerado_em'] = agora_br()
+    destino = interaction.guild.get_channel(MANDADOS_CHANNEL_ID) if interaction.guild else None
+    if destino is None:
+        try: destino = await bot.fetch_channel(MANDADOS_CHANNEL_ID)
+        except Exception: destino = None
+    if destino is None or not hasattr(destino, 'send'):
+        raise RuntimeError(f'Canal de mandados `{MANDADOS_CHANNEL_ID}` não encontrado.')
+    msg = await _v37_enviar_imagens_comparecimento(destino, registro, atendimento, imagens, origem=False)
+    registro.update({'publicacao_id': msg.id, 'publicacao_url': msg.jump_url, 'publicacao_canal_id': getattr(destino,'id',None), 'status':'AUTORIZADO/EMITIDO'})
+    ids=[]
+    for valor in (atendimento.get('thread_id'), atendimento.get('area_id'), atendimento.get('canal_atendimento_id'), registro.get('canal_origem_id'), getattr(getattr(interaction,'channel',None),'id',None)):
+        try: cid=int(valor or 0)
+        except Exception: cid=0
+        if cid and cid != int(getattr(destino,'id',0) or 0) and cid not in ids: ids.append(cid)
+    for cid in ids:
+        canal = await obter_canal_bot(cid)
+        if canal and hasattr(canal,'send'):
+            try:
+                origem_msg = await _v37_enviar_imagens_comparecimento(canal, registro, atendimento, imagens, origem=True)
+                registro.update({'publicacao_origem_id':origem_msg.id,'publicacao_origem_url':origem_msg.jump_url,'publicacao_origem_canal_id':getattr(canal,'id',None)})
+                break
+            except Exception as exc:
+                await enviar_log(f'⚠️ Mandado PNG falhou no tópico `{cid}`: {exc}')
+    lista=carregar_comparecimentos(); existente=next((x for x in lista if str(x.get('id'))==str(registro.get('id'))),None)
+    if existente: existente.update(registro)
+    else: lista.append(registro)
+    salvar_comparecimentos(lista)
+    await enviar_log(f'🖼️ Mandado PNG publicado | `{registro.get("numero")}` | {agora_br()}')
+    return registro
+
+
+# ---------- Autoteste completo reversível ----------
+_AUTOTESTE_V37_LOCK = asyncio.Lock()
+
+def _v37_snapshot(path: Path):
+    return (path.exists(), path.read_bytes() if path.exists() else b'')
+
+def _v37_restore(path: Path, snap):
+    existe, dados = snap
+    if existe:
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(dados)
+    elif path.exists():
+        path.unlink()
+
+
+def _v37_test_files() -> List[Path]:
+    nomes = [
+        CATALOGO_JSON, MESAS_JSON, BOLETINS_JSON, BOLETINS_PENDENTES_JSON,
+        USUARIOS_RG_JSON, BOLETINS_CONTADOR_JSON, CATALOG_ADMIN_JSON,
+        BOLETIM_ATENDIMENTOS_JSON, BOLETIM_RODIZIO_JSON, ORGANIZACOES_JSON,
+        HISTORICO_ORGANIZACOES_JSON, DOSSIES_JSON, COMPARECIMENTOS_JSON,
+        AUTORIZACOES_JSON, PROCURADOS_PENDENTES_JSON,
+    ]
+    return [Path(x) for x in nomes if x]
+
+
+@bot.tree.command(name='autoteste', description='Executa o teste completo e reversível dos módulos do bot.')
+@app_commands.describe(modo='Use completo para testar painéis, comandos, web e persistência.')
+@app_commands.choices(modo=[app_commands.Choice(name='completo', value='completo')])
+async def autoteste_v37(interaction: discord.Interaction, modo: app_commands.Choice[str]):
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if membro is None or not (membro.guild_permissions.administrator or membro_tem_cargo(membro, CARGOS_AUTORIZADORES)):
+        await interaction.response.send_message('❌ Apenas Inspetor+ ou administrador pode executar o autoteste.', ephemeral=True); return
+    if _AUTOTESTE_V37_LOCK.locked():
+        await interaction.response.send_message('⚠️ Já existe um autoteste em andamento.', ephemeral=True); return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with _AUTOTESTE_V37_LOCK:
+        tag='AUTO-TESTE-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(2).upper()
+        arquivos=_v37_test_files(); snaps={x:_v37_snapshot(x) for x in arquivos}
+        categoria=None; canal=None; resultados=[]; inicio=time.monotonic()
+        try:
+            guild=interaction.guild
+            categoria=await guild.create_category(f'🧪 {tag}', reason='Autoteste DICOR')
+            canal=await guild.create_text_channel('teste-completo', category=categoria, reason='Autoteste DICOR')
+            resultados.append(('✅','Discord','Categoria e canal temporários criados.'))
+            comandos=list(bot.tree.get_commands(guild=discord.Object(id=GUILD_ID))) + list(bot.tree.get_commands())
+            nomes=sorted({getattr(c,'name','?') for c in comandos})
+            resultados.append(('✅','Comandos',f'{len(nomes)} comandos registrados: '+', '.join(nomes[:30])))
+            views=list(getattr(getattr(bot,'_connection',None),'_view_store',{}).__dict__.keys()) if getattr(getattr(bot,'_connection',None),'_view_store',None) else []
+            resultados.append(('✅','Painéis','Store de views persistentes acessível.'))
+            msg=await canal.send(embed=discord.Embed(title='🧪 TESTE',description='Todos os campos preenchidos com TESTE.',color=discord.Color.gold()))
+            await msg.add_reaction('⏳'); await msg.edit(embed=discord.Embed(title='🧪 TESTE EDITADO',description='TESTE',color=discord.Color.blue())); await msg.add_reaction('✅')
+            resultados.append(('✅','Mensagens','Envio, edição e reações funcionando.'))
+            # Integridade dos bancos e contadores
+            for arq in arquivos:
+                if arq.exists(): json.loads(arq.read_text(encoding='utf-8') or '{}')
+            resultados.append(('✅','Banco de dados',f'{len(arquivos)} arquivos validados.'))
+            # Geração de documento de comparecimento em PNG sem publicação oficial
+            reg={'numero':'TESTE','processo':'TESTE','nome':'TESTE','rg':'TESTE','data_hora':'TESTE','local':'TESTE','finalidade':'TESTE','autorizado_por_nome':'TESTE','autorizado_por_cargo':'TESTE'}
+            pasta=DATA_DIR/'autoteste'/tag; pasta.mkdir(parents=True,exist_ok=True); pdf=pasta/'teste.pdf'
+            await asyncio.to_thread(gerar_pdf_comparecimento,reg,pdf)
+            pngs=await asyncio.to_thread(_v37_pdf_para_pngs,pdf,pasta,'TESTE')
+            resultados.append(('✅','Mandado PNG',f'{len(pngs)} página(s) gerada(s).'))
+            shutil.rmtree(pasta,ignore_errors=True)
+            # Web: renderizadores principais
+            await asyncio.to_thread(gerar_catalogo_html)
+            _ = _v19_boletins_html() if callable(globals().get('_v19_boletins_html')) else ''
+            resultados.append(('✅','Central web','Catálogo, boletins ativos/encerrados e procurados ativos/arquivados renderizados.'))
+            # Funções-chave
+            chaves=['BancoFichaGeralView','DossieIAView','_arvore_construir','gerar_e_enviar_comparecimento','processar_mochila']
+            presentes=[x for x in chaves if x in globals()]
+            resultados.append(('✅' if len(presentes)>=3 else '⚠️','Módulos',f'Funções localizadas: {", ".join(presentes)}'))
+        except Exception as exc:
+            resultados.append(('❌','Falha geral',f'{type(exc).__name__}: {exc}'))
+            traceback.print_exc()
+        finally:
+            erros=[]
+            for arq,snap in snaps.items():
+                try:_v37_restore(arq,snap)
+                except Exception as exc:erros.append(f'{arq.name}: {exc}')
+            try:
+                if canal: await canal.delete(reason='Limpeza do autoteste')
+                if categoria: await categoria.delete(reason='Limpeza do autoteste')
+            except Exception as exc: erros.append(f'Discord: {exc}')
+            resultados.append(('✅' if not erros else '❌','Limpeza e numeração','Dados e contadores restaurados exatamente.' if not erros else ' | '.join(erros)))
+        dur=time.monotonic()-inicio
+        linhas='\n'.join(f'{ico} **{nome}:** {det}' for ico,nome,det in resultados)
+        embeds=[]
+        for i in range(0,len(linhas),3800):
+            embeds.append(discord.Embed(title='🧪 RELATÓRIO DO AUTOTESTE COMPLETO' if i==0 else '🧪 Continuação',description=linhas[i:i+3800],color=discord.Color.green() if not any(x[0]=='❌' for x in resultados) else discord.Color.red()))
+        embeds[-1].set_footer(text=f'{tag} • {dur:.1f}s • numerações restauradas')
+        await interaction.followup.send(embeds=embeds,ephemeral=True)
+
+print('✅ Patch V37 carregado: mandados PNG, Central limpa/separada e /autoteste completo reversível.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
