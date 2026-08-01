@@ -55477,15 +55477,32 @@ print('✅ V44 carregada: Central operacional e numeração dos boletins corrigi
 
 @web.middleware
 async def central_auth_middleware(request: web.Request, handler):
+    # V47: usa o validador de sessão que realmente existe no código e libera
+    # explicitamente as rotas do painel da live/OBS.
     caminho = request.path or '/'
+    rotas_live = {
+        str(globals().get('LIVE_OVERLAY_PATH') or '/ops/live-dicor-7f3a'),
+        str(globals().get('LIVE_OVERLAY_API_PATH') or '/api/ops/live-dicor'),
+        str(globals().get('LIVE_OVERLAY_STATE_PATH') or '/api/ops/live-dicor-state'),
+    }
     publicos = (
         caminho in {'/', '/index.html', '/boletins', '/boletins.html', '/pericias', '/pericias.html', '/catalogo', '/catalogo.html', '/acesso', '/sair', '/health', '/healthz'}
+        or caminho in rotas_live
         or caminho.startswith('/catalogo') or caminho.startswith('/uploads/')
         or caminho.startswith('/central/') or caminho.startswith('/public/')
         or caminho.startswith('/assets/')
     )
-    if publicos or _central_cookie_valido(request):
+    validador = globals().get('_central_token_valido')
+    sessao_valida = False
+    if callable(validador):
+        try:
+            sessao_valida = bool(validador(request))
+        except Exception:
+            traceback.print_exc()
+    if publicos or sessao_valida:
         return await handler(request)
+    if caminho.startswith('/api/'):
+        return web.json_response({'ok': False, 'erro': 'Acesso restrito.'}, status=401)
     destino = quote(str(request.rel_url), safe='/?:=&%')
     raise web.HTTPFound(f'/acesso?next={destino}')
 
@@ -55524,6 +55541,7 @@ async def central_portal_http(request: web.Request) -> web.Response:
     return web.Response(text=page, content_type='text/html', charset='utf-8')
 
 print('✅ V45 carregada: layout clássico restaurado e rotas operacionais sem loop de login.', flush=True)
+print('✅ V47 carregada: autenticação da Central e painel da live corrigidos.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
