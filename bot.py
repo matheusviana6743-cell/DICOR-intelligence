@@ -55568,5 +55568,65 @@ print('✅ V45 carregada: layout clássico restaurado e rotas operacionais sem l
 print('✅ V47 carregada: autenticação da Central e painel da live corrigidos.', flush=True)
 print('✅ V48 carregada: layout aprovado da Central restaurado e fixado.', flush=True)
 
+# =====================================================
+# V49 — LAYOUT EXATO APROVADO DA CENTRAL
+# =====================================================
+
+def _v49_card_bo(boletim: dict) -> str:
+    numero = _v44_numero_canonico(boletim.get('numero') or boletim.get('texto'))
+    status = str(boletim.get('status') or 'EM ABERTO').upper()
+    texto = _v37_limpar_texto_central(str(boletim.get('texto') or 'Conteúdo não informado.'))
+    corpo = html.escape(texto).replace('\n', '<br>')
+    jump = str(boletim.get('mensagem_url') or boletim.get('jump_url') or '').strip()
+    urls = []
+    for item in boletim.get('midias', []) or boletim.get('anexos', []) or []:
+        try:
+            u = _v21_midia_url(item)
+        except Exception:
+            u = str(item or '').strip()
+        if u and u not in urls:
+            urls.append(u)
+    imagens = []
+    for u in urls[:8]:
+        safe = html.escape(u, quote=True)
+        imagens.append(f'<button class="photo" type="button" data-url="{safe}" onclick="openPhoto(this.dataset.url)"><img src="{safe}" loading="lazy" alt="Anexo de {html.escape(numero)}"></button>')
+    media = f'<div class="media">{"".join(imagens)}</div>' if imagens else '<p class="empty-media">Nenhuma foto anexada ao boletim.</p>'
+    link = html.escape(jump, quote=True) if jump else '/boletins'
+    return ('<article class="bo-card"><div class="bo-head"><div><small>BOLETIM</small>'
+            f'<h2>{html.escape(numero)}</h2></div><span>{html.escape(status)}</span></div>'
+            f'<div class="bo-text">{corpo}</div>'
+            f'<a class="open" href="{link}" target="_blank" rel="noopener">Ver boletim completo</a>'
+            f'{media}<div class="source">Fonte: canal oficial de boletins • consulta somente leitura.</div></article>')
+
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    boletins = _v44_boletins_ativos_snapshot()
+    qtd_bo = len(boletins)
+    qtd_procurados = len(_v43_procurados_ativos())
+    pericias = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(pericias, dict):
+        pericias = pericias.get('pericias') or pericias.get('registros') or []
+    qtd_pericias = len([x for x in pericias if isinstance(x, dict) and _v44_pericia_pendente(x)])
+    cards = ''.join(_v49_card_bo(x) for x in boletins) or '<div class="none">Nenhum boletim ativo no momento.</div>'
+    css = """
+:root{--bg:#080904;--panel:#10120d;--panel2:#0c0e09;--gold:#d9ad3f;--gold2:#f2d675;--line:#493b1d;--text:#f4efdc;--muted:#a49d88}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 50% -15%,#4f3c1028,transparent 36%),var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif;min-height:100vh}
+.top{height:108px;border-bottom:1px solid var(--line);background:#080906f7;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4.5vw;position:sticky;top:0;z-index:30}
+.brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:68px;height:78px;object-fit:contain;filter:drop-shadow(0 0 15px #d9ad3f40)}.brand h1{font-size:19px;letter-spacing:2px;margin:0}.brand small{display:block;color:var(--gold);letter-spacing:1.3px;margin-top:4px}.nav{justify-self:end;display:flex;gap:17px}.nav a{color:#e9d994;text-decoration:none;font-size:13px}.nav a:hover{color:#fff2b3}
+.tabs-wrap{border-bottom:1px solid #2f2815;background:#0b0c08;position:sticky;top:108px;z-index:20}.tabs{max-width:1280px;margin:auto;display:flex;justify-content:center;gap:10px;padding:0 20px}.tabs a{min-width:155px;text-align:center;color:#eee1b1;text-decoration:none;background:#10120d;border:1px solid #3f351b;border-top:0;border-radius:0 0 10px 10px;padding:11px 18px;font-size:12px;font-weight:900}.tabs a.active{background:linear-gradient(180deg,#d6aa35,#9a7217);color:#fff;border-color:#d9ad3f}
+.wrap{max-width:1320px;margin:auto;padding:26px 22px 80px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.bo-card{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:18px;padding:22px;align-self:start;box-shadow:0 18px 45px #0004}.bo-head{display:flex;justify-content:space-between;gap:15px;border-bottom:1px solid #38301a;padding-bottom:13px}.bo-head small{color:#d1c7a5;letter-spacing:1px}.bo-head h2{margin:5px 0 0;color:var(--gold2);font-family:Georgia,serif;font-size:23px}.bo-head span{border:1px solid #6c5825;border-radius:99px;padding:7px 11px;height:max-content;color:#ead27b;white-space:nowrap;font-size:11px}.bo-text{color:#ddd7c5;line-height:1.58;padding:16px 0 10px;max-height:270px;overflow:hidden;position:relative;word-break:break-word}.bo-text:after{content:'';position:absolute;left:0;right:0;bottom:0;height:48px;background:linear-gradient(transparent,var(--panel))}.open{display:inline-block;color:#f2d47d;text-decoration:none;border:1px solid #6b582a;border-radius:9px;padding:9px 12px;font-weight:800;margin:2px 0 8px}.open:hover{background:#19160d}.media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}.photo{padding:0;border:1px solid #4b3d1d;border-radius:11px;overflow:hidden;background:#050604;cursor:zoom-in}.photo img{display:block;width:100%;height:220px;object-fit:contain}.empty-media{color:var(--muted);font-size:13px;margin:10px 0}.source{border-top:1px dashed #302a19;padding-top:12px;margin-top:10px;color:#9a927f;font-size:11px}.none{grid-column:1/-1;border:1px solid var(--line);border-radius:16px;padding:26px;color:var(--muted);background:var(--panel)}
+.viewer{display:none;position:fixed;inset:0;background:#000e;z-index:80;align-items:center;justify-content:center;padding:25px}.viewer.open{display:flex}.viewer img{max-width:95vw;max-height:90vh;object-fit:contain;border:1px solid #786329;border-radius:13px;background:#050604}.viewer button{position:absolute;top:20px;right:24px;width:42px;height:42px;border:0;border-radius:50%;background:var(--gold);font-size:24px;cursor:pointer}
+@media(max-width:900px){.top{height:auto;grid-template-columns:1fr;padding:15px}.brand{grid-column:1}.nav{justify-self:start;flex-wrap:wrap;margin-top:10px}.tabs-wrap{top:104px}.tabs{justify-content:flex-start;overflow:auto}.tabs a{min-width:135px}.grid{grid-template-columns:1fr}.media{grid-template-columns:1fr}}
+"""
+    page = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DICOR • Central de Boletins</title><style>{css}</style></head><body>
+<header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"><div><h1>DICOR • CENTRAL DE BOLETINS</h1><small>CONSULTA INTERNA • SOMENTE LEITURA</small></div></div><nav class="nav"><a href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a><a href="/pericias">Perícias</a></nav></header>
+<div class="tabs-wrap"><nav class="tabs"><a class="active" href="/boletins">EM ABERTO ({qtd_bo})</a><a href="/catalogo">PROCURADOS ({qtd_procurados})</a><a href="/pericias">PERÍCIAS ({qtd_pericias})</a></nav></div>
+<main class="wrap"><section class="grid">{cards}</section></main>
+<div id="viewer" class="viewer" onclick="closePhoto(event)"><button onclick="closePhoto(event)">×</button><img id="viewerImg"></div>
+<script>function openPhoto(u){{viewerImg.src=u;viewer.classList.add('open')}}function closePhoto(e){{if(e)e.stopPropagation();viewer.classList.remove('open');viewerImg.src=''}}</script></body></html>'''
+    return web.Response(text=page, content_type='text/html', charset='utf-8')
+
+print('✅ V49 carregada: layout exato aprovado restaurado sem hero ou redesenho.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
