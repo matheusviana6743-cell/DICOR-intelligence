@@ -55628,5 +55628,32 @@ async def central_portal_http(request: web.Request) -> web.Response:
 
 print('✅ V49 carregada: layout exato aprovado restaurado sem hero ou redesenho.', flush=True)
 
+
+# =====================================================
+# V50 — DASHBOARD INICIAL RESTAURADO + ABAS COMPLETAS
+# Não altera o painel da live/OBS.
+# =====================================================
+
+def _v50_contar_pericias_pendentes() -> int:
+    dados = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(dados, dict):
+        dados = dados.get('pericias') or dados.get('registros') or []
+    return len([x for x in dados if isinstance(x, dict) and _v44_pericia_pendente(x)])
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    qtd_bo = len(_v44_boletins_ativos_snapshot())
+    qtd_procurados = len(_v43_procurados_ativos())
+    qtd_pericias = _v50_contar_pericias_pendentes()
+    cards = f'''<article><div class="ico">📋</div><h3>Boletins Ativos</h3><strong>{qtd_bo}</strong><p>Ocorrências ainda em aberto ou atendimento.</p><a href="/boletins">Abrir módulo</a></article>
+<article><div class="ico">🎯</div><h3>Procurados Ativos</h3><strong>{qtd_procurados}</strong><p>Lista oficial do canal de procurados ativos.</p><a href="/catalogo">Abrir módulo</a></article>
+<article><div class="ico">🧪</div><h3>Perícias Pendentes</h3><strong>{qtd_pericias}</strong><p>Perícias que ainda exigem conclusão.</p><a href="/pericias">Abrir módulo</a></article>
+<article class="private"><div class="ico">🗃️</div><h3>Banco de Dados</h3><p>Fichas, evidências, pesquisas e inteligência investigativa.</p><a href="/fichas">Abrir módulo</a></article>
+<article class="private"><div class="ico">🧬</div><h3>Árvore de Inteligência</h3><p>Vínculos entre pessoas, veículos e organizações.</p><a href="/arvore">Abrir módulo</a></article>'''
+    css = ''':root{--g:#d7a93d;--g2:#f2d47d;--bg:#070806;--p:#10120d;--l:#3b321a;--t:#f7f1db;--m:#96917e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--t);font-family:Inter,Arial;min-height:100vh}header{height:108px;border-bottom:1px solid var(--l);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07f4}.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:74px;height:80px;object-fit:contain;filter:drop-shadow(0 0 20px #d7a93d40)}.brand h1{margin:0;font-size:20px;letter-spacing:2px}.brand small{color:var(--g);letter-spacing:1.5px}.nav{justify-self:end;display:flex;gap:16px;flex-wrap:wrap}.nav a{color:#e8dcab;text-decoration:none;font-size:13px}.nav a:hover,.nav .active{color:var(--g2)}main{max-width:1250px;margin:auto;padding:58px 24px 75px}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:34px;align-items:center;margin-bottom:44px}.label{font-size:11px;letter-spacing:2px;color:var(--g)}.hero h2{font:52px/1.04 Georgia;margin:10px 0 18px}.hero h2 span{color:var(--g2)}.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.mark{height:260px;border:1px solid var(--l);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center}.mark img{width:185px;height:195px;object-fit:contain}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:40px}.summary a{display:flex;justify-content:space-between;align-items:center;text-decoration:none;color:var(--t);border:1px solid var(--l);background:#0d0f0b;border-radius:14px;padding:16px 18px}.summary b{font-size:25px;color:var(--g2)}.section{font-size:11px;letter-spacing:2px;color:var(--g);margin-bottom:15px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.grid article{min-height:225px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative}.grid article:hover{border-color:#8b712d;transform:translateY(-3px)}.ico{font-size:30px}.grid h3{margin:18px 0 7px}.grid strong{display:block;font-size:36px;color:var(--g2)}.grid p{color:var(--m);line-height:1.5;min-height:48px}.grid a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--g2),var(--g));padding:10px 14px;border-radius:9px;font-weight:800}.private:after{content:'ACESSO RESTRITO';position:absolute;right:15px;top:15px;color:#bfa85d;font-size:9px;letter-spacing:1.2px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}footer{text-align:center;color:#625f52;font-size:11px;padding:0 20px 42px}@media(max-width:900px){header{height:auto;grid-template-columns:1fr;padding:15px}.brand{grid-column:1}.nav{justify-self:start;margin-top:12px}.hero{grid-template-columns:1fr}.mark{display:none}.grid{grid-template-columns:1fr 1fr}}@media(max-width:650px){.grid,.summary{grid-template-columns:1fr}.hero h2{font-size:36px}}'''
+    page = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DICOR • Central de Inteligência</title><style>{css}</style></head><body><header><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>DICOR • CENTRAL DE INTELIGÊNCIA</h1><small>CONSULTA INTERNA • SISTEMA INTEGRADO</small></div></div><nav class="nav"><a class="active" href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a><a href="/pericias">Perícias</a><a href="/fichas">Banco de Dados</a><a href="/arvore">Árvore</a></nav></header><main><section class="hero"><div><div class="label">DASHBOARD OPERACIONAL</div><h2>Inteligência centralizada com identidade <span>DICOR</span>.</h2><p>Dashboard inicial com os módulos operacionais e investigativos em abas separadas. O painel da live permanece sem alterações.</p></div><div class="mark"><img src="/central/brasao-dicor.png"></div></section><section class="summary"><a href="/boletins"><span>Boletins ativos</span><b>{qtd_bo}</b></a><a href="/catalogo"><span>Procurados ativos</span><b>{qtd_procurados}</b></a><a href="/pericias"><span>Perícias pendentes</span><b>{qtd_pericias}</b></a></section><div class="section">MÓDULOS DA CENTRAL</div><section class="grid">{cards}</section></main><footer>DICOR • POLÍCIA FEDERAL • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+    return web.Response(text=page, content_type='text/html', charset='utf-8')
+
+print('✅ V50 carregada: dashboard inicial restaurado; Banco de Dados e Árvore somente na Central Web; painel da live preservado.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
