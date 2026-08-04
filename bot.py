@@ -59546,5 +59546,398 @@ print(
     'canal temporário e erros somente nos logs.',
     flush=True,
 )
+
+
+# =====================================================
+# PATCH V59 — AUTORIZAÇÃO NO BO + CONFIRMAÇÃO COM LINK
+# =====================================================
+# Regras:
+# - Estagiário e Investigador: nunca publicam diretamente; enviam autorização
+#   para o tópico do BO.
+# - Inspetor, Vice-Diretor e Diretor: publicam diretamente.
+# - Após a publicação, o tópico do BO recebe uma única confirmação com o link.
+# - O canal temporário de fotos é apagado somente após a publicação concluída.
+# - O canal do BO recebe apenas a autorização (quando necessária) e o resultado.
+
+_V59_VIEWS_REGISTRADAS = False
+_V59_PUBLICAR_PROCURADO_BASE = _publicar_procurado_boletim_aprovado
+
+
+async def _v59_canal_bo(
+    atendimento: Dict[str, Any],
+    dados: Optional[Dict[str, Any]] = None,
+) -> Any:
+    dados = dict(dados or {})
+    candidatos = (
+        dados.get('_canal_bo_origem_id'),
+        dados.get('canal_bo_origem_id'),
+        atendimento.get('area_id'),
+        atendimento.get('thread_id'),
+        atendimento.get('canal_atendimento_id'),
+    )
+    vistos = set()
+    for valor in candidatos:
+        try:
+            canal_id = int(valor or 0)
+        except Exception:
+            canal_id = 0
+        if not canal_id or canal_id in vistos:
+            continue
+        vistos.add(canal_id)
+        canal = await obter_canal_bot(canal_id)
+        if canal is not None and hasattr(canal, 'send'):
+            return canal
+    return None
+
+
+async def _v59_apagar_canal_temporario(canal_id: int, *, atraso: float = 8.0) -> None:
+    try:
+        await asyncio.sleep(max(1.0, float(atraso)))
+        canal_id = int(canal_id or 0)
+        if not canal_id:
+            return
+        cadastros_pendentes.pop(canal_id, None)
+        try:
+            salvar_cadastros_pendentes()
+        except Exception:
+            pass
+        canal = await obter_canal_bot(canal_id)
+        if canal is not None and hasattr(canal, 'delete'):
+            await canal.delete(reason='Cadastro de procurado concluído e publicado')
+    except discord.NotFound:
+        pass
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ V59 não conseguiu apagar canal temporário `{canal_id}`: '
+            f'{type(erro).__name__}: {erro}'
+        )
+
+
+async def _v59_notificar_publicacao_no_bo(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+    url: str,
+) -> Optional[discord.Message]:
+    # Evita confirmação duplicada em reconexão ou clique repetido.
+    mensagem_existente_id = int(
+        atendimento.get('procurado_confirmacao_bo_mensagem_id') or 0
+    )
+    canal = await _v59_canal_bo(atendimento, dados)
+    if canal is None:
+        await enviar_log(
+            f'⚠️ V59 publicou procurado, mas não localizou o tópico do BO | '
+            f'BO `{atendimento.get("numero")}` | RG `{dados.get("rg")}` | {url}'
+        )
+        return None
+
+    if mensagem_existente_id and hasattr(canal, 'fetch_message'):
+        try:
+            return await canal.fetch_message(mensagem_existente_id)
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title='✅ PROCURADO CADASTRADO',
+        description=(
+            'O cadastro foi concluído e publicado no canal oficial de procurados.'
+        ),
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name='👤 Indivíduo',
+        value=(
+            f'**{dados.get("nome", "Não informado")}**\n'
+            f'RG: `{dados.get("rg", "Não informado")}`'
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name='📋 Boletim',
+        value=f'`{atendimento.get("numero") or dados.get("numero_boletim") or "N/I"}`',
+        inline=True,
+    )
+    embed.add_field(
+        name='🔐 Autorização',
+        value=(
+            f'**{cargo_autorizador(autorizador)}**\n'
+            f'{autorizador.mention}'
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name='🔗 Publicação oficial',
+        value=f'[Abrir mensagem do procurado]({url})',
+        inline=False,
+    )
+    embed.set_footer(
+        text='Polícia Federal • DICOR • Cadastro vinculado ao boletim'
+    )
+    mensagem = await canal.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
+    atendimento['procurado_confirmacao_bo_mensagem_id'] = mensagem.id
+    atendimento['procurado_confirmacao_bo_mensagem_url'] = mensagem.jump_url
+    atendimento['procurado_confirmacao_bo_em'] = agora_br()
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    return mensagem
+
+
+async def _publicar_procurado_boletim_aprovado(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+) -> str:
+    """Publica, confirma no BO e encerra o canal temporário."""
+    url = await _V59_PUBLICAR_PROCURADO_BASE(atendimento, dados, autorizador)
+    try:
+        await _v59_notificar_publicacao_no_bo(
+            atendimento, dados, autorizador, url
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V59 falhou ao confirmar procurado no BO | '
+            f'BO `{atendimento.get("numero")}` | RG `{dados.get("rg")}` | '
+            f'{type(erro).__name__}: {erro}\n```py\n'
+            f'{traceback.format_exc()[-2200:]}\n```'
+        )
+
+    canal_temp_id = int(
+        dados.get('_canal_temporario_id')
+        or dados.get('_canal_fluxo_id')
+        or 0
+    )
+    if canal_temp_id:
+        asyncio.create_task(
+            _v59_apagar_canal_temporario(canal_temp_id),
+            name=f'v59-apagar-procurado-{canal_temp_id}',
+        )
+    return url
+
+
+class FinalizarProcuradoView(View):
+    """Finalização V59 com hierarquia correta e autorização no tópico do BO."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Finalizar Cadastro',
+        emoji='✅',
+        style=discord.ButtonStyle.green,
+        custom_id='dic_finalizar_procurado',
+    )
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.response.send_message(
+                '❌ Canal temporário inválido.', ephemeral=True
+            )
+
+        dados = cadastros_pendentes.get(int(canal.id))
+        if not isinstance(dados, dict) or not dados.get('_fluxo_fotos_v58'):
+            return await interaction.response.send_message(
+                '❌ Não encontrei os dados deste cadastro.', ephemeral=True
+            )
+        if (
+            interaction.user.id != int(dados.get('autor_id') or 0)
+            and not usuario_e_administrador(interaction.user)
+        ):
+            return await interaction.response.send_message(
+                '❌ Apenas quem iniciou o cadastro ou Inspetor+ pode concluir.',
+                ephemeral=True,
+            )
+        if procurar_por_rg(dados.get('rg')):
+            return await interaction.response.send_message(
+                '⚠️ Este RG já está cadastrado como procurado.',
+                view=AbrirEdicaoProcuradoView(procurar_por_rg(dados.get('rg'))),
+                ephemeral=True,
+            )
+        if not _fotos_procurado_validas(dados):
+            return await interaction.response.send_message(
+                '❌ A foto do indivíduo e a foto do RG precisam estar confirmadas.',
+                ephemeral=True,
+            )
+
+        atendimento = _v56_atendimento_por_id(dados.get('_atendimento_id'))
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ O atendimento do boletim não foi localizado.', ephemeral=True
+            )
+
+        membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if membro is None:
+            return await interaction.response.send_message(
+                '❌ Não consegui verificar seu cargo.', ephemeral=True
+            )
+
+        eh_inspetor_mais = usuario_e_administrador(membro)
+        precisa_autorizacao = usuario_precisa_autorizacao_dicor(membro)
+        if not eh_inspetor_mais and not precisa_autorizacao:
+            return await interaction.response.send_message(
+                '❌ Somente Estagiário, Investigador ou Inspetor+ pode concluir.',
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        dados = dict(dados)
+        dados.update({
+            '_canal_temporario_id': int(canal.id),
+            '_canal_fluxo_id': int(canal.id),
+            '_solicitante_id': int(dados.get('autor_id') or interaction.user.id),
+            '_solicitante_nome': str(dados.get('autor_nome') or interaction.user),
+            '_canal_bo_origem_id': int(
+                dados.get('_canal_bo_origem_id')
+                or atendimento.get('area_id')
+                or 0
+            ),
+            'numero_boletim': atendimento.get('numero'),
+            'boletim': atendimento.get('numero'),
+        })
+        cadastros_pendentes[int(canal.id)] = dados
+        salvar_cadastros_pendentes()
+
+        atendimento.update({
+            'procurado_solicitado': dict(dados),
+            'procurado_solicitado_por_id': int(dados.get('autor_id') or interaction.user.id),
+            'procurado_solicitado_por_nome': str(dados.get('autor_nome') or interaction.user),
+            'procurado_solicitado_em': atendimento.get('procurado_solicitado_em') or agora_br(),
+            'procurado_canal_temporario_id': int(canal.id),
+        })
+
+        try:
+            if eh_inspetor_mais:
+                atendimento['procurado_status'] = 'publicando_direto'
+                atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+                url = await _publicar_procurado_boletim_aprovado(
+                    atendimento, dados, membro
+                )
+                await interaction.followup.send(
+                    f'✅ Procurado publicado. A confirmação foi enviada ao tópico do BO.\n{url}',
+                    ephemeral=True,
+                )
+                return
+
+            # Estagiário e Investigador obrigatoriamente pedem autorização.
+            atendimento['procurado_status'] = 'aguardando_autorizacao'
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+            area_id = int(
+                dados.get('_canal_bo_origem_id')
+                or atendimento.get('area_id')
+                or 0
+            )
+            solicitacao = await criar_solicitacao_autorizacao(
+                interaction=interaction,
+                tipo='procurado_boletim',
+                dados=dados,
+                contexto={
+                    'atendimento_id': atendimento.get('id'),
+                    'area_id': area_id,
+                    'canal_provisorio_id': int(canal.id),
+                },
+            )
+            atendimento['procurado_autorizacao_id'] = solicitacao['id']
+            atendimento['procurado_status'] = 'aguardando_autorizacao'
+            atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+            dados['solicitacao_id'] = solicitacao['id']
+            dados['status'] = 'AGUARDANDO AUTORIZAÇÃO'
+            cadastros_pendentes[int(canal.id)] = dados
+            salvar_cadastros_pendentes()
+
+            try:
+                await interaction.message.edit(
+                    content=(
+                        '📩 **Cadastro aguardando autorização.**\n'
+                        f'Solicitação: `{solicitacao["id"]}`\n\n'
+                        'A decisão será feita no tópico do boletim. '
+                        'Este canal será apagado após a publicação.'
+                    ),
+                    view=None,
+                )
+            except Exception:
+                pass
+            await interaction.followup.send(
+                f'✅ Solicitação `{solicitacao["id"]}` enviada ao tópico do BO para Inspetor+ decidir.',
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f'❌ V59 falha ao finalizar procurado | canal `{canal.id}` | '
+                f'RG `{dados.get("rg")}` | usuário `{interaction.user.id}` | '
+                f'{type(erro).__name__}: {erro}\n```py\n'
+                f'{traceback.format_exc()[-2600:]}\n```'
+            )
+            try:
+                await interaction.followup.send(
+                    '❌ Não foi possível concluir. O erro foi enviado somente aos logs.',
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(
+        label='Cancelar',
+        emoji='❌',
+        style=discord.ButtonStyle.red,
+        custom_id='dic_cancelar_procurado',
+    )
+    async def cancelar(self, interaction: discord.Interaction, button: Button):
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.response.send_message(
+                '❌ Canal inválido.', ephemeral=True
+            )
+        dados = cadastros_pendentes.get(int(canal.id), {})
+        if (
+            interaction.user.id != int(dados.get('autor_id') or 0)
+            and not usuario_e_administrador(interaction.user)
+        ):
+            return await interaction.response.send_message(
+                '❌ Apenas quem iniciou ou Inspetor+ pode cancelar.', ephemeral=True
+            )
+        if str(dados.get('status') or '').upper() == 'AGUARDANDO AUTORIZAÇÃO':
+            return await interaction.response.send_message(
+                '⚠️ Este cadastro já foi enviado para autorização no BO.',
+                ephemeral=True,
+            )
+        await interaction.response.send_message(
+            '✅ Cadastro cancelado. O canal será apagado.', ephemeral=True
+        )
+        asyncio.create_task(
+            _v59_apagar_canal_temporario(int(canal.id), atraso=2),
+            name=f'v59-cancelar-{canal.id}',
+        )
+
+
+@bot.listen('on_ready')
+async def v59_registrar_view_finalizacao() -> None:
+    global _V59_VIEWS_REGISTRADAS
+    if _V59_VIEWS_REGISTRADAS:
+        return
+    try:
+        bot.add_view(FinalizarProcuradoView())
+        _V59_VIEWS_REGISTRADAS = True
+        print(
+            '✅ V59 view registrada — Estagiário/Investigador pedem autorização no BO; Inspetor+ publica direto.',
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V59 falha ao registrar view: {type(erro).__name__}: {erro}'
+        )
+
+
+print(
+    '✅ V59 carregada — autorização de Estagiário/Investigador no tópico do BO, '
+    'confirmação com link e exclusão do canal temporário após publicação.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
