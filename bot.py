@@ -61576,5 +61576,214 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V65 — CORREÇÃO DEFINITIVA DOS COMPONENTES DAS FICHAS
+# =====================================================
+# Causa corrigida:
+# o Select ocupa largura 5 e não pode dividir a mesma row com botões.
+# Agora:
+#   row 0 = seletor de fichas
+#   row 1 = IA, Árvore, Editar e Identificação
+
+class V65FichaGeralView(View):
+    def __init__(
+        self,
+        usuario_id: int,
+        perfil: Optional[Dict[str, Any]] = None,
+        opcoes: Optional[List[Tuple[str, int, str, str, str]]] = None,
+    ):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        self.perfil = dict(perfil or {})
+        self.opcoes = list(opcoes or [])
+
+        # O seletor ocupa sozinho toda a primeira linha.
+        if self.opcoes:
+            self.add_item(V63FichaGeralSelect(self.opcoes))
+
+        if self.perfil:
+            tipo = str(self.perfil.get("tipo") or "geral")
+            rid = int(
+                self.perfil.get("registro_id")
+                or (self.perfil.get("individuo") or {}).get("id")
+                or 0
+            )
+
+            botao_ia = BancoConsultarIAButton(
+                tipo, rid, self.perfil, row=1
+            )
+            botao_arvore = BancoVerArvoreButton(
+                tipo, rid, row=1
+            )
+            botao_editar = V63EditarFichaButton(self.perfil)
+            botao_editar.row = 1
+
+            botao_identificacao = BancoVerIdentificacaoButton()
+            botao_identificacao.row = 1
+
+            self.add_item(botao_ia)
+            self.add_item(botao_arvore)
+            self.add_item(botao_editar)
+            self.add_item(botao_identificacao)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message(
+                "❌ Esta consulta pertence a outro agente.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+# Todas as referências globais passam a usar a view corrigida.
+V63FichaGeralView = V65FichaGeralView
+BancoFichaGeralView = V65FichaGeralView
+
+
+# Substitui o callback do seletor para garantir que ele use a V65.
+async def _v65_ficha_select_callback(
+    self: V63FichaGeralSelect,
+    interaction: discord.Interaction,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    tipo = ""
+    rid = 0
+    try:
+        tipo, texto_id = self.values[0].split(":", 1)
+        rid = int(texto_id)
+
+        if tipo == "faccao":
+            registro = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _banco_prof_registro_por_id,
+                    "faccao",
+                    rid,
+                ),
+                timeout=20,
+            )
+            if not registro:
+                return await interaction.edit_original_response(
+                    content="❌ Organização não encontrada.",
+                    embed=None,
+                    view=None,
+                )
+            return await interaction.edit_original_response(
+                content=None,
+                embed=_banco_embed_consulta_faccao(registro),
+                view=None,
+            )
+
+        perfil = await asyncio.wait_for(
+            asyncio.to_thread(
+                _v63_carregar_ficha_segura,
+                tipo,
+                rid,
+            ),
+            timeout=30,
+        )
+        if not perfil:
+            return await interaction.edit_original_response(
+                content="❌ A ficha não foi encontrada.",
+                embed=None,
+                view=None,
+            )
+
+        embed = _v63_embed_seguro(perfil)
+        view = V65FichaGeralView(
+            int(interaction.user.id),
+            perfil,
+            self._opcoes_brutas,
+        )
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=view,
+        )
+
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f"❌ V65 falha ao abrir ficha `{tipo}:{rid}` | "
+            f"{type(erro).__name__}: {erro}\n"
+            f"```py\n{traceback.format_exc()[-2500:]}\n```"
+        )
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ Não foi possível abrir esta ficha. "
+                    "O diagnóstico foi enviado aos logs."
+                ),
+                embed=None,
+                view=None,
+            )
+        except Exception:
+            pass
+
+
+V63FichaGeralSelect.callback = _v65_ficha_select_callback
+
+
+# Painel do Banco: remove todos os blocos AÇÕES duplicados e adiciona somente um.
+_V65_BANCO_EMBED_ANTERIOR = banco_embed_painel
+
+
+def banco_embed_painel() -> discord.Embed:
+    embed = _V65_BANCO_EMBED_ANTERIOR()
+
+    indices_acoes = [
+        indice
+        for indice, campo in enumerate(list(embed.fields))
+        if "AÇÕES" in str(campo.name or "").upper()
+    ]
+    for indice in reversed(indices_acoes):
+        embed.remove_field(indice)
+
+    embed.add_field(
+        name="🧭 AÇÕES",
+        value=(
+            "**Criar ficha — Inspetor+:** imagem, documento, COPOM ou relatório.\n"
+            "**Pesquisar fichas — todos:** fichas, veículos, organizações, "
+            "evidências e anexos.\n"
+            "**Painel — Inspetor+:** importar ou atualizar a formação de uma organização.\n"
+            "**Sincronização:** automática, sem necessidade de ação manual."
+        ),
+        inline=False,
+    )
+    embed.set_footer(
+        text=(
+            "Polícia Federal • acesso controlado por cargos • "
+            "sincronização automática ativa"
+        )
+    )
+    return embed
+
+
+@bot.listen("on_ready")
+async def _v65_on_ready():
+    try:
+        await asyncio.sleep(16)
+        quantidade = await _v61_atualizar_paineis_banco()
+        print(
+            f"✅ V65 fichas corrigidas e {quantidade} painel(is) "
+            "do Banco sem AÇÕES duplicadas.",
+            flush=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+print(
+    "✅ V65 carregada — seletor na row 0, quatro botões na row 1 "
+    "e bloco AÇÕES único.",
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
