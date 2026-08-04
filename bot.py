@@ -58753,3 +58753,84 @@ async def _publicar_procurado_boletim_aprovado(
 print(
     "✅ V56 carregada — cadastro de procurado corrigido e fluxo movido para canal privado."
 )
+
+# =====================================================
+# PATCH V57 — FOTO DE PROCURADO NÃO FALHA MAIS POR VOLUME/CDN
+# =====================================================
+# 1) Tenta persistir normalmente.
+# 2) Se o volume/upload falhar, preserva o URL original do anexo do Discord.
+# 3) O fluxo continua e solicita o RG, em vez de parar com RuntimeError.
+
+_V57_SALVAR_FOTO_BASE = _v52_salvar_foto
+
+async def _v52_salvar_foto(anexo: discord.Attachment, prefixo: str) -> str:
+    erro_persistencia = None
+    try:
+        resultado = await asyncio.wait_for(
+            salvar_anexo_publico(anexo, prefixo),
+            timeout=35,
+        )
+        resultado = str(resultado or '').strip()
+        if resultado:
+            return resultado
+    except Exception as erro:
+        erro_persistencia = erro
+
+    # Fallback confiável: o anexo já existe no Discord e pode ser usado na
+    # publicação oficial. Evita interromper o cadastro por erro do volume.
+    for valor in (
+        getattr(anexo, 'url', None),
+        getattr(anexo, 'proxy_url', None),
+    ):
+        url = str(valor or '').strip()
+        if url.startswith(('https://', 'http://')):
+            await enviar_log(
+                f'⚠️ V57 foto preservada pelo URL do Discord | prefixo `{prefixo}` | '
+                f'falha de persistência `{type(erro_persistencia).__name__ if erro_persistencia else "RETORNO_VAZIO"}`'
+            )
+            return url
+
+    detalhe = (
+        f'{type(erro_persistencia).__name__}: {erro_persistencia}'
+        if erro_persistencia else 'salvamento retornou vazio e anexo sem URL'
+    )
+    raise RuntimeError(f'Não foi possível preservar a foto: {detalhe}')
+
+
+# Mostra o diagnóstico real nos logs, mas mantém uma mensagem simples no chat.
+_V57_PROCESSAR_PAINEL_BASE = _v52_processar_painel
+_V57_PROCESSAR_BOLETIM_BASE = _v52_processar_boletim
+
+async def _v57_processar_com_diagnostico(funcao, message: discord.Message, origem: str) -> bool:
+    try:
+        return await funcao(message)
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V57 erro inesperado em foto de procurado ({origem}) | '
+            f'canal `{getattr(message.channel, "id", 0)}` | mensagem `{message.id}` | '
+            f'{type(erro).__name__}: {erro}\n```py\n{traceback.format_exc()[-2500:]}\n```'
+        )
+        try:
+            await message.channel.send(
+                '❌ Ocorreu uma falha ao ler a foto. Reenvie a mesma imagem uma vez.',
+                delete_after=20,
+            )
+        except Exception:
+            pass
+        return True
+
+
+async def _v52_processar_painel(message: discord.Message) -> bool:
+    return await _v57_processar_com_diagnostico(
+        _V57_PROCESSAR_PAINEL_BASE, message, 'canal privado/painel'
+    )
+
+
+async def _v52_processar_boletim(message: discord.Message) -> bool:
+    return await _v57_processar_com_diagnostico(
+        _V57_PROCESSAR_BOLETIM_BASE, message, 'boletim legado'
+    )
+
+
+print('✅ V57 carregada — fotos de procurados usam fallback do Discord e não param mais por RuntimeError.')
