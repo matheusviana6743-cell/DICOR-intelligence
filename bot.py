@@ -6967,7 +6967,7 @@ async def criar_mesa_por_texto(ctx: commands.Context, apelido: str, familia: str
     dados_iniciais_mesa = {
         "nome": f"OPERAÇÃO {familia.upper()}",
         "comunidade": familia,
-        "delegado": str(interaction.user.display_name if hasattr(interaction, 'user') else ctx.author.display_name),
+        "delegado": str(ctx.author.display_name),
         "data_abertura": agora_br()
     }
 
@@ -55655,7 +55655,2589 @@ async def central_portal_http(request: web.Request) -> web.Response:
 
 print('✅ V50 carregada: dashboard inicial restaurado; Banco de Dados e Árvore somente na Central Web; painel da live preservado.', flush=True)
 
+
 print('✅ V51 carregada: Central sem os três botões superiores; módulos preservados.')
+
+# =====================================================
+# V52 — FOTOS DE PROCURADOS AUTOMÁTICAS E PROCESSOS MAIS RÁPIDOS
+# =====================================================
+# Mantém todos os fluxos existentes. A novidade é que uma foto enviada na
+# etapa correta é aceita automaticamente, sem depender do botão que poderia
+# ficar preso em "pensando". Operações de disco recebem timeout e trava por
+# canal para impedir processamento duplicado.
+
+_V52_FOTO_LOCKS: Dict[int, asyncio.Lock] = {}
+_V52_MENSAGENS_PROCESSADAS: set[int] = set()
+_V52_RECUPERACAO_EXECUTADA = False
+
+
+def _v52_lock(canal_id: int) -> asyncio.Lock:
+    lock = _V52_FOTO_LOCKS.get(int(canal_id))
+    if lock is None:
+        lock = asyncio.Lock()
+        _V52_FOTO_LOCKS[int(canal_id)] = lock
+    return lock
+
+
+def _v52_imagens_mensagem(message: discord.Message) -> List[discord.Attachment]:
+    return [
+        a for a in getattr(message, 'attachments', [])
+        if ((str(getattr(a, 'content_type', '') or '').lower().startswith('image/'))
+            or Path(str(getattr(a, 'filename', '') or '')).suffix.lower() in {'.png','.jpg','.jpeg','.webp','.gif'})
+    ]
+
+
+async def _v52_salvar_foto(anexo: discord.Attachment, prefixo: str) -> str:
+    # Evita que falha de rede/CDN deixe o fluxo pendurado para sempre.
+    return await asyncio.wait_for(salvar_anexo_publico(anexo, prefixo), timeout=45)
+
+
+def _v52_atendimento_do_canal(canal_id: int) -> Optional[Dict[str, Any]]:
+    cid = int(canal_id or 0)
+    candidatos = []
+    for atendimento in carregar_atendimentos_boletins():
+        if not isinstance(atendimento, dict):
+            continue
+        ids = {
+            int(atendimento.get(chave) or 0)
+            for chave in ('thread_id', 'area_id', 'canal_id', 'channel_id')
+        }
+        if cid in ids:
+            candidatos.append(atendimento)
+    return candidatos[-1] if candidatos else None
+
+
+class V52FinalizarProcuradoBoletimView(View):
+    def __init__(self, atendimento_id: str, pedido_id: str):
+        super().__init__(timeout=900)
+        self.atendimento_id = str(atendimento_id)
+        self.pedido_id = str(pedido_id)
+
+    @discord.ui.button(label='Concluir Procurado', emoji='✅', style=discord.ButtonStyle.green)
+    async def concluir(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        atendimento = _atendimento_por_id(self.atendimento_id)
+        if not atendimento:
+            return await interaction.followup.send('❌ Atendimento não encontrado.', ephemeral=True)
+        pedidos = atendimento.get('procurado_pedidos', {})
+        pedido = pedidos.get(self.pedido_id) if isinstance(pedidos, dict) else None
+        if not isinstance(pedido, dict):
+            return await interaction.followup.send('❌ Pedido não encontrado.', ephemeral=True)
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.followup.send(
+                '❌ Apenas o responsável atual ou Inspetor+ pode concluir.', ephemeral=True
+            )
+        if str(pedido.get('status') or '') not in {'fotos_confirmadas', 'aguardando_conclusao'}:
+            return await interaction.followup.send(
+                f"⚠️ Este pedido já está `{pedido.get('status', 'processado')}`.", ephemeral=True
+            )
+        await _encaminhar_pedido_procurado_boletim_completo(
+            interaction, atendimento, self.pedido_id, pedido
+        )
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+
+
+async def _v52_processar_painel(message: discord.Message) -> bool:
+    canal = message.channel
+    if not isinstance(canal, discord.TextChannel):
+        return False
+    dados = cadastros_pendentes.get(canal.id)
+    if not isinstance(dados, dict):
+        return False
+    etapa = str(dados.get('etapa_fotos') or '')
+    if etapa not in {'aguardando_foto_individuo','corrigir_foto_individuo','aguardando_foto_rg','corrigir_foto_rg'}:
+        return False
+    if message.author.id != int(dados.get('autor_id') or 0) and not usuario_e_administrador(message.author):
+        return False
+    imagens = _v52_imagens_mensagem(message)
+    if not imagens:
+        return False
+    if len(imagens) != 1:
+        await canal.send('❌ Envie somente **uma imagem por etapa**.', delete_after=12)
+        return True
+
+    status = await canal.send('⏳ Foto recebida. Salvando com segurança...')
+    try:
+        if etapa in {'aguardando_foto_individuo','corrigir_foto_individuo'}:
+            foto = await _v52_salvar_foto(imagens[0], f"individuo-{dados.get('rg')}-{canal.id}")
+            dados.update({
+                'foto_individuo': foto,
+                'foto_individuo_msg_id': message.id,
+                'foto_individuo_anexo_id': getattr(imagens[0], 'id', None),
+                'foto_individuo_confirmada_em': agora_br(),
+                'foto_individuo_confirmada_por_id': message.author.id,
+                'etapa_fotos': 'aguardando_foto_rg',
+            })
+            cadastros_pendentes[canal.id] = dados
+            await asyncio.to_thread(salvar_cadastros_pendentes)
+            prompt = await status.edit(content=(
+                '✅ **Foto do indivíduo aceita automaticamente.**\n\n'
+                '🪪 Agora envie **somente a foto do RG** para concluir as fotos obrigatórias.'
+            ))
+            dados['foto_rg_prompt_id'] = prompt.id
+            cadastros_pendentes[canal.id] = dados
+            await asyncio.to_thread(salvar_cadastros_pendentes)
+            return True
+
+        foto = await _v52_salvar_foto(imagens[0], f"rg-{dados.get('rg')}-{canal.id}")
+        dados.update({
+            'foto_rg': foto,
+            'foto_rg_msg_id': message.id,
+            'foto_rg_anexo_id': getattr(imagens[0], 'id', None),
+            'foto_rg_confirmada_em': agora_br(),
+            'foto_rg_confirmada_por_id': message.author.id,
+            'etapa_fotos': 'fotos_confirmadas',
+        })
+        cadastros_pendentes[canal.id] = dados
+        await asyncio.to_thread(salvar_cadastros_pendentes)
+        await status.edit(content=(
+            '✅ **Foto do RG aceita. As duas fotos estão confirmadas.**\n'
+            'Clique abaixo para finalizar o cadastro.'
+        ), view=FinalizarProcuradoView())
+        return True
+    except asyncio.TimeoutError:
+        await status.edit(content='❌ O download da foto demorou demais. Reenvie a imagem uma vez.')
+        return True
+    except Exception as erro:
+        await status.edit(content=f'❌ Não consegui salvar a foto: `{type(erro).__name__}`.')
+        await enviar_log(f'❌ V52 foto procurado painel `{canal.id}`: {type(erro).__name__}: {erro}')
+        return True
+
+
+async def _v52_processar_boletim(message: discord.Message) -> bool:
+    atendimento = _v52_atendimento_do_canal(int(getattr(message.channel, 'id', 0) or 0))
+    if not atendimento:
+        return False
+    if not isinstance(message.author, discord.Member):
+        return False
+    if not (
+        message.author.id == int(atendimento.get('agente_id') or 0)
+        or usuario_e_administrador(message.author)
+    ):
+        return False
+    pedidos = atendimento.get('procurado_pedidos', {})
+    if not isinstance(pedidos, dict):
+        return False
+    imagens = _v52_imagens_mensagem(message)
+    if not imagens:
+        return False
+    pendentes = []
+    for pid, pedido in pedidos.items():
+        if not isinstance(pedido, dict):
+            continue
+        etapa = str(pedido.get('status') or '')
+        if etapa not in {'aguardando_foto_individuo','corrigir_foto_individuo','aguardando_foto_rg','corrigir_foto_rg'}:
+            continue
+        prompt_id = int(
+            pedido.get('foto_individuo_prompt_id')
+            if 'foto_individuo' in etapa else pedido.get('foto_rg_prompt_id')
+            or 0
+        )
+        if int(message.id) > prompt_id:
+            pendentes.append((prompt_id, str(pid), pedido))
+    if not pendentes:
+        return False
+    _, pedido_id, pedido = sorted(pendentes, key=lambda x: x[0], reverse=True)[0]
+    if len(imagens) != 1:
+        await message.channel.send('❌ Envie somente **uma imagem por etapa**.', delete_after=12)
+        return True
+
+    etapa = str(pedido.get('status') or '')
+    dados = dict(pedido.get('dados') or {})
+    status = await message.channel.send('⏳ Foto recebida. Validando e salvando...')
+    try:
+        if etapa in {'aguardando_foto_individuo','corrigir_foto_individuo'}:
+            foto = await _v52_salvar_foto(
+                imagens[0], f"boletim-individuo-{dados.get('rg')}-{pedido_id}"
+            )
+            dados.update({
+                'foto_individuo': foto,
+                'foto_individuo_msg_id': message.id,
+                'foto_individuo_anexo_id': getattr(imagens[0], 'id', None),
+                'foto_individuo_confirmada_em': agora_br(),
+                'foto_individuo_confirmada_por_id': message.author.id,
+            })
+            pedido['dados'] = dados
+            pedido['status'] = 'aguardando_foto_rg'
+            pedido['foto_rg_prompt_id'] = status.id
+            _guardar_pedido_atendimento(atendimento, 'procurado_pedidos', pedido_id, pedido)
+            await asyncio.to_thread(
+                atualizar_atendimento_boletim, 'id', atendimento.get('id'), atendimento
+            )
+            await status.edit(content=(
+                '✅ **Foto do indivíduo aceita automaticamente.**\n'
+                f'🔖 Pedido: `{pedido_id}`\n\n'
+                '🪪 Envie agora **somente a foto do RG** para concluir.'
+            ))
+            return True
+
+        foto = await _v52_salvar_foto(
+            imagens[0], f"boletim-rg-{dados.get('rg')}-{pedido_id}"
+        )
+        dados.update({
+            'foto_rg': foto,
+            'foto_rg_msg_id': message.id,
+            'foto_rg_anexo_id': getattr(imagens[0], 'id', None),
+            'foto_rg_confirmada_em': agora_br(),
+            'foto_rg_confirmada_por_id': message.author.id,
+        })
+        pedido['dados'] = dados
+        pedido['status'] = 'fotos_confirmadas'
+        _guardar_pedido_atendimento(atendimento, 'procurado_pedidos', pedido_id, pedido)
+        await asyncio.to_thread(
+            atualizar_atendimento_boletim, 'id', atendimento.get('id'), atendimento
+        )
+        await status.edit(content=(
+            '✅ **Foto do RG aceita. As duas fotos estão confirmadas.**\n'
+            'Clique abaixo para concluir o procurado.'
+        ), view=V52FinalizarProcuradoBoletimView(str(atendimento.get('id')), pedido_id))
+        return True
+    except asyncio.TimeoutError:
+        await status.edit(content='❌ O download da foto demorou demais. Reenvie a imagem uma vez.')
+        return True
+    except Exception as erro:
+        await status.edit(content=f'❌ Não consegui salvar a foto: `{type(erro).__name__}`.')
+        await enviar_log(f'❌ V52 foto procurado boletim `{pedido_id}`: {type(erro).__name__}: {erro}')
+        return True
+
+
+@bot.listen('on_message')
+async def v52_fotos_procurados_automaticas(message: discord.Message) -> None:
+    if getattr(message.author, 'bot', False) or not getattr(message, 'attachments', None):
+        return
+    if int(message.id) in _V52_MENSAGENS_PROCESSADAS:
+        return
+    async with _v52_lock(int(message.channel.id)):
+        if int(message.id) in _V52_MENSAGENS_PROCESSADAS:
+            return
+        processado = await _v52_processar_painel(message)
+        if not processado:
+            processado = await _v52_processar_boletim(message)
+        if processado:
+            _V52_MENSAGENS_PROCESSADAS.add(int(message.id))
+
+
+async def _v52_recuperar_pendencias_existentes() -> None:
+    # Recupera fotos que já haviam sido enviadas antes do deploy e ficaram em "pensando".
+    await bot.wait_until_ready()
+    await asyncio.sleep(4)
+    # Canais provisórios do painel.
+    for canal_id, dados in list(cadastros_pendentes.items()):
+        if not isinstance(dados, dict):
+            continue
+        etapa = str(dados.get('etapa_fotos') or '')
+        if etapa not in {'aguardando_foto_individuo','corrigir_foto_individuo','aguardando_foto_rg','corrigir_foto_rg'}:
+            continue
+        canal = bot.get_channel(int(canal_id))
+        if not isinstance(canal, discord.TextChannel):
+            continue
+        prompt_id = int(
+            dados.get('foto_individuo_prompt_id')
+            if 'foto_individuo' in etapa else dados.get('foto_rg_prompt_id')
+            or 0
+        )
+        try:
+            async for msg in canal.history(limit=30, after=discord.Object(id=prompt_id), oldest_first=True):
+                if not getattr(msg.author, 'bot', False) and _v52_imagens_mensagem(msg):
+                    await _v52_processar_painel(msg)
+                    break
+        except Exception as erro:
+            print(f'⚠️ V52 recuperação painel {canal_id}: {erro}', flush=True)
+    # Pedidos abertos dentro dos boletins.
+    for atendimento in carregar_atendimentos_boletins():
+        if not isinstance(atendimento, dict):
+            continue
+        canal = bot.get_channel(int(atendimento.get('area_id') or atendimento.get('thread_id') or 0))
+        if canal is None or not hasattr(canal, 'history'):
+            continue
+        pedidos = atendimento.get('procurado_pedidos', {})
+        if not isinstance(pedidos, dict):
+            continue
+        for pedido in pedidos.values():
+            if not isinstance(pedido, dict):
+                continue
+            etapa = str(pedido.get('status') or '')
+            if etapa not in {'aguardando_foto_individuo','corrigir_foto_individuo','aguardando_foto_rg','corrigir_foto_rg'}:
+                continue
+            prompt_id = int(
+                pedido.get('foto_individuo_prompt_id')
+                if 'foto_individuo' in etapa else pedido.get('foto_rg_prompt_id')
+                or 0
+            )
+            try:
+                async for msg in canal.history(limit=30, after=discord.Object(id=prompt_id), oldest_first=True):
+                    if not getattr(msg.author, 'bot', False) and _v52_imagens_mensagem(msg):
+                        await _v52_processar_boletim(msg)
+                        break
+            except Exception as erro:
+                print(f'⚠️ V52 recuperação boletim: {erro}', flush=True)
+
+
+@bot.listen('on_ready')
+async def v52_iniciar_recuperacao_e_views() -> None:
+    global _V52_RECUPERACAO_EXECUTADA
+    if _V52_RECUPERACAO_EXECUTADA:
+        return
+    _V52_RECUPERACAO_EXECUTADA = True
+    try:
+        # Views dinâmicas novas não são persistentes; as mensagens recuperadas recebem uma nova view.
+        asyncio.create_task(_v52_recuperar_pendencias_existentes())
+        print('✅ V52 fotos de procurados: captura automática e recuperação de pendências ativas.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V52 inicialização: {erro}', flush=True)
+
+print('✅ V52 carregada: fotos aceitas automaticamente, pedidos presos recuperados e I/O com timeout.')
+
+# =====================================================
+# V53 — REVISÃO GERAL + HISTÓRICO PRISIONAL RESILIENTE
+# - Salva Nome/RG/dados penais imediatamente, antes do OCR.
+# - OCR e compactação das imagens passam a ocorrer em segundo plano.
+# - Falha, lentidão ou ausência de imagem não impede a criação/atualização da ficha.
+# - Aceita encaminhamentos/snapshots e mensagens oficiais de bots no canal prisional.
+# - Reprocessa automaticamente registros antigos/incompletos.
+# - Adiciona timeouts por etapa, estado persistente e diagnóstico no banco.
+# - Exibe pena, multa, fiança, infrações e porte de arma na ficha geral.
+# =====================================================
+
+V53_PRISAO_TEXTO_TIMEOUT = max(4.0, env_float("V53_PRISAO_TEXTO_TIMEOUT", 12.0))
+V53_PRISAO_DOWNLOAD_TIMEOUT = max(8.0, env_float("V53_PRISAO_DOWNLOAD_TIMEOUT", 25.0))
+V53_PRISAO_OCR_TIMEOUT = max(8.0, env_float("V53_PRISAO_OCR_TIMEOUT", 30.0))
+V53_PRISAO_TOTAL_IMAGENS_TIMEOUT = max(20.0, env_float("V53_PRISAO_TOTAL_IMAGENS_TIMEOUT", 95.0))
+V53_PRISAO_MAX_IMAGENS = max(1, min(12, env_int("V53_PRISAO_MAX_IMAGENS", 8)))
+V53_PRISAO_MONITOR_INTERVAL = max(300, env_int("V53_PRISAO_MONITOR_INTERVAL", 900))
+
+_V53_SCHEMA_PRONTO = False
+_V53_SCHEMA_LOCK = threading.RLock()
+_V53_PRISAO_TASKS: set[asyncio.Task] = set()
+_V53_PRISAO_ENRIQUECENDO: set[int] = set()
+_V53_PRISAO_MONITOR_TASK: Optional[asyncio.Task] = None
+_V53_PRISAO_RECUPERACAO_EXECUTADA = False
+_V53_INIT_ANTES = inicializar_banco_dicor
+_V53_EMBED_FICHA_ANTES = _banco_embed_ficha_geral
+
+
+def inicializar_banco_dicor() -> None:
+    """Inicialização final do banco com migrações idempotentes da V53."""
+    global _V53_SCHEMA_PRONTO
+    _V53_INIT_ANTES()
+    if _V53_SCHEMA_PRONTO:
+        return
+    with _V53_SCHEMA_LOCK:
+        if _V53_SCHEMA_PRONTO:
+            return
+        with _banco_conexao() as db:
+            colunas = {str(row[1]) for row in db.execute("PRAGMA table_info(historico_prisoes)").fetchall()}
+            migracoes = {
+                "porte_arma": "TEXT DEFAULT ''",
+                "infracoes_json": "TEXT DEFAULT '[]'",
+                "processamento_status": "TEXT DEFAULT 'PENDENTE'",
+                "processamento_erro": "TEXT DEFAULT ''",
+                "imagens_processadas": "INTEGER DEFAULT 0",
+                "ocr_tentativas": "INTEGER DEFAULT 0",
+                "atualizado_imagens_em": "TEXT DEFAULT ''",
+                "texto_hash": "TEXT DEFAULT ''",
+            }
+            for coluna, definicao in migracoes.items():
+                if coluna not in colunas:
+                    db.execute(f"ALTER TABLE historico_prisoes ADD COLUMN {coluna} {definicao}")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prisoes_processamento "
+                "ON historico_prisoes(processamento_status, atualizado_em)"
+            )
+        _V53_SCHEMA_PRONTO = True
+
+
+def _v53_prisao_texto_payloads(payloads: List[Any]) -> str:
+    partes: List[str] = []
+    vistos: set[str] = set()
+    for payload in payloads:
+        conteudo = str(_prisao_obj_get(payload, "content", "") or "").strip()
+        if conteudo and conteudo not in vistos:
+            vistos.add(conteudo)
+            partes.append(conteudo)
+        for embed in list(_prisao_obj_get(payload, "embeds", []) or []):
+            trecho = str(_prisao_embed_texto(embed) or "").strip()
+            if trecho and trecho not in vistos:
+                vistos.add(trecho)
+                partes.append(trecho)
+    return "\n\n".join(partes).strip()
+
+
+async def _v53_prisao_payloads(message: discord.Message) -> List[Any]:
+    try:
+        payloads = await asyncio.wait_for(
+            _prisao_payloads_mensagem(message),
+            timeout=V53_PRISAO_TEXTO_TIMEOUT,
+        )
+        return list(payloads or [message])
+    except Exception as erro:
+        print(
+            f"⚠️ V53 prisão {getattr(message, 'id', 0)}: fallback de snapshot "
+            f"({type(erro).__name__}: {erro}).",
+            flush=True,
+        )
+        return [message]
+
+
+def _v53_prisao_extrair_identidade(texto: str) -> Tuple[str, str]:
+    nome, rg = _prisao_extrair_identidade(texto)
+    bruto = str(texto or "").replace("**", "").replace("`", "")
+    if not nome:
+        for padrao in (
+            r"(?im)(?:^|\n)\s*[#>*•\-]*\s*nome\s*[:\-]\s*([^\n\r]{2,120})",
+            r"(?im)(?:^|\n)\s*[#>*•\-]*\s*preso\s*[:\-]\s*([^\n\r]{2,120})",
+            r"(?im)(?:^|\n)\s*[#>*•\-]*\s*propriet[aá]rio\s*[:\-]\s*([^\n\r]{2,120})",
+        ):
+            achado = re.search(padrao, bruto)
+            if achado:
+                nome = _banco_limpar_texto(achado.group(1), 120).strip(" *#>-•")
+                break
+    if not rg:
+        for padrao in (
+            r"(?im)(?:^|\n)\s*[#>*•\-]*\s*(?:rg|passaporte)\s*[:\-]\s*([A-Za-z0-9.\-/]{2,24})",
+            r"(?i)\b(?:rg|passaporte)\s*#?\s*([0-9A-Za-z.\-/]{2,24})\b",
+        ):
+            achado = re.search(padrao, bruto)
+            if achado:
+                rg = _banco_normalizar_rg(achado.group(1))
+                break
+    # Evita capturar o título/rodapé como nome.
+    nome = re.sub(r"\s+", " ", str(nome or "")).strip(" :*#>-•")[:120]
+    if normalizar_busca(nome) in {
+        "informacoes do preso", "informacoes da prisao", "registro de calculo penal"
+    }:
+        nome = ""
+    return nome, _banco_normalizar_rg(rg)
+
+
+def _v53_prisao_extrair_infracoes(texto: str) -> List[Dict[str, str]]:
+    bruto = str(texto or "").replace("**", "").replace("`", "")
+    itens: List[Dict[str, str]] = []
+    vistos: set[Tuple[str, str]] = set()
+    for linha in bruto.splitlines():
+        limpa = linha.strip()
+        achado = re.match(
+            r"^[\s>*•\-]*([0-9]{1,3}(?:\.[0-9]{1,3})+)\s*[-–—:]\s*(.+?)\s*$",
+            limpa,
+            flags=re.I,
+        )
+        if not achado:
+            continue
+        artigo = _banco_limpar_texto(achado.group(1), 30)
+        descricao = _banco_limpar_texto(achado.group(2), 300)
+        pena = ""
+        m_pena = re.search(r"\(([^()]*(?:mes(?:es)?|ano(?:s)?|multa)[^()]*)\)\s*$", descricao, flags=re.I)
+        if m_pena:
+            pena = _banco_limpar_texto(m_pena.group(1), 100)
+            descricao = _banco_limpar_texto(descricao[:m_pena.start()], 260)
+        chave = (artigo, normalizar_busca(descricao))
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        itens.append({"artigo": artigo, "descricao": descricao, "pena": pena})
+    return itens[:80]
+
+
+def _v53_prisao_extrair_detalhes(texto: str) -> Dict[str, Any]:
+    detalhes = dict(_prisao_extrair_detalhes(texto) or {})
+    bruto = str(texto or "").replace("**", "").replace("`", "")
+
+    def campo(padroes: Tuple[str, ...], limite: int = 150) -> str:
+        for padrao in padroes:
+            achado = re.search(padrao, bruto, flags=re.I | re.M)
+            if achado:
+                return _banco_limpar_texto(achado.group(1), limite)
+        return ""
+
+    infracoes = _v53_prisao_extrair_infracoes(bruto)
+    detalhes.update({
+        "data_prisao": detalhes.get("data_prisao") or campo((r"Data\s+da\s+Pris[aã]o\s*[:\-]\s*([^\n\r]+)",), 40),
+        "pena_total": detalhes.get("pena_total") or campo((r"Pena\s+Total\s*[:\-]\s*([^\n\r]+)",), 100),
+        "multa_total": detalhes.get("multa_total") or campo((r"Multa\s+Total\s*[:\-]\s*([^\n\r]+)",), 100),
+        "fianca": detalhes.get("fianca") or campo((r"Fian[cç]a\s*[:\-]\s*([^\n\r]+)",), 100),
+        "porte_arma": campo((r"Porte\s+de\s+Arma\s*[:\-]\s*([^\n\r]+)",), 120),
+        "infracoes": infracoes,
+        "infracoes_quantidade": max(int(detalhes.get("infracoes_quantidade") or 0), len(infracoes)),
+    })
+    return detalhes
+
+
+def _v53_prisao_descritores_payloads(payloads: List[Any]) -> List[Dict[str, Any]]:
+    descritores: List[Dict[str, Any]] = []
+    vistos: set[str] = set()
+    indice = 0
+    for payload in payloads:
+        for anexo in list(_prisao_obj_get(payload, "attachments", []) or []):
+            indice += 1
+            url = _prisao_midia_url(anexo)
+            aid = str(_prisao_obj_get(anexo, "id", "") or "")
+            nome = _prisao_midia_nome(anexo, indice)
+            chave = f"att:{aid}:{url}:{nome}"
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            descritores.append({
+                "obj": anexo,
+                "url": url,
+                "nome": nome,
+                "content_type": str(_prisao_obj_get(anexo, "content_type", "") or ""),
+                "ordem": indice,
+                "origem": "attachment",
+            })
+        for embed in list(_prisao_obj_get(payload, "embeds", []) or []):
+            for rotulo in ("image", "thumbnail"):
+                media = _prisao_obj_get(embed, rotulo, None)
+                if not media:
+                    continue
+                url = _prisao_midia_url(media)
+                if not url or url in vistos:
+                    continue
+                indice += 1
+                vistos.add(url)
+                descritores.append({
+                    "obj": media,
+                    "url": url,
+                    "nome": f"{rotulo}-{indice}.png",
+                    "content_type": "image/png",
+                    "ordem": indice,
+                    "origem": "embed",
+                })
+    return descritores[:V53_PRISAO_MAX_IMAGENS]
+
+
+def _v53_prisao_meta(message: discord.Message) -> Dict[str, Any]:
+    origem_msg, origem_canal, origem_guild = _prisao_referencia_origem(message)
+    return {
+        "mensagem_id": int(getattr(message, "id", 0) or 0),
+        "canal_id": int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+        "mensagem_url": str(getattr(message, "jump_url", "") or ""),
+        "mensagem_origem_id": int(origem_msg or 0),
+        "canal_origem_id": int(origem_canal or 0),
+        "guild_origem_id": int(origem_guild or 0),
+        "criado_por_id": int(getattr(getattr(message, "author", None), "id", 0) or 0),
+    }
+
+
+def _v53_prisao_salvar_nucleo_sync(
+    meta: Dict[str, Any], nome: str, rg: str, texto: str, detalhes: Dict[str, Any]
+) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    rg_n = _banco_normalizar_rg(rg)
+    individuo = banco_upsert_individuo(
+        nome=nome,
+        rg=rg_n,
+        origem="historico_prisao",
+        criado_por_id=int(meta.get("criado_por_id") or 0),
+        ultima_origem_url=str(meta.get("mensagem_url") or ""),
+        dados_extras={
+            "ultima_prisao": str(detalhes.get("data_prisao") or ""),
+            "pena_total": str(detalhes.get("pena_total") or ""),
+            "infracoes_quantidade": int(detalhes.get("infracoes_quantidade") or 0),
+        },
+    )
+    individuo_id = int(individuo.get("id") or 0)
+    agora = _banco_agora_iso()
+    texto_hash = hashlib.sha256(str(texto or "").encode("utf-8", errors="ignore")).hexdigest()
+    infracoes_json = json.dumps(list(detalhes.get("infracoes") or []), ensure_ascii=False)
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            INSERT INTO historico_prisoes
+            (mensagem_id, canal_id, mensagem_url, mensagem_origem_id, canal_origem_id,
+             guild_origem_id, individuo_id, nome_texto, rg_texto, nome_ocr, rg_ocr,
+             conferencia_status, conferencia_detalhes, data_prisao, pena_total,
+             multa_total, fianca, infracoes_quantidade, texto_original,
+             foto_individuo_path, foto_rg_path, foto_mochila_url, itens_ilegais_json,
+             mochila_analisada, criado_por_id, criado_em, atualizado_em,
+             porte_arma, infracoes_json, processamento_status, processamento_erro,
+             imagens_processadas, ocr_tentativas, atualizado_imagens_em, texto_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', 'TEXTO_VALIDADO',
+                    'Nome, RG e dados penais salvos; imagens em processamento.',
+                    ?, ?, ?, ?, ?, ?, '', '', '', '[]', 0, ?, ?, ?, ?, ?,
+                    'TEXTO_SALVO', '', 0, 0, '', ?)
+            ON CONFLICT(mensagem_id) DO UPDATE SET
+                canal_id=excluded.canal_id,
+                mensagem_url=excluded.mensagem_url,
+                mensagem_origem_id=excluded.mensagem_origem_id,
+                canal_origem_id=excluded.canal_origem_id,
+                guild_origem_id=excluded.guild_origem_id,
+                individuo_id=excluded.individuo_id,
+                nome_texto=excluded.nome_texto,
+                rg_texto=excluded.rg_texto,
+                data_prisao=excluded.data_prisao,
+                pena_total=excluded.pena_total,
+                multa_total=excluded.multa_total,
+                fianca=excluded.fianca,
+                infracoes_quantidade=excluded.infracoes_quantidade,
+                texto_original=excluded.texto_original,
+                porte_arma=excluded.porte_arma,
+                infracoes_json=excluded.infracoes_json,
+                texto_hash=excluded.texto_hash,
+                processamento_status=CASE
+                    WHEN historico_prisoes.processamento_status='CONCLUIDO' THEN 'CONCLUIDO'
+                    ELSE 'TEXTO_SALVO'
+                END,
+                processamento_erro='',
+                atualizado_em=excluded.atualizado_em
+            """,
+            (
+                int(meta.get("mensagem_id") or 0), int(meta.get("canal_id") or 0),
+                str(meta.get("mensagem_url") or ""), int(meta.get("mensagem_origem_id") or 0),
+                int(meta.get("canal_origem_id") or 0), int(meta.get("guild_origem_id") or 0),
+                individuo_id, nome, rg_n, str(detalhes.get("data_prisao") or ""),
+                str(detalhes.get("pena_total") or ""), str(detalhes.get("multa_total") or ""),
+                str(detalhes.get("fianca") or ""), int(detalhes.get("infracoes_quantidade") or 0),
+                str(texto or "")[:30000], int(meta.get("criado_por_id") or 0), agora, agora,
+                str(detalhes.get("porte_arma") or ""), infracoes_json, texto_hash,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO fontes_ficha_individuo
+            (individuo_id, tipo, mensagem_id, canal_id, mensagem_url,
+             numero_referencia, descricao, criado_em)
+            VALUES (?, 'PRISAO', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tipo, mensagem_id) DO UPDATE SET
+                individuo_id=excluded.individuo_id,
+                canal_id=excluded.canal_id,
+                mensagem_url=excluded.mensagem_url,
+                numero_referencia=excluded.numero_referencia,
+                descricao=excluded.descricao
+            """,
+            (
+                individuo_id, int(meta.get("mensagem_id") or 0), int(meta.get("canal_id") or 0),
+                str(meta.get("mensagem_url") or ""), str(detalhes.get("data_prisao") or ""),
+                f"Prisão: {detalhes.get('pena_total') or 'pena não informada'}; "
+                f"{int(detalhes.get('infracoes_quantidade') or 0)} infração(ões).",
+                agora,
+            ),
+        )
+        total = int(db.execute(
+            "SELECT COUNT(*) FROM historico_prisoes WHERE individuo_id=?", (individuo_id,)
+        ).fetchone()[0])
+        _banco_historico(
+            "INDIVIDUO", rg_n, "PRISAO_TEXTO_VINCULADO",
+            f"Mensagem {meta.get('mensagem_id')} | Data: {detalhes.get('data_prisao') or 'N/I'} | "
+            f"Infrações: {int(detalhes.get('infracoes_quantidade') or 0)}",
+            int(meta.get("criado_por_id") or 0), db,
+        )
+    return {"individuo": individuo, "individuo_id": individuo_id, "total_prisoes": total}
+
+
+def _v53_prisao_estado_sync(mensagem_id: int) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        row = db.execute(
+            "SELECT mensagem_id, individuo_id, processamento_status, processamento_erro, "
+            "imagens_processadas, mochila_analisada, ocr_tentativas "
+            "FROM historico_prisoes WHERE mensagem_id=?",
+            (int(mensagem_id),),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def _v53_prisao_marcar_status_sync(
+    mensagem_id: int,
+    status: str,
+    erro: str = "",
+    *,
+    imagens: Optional[int] = None,
+    mochila_analisada: Optional[int] = None,
+    incrementar_ocr: bool = False,
+) -> None:
+    inicializar_banco_dicor()
+    agora = _banco_agora_iso()
+    campos = ["processamento_status=?", "processamento_erro=?", "atualizado_em=?"]
+    valores: List[Any] = [str(status or "")[:50], str(erro or "")[:1500], agora]
+    if imagens is not None:
+        campos.append("imagens_processadas=?")
+        valores.append(max(0, int(imagens)))
+    if mochila_analisada is not None:
+        campos.append("mochila_analisada=?")
+        valores.append(1 if mochila_analisada else 0)
+    if incrementar_ocr:
+        campos.append("ocr_tentativas=COALESCE(ocr_tentativas,0)+1")
+    if status in {"CONCLUIDO", "PARCIAL", "SEM_IMAGENS", "ERRO_IMAGENS"}:
+        campos.append("atualizado_imagens_em=?")
+        valores.append(agora)
+    valores.append(int(mensagem_id))
+    with _banco_conexao() as db:
+        db.execute(
+            f"UPDATE historico_prisoes SET {', '.join(campos)} WHERE mensagem_id=?",
+            tuple(valores),
+        )
+
+
+async def _v53_prisao_processar_uma_midia(
+    descritor: Dict[str, Any], pasta: Path, semaforo: asyncio.Semaphore
+) -> Optional[Dict[str, Any]]:
+    async with semaforo:
+        try:
+            caminho = await asyncio.wait_for(
+                _prisao_baixar_descritor(descritor, pasta),
+                timeout=V53_PRISAO_DOWNLOAD_TIMEOUT,
+            )
+            if caminho is None:
+                return None
+            eh_imagem = await asyncio.to_thread(_prisao_eh_imagem, caminho)
+            if not eh_imagem:
+                return None
+            try:
+                ocr_texto, ocr_linhas = await asyncio.wait_for(
+                    asyncio.to_thread(_prisao_ocr_texto, caminho),
+                    timeout=V53_PRISAO_OCR_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                ocr_texto, ocr_linhas = "", []
+            item = dict(descritor)
+            item.update({"path": caminho, "ocr_texto": ocr_texto, "ocr_linhas": ocr_linhas})
+            return item
+        except Exception as erro:
+            print(
+                f"⚠️ V53 mídia prisional {descritor.get('nome')}: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+            return None
+
+
+async def _v53_prisao_snapshot_backup(individuo_id: int) -> None:
+    try:
+        await asyncio.sleep(1.5)
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, "individuo", int(individuo_id))
+        if perfil:
+            await asyncio.to_thread(_banco_ficha_geral_snapshot, perfil)
+        await asyncio.to_thread(_banco_criar_backup_duravel, "historico-prisao-v53")
+    except Exception as erro:
+        print(f"⚠️ V53 snapshot/backup prisional: {type(erro).__name__}: {erro}", flush=True)
+
+
+def _v53_acompanhar_task(task: asyncio.Task) -> None:
+    _V53_PRISAO_TASKS.add(task)
+    def concluir(tarefa: asyncio.Task) -> None:
+        _V53_PRISAO_TASKS.discard(tarefa)
+        try:
+            tarefa.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            traceback.print_exc()
+    task.add_done_callback(concluir)
+
+
+async def _v53_prisao_enriquecer_imagens(
+    message: discord.Message,
+    payloads: List[Any],
+    nome: str,
+    rg: str,
+    texto: str,
+    detalhes: Dict[str, Any],
+    nucleo: Dict[str, Any],
+) -> None:
+    mensagem_id = int(getattr(message, "id", 0) or 0)
+    if not mensagem_id or mensagem_id in _V53_PRISAO_ENRIQUECENDO:
+        return
+    _V53_PRISAO_ENRIQUECENDO.add(mensagem_id)
+    try:
+        descritores = _v53_prisao_descritores_payloads(payloads)
+        if not descritores:
+            await asyncio.to_thread(
+                _v53_prisao_marcar_status_sync,
+                mensagem_id, "SEM_IMAGENS", "Nenhuma imagem foi localizada no encaminhamento.",
+                imagens=0, mochila_analisada=0,
+            )
+            return
+        await asyncio.to_thread(
+            _v53_prisao_marcar_status_sync,
+            mensagem_id, "PROCESSANDO_IMAGENS", "", incrementar_ocr=True,
+        )
+        with tempfile.TemporaryDirectory(prefix="dicor-prisao-v53-") as tmp:
+            pasta = Path(tmp)
+            semaforo = asyncio.Semaphore(2)
+            tarefas = [
+                _v53_prisao_processar_uma_midia(descritor, pasta, semaforo)
+                for descritor in descritores
+            ]
+            try:
+                resultados = await asyncio.wait_for(
+                    asyncio.gather(*tarefas, return_exceptions=False),
+                    timeout=V53_PRISAO_TOTAL_IMAGENS_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                resultados = []
+            midias = [item for item in resultados if isinstance(item, dict)]
+            if not midias:
+                await asyncio.to_thread(
+                    _v53_prisao_marcar_status_sync,
+                    mensagem_id, "ERRO_IMAGENS",
+                    "As imagens não puderam ser baixadas ou analisadas dentro do limite de tempo.",
+                    imagens=0, mochila_analisada=0,
+                )
+                return
+
+            classes = _prisao_classificar_midias(midias, nome, rg)
+            individuo_item = classes.get("individuo")
+            rg_item = classes.get("rg")
+            mochila_item = classes.get("mochila")
+            conferencia = _prisao_conferir_identidade(nome, rg, rg_item)
+            foto_ind_path = foto_rg_path = foto_ind_url = foto_rg_url = ""
+            foto_mochila_url = str((mochila_item or {}).get("url") or "")
+
+            async def comprimir(item: Optional[Dict[str, Any]], tipo: str) -> Tuple[str, str]:
+                if not item or not item.get("path"):
+                    return "", ""
+                try:
+                    destino, url = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _prisao_comprimir_para_upload, Path(item["path"]), rg, tipo
+                        ),
+                        timeout=25,
+                    )
+                    return str(destino), str(url or item.get("url") or "")
+                except Exception as erro:
+                    print(f"⚠️ V53 compactação {tipo}: {type(erro).__name__}: {erro}", flush=True)
+                    return "", str(item.get("url") or "")
+
+            (foto_ind_path, foto_ind_url), (foto_rg_path, foto_rg_url) = await asyncio.gather(
+                comprimir(individuo_item, "individuo"),
+                comprimir(rg_item, "rg"),
+            )
+            if mochila_item:
+                _, mochila_url = await comprimir(mochila_item, "mochila")
+                if mochila_url:
+                    foto_mochila_url = mochila_url
+            itens_ilegais = await asyncio.to_thread(_prisao_analisar_itens_ilegais_mochila, mochila_item)
+
+            salvo = await asyncio.to_thread(
+                _prisao_salvar_registro_sync,
+                message=message,
+                nome=nome,
+                rg=rg,
+                texto=texto,
+                detalhes=detalhes,
+                conferencia=conferencia,
+                foto_individuo_path=foto_ind_path,
+                foto_rg_path=foto_rg_path,
+                foto_individuo_url=foto_ind_url,
+                foto_rg_url=foto_rg_url,
+                foto_mochila_url=foto_mochila_url,
+                itens_ilegais=itens_ilegais,
+            )
+            status_final = "CONCLUIDO" if len(midias) == len(descritores) else "PARCIAL"
+            await asyncio.to_thread(
+                _v53_prisao_marcar_status_sync,
+                mensagem_id, status_final,
+                "" if status_final == "CONCLUIDO" else "Uma ou mais imagens não puderam ser processadas.",
+                imagens=len(midias), mochila_analisada=1 if mochila_item else 0,
+            )
+            individuo_id = int(
+                (salvo.get("individuo") or {}).get("id")
+                or nucleo.get("individuo_id")
+                or 0
+            )
+            if individuo_id:
+                _v53_acompanhar_task(asyncio.create_task(
+                    _v53_prisao_snapshot_backup(individuo_id),
+                    name=f"prisao-v53-backup-{mensagem_id}",
+                ))
+    except Exception as erro:
+        traceback.print_exc()
+        await asyncio.to_thread(
+            _v53_prisao_marcar_status_sync,
+            mensagem_id, "ERRO_IMAGENS", f"{type(erro).__name__}: {erro}",
+        )
+        await enviar_log(
+            f"❌ V53 imagens do histórico prisional `{mensagem_id}`: "
+            f"{type(erro).__name__}: {erro}"
+        )
+    finally:
+        _V53_PRISAO_ENRIQUECENDO.discard(mensagem_id)
+
+
+async def _v53_prisao_permissao(message: discord.Message, force_reprocess: bool) -> bool:
+    if force_reprocess:
+        return True
+    autor = getattr(message, "author", None)
+    if autor is None:
+        return False
+    # Mensagens oficiais de outros bots são aceitas no canal exclusivo quando
+    # o próprio conteúdo comprovar que se trata de um registro prisional.
+    if bool(getattr(autor, "bot", False)):
+        return int(getattr(autor, "id", 0) or 0) != int(getattr(getattr(bot, "user", None), "id", 0) or 0)
+    membro: Optional[discord.Member] = autor if isinstance(autor, discord.Member) else None
+    if membro is None and getattr(message, "guild", None) is not None:
+        membro = message.guild.get_member(int(getattr(autor, "id", 0) or 0))
+        if membro is None:
+            try:
+                membro = await asyncio.wait_for(
+                    message.guild.fetch_member(int(getattr(autor, "id", 0) or 0)), timeout=8
+                )
+            except Exception:
+                membro = None
+    return bool(membro and _membro_inspetor_mais(membro))
+
+
+async def _prisao_processar_mensagem(
+    message: discord.Message,
+    *,
+    historico: bool = False,
+    force_reprocess: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Processador final V53.
+
+    O núcleo textual é persistido antes de qualquer download/OCR. Assim, uma
+    imagem lenta ou inválida nunca impede a ficha de receber a prisão.
+    """
+    mensagem_id = int(getattr(message, "id", 0) or 0)
+    canal_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+    if not mensagem_id or canal_id != int(HISTORICO_PRISAO_CHANNEL_ID):
+        return None
+    if int(getattr(getattr(message, "author", None), "id", 0) or 0) == int(getattr(getattr(bot, "user", None), "id", 0) or 0):
+        return None
+
+    async with _prisao_lock(mensagem_id):
+        estado = await asyncio.to_thread(_v53_prisao_estado_sync, mensagem_id)
+        if estado and str(estado.get("processamento_status") or "") == "CONCLUIDO" and not force_reprocess:
+            return {
+                "individuo_id": int(estado.get("individuo_id") or 0),
+                "total_prisoes": 1,
+                "ja_processado": True,
+            }
+
+        payloads = await _v53_prisao_payloads(message)
+        texto = _v53_prisao_texto_payloads(payloads)
+        nome, rg = _v53_prisao_extrair_identidade(texto)
+        if not nome or not rg:
+            if not historico:
+                await _prisao_enviar_retorno_temporario(
+                    message,
+                    content=(
+                        "⚠️ **PRISÃO NÃO IDENTIFICADA**\n"
+                        "Não encontrei `Nome:` e `RG:`/`Passaporte:` no texto encaminhado. "
+                        "O registro não foi descartado; reenvie mantendo esses dois campos."
+                    ),
+                )
+            try:
+                await message.add_reaction("⚠️")
+            except Exception:
+                pass
+            return None
+
+        permitido = await _v53_prisao_permissao(message, force_reprocess)
+        if not permitido and not historico:
+            await _prisao_enviar_retorno_temporario(
+                message,
+                content="⚠️ Apenas **Inspetor+** pode importar manualmente um histórico prisional.",
+            )
+            return None
+
+        detalhes = _v53_prisao_extrair_detalhes(texto)
+        meta = _v53_prisao_meta(message)
+        try:
+            nucleo = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _v53_prisao_salvar_nucleo_sync, meta, nome, rg, texto, detalhes
+                ),
+                timeout=25,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await message.add_reaction("❌")
+            except Exception:
+                pass
+            await enviar_log(
+                f"❌ V53 núcleo prisional `{mensagem_id}`: {type(erro).__name__}: {erro}"
+            )
+            if not historico:
+                await _prisao_enviar_retorno_temporario(
+                    message,
+                    content=f"❌ Não foi possível salvar o registro prisional: `{type(erro).__name__}`.",
+                )
+            return None
+
+        # O banco já está atualizado neste ponto. O OCR não segura mais o fluxo.
+        try:
+            await message.add_reaction("✅")
+            for emoji in ("⏳",):
+                try:
+                    await message.remove_reaction(emoji, message.guild.me if message.guild else bot.user)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if not historico:
+            infracoes = list(detalhes.get("infracoes") or [])
+            resumo_infracoes = "\n".join(
+                f"• `{item.get('artigo')}` — {item.get('descricao')}"
+                for item in infracoes[:5]
+            ) or "Não detalhadas no texto."
+            embed = discord.Embed(
+                title="✅ DADOS PRISIONAIS VINCULADOS À FICHA",
+                description=(
+                    "Nome, RG e dados penais já foram salvos. As imagens serão analisadas "
+                    "em segundo plano e não bloqueiam mais a ficha."
+                ),
+                color=discord.Color.green(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            embed.add_field(name="👤 Indivíduo", value=f"**{nome}**\nRG `{rg}`", inline=True)
+            embed.add_field(name="📅 Data", value=str(detalhes.get("data_prisao") or "Não informada"), inline=True)
+            embed.add_field(name="⏱️ Pena", value=str(detalhes.get("pena_total") or "Não informada"), inline=True)
+            embed.add_field(name="💰 Multa", value=str(detalhes.get("multa_total") or "Não informada"), inline=True)
+            embed.add_field(name="💵 Fiança", value=str(detalhes.get("fianca") or "Não informada"), inline=True)
+            embed.add_field(name="📑 Infrações", value=resumo_infracoes[:1024], inline=False)
+            await _prisao_enviar_retorno_temporario(message, embed=embed, delete_after=45)
+
+        tarefa = asyncio.create_task(
+            _v53_prisao_enriquecer_imagens(
+                message, payloads, nome, rg, texto, detalhes, nucleo
+            ),
+            name=f"prisao-v53-imagens-{mensagem_id}",
+        )
+        _v53_acompanhar_task(tarefa)
+        try:
+            await enviar_log(
+                f"🚔 V53 prisão vinculada imediatamente | {nome} | RG `{rg}` | "
+                f"mensagem `{mensagem_id}` | imagens em segundo plano."
+            )
+        except Exception:
+            pass
+        return nucleo
+
+
+def _banco_embed_ficha_geral(perfil: Dict[str, Any]) -> discord.Embed:
+    """Ficha final: mantém tudo que já existia e detalha os dados prisionais."""
+    embed = _V53_EMBED_FICHA_ANTES(perfil)
+    prisoes = list((perfil or {}).get("historico_prisoes") or [])
+    if not prisoes or len(embed.fields) >= 25:
+        return embed
+    linhas: List[str] = []
+    for prisao in prisoes[:5]:
+        data = str(prisao.get("data_prisao") or "Data não informada")[:25]
+        pena = str(prisao.get("pena_total") or "pena N/I")[:45]
+        qtd = int(prisao.get("infracoes_quantidade") or 0)
+        multa = str(prisao.get("multa_total") or "").strip()
+        fianca = str(prisao.get("fianca") or "").strip()
+        url = str(prisao.get("mensagem_url") or "")
+        cabecalho = f"{data} — {pena} — {qtd} infração(ões)"
+        if url:
+            cabecalho = f"[{cabecalho}]({url})"
+        extras = []
+        if multa:
+            extras.append(f"Multa: {multa}")
+        if fianca:
+            extras.append(f"Fiança: {fianca}")
+        status_proc = str(prisao.get("processamento_status") or "").strip()
+        if status_proc and status_proc != "CONCLUIDO":
+            extras.append(f"Imagens: {status_proc.replace('_', ' ').title()}")
+        linhas.append(f"• {cabecalho}" + (f"\n  {' • '.join(extras)}" if extras else ""))
+    embed.add_field(
+        name="⚖️ RESUMO PENAL DAS ÚLTIMAS PRISÕES",
+        value="\n".join(linhas)[:1024],
+        inline=False,
+    )
+    return embed
+
+
+async def _v53_prisao_reprocessar_canal(
+    guild: Optional[discord.Guild], *, limite: int = 300, somente_incompletos: bool = True
+) -> Dict[str, int]:
+    stats = {"verificados": 0, "processados": 0, "ignorados": 0, "falhas": 0}
+    if guild is None:
+        return stats
+    canal = guild.get_channel(int(HISTORICO_PRISAO_CHANNEL_ID))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(HISTORICO_PRISAO_CHANNEL_ID))
+        except Exception:
+            return stats
+    if not hasattr(canal, "history"):
+        return stats
+    semaforo = asyncio.Semaphore(2)
+
+    async def tratar(msg: discord.Message) -> None:
+        async with semaforo:
+            stats["verificados"] += 1
+            try:
+                estado = await asyncio.to_thread(_v53_prisao_estado_sync, int(msg.id))
+                status = str(estado.get("processamento_status") or "")
+                if somente_incompletos and status == "CONCLUIDO":
+                    stats["ignorados"] += 1
+                    return
+                resultado = await _prisao_processar_mensagem(
+                    msg, historico=True, force_reprocess=bool(estado)
+                )
+                if resultado:
+                    stats["processados"] += 1
+                else:
+                    stats["ignorados"] += 1
+            except Exception:
+                stats["falhas"] += 1
+                traceback.print_exc()
+
+    mensagens: List[discord.Message] = []
+    try:
+        async for msg in canal.history(limit=max(1, min(2000, int(limite))), oldest_first=False):
+            if int(getattr(getattr(msg, "author", None), "id", 0) or 0) == int(getattr(getattr(bot, "user", None), "id", 0) or 0):
+                continue
+            mensagens.append(msg)
+    except Exception:
+        traceback.print_exc()
+        return stats
+    for inicio in range(0, len(mensagens), 8):
+        await asyncio.gather(*(tratar(msg) for msg in mensagens[inicio:inicio + 8]))
+        await asyncio.sleep(0.4)
+    return stats
+
+
+async def _v53_prisao_monitor_loop() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            guild = bot.get_guild(int(GUILD_ID))
+            await _v53_prisao_reprocessar_canal(guild, limite=80, somente_incompletos=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as erro:
+            print(f"⚠️ V53 monitor prisional: {type(erro).__name__}: {erro}", flush=True)
+        await asyncio.sleep(V53_PRISAO_MONITOR_INTERVAL)
+
+
+@bot.tree.command(
+    name="reprocessarprisoes",
+    description="Relê os registros prisionais incompletos e atualiza as fichas.",
+)
+@app_commands.describe(limite="Quantidade de mensagens recentes para revisar (20 a 1000)")
+async def reprocessar_prisoes_v53(interaction: discord.Interaction, limite: int = 300):
+    permitido = bool(
+        isinstance(interaction.user, discord.Member)
+        and (_membro_inspetor_mais(interaction.user) or usuario_e_administrador(interaction.user))
+    )
+    if not permitido:
+        return await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode reprocessar o histórico prisional.", ephemeral=True
+        )
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    limite = max(20, min(1000, int(limite)))
+    stats = await _v53_prisao_reprocessar_canal(
+        interaction.guild, limite=limite, somente_incompletos=True
+    )
+    await interaction.followup.send(
+        "✅ **REPROCESSAMENTO PRISIONAL CONCLUÍDO**\n"
+        f"Verificados: `{stats['verificados']}`\n"
+        f"Processados: `{stats['processados']}`\n"
+        f"Já completos/ignorados: `{stats['ignorados']}`\n"
+        f"Falhas: `{stats['falhas']}`",
+        ephemeral=True,
+    )
+
+
+@bot.listen("on_ready")
+async def v53_iniciar_revisao_prisional() -> None:
+    global _V53_PRISAO_MONITOR_TASK, _V53_PRISAO_RECUPERACAO_EXECUTADA
+    try:
+        await asyncio.to_thread(inicializar_banco_dicor)
+    except Exception as erro:
+        print(f"❌ V53 migração do banco prisional: {type(erro).__name__}: {erro}", flush=True)
+        traceback.print_exc()
+        return
+    if not _V53_PRISAO_RECUPERACAO_EXECUTADA:
+        _V53_PRISAO_RECUPERACAO_EXECUTADA = True
+        guild = bot.get_guild(int(GUILD_ID))
+        _v53_acompanhar_task(asyncio.create_task(
+            _v53_prisao_reprocessar_canal(
+                guild, limite=HISTORICO_PRISAO_SCAN_LIMIT, somente_incompletos=True
+            ),
+            name="prisao-v53-recuperacao-inicial",
+        ))
+    if _V53_PRISAO_MONITOR_TASK is None or _V53_PRISAO_MONITOR_TASK.done():
+        _V53_PRISAO_MONITOR_TASK = asyncio.create_task(
+            _v53_prisao_monitor_loop(), name="prisao-v53-monitor"
+        )
+    print(
+        "✅ V53 prisional ativo: texto salvo imediatamente, imagens em segundo plano, "
+        "timeouts, recuperação automática e resumo penal na ficha.",
+        flush=True,
+    )
+
+
+print(
+    "✅ V53 revisão geral carregada: histórico prisional resiliente, dados penais imediatos "
+    "e reprocessamento automático sem remover funções anteriores.",
+    flush=True,
+)
+
+# =====================================================
+# V53.1 — REVISÃO ESTÁTICA GERAL E CORREÇÕES DE INTEGRIDADE
+# - Corrige referências globais ausentes encontradas na varredura do arquivo inteiro.
+# - Restaura comandos de histórico/fechamento de mesas por texto.
+# - Corrige conversão PNG de comparecimentos, painel do Banco, IA de itens e autoteste.
+# - Não remove nem substitui módulos existentes; apenas fornece compatibilidade/fallbacks.
+# =====================================================
+
+# Compatibilidade do conversor de PDF/PNG: o arquivo importa Pillow como PILImage,
+# mas uma rotina antiga ainda usa o nome Image.
+if "Image" not in globals():
+    Image = PILImage
+
+
+def _banco_prof_embed_painel() -> discord.Embed:
+    """Alias estável usado pelos restauradores V9/V10/V11 do painel do Banco."""
+    return banco_embed_painel()
+
+
+def membro_tem_cargo(membro: Any, cargos: Any) -> bool:
+    """Verifica cargos com tolerância a IDs, objetos Role, listas, sets e strings."""
+    if membro is None:
+        return False
+    if isinstance(cargos, (int, str, discord.Role)):
+        cargos = [cargos]
+    ids: set[int] = set()
+    for cargo in (cargos or []):
+        try:
+            valor = getattr(cargo, "id", cargo)
+            if str(valor).strip().isdigit():
+                ids.add(int(valor))
+        except Exception:
+            continue
+    try:
+        return any(int(getattr(cargo, "id", 0) or 0) in ids for cargo in getattr(membro, "roles", []))
+    except Exception:
+        return False
+
+
+async def historico_mesa_core(interaction: discord.Interaction) -> None:
+    """Exibe o histórico das mesas sem depender de uma função removida por patches antigos."""
+    try:
+        if not isinstance(interaction.user, discord.Member) or not usuario_tem_equipe(interaction.user):
+            await responder_interacao(interaction, "❌ Apenas a equipe autorizada pode consultar o histórico das mesas.", True)
+            return
+        mesas = list(carregar_mesas() or [])
+        mesas.sort(
+            key=lambda m: str(m.get("fechada_em") or m.get("criada_em") or ""),
+            reverse=True,
+        )
+        abertas = sum(1 for m in mesas if str(m.get("status") or "").upper() == "ABERTA")
+        fechadas = sum(1 for m in mesas if str(m.get("status") or "").upper() == "FECHADA")
+        embed = discord.Embed(
+            title="📂 HISTÓRICO DE MESAS — DICOR",
+            description=(
+                f"**Total:** `{len(mesas)}` • **Abertas:** `{abertas}` • **Fechadas:** `{fechadas}`\n"
+                "Exibindo os registros mais recentes."
+            ),
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        linhas: List[str] = []
+        for mesa in mesas[:25]:
+            canal_id = int(mesa.get("canal_id") or 0)
+            status = str(mesa.get("status") or "N/I").upper()
+            familia = str(mesa.get("familia") or mesa.get("comunidade") or "Não informada")
+            apelido = str(mesa.get("apelido") or mesa.get("nome_canal") or "Mesa")
+            data = str(mesa.get("fechada_em") or mesa.get("criada_em") or "Data não informada")
+            icone = "🟢" if status == "ABERTA" else "🔒" if status == "FECHADA" else "⚪"
+            canal_txt = f"<#{canal_id}>" if canal_id else "canal não informado"
+            linhas.append(f"{icone} **{apelido} • {familia}**\n`{status}` • {data} • {canal_txt}")
+        embed.add_field(
+            name="Mesas registradas",
+            value=("\n\n".join(linhas)[:4000] if linhas else "Nenhuma mesa registrada."),
+            inline=False,
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as erro:
+        traceback.print_exc()
+        await responder_interacao(interaction, f"❌ Não foi possível carregar o histórico: `{type(erro).__name__}`.", True)
+
+
+class _V531ContextResponse:
+    def __init__(self, ctx: commands.Context):
+        self.ctx = ctx
+        self._feito = False
+
+    def is_done(self) -> bool:
+        return self._feito
+
+    async def defer(self, **_: Any) -> None:
+        self._feito = True
+        try:
+            await self.ctx.trigger_typing()
+        except Exception:
+            pass
+
+    async def send_message(self, content: Optional[str] = None, **kwargs: Any) -> discord.Message:
+        self._feito = True
+        kwargs.pop("ephemeral", None)
+        return await self.ctx.send(content=content, **kwargs)
+
+
+class _V531ContextFollowup:
+    def __init__(self, ctx: commands.Context):
+        self.ctx = ctx
+
+    async def send(self, content: Optional[str] = None, **kwargs: Any) -> discord.Message:
+        kwargs.pop("ephemeral", None)
+        return await self.ctx.send(content=content, **kwargs)
+
+
+class _V531ContextInteraction:
+    """Adaptador mínimo para reutilizar o fluxo oficial de fechar mesa no comando !fecharmesa."""
+    def __init__(self, ctx: commands.Context):
+        self._ctx = ctx
+        self.user = ctx.author
+        self.channel = ctx.channel
+        self.guild = ctx.guild
+        self.message = None
+        self.response = _V531ContextResponse(ctx)
+        self.followup = _V531ContextFollowup(ctx)
+
+    async def edit_original_response(self, content: Optional[str] = None, **kwargs: Any) -> discord.Message:
+        kwargs.pop("ephemeral", None)
+        return await self._ctx.send(content=content, **kwargs)
+
+
+async def fechar_mesa_por_texto(ctx: commands.Context, motivo: str = "Fechada por comando de texto") -> None:
+    """Restaura o comando textual, executando exatamente o mesmo núcleo do slash/button."""
+    if not isinstance(ctx.channel, discord.TextChannel):
+        await ctx.reply("❌ Use este comando dentro do canal da mesa.")
+        return
+    adaptador = _V531ContextInteraction(ctx)
+    await fechar_mesa_core(adaptador, motivo)
+
+
+def _v531_itens_ia_estruturados(valor: Any) -> Dict[str, Dict[str, int]]:
+    """Normaliza itens ilegais em {grupo: {item: quantidade}} para todas as rotinas da IA."""
+    saida: Dict[str, Dict[str, int]] = defaultdict(dict)
+
+    def adicionar(grupo: Any, nome: Any, quantidade: Any = 1) -> None:
+        grupo_s = str(grupo or "OUTROS").strip().upper() or "OUTROS"
+        nome_s = str(nome or "Item não identificado").strip() or "Item não identificado"
+        try:
+            qtd = max(1, int(float(str(quantidade or 1).replace(",", "."))))
+        except Exception:
+            qtd = 1
+        saida[grupo_s][nome_s] = int(saida[grupo_s].get(nome_s, 0)) + qtd
+
+    if isinstance(valor, list):
+        for item in valor:
+            if isinstance(item, dict):
+                adicionar(item.get("grupo") or item.get("categoria"), item.get("nome") or item.get("item"), item.get("quantidade") or item.get("qtd") or 1)
+            elif item not in (None, ""):
+                adicionar("OUTROS", item, 1)
+    elif isinstance(valor, dict):
+        # Registro único no formato {grupo, nome, quantidade}.
+        if any(k in valor for k in ("nome", "item", "quantidade", "qtd")):
+            adicionar(valor.get("grupo") or valor.get("categoria"), valor.get("nome") or valor.get("item"), valor.get("quantidade") or valor.get("qtd") or 1)
+        else:
+            for grupo, conteudo in valor.items():
+                if isinstance(conteudo, dict):
+                    for nome, qtd in conteudo.items():
+                        if isinstance(qtd, dict):
+                            adicionar(grupo, qtd.get("nome") or nome, qtd.get("quantidade") or qtd.get("qtd") or 1)
+                        else:
+                            adicionar(grupo, nome, qtd)
+                elif isinstance(conteudo, list):
+                    for item in conteudo:
+                        if isinstance(item, dict):
+                            adicionar(grupo, item.get("nome") or item.get("item"), item.get("quantidade") or item.get("qtd") or 1)
+                        else:
+                            adicionar(grupo, item, 1)
+                elif conteudo not in (None, ""):
+                    adicionar("OUTROS", grupo, conteudo)
+    return {grupo: dict(itens) for grupo, itens in saida.items()}
+
+
+def _dossie_ia_formatar_itens(itens: Any, filtro: str = "") -> List[str]:
+    estruturados = _v531_itens_ia_estruturados(itens)
+    filtro_n = _dossie_ia_normalizar(filtro or "")
+    linhas: List[str] = []
+    for grupo, conteudo in estruturados.items():
+        for nome, qtd in conteudo.items():
+            corpus = _dossie_ia_normalizar(f"{grupo} {nome}")
+            if filtro_n and filtro_n not in corpus:
+                continue
+            linhas.append(f"• **{nome} × {qtd}** — {grupo}")
+    return linhas
+
+
+_V531_DOSSIE_RESUMO_ANTERIOR = _dossie_ia_resumo_contexto
+
+
+def _dossie_ia_resumo_contexto(perfil: Dict[str, Any]) -> Dict[str, Any]:
+    contexto = dict(_V531_DOSSIE_RESUMO_ANTERIOR(perfil) or {})
+    perfil_d = _dossie_ia_dict(perfil)
+    bruto = perfil_d.get("itens_ilegais_acumulados") or perfil_d.get("itens_ilegais") or contexto.get("itens")
+    contexto["itens"] = _v531_itens_ia_estruturados(bruto)
+    return contexto
+
+
+print(
+    "✅ V53.1 integridade geral carregada: painel do Banco, mesas por texto/histórico, "
+    "PNG de comparecimento, IA de itens e verificação de cargos corrigidos.",
+    flush=True,
+)
+
+# =====================================================
+# V54 — AUDITOR AUTOMÁTICO DE INCONSISTÊNCIAS
+# - Canal fixo: 1529596208857878608 (pode ser sobrescrito por variável de ambiente).
+# - Executa ao iniciar, a cada 6 horas e após alterações relevantes.
+# - Nunca corrige ou apaga dados automaticamente.
+# - Deduplica alertas, atualiza o mesmo cartão e resolve quando o conflito desaparece.
+# =====================================================
+
+import hashlib as _aud_hashlib
+import unicodedata as _aud_unicodedata
+
+AUDITORIA_INCONSISTENCIAS_CHANNEL_ID = env_int(
+    "AUDITORIA_INCONSISTENCIAS_CHANNEL_ID",
+    1529596208857878608,
+)
+AUDITORIA_INTERVALO_HORAS = max(
+    1,
+    env_int("AUDITORIA_INTERVALO_HORAS", 6),
+)
+AUDITORIA_LIMITE_ALERTAS_POR_CICLO = max(
+    25,
+    env_int("AUDITORIA_LIMITE_ALERTAS_POR_CICLO", 150),
+)
+
+_AUDITORIA_LOOP_PRINCIPAL: Optional[asyncio.AbstractEventLoop] = None
+_AUDITORIA_TAREFA_PERIODICA: Optional[asyncio.Task] = None
+_AUDITORIA_TAREFA_DEBOUNCE: Optional[asyncio.Task] = None
+_AUDITORIA_LOCK = asyncio.Lock()
+_AUDITORIA_VIEWS_REGISTRADAS = False
+_AUDITORIA_ULTIMO_MOTIVO = "inicialização"
+
+
+def _auditoria_agora_iso() -> str:
+    try:
+        return _banco_agora_iso()
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _auditoria_normalizar_nome(valor: Any) -> str:
+    texto = str(valor or "").strip().casefold()
+    texto = _aud_unicodedata.normalize("NFKD", texto)
+    texto = "".join(ch for ch in texto if not _aud_unicodedata.combining(ch))
+    texto = re.sub(r"[^a-z0-9 ]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _auditoria_nome_util(valor: Any) -> bool:
+    nome = _auditoria_normalizar_nome(valor)
+    if len(nome) < 4:
+        return False
+    bloqueados = (
+        "teste", "desconhecido", "nao informado", "não informado",
+        "usuario desconhecido", "sem nome", "n a", "steve",
+    )
+    return not any(x in nome for x in bloqueados)
+
+
+def _auditoria_rg(valor: Any) -> str:
+    try:
+        return _banco_normalizar_rg(valor)
+    except Exception:
+        return re.sub(r"\D+", "", str(valor or ""))
+
+
+def _auditoria_telefone(valor: Any) -> str:
+    digitos = re.sub(r"\D+", "", str(valor or ""))
+    return digitos if len(digitos) >= 6 else ""
+
+
+def _auditoria_assinatura(dados: Any) -> str:
+    bruto = json.dumps(dados, ensure_ascii=False, sort_keys=True, default=str)
+    return _aud_hashlib.sha256(bruto.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _auditoria_issue(
+    chave: str,
+    tipo: str,
+    prioridade: str,
+    titulo: str,
+    linhas: List[str],
+) -> Dict[str, Any]:
+    dados = {
+        "chave": str(chave)[:220],
+        "tipo": str(tipo)[:80],
+        "prioridade": str(prioridade).upper()[:20],
+        "titulo": str(titulo)[:220],
+        "linhas": [str(x)[:900] for x in linhas if str(x).strip()][:30],
+    }
+    dados["assinatura"] = _auditoria_assinatura(dados)
+    return dados
+
+
+def _auditoria_inicializar_banco() -> None:
+    inicializar_banco_dicor()
+    with _banco_conexao() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS auditoria_inconsistencias (
+                chave TEXT PRIMARY KEY,
+                tipo TEXT NOT NULL,
+                prioridade TEXT NOT NULL,
+                titulo TEXT NOT NULL,
+                detalhes_json TEXT NOT NULL DEFAULT '[]',
+                assinatura TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'ATIVA',
+                mensagem_id INTEGER NOT NULL DEFAULT 0,
+                canal_id INTEGER NOT NULL DEFAULT 0,
+                primeira_deteccao TEXT NOT NULL,
+                ultima_deteccao TEXT NOT NULL,
+                resolvida_em TEXT DEFAULT '',
+                revisado_por_id INTEGER NOT NULL DEFAULT 0,
+                revisado_em TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS auditoria_meta (
+                chave TEXT PRIMARY KEY,
+                valor TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_auditoria_status
+                ON auditoria_inconsistencias(status, prioridade, ultima_deteccao DESC);
+            """
+        )
+
+
+def _auditoria_meta_obter(chave: str) -> str:
+    _auditoria_inicializar_banco()
+    with _banco_conexao() as db:
+        row = db.execute(
+            "SELECT valor FROM auditoria_meta WHERE chave=?",
+            (str(chave),),
+        ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _auditoria_meta_salvar(chave: str, valor: Any) -> None:
+    _auditoria_inicializar_banco()
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            INSERT INTO auditoria_meta(chave, valor) VALUES(?, ?)
+            ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor
+            """,
+            (str(chave), str(valor or "")),
+        )
+
+
+def _auditoria_json_registros(caminho: Any) -> List[Dict[str, Any]]:
+    if not caminho:
+        return []
+    try:
+        dados = carregar_json(caminho, [])
+    except Exception:
+        return []
+    saida: List[Dict[str, Any]] = []
+
+    def visitar(valor: Any) -> None:
+        if isinstance(valor, dict):
+            if any(k in valor for k in ("numero", "numero_boletim", "boletim", "rg", "nome")):
+                saida.append(dict(valor))
+            for sub in valor.values():
+                if isinstance(sub, (dict, list)):
+                    visitar(sub)
+        elif isinstance(valor, list):
+            for sub in valor:
+                visitar(sub)
+
+    visitar(dados)
+    return saida
+
+
+def _auditoria_coletar_sync() -> Dict[str, Any]:
+    """Varredura local do SQLite/JSON. Não chama a API do Discord."""
+    _auditoria_inicializar_banco()
+    issues: Dict[str, Dict[str, Any]] = {}
+    with _banco_conexao() as db:
+        individuos = [dict(x) for x in db.execute("SELECT * FROM individuos").fetchall()]
+        veiculos = [dict(x) for x in db.execute("SELECT * FROM veiculos").fetchall()]
+        membros = [dict(x) for x in db.execute(
+            "SELECT fm.*, f.nome AS faccao_nome FROM faccao_membros fm "
+            "LEFT JOIN faccoes f ON f.id=fm.faccao_id"
+        ).fetchall()]
+        prisoes = [dict(x) for x in db.execute("SELECT * FROM historico_prisoes").fetchall()]
+        fontes = [dict(x) for x in db.execute("SELECT * FROM fontes_ficha_individuo").fetchall()]
+
+    por_id = {int(x.get("id") or 0): x for x in individuos}
+    por_rg = {_auditoria_rg(x.get("rg")): x for x in individuos if _auditoria_rg(x.get("rg"))}
+
+    # 1) Mesmo RG associado a nomes diferentes em fontes distintas.
+    nomes_por_rg: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
+    def registrar_nome(rg: Any, nome: Any, fonte: str) -> None:
+        rg_n = _auditoria_rg(rg)
+        nome_n = _auditoria_normalizar_nome(nome)
+        if not rg_n or not _auditoria_nome_util(nome):
+            return
+        item = nomes_por_rg[rg_n].setdefault(nome_n, {"nome": str(nome).strip(), "fontes": set()})
+        item["fontes"].add(str(fonte))
+
+    for ind in individuos:
+        registrar_nome(ind.get("rg"), ind.get("nome"), "Ficha atual")
+    for p in prisoes:
+        registrar_nome(p.get("rg_texto"), p.get("nome_texto"), f"Prisional {p.get('mensagem_id')}")
+    for v in veiculos:
+        registrar_nome(v.get("proprietario_rg"), v.get("proprietario_nome"), f"Veículo {v.get('placa')}")
+    for m in membros:
+        registrar_nome(m.get("rg"), m.get("nome"), f"Organização {m.get('faccao_nome') or m.get('faccao_id')}")
+
+    for rg_n, nomes in nomes_por_rg.items():
+        if len(nomes) <= 1:
+            continue
+        linhas = []
+        for item in sorted(nomes.values(), key=lambda x: _auditoria_normalizar_nome(x.get("nome"))):
+            fontes_txt = ", ".join(sorted(item.get("fontes") or []))
+            linhas.append(f"• **{item.get('nome')}** — {fontes_txt}")
+        chave = f"RG_NOMES:{rg_n}"
+        issues[chave] = _auditoria_issue(
+            chave, "RG_COM_NOMES_DIFERENTES", "CRITICO",
+            f"RG {rg_n} associado a nomes diferentes",
+            [f"**RG:** `{rg_n}`", *linhas, "Nenhum nome foi alterado automaticamente."],
+        )
+
+    # 2) Mesmo nome exato associado a RGs diferentes.
+    rgs_por_nome: Dict[str, Dict[str, str]] = defaultdict(dict)
+    for ind in individuos:
+        nome = str(ind.get("nome") or "").strip()
+        nome_n = _auditoria_normalizar_nome(nome)
+        rg_n = _auditoria_rg(ind.get("rg"))
+        if rg_n and _auditoria_nome_util(nome) and len(nome_n.split()) >= 2:
+            rgs_por_nome[nome_n][rg_n] = nome
+    for nome_n, itens in rgs_por_nome.items():
+        if len(itens) <= 1:
+            continue
+        exibicao = next(iter(itens.values()))
+        rgs = sorted(itens.keys())
+        chave = f"NOME_RGS:{_aud_hashlib.sha1(nome_n.encode()).hexdigest()[:18]}"
+        issues[chave] = _auditoria_issue(
+            chave, "NOME_COM_RGS_DIFERENTES", "IMPORTANTE",
+            f"Nome associado a {len(rgs)} RGs",
+            [f"**Nome:** {exibicao}", f"**RGs:** {', '.join(f'`{x}`' for x in rgs)}", "Pode ser homônimo; exige conferência humana."],
+        )
+
+    # 3) Mesmo telefone em mais de uma ficha.
+    fichas_por_tel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for ind in individuos:
+        tel = _auditoria_telefone(ind.get("telefone"))
+        if tel:
+            fichas_por_tel[tel].append(ind)
+    for tel, itens in fichas_por_tel.items():
+        rgs = {_auditoria_rg(x.get("rg")) for x in itens if _auditoria_rg(x.get("rg"))}
+        if len(rgs) <= 1:
+            continue
+        chave = f"TELEFONE:{tel}"
+        linhas = [f"• **{x.get('nome')}** — RG `{_auditoria_rg(x.get('rg'))}`" for x in itens[:20]]
+        issues[chave] = _auditoria_issue(
+            chave, "TELEFONE_COMPARTILHADO", "CRITICO",
+            "Telefone associado a várias fichas",
+            [f"**Telefone:** `{tel}`", *linhas],
+        )
+
+    # 4) Veículos sem ficha de proprietário ou com nome divergente do RG atual.
+    for v in veiculos:
+        placa = str(v.get("placa") or "").strip()
+        rg_n = _auditoria_rg(v.get("proprietario_rg"))
+        nome_v = str(v.get("proprietario_nome") or "").strip()
+        if not placa:
+            continue
+        if rg_n and rg_n not in por_rg:
+            chave = f"VEICULO_SEM_FICHA:{placa}"
+            issues[chave] = _auditoria_issue(
+                chave, "VEICULO_SEM_PROPRIETARIO", "IMPORTANTE",
+                f"Veículo {placa} sem ficha do proprietário",
+                [f"**Placa:** `{placa}`", f"**RG informado:** `{rg_n}`", f"**Nome informado:** {nome_v or 'Não informado'}"],
+            )
+        elif rg_n and nome_v and rg_n in por_rg:
+            nome_atual = str(por_rg[rg_n].get("nome") or "")
+            if _auditoria_nome_util(nome_v) and _auditoria_normalizar_nome(nome_v) != _auditoria_normalizar_nome(nome_atual):
+                chave = f"VEICULO_NOME_DIVERGENTE:{placa}"
+                issues[chave] = _auditoria_issue(
+                    chave, "PROPRIETARIO_DIVERGENTE", "IMPORTANTE",
+                    f"Proprietário divergente no veículo {placa}",
+                    [f"**Placa:** `{placa}`", f"**RG:** `{rg_n}`", f"**Na ficha:** {nome_atual}", f"**No veículo:** {nome_v}"],
+                )
+
+    # 5) Prisionais órfãos, ligados à ficha errada ou sem fonte.
+    for p in prisoes:
+        mid = int(p.get("mensagem_id") or 0)
+        individuo_id = int(p.get("individuo_id") or 0)
+        rg_p = _auditoria_rg(p.get("rg_texto"))
+        ind = por_id.get(individuo_id)
+        if not ind:
+            chave = f"PRISAO_ORFA:{mid or p.get('id')}"
+            issues[chave] = _auditoria_issue(
+                chave, "PRISAO_SEM_FICHA", "IMPORTANTE",
+                "Prisional sem ficha vinculada",
+                [f"**Mensagem:** `{mid or 'N/I'}`", f"**Nome:** {p.get('nome_texto') or 'N/I'}", f"**RG:** `{rg_p or 'N/I'}`", str(p.get("mensagem_url") or "Fonte sem link")],
+            )
+            continue
+        rg_ind = _auditoria_rg(ind.get("rg"))
+        if rg_p and rg_ind and rg_p != rg_ind:
+            chave = f"PRISAO_RG_ERRADO:{mid or p.get('id')}"
+            issues[chave] = _auditoria_issue(
+                chave, "PRISAO_VINCULO_ERRADO", "CRITICO",
+                "Prisional vinculado a RG diferente",
+                [f"**Mensagem:** `{mid or 'N/I'}`", f"**RG no prisional:** `{rg_p}`", f"**RG da ficha vinculada:** `{rg_ind}`", f"**Ficha:** {ind.get('nome')}"],
+            )
+        if not str(p.get("mensagem_url") or "").strip():
+            chave = f"PRISAO_SEM_FONTE:{mid or p.get('id')}"
+            issues[chave] = _auditoria_issue(
+                chave, "REGISTRO_SEM_FONTE", "ATENCAO",
+                "Prisional sem link da mensagem original",
+                [f"**Nome:** {p.get('nome_texto') or ind.get('nome')}", f"**RG:** `{rg_p or rg_ind}`", f"**Mensagem ID:** `{mid or 'N/I'}`"],
+            )
+
+    # 6) Fontes documentais sem URL ou apontando para ficha inexistente.
+    fontes_sem_url = [x for x in fontes if not str(x.get("mensagem_url") or "").strip()]
+    if fontes_sem_url:
+        chave = "FONTES_SEM_URL"
+        linhas = [
+            f"• {x.get('tipo') or 'FONTE'} `{x.get('mensagem_id') or 'N/I'}` — indivíduo ID `{x.get('individuo_id')}`"
+            for x in fontes_sem_url[:25]
+        ]
+        issues[chave] = _auditoria_issue(
+            chave, "FONTES_SEM_LINK", "ATENCAO",
+            f"{len(fontes_sem_url)} fontes sem link original",
+            [*linhas, *( [f"… e mais {len(fontes_sem_url)-25} registro(s)."] if len(fontes_sem_url) > 25 else [] )],
+        )
+
+    # 7) Fichas sem identificação visual — agrupado para não poluir o canal.
+    sem_foto = [x for x in individuos if not str(x.get("foto_individuo_url") or x.get("foto_individuo_path") or "").strip()]
+    sem_rg_foto = [x for x in individuos if not str(x.get("foto_rg_url") or x.get("foto_rg_path") or "").strip()]
+    if sem_foto:
+        chave = "FICHAS_SEM_FOTO_INDIVIDUO"
+        linhas = [f"• {x.get('nome')} — RG `{_auditoria_rg(x.get('rg'))}`" for x in sem_foto[:25]]
+        issues[chave] = _auditoria_issue(
+            chave, "FICHAS_INCOMPLETAS", "ATENCAO",
+            f"{len(sem_foto)} fichas sem foto do indivíduo",
+            [*linhas, *( [f"… e mais {len(sem_foto)-25} ficha(s)."] if len(sem_foto) > 25 else [] )],
+        )
+    if sem_rg_foto:
+        chave = "FICHAS_SEM_FOTO_RG"
+        linhas = [f"• {x.get('nome')} — RG `{_auditoria_rg(x.get('rg'))}`" for x in sem_rg_foto[:25]]
+        issues[chave] = _auditoria_issue(
+            chave, "FICHAS_INCOMPLETAS", "ATENCAO",
+            f"{len(sem_rg_foto)} fichas sem foto do RG",
+            [*linhas, *( [f"… e mais {len(sem_rg_foto)-25} ficha(s)."] if len(sem_rg_foto) > 25 else [] )],
+        )
+
+    # 8) Mesmo RG ativo em mais de uma organização.
+    faccoes_por_rg: Dict[str, set[str]] = defaultdict(set)
+    for m in membros:
+        if int(m.get("ativo") or 0) != 1:
+            continue
+        rg_n = _auditoria_rg(m.get("rg"))
+        fac = str(m.get("faccao_nome") or m.get("faccao_id") or "").strip()
+        if rg_n and fac:
+            faccoes_por_rg[rg_n].add(fac)
+    for rg_n, faccoes in faccoes_por_rg.items():
+        if len(faccoes) <= 1:
+            continue
+        chave = f"MULTIPLAS_ORGS:{rg_n}"
+        issues[chave] = _auditoria_issue(
+            chave, "MULTIPLAS_ORGANIZACOES", "IMPORTANTE",
+            f"RG {rg_n} ativo em várias organizações",
+            [f"**RG:** `{rg_n}`", f"**Organizações:** {', '.join(sorted(faccoes))}", "Pode ser histórico não encerrado; exige revisão."],
+        )
+
+    # 9) Números de BO duplicados, apenas quando existem IDs de origem diferentes.
+    numeros: Dict[str, set[str]] = defaultdict(set)
+    for caminho in (globals().get("BOLETINS_JSON"), globals().get("BOLETIM_ATENDIMENTOS_JSON")):
+        for item in _auditoria_json_registros(caminho):
+            valor = item.get("numero") or item.get("numero_boletim") or item.get("boletim")
+            if not valor:
+                continue
+            m = re.search(r"(\d{1,6})", str(valor))
+            if not m:
+                continue
+            numero = str(int(m.group(1)))
+            identidade = str(
+                item.get("thread_id") or item.get("topico_id") or item.get("mensagem_id")
+                or item.get("canal_id") or item.get("id") or ""
+            ).strip()
+            if identidade:
+                numeros[numero].add(identidade)
+    for numero, ids in numeros.items():
+        if len(ids) <= 1:
+            continue
+        chave = f"BO_DUPLICADO:{numero}"
+        issues[chave] = _auditoria_issue(
+            chave, "NUMERACAO_BO_DUPLICADA", "CRITICO",
+            f"Número de boletim duplicado: {int(numero):03d}",
+            [f"**Número:** `BO-{int(numero):03d}`", f"**Registros diferentes:** {', '.join(f'`{x}`' for x in sorted(ids)[:15])}"],
+        )
+
+    return {
+        "issues": issues,
+        "rgs_cadastrados": sorted(por_rg.keys()),
+        "total_individuos": len(individuos),
+        "total_veiculos": len(veiculos),
+        "total_prisoes": len(prisoes),
+    }
+
+
+async def _auditoria_canal() -> Optional[discord.TextChannel]:
+    canal = bot.get_channel(int(AUDITORIA_INCONSISTENCIAS_CHANNEL_ID))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(AUDITORIA_INCONSISTENCIAS_CHANNEL_ID))
+        except Exception:
+            return None
+    return canal if isinstance(canal, discord.TextChannel) else None
+
+
+async def _auditoria_issues_procurados_canal(rgs_cadastrados: set[str]) -> Dict[str, Dict[str, Any]]:
+    """Usa exclusivamente o canal oficial de procurados ativos."""
+    saida: Dict[str, Dict[str, Any]] = {}
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return saida
+    canal = guild.get_channel(int(PROCURADOS_CHANNEL_ID))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(PROCURADOS_CHANNEL_ID))
+        except Exception:
+            return saida
+    if not isinstance(canal, discord.TextChannel):
+        return saida
+    try:
+        async for msg in canal.history(limit=500, oldest_first=False):
+            partes = [str(msg.content or "")]
+            for emb in msg.embeds:
+                partes.extend([str(emb.title or ""), str(emb.description or "")])
+                for campo in emb.fields:
+                    partes.extend([str(campo.name or ""), str(campo.value or "")])
+            texto = "\n".join(partes)
+            rg_match = re.search(r"(?i)\b(?:RG|PASSAPORTE)\s*[:#\-]?\s*`?([0-9]{2,9})`?", texto)
+            if not rg_match:
+                continue
+            rg_n = _auditoria_rg(rg_match.group(1))
+            if not rg_n or rg_n in rgs_cadastrados:
+                continue
+            nome_match = re.search(r"(?im)^\s*(?:NOME|PROCURADO)\s*[:#\-]\s*\**([^\n|]+)", texto)
+            nome = str(nome_match.group(1)).replace("*", "").strip() if nome_match else "Nome não identificado"
+            chave = f"PROCURADO_SEM_FICHA:{rg_n}"
+            saida[chave] = _auditoria_issue(
+                chave, "PROCURADO_SEM_FICHA", "CRITICO",
+                f"Procurado ativo sem ficha — RG {rg_n}",
+                [f"**Nome:** {nome}", f"**RG:** `{rg_n}`", f"[Abrir publicação oficial]({msg.jump_url})"],
+            )
+    except Exception:
+        traceback.print_exc()
+    return saida
+
+
+def _auditoria_cor(prioridade: str) -> discord.Color:
+    p = str(prioridade).upper()
+    if p == "CRITICO":
+        return discord.Color.red()
+    if p == "IMPORTANTE":
+        return discord.Color.orange()
+    if p == "ATENCAO":
+        return discord.Color.gold()
+    return discord.Color.blue()
+
+
+def _auditoria_icone(prioridade: str) -> str:
+    return {"CRITICO": "🔴", "IMPORTANTE": "🟠", "ATENCAO": "🟡", "INFORMATIVO": "🔵"}.get(str(prioridade).upper(), "⚠️")
+
+
+def _auditoria_embed_issue(issue: Dict[str, Any], *, estado: str = "ATIVA") -> discord.Embed:
+    prioridade = str(issue.get("prioridade") or "ATENCAO").upper()
+    linhas = list(issue.get("linhas") or [])
+    if estado == "RESOLVIDA":
+        titulo = f"✅ RESOLVIDA — {issue.get('titulo')}"
+        cor = discord.Color.green()
+    elif estado == "IGNORADA":
+        titulo = f"☑️ REVISADA COMO CORRETA — {issue.get('titulo')}"
+        cor = discord.Color.dark_grey()
+    else:
+        titulo = f"{_auditoria_icone(prioridade)} INCONSISTÊNCIA — {issue.get('titulo')}"
+        cor = _auditoria_cor(prioridade)
+    descricao = "\n".join(linhas)[:3900] or "Sem detalhes adicionais."
+    embed = discord.Embed(
+        title=titulo[:256],
+        description=descricao,
+        color=cor,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="Prioridade", value=prioridade, inline=True)
+    embed.add_field(name="Tipo", value=str(issue.get("tipo") or "N/I")[:1024], inline=True)
+    embed.set_footer(text=f"Chave: {issue.get('chave')} • Nenhum dado é alterado automaticamente")
+    return embed
+
+
+def _auditoria_autorizado(usuario: Any) -> bool:
+    if not isinstance(usuario, discord.Member):
+        return False
+    try:
+        if usuario.guild_permissions.administrator:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(_membro_inspetor_mais(usuario))
+    except Exception:
+        ids = {1490200388912156692, 1490200383614615725, 1490200382776021132}
+        return any(int(getattr(r, "id", 0) or 0) in ids for r in getattr(usuario, "roles", []))
+
+
+class AuditoriaIssueView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Revisar detalhes", emoji="🔍", style=discord.ButtonStyle.secondary, custom_id="auditoria:revisar")
+    async def revisar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            await interaction.response.send_message("❌ Apenas Inspetor+ pode revisar alertas.", ephemeral=True)
+            return
+        mid = int(getattr(interaction.message, "id", 0) or 0)
+        _auditoria_inicializar_banco()
+        with _banco_conexao() as db:
+            row = db.execute("SELECT * FROM auditoria_inconsistencias WHERE mensagem_id=?", (mid,)).fetchone()
+        if not row:
+            await interaction.response.send_message("⚠️ Registro de auditoria não localizado.", ephemeral=True)
+            return
+        dados = dict(row)
+        try:
+            linhas = json.loads(str(dados.get("detalhes_json") or "[]"))
+        except Exception:
+            linhas = []
+        embed = discord.Embed(title="🔍 REVISÃO DA INCONSISTÊNCIA", color=_auditoria_cor(dados.get("prioridade")))
+        embed.description = "\n".join(str(x) for x in linhas)[:3900] or "Sem detalhes."
+        embed.add_field(name="Chave", value=f"`{dados.get('chave')}`", inline=False)
+        embed.add_field(name="Detectada em", value=str(dados.get("primeira_deteccao") or "N/I"), inline=True)
+        embed.add_field(name="Última confirmação", value=str(dados.get("ultima_deteccao") or "N/I"), inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Marcar como correto", emoji="✅", style=discord.ButtonStyle.success, custom_id="auditoria:ignorar")
+    async def ignorar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            await interaction.response.send_message("❌ Apenas Inspetor+ pode concluir a revisão.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        mid = int(getattr(interaction.message, "id", 0) or 0)
+        agora = _auditoria_agora_iso()
+        _auditoria_inicializar_banco()
+        with _banco_conexao() as db:
+            row = db.execute("SELECT * FROM auditoria_inconsistencias WHERE mensagem_id=?", (mid,)).fetchone()
+            if row:
+                db.execute(
+                    "UPDATE auditoria_inconsistencias SET status='IGNORADA', revisado_por_id=?, revisado_em=? WHERE mensagem_id=?",
+                    (int(interaction.user.id), agora, mid),
+                )
+        if not row:
+            await interaction.followup.send("⚠️ Registro não localizado.", ephemeral=True)
+            return
+        dados = dict(row)
+        try:
+            linhas = json.loads(str(dados.get("detalhes_json") or "[]"))
+        except Exception:
+            linhas = []
+        issue = {**dados, "linhas": linhas}
+        try:
+            await interaction.message.edit(embed=_auditoria_embed_issue(issue, estado="IGNORADA"), view=None)
+        except Exception:
+            pass
+        await interaction.followup.send("✅ Caso marcado como correto. Ele só será reaberto se os dados mudarem.", ephemeral=True)
+        _auditoria_solicitar_varredura("revisão manual")
+
+
+class AuditoriaResumoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verificar agora", emoji="🔄", style=discord.ButtonStyle.primary, custom_id="auditoria:verificar_agora")
+    async def verificar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            await interaction.response.send_message("❌ Apenas Inspetor+ pode iniciar uma varredura.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        resultado = await _auditoria_executar("botão do resumo")
+        if resultado.get("ocupado"):
+            await interaction.followup.send("⏳ Já existe uma auditoria em andamento.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"✅ Auditoria concluída: `{resultado.get('detectadas', 0)}` ativa(s), "
+                f"`{resultado.get('novas', 0)}` nova(s) e `{resultado.get('resolvidas', 0)}` resolvida(s).",
+                ephemeral=True,
+            )
+
+
+def _auditoria_ler_registros() -> Dict[str, Dict[str, Any]]:
+    _auditoria_inicializar_banco()
+    with _banco_conexao() as db:
+        rows = db.execute("SELECT * FROM auditoria_inconsistencias").fetchall()
+    return {str(x["chave"]): dict(x) for x in rows}
+
+
+async def _auditoria_obter_mensagem(canal: discord.TextChannel, mensagem_id: int) -> Optional[discord.Message]:
+    if not mensagem_id:
+        return None
+    try:
+        return await canal.fetch_message(int(mensagem_id))
+    except Exception:
+        return None
+
+
+async def _auditoria_atualizar_resumo(canal: discord.TextChannel, motivo: str, stats: Dict[str, int]) -> None:
+    _auditoria_inicializar_banco()
+    with _banco_conexao() as db:
+        contagens = {
+            str(row[0]): int(row[1])
+            for row in db.execute(
+                "SELECT prioridade, COUNT(*) FROM auditoria_inconsistencias WHERE status='ATIVA' GROUP BY prioridade"
+            ).fetchall()
+        }
+        ignoradas = int(db.execute("SELECT COUNT(*) FROM auditoria_inconsistencias WHERE status='IGNORADA'").fetchone()[0])
+        resolvidas = int(db.execute("SELECT COUNT(*) FROM auditoria_inconsistencias WHERE status='RESOLVIDA'").fetchone()[0])
+    embed = discord.Embed(
+        title="🛡️ AUDITORIA AUTOMÁTICA DO BANCO",
+        description=(
+            "Verificação totalmente automática. O bot **não apaga, une ou corrige fichas sozinho**.\n"
+            f"**Motivo da última varredura:** {motivo}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name="🔴 Críticos", value=str(contagens.get("CRITICO", 0)), inline=True)
+    embed.add_field(name="🟠 Importantes", value=str(contagens.get("IMPORTANTE", 0)), inline=True)
+    embed.add_field(name="🟡 Atenção", value=str(contagens.get("ATENCAO", 0)), inline=True)
+    embed.add_field(name="☑️ Revisados como corretos", value=str(ignoradas), inline=True)
+    embed.add_field(name="✅ Resolvidos", value=str(resolvidas), inline=True)
+    embed.add_field(name="⏱️ Próxima varredura", value=f"Em até {AUDITORIA_INTERVALO_HORAS} hora(s)", inline=True)
+    embed.set_footer(text=f"Canal oficial {AUDITORIA_INCONSISTENCIAS_CHANNEL_ID} • Atualização automática")
+    mid = int(_auditoria_meta_obter("mensagem_resumo_id") or 0)
+    mensagem = await _auditoria_obter_mensagem(canal, mid)
+    if mensagem:
+        try:
+            await mensagem.edit(embed=embed, view=AuditoriaResumoView())
+            return
+        except Exception:
+            pass
+    try:
+        mensagem = await canal.send(embed=embed, view=AuditoriaResumoView())
+        _auditoria_meta_salvar("mensagem_resumo_id", mensagem.id)
+    except Exception:
+        traceback.print_exc()
+
+
+async def _auditoria_executar(motivo: str = "automática") -> Dict[str, int]:
+    global _AUDITORIA_ULTIMO_MOTIVO
+    if _AUDITORIA_LOCK.locked():
+        return {"ocupado": 1}
+    async with _AUDITORIA_LOCK:
+        _AUDITORIA_ULTIMO_MOTIVO = str(motivo)
+        stats = {"detectadas": 0, "novas": 0, "atualizadas": 0, "resolvidas": 0, "ignoradas": 0, "falhas": 0}
+        canal = await _auditoria_canal()
+        if canal is None:
+            print(f"⚠️ Auditoria: canal {AUDITORIA_INCONSISTENCIAS_CHANNEL_ID} não localizado.", flush=True)
+            return {**stats, "sem_canal": 1}
+        try:
+            coletado = await asyncio.to_thread(_auditoria_coletar_sync)
+            atuais: Dict[str, Dict[str, Any]] = dict(coletado.get("issues") or {})
+            oficiais = await _auditoria_issues_procurados_canal(set(coletado.get("rgs_cadastrados") or []))
+            atuais.update(oficiais)
+            stats["detectadas"] = len(atuais)
+            existentes = _auditoria_ler_registros()
+            agora = _auditoria_agora_iso()
+
+            processadas = 0
+            for chave, issue in sorted(
+                atuais.items(),
+                key=lambda kv: ({"CRITICO": 0, "IMPORTANTE": 1, "ATENCAO": 2}.get(kv[1].get("prioridade"), 9), kv[0]),
+            ):
+                if processadas >= AUDITORIA_LIMITE_ALERTAS_POR_CICLO:
+                    break
+                anterior = existentes.get(chave)
+                assinatura = str(issue.get("assinatura") or "")
+                status_anterior = str((anterior or {}).get("status") or "")
+                mesma_assinatura = bool(anterior and str(anterior.get("assinatura") or "") == assinatura)
+                if anterior and status_anterior == "IGNORADA" and mesma_assinatura:
+                    with _banco_conexao() as db:
+                        db.execute("UPDATE auditoria_inconsistencias SET ultima_deteccao=? WHERE chave=?", (agora, chave))
+                    stats["ignoradas"] += 1
+                    continue
+                if anterior and status_anterior == "ATIVA" and mesma_assinatura:
+                    with _banco_conexao() as db:
+                        db.execute("UPDATE auditoria_inconsistencias SET ultima_deteccao=? WHERE chave=?", (agora, chave))
+                    continue
+
+                mensagem = await _auditoria_obter_mensagem(canal, int((anterior or {}).get("mensagem_id") or 0))
+                try:
+                    if mensagem:
+                        await mensagem.edit(embed=_auditoria_embed_issue(issue), view=AuditoriaIssueView())
+                        stats["atualizadas"] += 1
+                    else:
+                        mensagem = await canal.send(embed=_auditoria_embed_issue(issue), view=AuditoriaIssueView())
+                        stats["novas"] += 1
+                        await asyncio.sleep(0.12)
+                    with _banco_conexao() as db:
+                        db.execute(
+                            """
+                            INSERT INTO auditoria_inconsistencias
+                            (chave, tipo, prioridade, titulo, detalhes_json, assinatura, status,
+                             mensagem_id, canal_id, primeira_deteccao, ultima_deteccao,
+                             resolvida_em, revisado_por_id, revisado_em)
+                            VALUES (?, ?, ?, ?, ?, ?, 'ATIVA', ?, ?, ?, ?, '', 0, '')
+                            ON CONFLICT(chave) DO UPDATE SET
+                                tipo=excluded.tipo,
+                                prioridade=excluded.prioridade,
+                                titulo=excluded.titulo,
+                                detalhes_json=excluded.detalhes_json,
+                                assinatura=excluded.assinatura,
+                                status='ATIVA',
+                                mensagem_id=excluded.mensagem_id,
+                                canal_id=excluded.canal_id,
+                                ultima_deteccao=excluded.ultima_deteccao,
+                                resolvida_em='',
+                                revisado_por_id=0,
+                                revisado_em=''
+                            """,
+                            (
+                                chave, issue.get("tipo"), issue.get("prioridade"), issue.get("titulo"),
+                                json.dumps(issue.get("linhas") or [], ensure_ascii=False), assinatura,
+                                int(mensagem.id), int(canal.id),
+                                str((anterior or {}).get("primeira_deteccao") or agora), agora,
+                            ),
+                        )
+                    processadas += 1
+                except Exception:
+                    stats["falhas"] += 1
+                    traceback.print_exc()
+
+            # Resolve automaticamente alertas que deixaram de existir.
+            for chave, anterior in existentes.items():
+                if chave in atuais:
+                    continue
+                if str(anterior.get("status") or "") not in {"ATIVA", "IGNORADA"}:
+                    continue
+                try:
+                    try:
+                        linhas = json.loads(str(anterior.get("detalhes_json") or "[]"))
+                    except Exception:
+                        linhas = []
+                    issue = {**anterior, "linhas": linhas}
+                    mensagem = await _auditoria_obter_mensagem(canal, int(anterior.get("mensagem_id") or 0))
+                    if mensagem:
+                        await mensagem.edit(embed=_auditoria_embed_issue(issue, estado="RESOLVIDA"), view=None)
+                    with _banco_conexao() as db:
+                        db.execute(
+                            "UPDATE auditoria_inconsistencias SET status='RESOLVIDA', resolvida_em=?, ultima_deteccao=? WHERE chave=?",
+                            (agora, agora, chave),
+                        )
+                    stats["resolvidas"] += 1
+                except Exception:
+                    stats["falhas"] += 1
+                    traceback.print_exc()
+
+            await _auditoria_atualizar_resumo(canal, str(motivo), stats)
+            print(
+                f"✅ Auditoria automática: {stats['detectadas']} detectada(s), {stats['novas']} nova(s), "
+                f"{stats['atualizadas']} atualizada(s), {stats['resolvidas']} resolvida(s), "
+                f"{stats['falhas']} falha(s). Canal {AUDITORIA_INCONSISTENCIAS_CHANNEL_ID}.",
+                flush=True,
+            )
+            return stats
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await canal.send(
+                    f"❌ **Falha na auditoria automática**\n`{type(erro).__name__}: {str(erro)[:1200]}`",
+                    delete_after=300,
+                )
+            except Exception:
+                pass
+            return {**stats, "falhas": stats.get("falhas", 0) + 1}
+
+
+async def _auditoria_debounce_exec(motivo: str) -> None:
+    await asyncio.sleep(20)
+    await _auditoria_executar(motivo)
+
+
+def _auditoria_criar_debounce(motivo: str) -> None:
+    global _AUDITORIA_TAREFA_DEBOUNCE
+    if _AUDITORIA_TAREFA_DEBOUNCE and not _AUDITORIA_TAREFA_DEBOUNCE.done():
+        _AUDITORIA_TAREFA_DEBOUNCE.cancel()
+    _AUDITORIA_TAREFA_DEBOUNCE = asyncio.create_task(
+        _auditoria_debounce_exec(str(motivo)),
+        name="auditoria-inconsistencias-debounce",
+    )
+
+
+def _auditoria_solicitar_varredura(motivo: str = "alteração no banco") -> None:
+    loop = _AUDITORIA_LOOP_PRINCIPAL
+    if loop is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(_auditoria_criar_debounce, str(motivo))
+    except Exception:
+        pass
+
+
+async def _auditoria_loop_periodico() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(25)
+    while not bot.is_closed():
+        await _auditoria_executar("verificação periódica")
+        try:
+            await asyncio.sleep(AUDITORIA_INTERVALO_HORAS * 3600)
+        except asyncio.CancelledError:
+            return
+
+
+# Disparos após alterações importantes, mantendo todas as funções originais.
+_AUDITORIA_UPSERT_INDIVIDUO_ANTERIOR = banco_upsert_individuo
+
+def banco_upsert_individuo(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    resultado = _AUDITORIA_UPSERT_INDIVIDUO_ANTERIOR(*args, **kwargs)
+    _auditoria_solicitar_varredura("ficha criada ou atualizada")
+    return resultado
+
+
+_AUDITORIA_UPSERT_VEICULO_ANTERIOR = banco_upsert_veiculo
+
+def banco_upsert_veiculo(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    resultado = _AUDITORIA_UPSERT_VEICULO_ANTERIOR(*args, **kwargs)
+    _auditoria_solicitar_varredura("veículo criado ou atualizado")
+    return resultado
+
+
+_AUDITORIA_SALVAR_PROCURADOS_ANTERIOR = salvar_procurados
+
+def salvar_procurados(lista: List[Dict[str, Any]]) -> None:
+    _AUDITORIA_SALVAR_PROCURADOS_ANTERIOR(lista)
+    _auditoria_solicitar_varredura("procurado criado, atualizado ou retirado")
+
+
+_AUDITORIA_SALVAR_BOLETINS_ANTERIOR = salvar_boletins
+
+def salvar_boletins(lista: List[Dict[str, Any]]) -> None:
+    _AUDITORIA_SALVAR_BOLETINS_ANTERIOR(lista)
+    _auditoria_solicitar_varredura("boletim criado ou atualizado")
+
+
+@bot.listen("on_message")
+async def _auditoria_observar_canais(message: discord.Message) -> None:
+    if not message.guild:
+        return
+    canais = {
+        int(globals().get("HISTORICO_PRISAO_CHANNEL_ID", 0) or 0),
+        int(globals().get("PROCURADOS_CHANNEL_ID", 0) or 0),
+        int(globals().get("BOLETINS_CHANNEL_ID", 0) or 0),
+        int(globals().get("BANCO_PERICIA_CHANNEL_ID", 0) or 0),
+        int(globals().get("PERICIA_FLUXO_CHANNEL_ID", 0) or 0),
+        int(globals().get("PERICIAS_CHANNEL_ID", 0) or 0),
+    }
+    canal_id = int(getattr(message.channel, "id", 0) or 0)
+    if canal_id and canal_id in canais:
+        _auditoria_solicitar_varredura(f"nova atividade no canal {canal_id}")
+
+
+@bot.tree.command(name="auditoriaagora", description="Executa agora a auditoria automática do banco DICOR.")
+async def auditoria_agora_comando(interaction: discord.Interaction) -> None:
+    if not _auditoria_autorizado(interaction.user):
+        await interaction.response.send_message("❌ Apenas Inspetor+ pode executar esta auditoria.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    resultado = await _auditoria_executar(f"solicitada por {interaction.user}")
+    if resultado.get("ocupado"):
+        await interaction.followup.send("⏳ Já existe uma auditoria em andamento.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ Auditoria concluída no canal <#{AUDITORIA_INCONSISTENCIAS_CHANNEL_ID}>.\n"
+        f"Detectadas: **{resultado.get('detectadas', 0)}** • Novas: **{resultado.get('novas', 0)}** • "
+        f"Resolvidas: **{resultado.get('resolvidas', 0)}** • Falhas: **{resultado.get('falhas', 0)}**",
+        ephemeral=True,
+    )
+
+
+_AUDITORIA_ON_READY_ANTERIOR = on_ready
+
+@bot.event
+async def on_ready() -> None:
+    global _AUDITORIA_LOOP_PRINCIPAL, _AUDITORIA_TAREFA_PERIODICA, _AUDITORIA_VIEWS_REGISTRADAS
+    await _AUDITORIA_ON_READY_ANTERIOR()
+    _AUDITORIA_LOOP_PRINCIPAL = asyncio.get_running_loop()
+    try:
+        _auditoria_inicializar_banco()
+        if not _AUDITORIA_VIEWS_REGISTRADAS:
+            bot.add_view(AuditoriaIssueView())
+            bot.add_view(AuditoriaResumoView())
+            _AUDITORIA_VIEWS_REGISTRADAS = True
+        if _AUDITORIA_TAREFA_PERIODICA is None or _AUDITORIA_TAREFA_PERIODICA.done():
+            _AUDITORIA_TAREFA_PERIODICA = asyncio.create_task(
+                _auditoria_loop_periodico(),
+                name="auditoria-inconsistencias-periodica",
+            )
+        print(
+            f"✅ Auditor automático V54 ativo: canal {AUDITORIA_INCONSISTENCIAS_CHANNEL_ID}, "
+            f"intervalo {AUDITORIA_INTERVALO_HORAS}h e verificação após alterações.",
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f"⚠️ Falha ao iniciar auditor automático: {type(erro).__name__}: {erro}", flush=True)
+
+
+print(
+    f"✅ V54 Auditor de Inconsistências carregado — alertas automáticos no canal "
+    f"{AUDITORIA_INCONSISTENCIAS_CHANNEL_ID}, sem correções destrutivas.",
+    flush=True,
+)
 
 if __name__ == '__main__':
     asyncio.run(main())
+
+# =====================================================
+# PATCH V55 — MANDADOS/COMPARECIMENTOS SOMENTE COMO IMAGEM NO CHAT
+# =====================================================
+# Regra fixa: nunca mais publicar PDF para o usuário baixar.
+# O documento é renderizado em PNG e enviado já visível no chat, como “print”.
+
+def _v55_pdf_para_imagem_unica(caminho_pdf: Path, caminho_png: Path) -> Path:
+    if fitz is None:
+        raise RuntimeError('PyMuPDF não está instalado. Adicione `pymupdf` ao requirements.txt.')
+    if PILImage is None:
+        raise RuntimeError('Pillow não está instalado corretamente no ambiente.')
+
+    caminho_png.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(str(caminho_pdf))
+    paginas = []
+    try:
+        for pagina in doc:
+            pix = pagina.get_pixmap(matrix=fitz.Matrix(2.15, 2.15), alpha=False)
+            img = PILImage.open(io.BytesIO(pix.tobytes('png'))).convert('RGB')
+            paginas.append(img)
+    finally:
+        doc.close()
+
+    if not paginas:
+        raise RuntimeError('Nenhuma página foi renderizada para imagem.')
+
+    margem = 28
+    largura = max(img.width for img in paginas) + margem * 2
+    altura = sum(img.height for img in paginas) + margem * (len(paginas) + 1)
+    fundo = PILImage.new('RGB', (largura, altura), (245, 246, 248))
+    y = margem
+    for img in paginas:
+        x = (largura - img.width) // 2
+        fundo.paste(img, (x, y))
+        y += img.height + margem
+    fundo.save(caminho_png, format='PNG', optimize=True)
+    return caminho_png
+
+
+def _v55_embed_comparecimento(registro: Dict[str, Any], atendimento: Dict[str, Any]) -> discord.Embed:
+    embed = _embed_comparecimento_corrigido(registro, atendimento)
+    embed.title = '📄 Solicitação de Comparecimento'
+    embed.description = 'Documento oficial publicado diretamente como imagem no chat.'
+    embed.set_footer(text='Polícia Federal • DICOR • Salve a imagem e utilize no jogo')
+    return embed
+
+
+async def _v55_enviar_imagem_comparecimento_destino(
+    destino: Any,
+    registro: Dict[str, Any],
+    atendimento: Dict[str, Any],
+    caminho_png: Path,
+    *,
+    origem: bool = False,
+) -> discord.Message:
+    conteudo = (
+        f'<@{int(registro.get("autorizado_por_id") or 0)}>\n'
+        if int(registro.get('autorizado_por_id') or 0) else ''
+    )
+    conteudo += (
+        '✅ **Mandado autorizado — imagem anexada neste tópico.**'
+        if origem else
+        '📸 **Mandado/Solicitação de Comparecimento DICOR**'
+    )
+    arquivo = discord.File(str(caminho_png), filename=caminho_png.name)
+    embed = _v55_embed_comparecimento(registro, atendimento)
+    embed.set_image(url=f'attachment://{caminho_png.name}')
+    return await destino.send(
+        content=conteudo,
+        embed=embed,
+        file=arquivo,
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+
+
+async def gerar_e_enviar_comparecimento(
+    interaction: discord.Interaction,
+    atendimento: Dict[str, Any],
+    registro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Gera o comparecimento e publica SOMENTE uma imagem no canal oficial e no tópico de origem."""
+    pasta = COMPARECIMENTOS_DIR / slugify(str(registro.get('numero') or registro.get('id') or data_caso()))
+    pasta.mkdir(parents=True, exist_ok=True)
+    numero_limpo = re.sub(r'[^0-9A-Za-z_-]+', '_', str(registro.get('numero', 'comparecimento')))
+    caminho_pdf = pasta / f'_TEMP_SOLICITACAO_COMPARECIMENTO_{numero_limpo}.pdf'
+    caminho_png = pasta / f'SOLICITACAO_COMPARECIMENTO_{numero_limpo}.png'
+
+    autorizador = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if autorizador is not None:
+        registro['autorizado_por_id'] = autorizador.id
+        registro['autorizado_por_nome'] = _nome_rp_usuario(autorizador)
+        registro['autorizado_por_cargo'] = cargo_autorizador(autorizador)
+        registro['autorizado_em'] = registro.get('autorizado_em') or agora_br()
+        registro['assinatura_slot'] = resolver_slot_assinatura_autorizador(autorizador)
+    else:
+        registro['autorizado_por_nome'] = _apelido_rp_de_texto(registro.get('autorizado_por_nome')) or 'Autoridade responsável'
+
+    await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
+    if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 0:
+        raise RuntimeError('O documento do mandado foi gerado vazio ou não foi encontrado.')
+
+    await asyncio.to_thread(_v55_pdf_para_imagem_unica, caminho_pdf, caminho_png)
+    if not caminho_png.exists() or caminho_png.stat().st_size <= 0:
+        raise RuntimeError('A imagem do mandado foi gerada vazia ou não foi encontrada.')
+
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    registro.pop('arquivo_pdf', None)
+    registro.pop('arquivo_docx', None)
+    registro['arquivo_imagem'] = str(caminho_png)
+    registro['arquivos_imagem'] = [str(caminho_png)]
+    registro['formato'] = 'PNG'
+    registro['gerado_em'] = agora_br()
+
+    destino_oficial = interaction.guild.get_channel(MANDADOS_CHANNEL_ID) if interaction.guild else None
+    if destino_oficial is None:
+        try:
+            destino_oficial = await bot.fetch_channel(MANDADOS_CHANNEL_ID)
+        except Exception:
+            destino_oficial = None
+    if destino_oficial is None or not hasattr(destino_oficial, 'send'):
+        raise RuntimeError(f'Canal de mandados `{MANDADOS_CHANNEL_ID}` não encontrado ou sem permissão de envio.')
+
+    limite = int(getattr(getattr(destino_oficial, 'guild', None), 'filesize_limit', 25 * 1024 * 1024) or 25 * 1024 * 1024)
+    if caminho_png.stat().st_size > limite:
+        raise RuntimeError(
+            f'A imagem possui {caminho_png.stat().st_size / 1024 / 1024:.1f} MB e ultrapassa o limite do Discord.'
+        )
+
+    mensagem_oficial = await _v55_enviar_imagem_comparecimento_destino(
+        destino_oficial, registro, atendimento, caminho_png, origem=False
+    )
+    registro.update({
+        'publicacao_id': mensagem_oficial.id,
+        'publicacao_url': mensagem_oficial.jump_url,
+        'publicacao_canal_id': getattr(destino_oficial, 'id', None),
+        'status': 'AUTORIZADO/EMITIDO',
+    })
+
+    ids_origem: List[int] = []
+    for valor in (
+        atendimento.get('thread_id'),
+        atendimento.get('area_id'),
+        atendimento.get('canal_atendimento_id'),
+        registro.get('canal_origem_id'),
+        getattr(getattr(interaction, 'channel', None), 'id', None),
+    ):
+        try:
+            cid = int(valor or 0)
+        except Exception:
+            cid = 0
+        if cid and cid != int(getattr(destino_oficial, 'id', 0) or 0) and cid not in ids_origem:
+            ids_origem.append(cid)
+
+    for cid in ids_origem:
+        canal_origem = await obter_canal_bot(cid)
+        if canal_origem is None or not hasattr(canal_origem, 'send'):
+            continue
+        try:
+            mensagem_origem = await _v55_enviar_imagem_comparecimento_destino(
+                canal_origem, registro, atendimento, caminho_png, origem=True
+            )
+            registro.update({
+                'publicacao_origem_id': mensagem_origem.id,
+                'publicacao_origem_url': mensagem_origem.jump_url,
+                'publicacao_origem_canal_id': getattr(canal_origem, 'id', None),
+            })
+            break
+        except Exception as erro_origem:
+            await enviar_log(f'⚠️ Mandado publicado no canal oficial, mas falhou no tópico `{cid}`: {erro_origem}')
+
+    lista = carregar_comparecimentos()
+    existente = next((item for item in lista if str(item.get('id')) == str(registro.get('id'))), None)
+    if existente:
+        existente.update(registro)
+    else:
+        lista.append(registro)
+    salvar_comparecimentos(lista)
+
+    await enviar_log(
+        f'🖼️ Mandado em imagem publicado | solicitação `{registro.get("numero")}` | '
+        f'canal oficial `{getattr(destino_oficial, "id", 0)}` | '
+        f'tópico `{registro.get("publicacao_origem_canal_id", "não localizado")}` | '
+        f'autorizador `{registro.get("autorizado_por_id")}` | {agora_br()}'
+    )
+    return registro
+
+
+async def _enviar_comparecimento_fallback_canal_atual(
+    interaction: discord.Interaction,
+    registro: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fallback: se o canal oficial falhar, envia IMAGEM no canal atual em vez de PDF."""
+    pasta = COMPARECIMENTOS_DIR / slugify(str(registro.get('numero') or registro.get('id') or data_caso()))
+    pasta.mkdir(parents=True, exist_ok=True)
+    numero_limpo = re.sub(r'[^0-9A-Za-z_-]+', '_', str(registro.get('numero') or 'comparecimento'))
+    caminho_png = Path(str(registro.get('arquivo_imagem') or ''))
+
+    if not caminho_png.exists() or caminho_png.stat().st_size <= 0:
+        caminho_pdf = pasta / f'_TEMP_SOLICITACAO_COMPARECIMENTO_{numero_limpo}.pdf'
+        await asyncio.to_thread(gerar_pdf_comparecimento, registro, caminho_pdf)
+        caminho_png = pasta / f'SOLICITACAO_COMPARECIMENTO_{numero_limpo}.png'
+        await asyncio.to_thread(_v55_pdf_para_imagem_unica, caminho_pdf, caminho_png)
+        try:
+            caminho_pdf.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    canal = getattr(interaction, 'channel', None)
+    if canal is None or not hasattr(canal, 'send'):
+        raise RuntimeError('O canal atual não permite o envio do mandado.')
+
+    mensagem = await _v55_enviar_imagem_comparecimento_destino(
+        canal, registro, {'numero': registro.get('processo') or registro.get('boletim')}, caminho_png, origem=True
+    )
+
+    registro.pop('arquivo_pdf', None)
+    registro.pop('arquivo_docx', None)
+    registro['arquivo_imagem'] = str(caminho_png)
+    registro['arquivos_imagem'] = [str(caminho_png)]
+    registro['formato'] = 'PNG'
+    registro.update({
+        'publicacao_id': mensagem.id,
+        'publicacao_url': mensagem.jump_url,
+        'publicacao_canal_id': getattr(canal, 'id', None),
+        'status': 'AUTORIZADO/EMITIDO',
+        'publicado_em_fallback': True,
+    })
+    lista = carregar_comparecimentos()
+    existente = next((item for item in lista if str(item.get('id')) == str(registro.get('id'))), None)
+    if existente:
+        existente.update(registro)
+    else:
+        lista.append(registro)
+    salvar_comparecimentos(lista)
+    return registro
+
+print('✅ V55 carregada — mandados/comparecimentos agora saem somente em imagem no chat.')
