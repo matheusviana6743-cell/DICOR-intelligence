@@ -55227,14 +55227,21 @@ class PainelProcuradosView(View):
         for indice, pagina in enumerate(paginas, 1):
             embed = discord.Embed(title=f'📋 PROCURADOS ATIVOS — {indice}/{len(paginas)}', description=f'Fonte exclusiva: <#{int(PROCURADOS_CHANNEL_ID)}> • Total: **{len(ativos)}**', color=discord.Color.red())
             for registro in pagina:
-                nome = str(registro.get('nome') or 'Nome não informado')
-                rg = str(registro.get('rg') or 'Não informado')
-                crimes = str(valor_crimes_registro(registro) or 'Não informado')
-                url = str(registro.get('mensagem_url') or '')
-                valor = f'**RG:** `{rg}`\n**Crimes:** {crimes[:350]}'
-                if url:
-                    valor += f'\n[🔗 Abrir publicação]({url})'
-                embed.add_field(name=f'🚨 {nome}', value=valor, inline=False)
+                nome = str(registro.get('nome') or 'Nome não informado').strip()
+                rg = str(registro.get('rg') or 'Não informado').strip()
+                ultimo = str(
+                    registro.get('ultimo_avistamento')
+                    or registro.get('informacoes')
+                    or 'Não informado'
+                ).strip()
+                embed.add_field(
+                    name=f'👤 {nome}',
+                    value=(
+                        f'**RG:** `{rg}`\n'
+                        f'**Último avistamento:** {ultimo[:700]}'
+                    ),
+                    inline=False,
+                )
             if primeira:
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 primeira = False
@@ -61067,6 +61074,507 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# V63 — ABERTURA SEGURA DAS FICHAS GERAIS
+# Corrige fichas que falhavam por excesso de conteúdo, módulos auxiliares
+# ou montagem acumulada de componentes de versões anteriores.
+# =====================================================
+
+
+def _v63_texto_limite(valor: Any, limite: int) -> str:
+    texto = str(valor or "").strip()
+    if len(texto) <= limite:
+        return texto
+    return texto[: max(1, limite - 1)].rstrip() + "…"
+
+
+def _v63_perfil_basico_sql(tipo: str, registro_id: int) -> Dict[str, Any]:
+    """Fallback mínimo: abre a ficha diretamente do SQLite sem enriquecimentos."""
+    inicializar_banco_dicor()
+    tipo = str(tipo or "").lower().strip()
+    if tipo == "geral":
+        tipo = "individuo"
+    registro_id = int(registro_id or 0)
+    with _banco_conexao() as db:
+        individuo = None
+        veiculo_base = None
+        if tipo == "individuo":
+            individuo = db.execute(
+                "SELECT * FROM individuos WHERE id=?", (registro_id,)
+            ).fetchone()
+        elif tipo == "veiculo":
+            veiculo_base = db.execute(
+                "SELECT * FROM veiculos WHERE id=?", (registro_id,)
+            ).fetchone()
+            if veiculo_base:
+                individuo = _banco_ficha_geral_individuo_do_veiculo(
+                    db, dict(veiculo_base)
+                )
+        if not individuo and not veiculo_base:
+            return {}
+
+        veiculos = []
+        if individuo:
+            iid = int(individuo["id"])
+            rg = str(individuo["rg"] or "")
+            veiculos = db.execute(
+                """
+                SELECT DISTINCT v.* FROM veiculos v
+                LEFT JOIN vinculos_individuo_veiculo l
+                  ON l.veiculo_id=v.id AND l.ativo=1
+                WHERE l.individuo_id=? OR v.proprietario_individuo_id=?
+                   OR v.proprietario_rg=?
+                ORDER BY v.atualizado_em DESC, v.placa
+                """,
+                (iid, iid, rg),
+            ).fetchall()
+        elif veiculo_base:
+            veiculos = [veiculo_base]
+
+        arquivos = []
+        try:
+            filtros = []
+            params = []
+            if individuo:
+                filtros.append("individuo_id=?")
+                params.append(int(individuo["id"]))
+            ids_veiculos = [int(x["id"]) for x in veiculos]
+            if ids_veiculos:
+                filtros.append(
+                    "veiculo_id IN (%s)" % ",".join("?" for _ in ids_veiculos)
+                )
+                params.extend(ids_veiculos)
+            if filtros:
+                arquivos = db.execute(
+                    "SELECT * FROM arquivos_ficha_geral WHERE "
+                    + " OR ".join(filtros)
+                    + " ORDER BY criado_em DESC",
+                    tuple(params),
+                ).fetchall()
+        except Exception:
+            arquivos = []
+
+    ind = dict(individuo) if individuo else {}
+    veics = [dict(x) for x in veiculos]
+    base = dict(veiculo_base) if veiculo_base else (veics[0] if veics else {})
+    return {
+        "tipo": "geral" if ind else "veiculo",
+        "registro_id": int(ind.get("id") or base.get("id") or 0),
+        "individuo": ind,
+        "veiculo_base": base,
+        "veiculos": veics,
+        "arquivos": [dict(x) for x in arquivos],
+        "carregamento_reduzido": True,
+    }
+
+
+def _v63_carregar_ficha_segura(tipo: str, registro_id: int) -> Dict[str, Any]:
+    tipo_original = str(tipo or "geral").lower().strip()
+    tipo_tentativa = "individuo" if tipo_original == "geral" else tipo_original
+    erros = []
+    for candidato in (tipo_tentativa, tipo_original):
+        try:
+            perfil = _banco_ficha_geral_carregar(candidato, int(registro_id))
+            if perfil:
+                return dict(perfil)
+        except Exception as erro:
+            erros.append(f"{candidato}:{type(erro).__name__}:{erro}")
+    try:
+        perfil = _v63_perfil_basico_sql(tipo_tentativa, int(registro_id))
+        if perfil:
+            if erros:
+                perfil["avisos_carregamento"] = erros
+            return perfil
+    except Exception as erro:
+        erros.append(f"fallback:{type(erro).__name__}:{erro}")
+    raise RuntimeError(" | ".join(erros) or "Ficha não localizada")
+
+
+def _v63_embed_minimo(perfil: Dict[str, Any]) -> discord.Embed:
+    ind = dict(perfil.get("individuo") or {})
+    veiculos = list(perfil.get("veiculos") or [])
+    base = dict(perfil.get("veiculo_base") or (veiculos[0] if veiculos else {}))
+    nome = str(ind.get("nome") or base.get("proprietario_nome") or "REGISTRO")
+    rg = str(ind.get("rg") or base.get("proprietario_rg") or "Não informado")
+    embed = discord.Embed(
+        title=_v63_texto_limite(f"📋 FICHA GERAL — {nome}", 256),
+        description="Cadastro unificado do Banco de Dados da Polícia Federal.",
+        color=discord.Color.from_rgb(30, 105, 190),
+    )
+    embed.add_field(
+        name="👤 IDENTIFICAÇÃO",
+        value=_v63_texto_limite(
+            f"**Nome:** {nome}\n**RG:** `{rg}`\n"
+            f"**Telefone:** {ind.get('telefone') or base.get('telefone_proprietario') or 'Não informado'}\n"
+            f"**Organização:** {ind.get('faccao_atual') or base.get('faccao') or 'Não informada'}",
+            1024,
+        ),
+        inline=False,
+    )
+    if veiculos:
+        linhas = []
+        for v in veiculos[:10]:
+            linhas.append(
+                f"• `{v.get('placa') or 'SEM PLACA'}` — "
+                f"{v.get('modelo') or 'Modelo não informado'}"
+            )
+        embed.add_field(
+            name=f"🚗 VEÍCULOS ({len(veiculos)})",
+            value=_v63_texto_limite("\n".join(linhas), 1024),
+            inline=False,
+        )
+    return embed
+
+
+def _v63_embed_seguro(perfil: Dict[str, Any]) -> discord.Embed:
+    """Reconstrói o embed dentro dos limites rígidos da API do Discord."""
+    try:
+        original = _banco_embed_ficha_geral(perfil)
+        if not isinstance(original, discord.Embed):
+            raise TypeError("Gerador não retornou Embed")
+    except Exception as erro:
+        print(
+            f"⚠️ V63 embed enriquecido falhou; usando ficha mínima: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return _v63_embed_minimo(perfil)
+
+    titulo = _v63_texto_limite(original.title or "📋 FICHA GERAL", 256)
+    descricao = _v63_texto_limite(original.description or "", 1800)
+    cor = original.color or discord.Color.from_rgb(30, 105, 190)
+    seguro = discord.Embed(title=titulo, description=descricao, color=cor)
+    total = len(titulo) + len(descricao)
+
+    for campo in list(original.fields)[:25]:
+        nome = _v63_texto_limite(getattr(campo, "name", "Informações"), 256)
+        valor = _v63_texto_limite(getattr(campo, "value", "—"), 1024) or "—"
+        custo = len(nome) + len(valor)
+        if total + custo > 5550:
+            break
+        seguro.add_field(
+            name=nome,
+            value=valor,
+            inline=bool(getattr(campo, "inline", False)),
+        )
+        total += custo
+
+    try:
+        rodape = _v63_texto_limite(original.footer.text or "", 900)
+        if rodape:
+            seguro.set_footer(text=rodape)
+    except Exception:
+        pass
+    try:
+        imagem = str(original.image.url or "")
+        if imagem.startswith("http") or imagem.startswith("attachment://"):
+            seguro.set_image(url=imagem)
+    except Exception:
+        pass
+    try:
+        miniatura = str(original.thumbnail.url or "")
+        if miniatura.startswith("http") or miniatura.startswith("attachment://"):
+            seguro.set_thumbnail(url=miniatura)
+    except Exception:
+        pass
+
+    if perfil.get("carregamento_reduzido") and len(seguro.fields) < 25:
+        seguro.add_field(
+            name="ℹ️ MODO DE COMPATIBILIDADE",
+            value="A ficha foi aberta com os dados essenciais. Os módulos complementares continuam disponíveis pelos botões.",
+            inline=False,
+        )
+    return seguro
+
+
+class V63EditarFichaButton(discord.ui.Button):
+    def __init__(self, perfil: Dict[str, Any]):
+        super().__init__(
+            label="Editar ficha", emoji="✏️",
+            style=discord.ButtonStyle.secondary, row=1,
+            custom_id=f"v63_editar_ficha:{int(perfil.get('registro_id') or 0)}:{secrets.token_hex(3)}",
+        )
+        self.perfil = dict(perfil or {})
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.send_modal(
+                BancoFichaGeralEditarModal(
+                    str(self.perfil.get("tipo") or "geral"),
+                    int(self.perfil.get("registro_id") or 0),
+                    self.perfil,
+                )
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V63 editar ficha: {type(erro).__name__}: {erro}"
+            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Não foi possível abrir a edição. O erro foi enviado aos logs.",
+                    ephemeral=True,
+                )
+
+
+class V63FichaGeralView(View):
+    def __init__(
+        self,
+        usuario_id: int,
+        perfil: Optional[Dict[str, Any]] = None,
+        opcoes: Optional[List[Tuple[str, int, str, str, str]]] = None,
+    ):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        self.perfil = dict(perfil or {})
+        self.opcoes = list(opcoes or [])
+        if self.opcoes:
+            self.add_item(V63FichaGeralSelect(self.opcoes))
+        if self.perfil:
+            tipo = str(self.perfil.get("tipo") or "geral")
+            rid = int(self.perfil.get("registro_id") or 0)
+            self.add_item(BancoConsultarIAButton(tipo, rid, self.perfil, row=0))
+            self.add_item(BancoVerArvoreButton(tipo, rid, row=0))
+            self.add_item(V63EditarFichaButton(self.perfil))
+            self.add_item(BancoVerIdentificacaoButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.usuario_id:
+            await interaction.response.send_message(
+                "❌ Esta consulta pertence a outro agente.", ephemeral=True
+            )
+            return False
+        return True
+
+
+class V63FichaGeralSelect(discord.ui.Select):
+    def __init__(self, opcoes: List[Tuple[str, int, str, str, str]]):
+        self._opcoes_brutas = list(opcoes)
+        options = []
+        for indice, x in enumerate(opcoes[:25]):
+            options.append(
+                discord.SelectOption(
+                    label=_v63_texto_limite(x[2], 100),
+                    value=f"{x[0]}:{int(x[1])}",
+                    description=_v63_texto_limite(x[3], 100),
+                    emoji=x[4],
+                )
+            )
+        super().__init__(
+            placeholder="Selecione uma ficha para visualizar",
+            min_values=1,
+            max_values=1,
+            row=0,
+            options=options,
+            custom_id=f"v63_selecionar_ficha:{secrets.token_hex(6)}",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        tipo = ""
+        rid = 0
+        try:
+            tipo, texto_id = self.values[0].split(":", 1)
+            rid = int(texto_id)
+            if tipo == "faccao":
+                registro = await asyncio.wait_for(
+                    asyncio.to_thread(_banco_prof_registro_por_id, "faccao", rid),
+                    timeout=20,
+                )
+                if not registro:
+                    return await interaction.edit_original_response(
+                        content="❌ Organização não encontrada.", embed=None, view=None
+                    )
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=_banco_embed_consulta_faccao(registro),
+                    view=None,
+                )
+                return
+
+            perfil = await asyncio.wait_for(
+                asyncio.to_thread(_v63_carregar_ficha_segura, tipo, rid),
+                timeout=30,
+            )
+            if not perfil:
+                return await interaction.edit_original_response(
+                    content="❌ A ficha não foi encontrada.", embed=None, view=None
+                )
+            embed = _v63_embed_seguro(perfil)
+            view = V63FichaGeralView(
+                int(interaction.user.id), perfil, self._opcoes_brutas
+            )
+            try:
+                await interaction.edit_original_response(
+                    content=None, embed=embed, view=view
+                )
+            except discord.HTTPException as erro_http:
+                # Última garantia: remove componentes e usa a ficha mínima.
+                print(
+                    f"⚠️ V63 Discord recusou ficha completa ({erro_http}); "
+                    "enviando versão mínima.",
+                    flush=True,
+                )
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=_v63_embed_minimo(perfil),
+                    view=V63FichaGeralView(int(interaction.user.id), perfil),
+                )
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await enviar_log(
+                    f"❌ V63 abrir ficha `{tipo}:{rid}` | "
+                    f"{type(erro).__name__}: {erro}\n```py\n"
+                    f"{traceback.format_exc()[-2500:]}\n```"
+                )
+            except Exception:
+                pass
+            try:
+                await interaction.edit_original_response(
+                    content="❌ Não foi possível abrir esta ficha. O diagnóstico foi enviado aos logs.",
+                    embed=None,
+                    view=None,
+                )
+            except Exception:
+                pass
+
+
+async def _v63_consultar_banco(interaction: discord.Interaction, consulta: str) -> None:
+    termo = str(consulta or "").strip()
+    if not termo:
+        return await _v14_editar_resposta(
+            interaction, content="❌ Digite algo para pesquisar.", view=None
+        )
+    try:
+        resultados = await asyncio.wait_for(
+            asyncio.to_thread(banco_buscar, termo), timeout=_V14_SEARCH_TIMEOUT
+        )
+        opcoes = await asyncio.wait_for(
+            asyncio.to_thread(_banco_ficha_geral_opcoes, resultados),
+            timeout=max(5.0, _V14_SEARCH_TIMEOUT / 2),
+        )
+        if not opcoes:
+            return await _v14_editar_resposta(
+                interaction,
+                embed=discord.Embed(
+                    title="🔎 CONSULTA AO BANCO",
+                    description=f"Nenhum registro foi localizado para **{termo[:100]}**.",
+                    color=discord.Color.from_rgb(215, 169, 61),
+                ),
+                view=None,
+            )
+
+        if len(opcoes) == 1:
+            tipo, rid, _, _, _ = opcoes[0]
+            if tipo == "faccao":
+                registro = await asyncio.to_thread(
+                    _banco_prof_registro_por_id, "faccao", rid
+                )
+                embed = _banco_embed_consulta_faccao(registro)
+                view = None
+            else:
+                perfil = await asyncio.wait_for(
+                    asyncio.to_thread(_v63_carregar_ficha_segura, tipo, rid),
+                    timeout=30,
+                )
+                embed = _v63_embed_seguro(perfil)
+                view = V63FichaGeralView(int(interaction.user.id), perfil)
+        else:
+            embed = _banco_ficha_geral_resultados_embed(termo, opcoes)
+            view = V63FichaGeralView(int(interaction.user.id), None, opcoes)
+        embed.color = discord.Color.from_rgb(215, 169, 61)
+        await _v14_editar_resposta(interaction, embed=embed, view=view)
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(
+                f"❌ V63 pesquisa/ficha `{termo}` | "
+                f"{type(erro).__name__}: {erro}\n```py\n"
+                f"{traceback.format_exc()[-2500:]}\n```"
+            )
+        except Exception:
+            pass
+        await _v14_editar_resposta(
+            interaction,
+            content="❌ Não foi possível montar a ficha. O diagnóstico foi enviado aos logs.",
+            view=None,
+        )
+
+
+# Substituições globais usadas pelo modal V61 e pelos demais painéis.
+BancoFichaGeralSelect = V63FichaGeralSelect
+BancoFichaGeralView = V63FichaGeralView
+_v14_consultar_banco = _v63_consultar_banco
+
+
+async def _banco_prof_enviar_consulta(
+    interaction: discord.Interaction,
+    consulta: str,
+    *,
+    editar_original: bool = False,
+) -> None:
+    # Os fluxos atuais já usam resposta deferida; o motor V63 finaliza a resposta.
+    await _v63_consultar_banco(interaction, consulta)
+
+
+class BancoAbrirFichaButton(discord.ui.Button):
+    def __init__(self, tipo: str, registro_id: int, indice: int = 0):
+        super().__init__(
+            label=("Abrir Ficha" if indice == 0 else f"Abrir Ficha {indice + 1}")[:80],
+            emoji="📂",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"v63_abrir_ficha:{tipo}:{int(registro_id)}:{secrets.token_hex(4)}",
+        )
+        self.tipo = str(tipo or "geral")
+        self.registro_id = int(registro_id or 0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if self.tipo == "faccao":
+                registro = await asyncio.to_thread(
+                    _banco_prof_registro_por_id, "faccao", self.registro_id
+                )
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=_banco_embed_consulta_faccao(registro),
+                    view=None,
+                )
+                return
+            perfil = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _v63_carregar_ficha_segura, self.tipo, self.registro_id
+                ),
+                timeout=30,
+            )
+            await interaction.edit_original_response(
+                content=None,
+                embed=_v63_embed_seguro(perfil),
+                view=V63FichaGeralView(int(interaction.user.id), perfil),
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await enviar_log(
+                    f"❌ V63 botão Abrir Ficha `{self.tipo}:{self.registro_id}` | "
+                    f"{type(erro).__name__}: {erro}"
+                )
+            except Exception:
+                pass
+            await interaction.edit_original_response(
+                content="❌ Não foi possível abrir esta ficha. O erro foi enviado aos logs.",
+                embed=None,
+                view=None,
+            )
+
+
+print(
+    "✅ V63 carregada — fichas com embed compacto, view limpa e fallback direto do banco.",
+    flush=True,
+)
 
 if __name__ == '__main__':
     asyncio.run(main())
