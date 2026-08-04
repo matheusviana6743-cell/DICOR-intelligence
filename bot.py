@@ -56670,28 +56670,10 @@ async def _prisao_processar_mensagem(
         except Exception:
             pass
 
-        if not historico:
-            infracoes = list(detalhes.get("infracoes") or [])
-            resumo_infracoes = "\n".join(
-                f"• `{item.get('artigo')}` — {item.get('descricao')}"
-                for item in infracoes[:5]
-            ) or "Não detalhadas no texto."
-            embed = discord.Embed(
-                title="✅ DADOS PRISIONAIS VINCULADOS À FICHA",
-                description=(
-                    "Nome, RG e dados penais já foram salvos. As imagens serão analisadas "
-                    "em segundo plano e não bloqueiam mais a ficha."
-                ),
-                color=discord.Color.green(),
-                timestamp=datetime.datetime.now(datetime.timezone.utc),
-            )
-            embed.add_field(name="👤 Indivíduo", value=f"**{nome}**\nRG `{rg}`", inline=True)
-            embed.add_field(name="📅 Data", value=str(detalhes.get("data_prisao") or "Não informada"), inline=True)
-            embed.add_field(name="⏱️ Pena", value=str(detalhes.get("pena_total") or "Não informada"), inline=True)
-            embed.add_field(name="💰 Multa", value=str(detalhes.get("multa_total") or "Não informada"), inline=True)
-            embed.add_field(name="💵 Fiança", value=str(detalhes.get("fianca") or "Não informada"), inline=True)
-            embed.add_field(name="📑 Infrações", value=resumo_infracoes[:1024], inline=False)
-            await _prisao_enviar_retorno_temporario(message, embed=embed, delete_after=45)
+        # V60: confirmação silenciosa.
+        # A prisão já foi salva e a mensagem original recebe apenas a reação ✅.
+        # Nenhum embed ou mensagem de confirmação é enviado ao canal.
+
 
         tarefa = asyncio.create_task(
             _v53_prisao_enriquecer_imagens(
@@ -59938,6 +59920,1153 @@ print(
     'confirmação com link e exclusão do canal temporário após publicação.',
     flush=True,
 )
+
+
+# =====================================================
+# V61 — PAINEL DO BANCO ORGANIZADO
+# - Somente 3 botões: Criar ficha, Pesquisar fichas e Painel.
+# - IA Investigadora removida do painel principal; permanece dentro das fichas.
+# - Central de Evidências integrada ao resultado da pesquisa.
+# - Sincronização continua automática, sem botão manual.
+# =====================================================
+
+class PFEvidenciasPesquisaIntegradaView(View):
+    def __init__(self, autor_id: int, consulta: str, quantidade: int):
+        super().__init__(timeout=300)
+        self.autor_id = int(autor_id)
+        self.consulta = str(consulta or "")[:150]
+        self.quantidade = max(0, int(quantidade or 0))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.autor_id or usuario_e_administrador(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "❌ Este resultado de pesquisa pertence a outro agente.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Ver evidências e anexos",
+        emoji="📦",
+        style=discord.ButtonStyle.secondary,
+        custom_id="pf_banco_evidencias_pesquisa_v61",
+    )
+    async def abrir_evidencias(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultados = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _pf_evidencias_buscar,
+                    self.consulta,
+                    40,
+                ),
+                timeout=25,
+            )
+            await interaction.followup.send(
+                embeds=_pf_evidencias_embeds(self.consulta, resultados),
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V61 falha na pesquisa integrada de evidências | "
+                f"consulta `{self.consulta}` | {type(erro).__name__}: {erro}"
+            )
+            await interaction.followup.send(
+                "❌ Não foi possível abrir as evidências. O erro foi enviado aos logs.",
+                ephemeral=True,
+            )
+
+
+class BancoConsultaIntegradaModalV61(Modal, title="Pesquisar no Banco da Polícia Federal"):
+    consulta = TextInput(
+        label="Nome, RG, telefone, placa ou organização",
+        placeholder="Ex.: 28457, Arlindo Silva ou ABC1D23",
+        min_length=1,
+        max_length=120,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception as erro:
+            if not _v14_erro_interacao_duplicada(erro):
+                raise
+            return
+
+        termo = str(self.consulta.value or "").strip()
+        if not termo:
+            return await interaction.followup.send(
+                "❌ Digite algo para pesquisar.",
+                ephemeral=True,
+            )
+
+        try:
+            # Mantém a pesquisa de ficha exatamente como já funcionava.
+            await _v14_consultar_banco(interaction, termo)
+
+            # A Central de Evidências agora fica incorporada à própria pesquisa.
+            try:
+                evidencias = await asyncio.wait_for(
+                    asyncio.to_thread(_pf_evidencias_buscar, termo, 40),
+                    timeout=20,
+                )
+            except Exception as erro_evidencias:
+                evidencias = []
+                await enviar_log(
+                    f"⚠️ V61 pesquisa da ficha concluída, mas evidências falharam | "
+                    f"consulta `{termo}` | {type(erro_evidencias).__name__}: {erro_evidencias}"
+                )
+
+            if evidencias:
+                await interaction.followup.send(
+                    content=(
+                        f"📦 **{len(evidencias)} evidência(s) ou anexo(s) relacionado(s)** "
+                        f"foram encontrados para `{termo}`."
+                    ),
+                    view=PFEvidenciasPesquisaIntegradaView(
+                        interaction.user.id,
+                        termo,
+                        len(evidencias),
+                    ),
+                    ephemeral=True,
+                )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V61 falha na pesquisa integrada | consulta `{termo}` | "
+                f"{type(erro).__name__}: {erro}"
+            )
+            try:
+                await interaction.followup.send(
+                    "❌ A pesquisa não pôde ser concluída. O erro foi enviado aos logs.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+
+async def _v61_abrir_criacao_ficha(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="📋 CRIAR OU IMPORTAR FICHA",
+        description=(
+            "Escolha como os dados serão enviados. "
+            "Nenhuma informação é salva sem prévia e confirmação."
+        ),
+        color=discord.Color.from_rgb(30, 88, 140),
+    )
+    embed.add_field(
+        name="📷 Criar por imagem",
+        value=(
+            "Envie RG, placa, cupom, COPOM, documento ou várias imagens. "
+            "O bot lê e monta uma ficha."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📥 Importar relatório",
+        value=(
+            "Cole um relato completo com rankings, veículos, mudanças de nome "
+            "e duplas recorrentes."
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=PFCriarFichaEscolhaView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+class BancoDadosViewV61(View):
+    """Painel principal reduzido e organizado do Banco de Dados."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # O próprio canal já controla quem pode visualizar o painel.
+        # Todos que possuem acesso ao canal podem pesquisar.
+        if isinstance(interaction.user, discord.Member):
+            return True
+        await interaction.response.send_message(
+            "❌ Esta ação precisa ser usada dentro do servidor.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ):
+        if _v14_erro_interacao_duplicada(error):
+            return
+        await _v12_enviar_erro_interacao(
+            interaction,
+            "A Central de Dados da PF apresentou uma falha.",
+            error,
+        )
+
+    @discord.ui.button(
+        label="Criar ficha",
+        emoji="📋",
+        style=discord.ButtonStyle.primary,
+        custom_id="pf_banco_criar_ficha_v61",
+        row=0,
+    )
+    async def criar(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas **Inspetor+** pode criar ou importar fichas.",
+                ephemeral=True,
+            )
+        await _v61_abrir_criacao_ficha(interaction)
+
+    @discord.ui.button(
+        label="Pesquisar fichas",
+        emoji="🔎",
+        style=discord.ButtonStyle.secondary,
+        custom_id="pf_banco_pesquisar_v61",
+        row=0,
+    )
+    async def pesquisar(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.send_modal(BancoConsultaIntegradaModalV61())
+
+    @discord.ui.button(
+        label="Painel",
+        emoji="🏴",
+        style=discord.ButtonStyle.secondary,
+        custom_id="pf_banco_painel_v61",
+        row=0,
+    )
+    async def painel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas **Inspetor+** pode importar ou atualizar painéis.",
+                ephemeral=True,
+            )
+        # Preserva o fluxo completo de importar/atualizar o painel de membros.
+        await _v12_banco_importar(interaction)
+
+
+BancoDadosView = BancoDadosViewV61
+
+_V61_EMBED_PAINEL_ANTERIOR = banco_embed_painel
+
+
+def banco_embed_painel() -> discord.Embed:
+    embed = _V61_EMBED_PAINEL_ANTERIOR()
+    embed.title = "🏛️ CENTRAL DE DADOS — POLÍCIA FEDERAL"
+    embed.description = (
+        "Consulta integrada de fichas, veículos, organizações, perícias e registros "
+        "da Polícia Federal.\n"
+        "A pesquisa também localiza evidências e anexos relacionados. "
+        "A IA Investigadora permanece disponível somente dentro da ficha aberta."
+    )
+
+    for indice, campo in enumerate(list(embed.fields)):
+        nome = str(campo.name or "")
+        if "AÇÕES" in nome.upper():
+            embed.set_field_at(
+                indice,
+                name="🧭 AÇÕES",
+                value=(
+                    "**Criar ficha — Inspetor+:** imagem, documento, COPOM ou relatório.\n"
+                    "**Pesquisar fichas — todos:** fichas, veículos, organizações, "
+                    "evidências e anexos.\n"
+                    "**Painel — Inspetor+:** importar ou atualizar a formação de uma organização.\n"
+                    "**Sincronização:** automática, sem necessidade de ação manual."
+                ),
+                inline=False,
+            )
+
+    embed.set_footer(
+        text=(
+            "Polícia Federal • acesso controlado por cargos • "
+            "sincronização automática ativa"
+        )
+    )
+    return embed
+
+
+async def _v61_atualizar_paineis_banco() -> int:
+    atualizados = 0
+    canais_vistos: set[int] = set()
+
+    try:
+        await _banco_prof_atualizar_painel()
+    except Exception:
+        pass
+
+    for guild in bot.guilds:
+        for canal in getattr(guild, "text_channels", []):
+            nome = normalizar_busca(getattr(canal, "name", ""))
+            if (
+                "banco-de-dados" not in nome
+                and "central-de-dados" not in nome
+                and int(getattr(canal, "id", 0) or 0)
+                != int(os.getenv("BANCO_DADOS_CHANNEL_ID", "0") or 0)
+            ):
+                continue
+            if int(canal.id) in canais_vistos:
+                continue
+            canais_vistos.add(int(canal.id))
+            try:
+                async for msg in canal.history(limit=120):
+                    if not bot.user or msg.author.id != bot.user.id:
+                        continue
+                    titulos = " ".join(
+                        str(e.title or "") for e in msg.embeds
+                    ).upper()
+                    if not any(
+                        alvo in titulos
+                        for alvo in (
+                            "CENTRAL DE DADOS",
+                            "BANCO DE DADOS",
+                            "CENTRAL DE FICHAS",
+                        )
+                    ):
+                        continue
+                    await msg.edit(
+                        embed=banco_embed_painel(),
+                        view=BancoDadosViewV61(),
+                    )
+                    atualizados += 1
+                    break
+            except Exception as erro:
+                print(
+                    f"⚠️ V61 não atualizou o painel no canal "
+                    f"{getattr(canal, 'id', 0)}: {erro}",
+                    flush=True,
+                )
+    return atualizados
+
+
+_V61_SETUP_ANTERIOR = bot.setup_hook
+
+
+async def _v61_setup_hook(self):
+    await _V61_SETUP_ANTERIOR()
+    try:
+        bot.add_view(BancoDadosViewV61())
+    except Exception:
+        pass
+
+
+bot.setup_hook = _v13_types.MethodType(_v61_setup_hook, bot)
+
+
+@bot.listen("on_ready")
+async def _v61_on_ready():
+    try:
+        # Aguarda os listeners de versões anteriores e aplica o painel definitivo.
+        await asyncio.sleep(14)
+        if not banco_dados_sincronizacao_automatica.is_running():
+            banco_dados_sincronizacao_automatica.start()
+        quantidade = await _v61_atualizar_paineis_banco()
+        print(
+            f"✅ V61 painel do Banco organizado: "
+            f"{quantidade} painel(is) atualizado(s); "
+            "Criar → Pesquisar → Painel; sincronização automática.",
+            flush=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+print(
+    "✅ V61 carregada — painel do Banco com Criar, Pesquisar e Painel; "
+    "evidências integradas à pesquisa; IA apenas na ficha; sync automático.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V62 — IDENTIFICAÇÃO OPERACIONAL, PERÍCIAS CENTRALIZADAS E OCR ESTÁVEL
+# =====================================================
+import threading as _v62_threading
+
+V62_OPERADORES_JSON = DATA_DIR / "acessos_operacionais_restritos.json"
+V62_OPERADOR_COOKIE = "dicor_operador_conta"
+V62_OPERADOR_COOKIE_DIAS = max(30, env_int("OPERADOR_COOKIE_DIAS", 365))
+V62_DONO_COOKIE = "dicor_dono_acessos"
+V62_DONO_PASSWORD = (
+    os.getenv("PLATAFORMA_DONO_PASSWORD", "").strip()
+    or os.getenv("CATALOG_ADMIN_PASSWORD", "").strip()
+)
+V62_DADOS_LOCK = _v62_threading.RLock()
+V62_OCR_STAGING_DIR = DATA_DIR / "ocr_staging_persistente"
+V62_OCR_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _v62_agora_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _v62_caminho_seguro(valor: Any, padrao: str = "/") -> str:
+    destino = str(valor or padrao).strip()
+    if not destino.startswith("/") or destino.startswith("//"):
+        return padrao
+    return destino[:1000]
+
+
+def _v62_carregar_dados() -> Dict[str, Any]:
+    with V62_DADOS_LOCK:
+        bruto = carregar_json(V62_OPERADORES_JSON, {})
+        if not isinstance(bruto, dict):
+            bruto = {}
+        bruto.setdefault("contas", [])
+        bruto.setdefault("eventos", [])
+        return bruto
+
+
+def _v62_salvar_dados(dados: Dict[str, Any]) -> None:
+    with V62_DADOS_LOCK:
+        salvar_json(V62_OPERADORES_JSON, dados)
+
+
+def _v62_assinar(payload: str) -> str:
+    segredo = f"{CENTRAL_DICOR_COOKIE_SECRET}|OPERADOR-V62"
+    return hmac.new(segredo.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _v62_criar_token_operador(request: web.Request, conta_id: str) -> str:
+    payload = f"{conta_id}.{_central_fingerprint(request)}.{int(time.time())}"
+    return f"{_central_b64(payload.encode())}.{_v62_assinar(payload)}"
+
+
+def _v62_conta_request(request: web.Request) -> Optional[Dict[str, Any]]:
+    token = str(request.cookies.get(V62_OPERADOR_COOKIE, "") or "").strip()
+    if not token or "." not in token:
+        return None
+    try:
+        corpo, assinatura = token.rsplit(".", 1)
+        corpo += "=" * (-len(corpo) % 4)
+        payload = base64.urlsafe_b64decode(corpo.encode()).decode()
+        if not hmac.compare_digest(assinatura, _v62_assinar(payload)):
+            return None
+        conta_id, fingerprint, emitido = payload.split(".", 2)
+        if fingerprint != _central_fingerprint(request):
+            return None
+        idade = int(time.time()) - int(emitido)
+        if idade < 0 or idade > V62_OPERADOR_COOKIE_DIAS * 86400:
+            return None
+        dados = _v62_carregar_dados()
+        return next(
+            (dict(x) for x in dados.get("contas", [])
+             if isinstance(x, dict) and str(x.get("id")) == conta_id),
+            None,
+        )
+    except Exception:
+        return None
+
+
+def _v62_registrar_evento(
+    request: web.Request,
+    conta: Dict[str, Any],
+    area: str,
+    *,
+    evento: str = "ACESSO",
+) -> None:
+    try:
+        dados = _v62_carregar_dados()
+        contas = [x for x in dados.get("contas", []) if isinstance(x, dict)]
+        conta_id = str(conta.get("id") or "")
+        alvo = next((x for x in contas if str(x.get("id")) == conta_id), None)
+        if alvo is None:
+            return
+        agora = _v62_agora_iso()
+        area_limpa = re.sub(r"[^a-z0-9_-]+", "-", str(area or "central").lower())[:60]
+        alvo["ultimo_acesso"] = agora
+        alvo["ultimo_modulo"] = area_limpa
+        alvo.setdefault("acessos", {})
+        alvo["acessos"][area_limpa] = int(alvo["acessos"].get(area_limpa, 0) or 0) + 1
+        fp = _central_fingerprint(request)
+        dispositivos = list(alvo.get("dispositivos") or [])
+        if fp not in dispositivos:
+            dispositivos.append(fp)
+        alvo["dispositivos"] = dispositivos[-20:]
+        alvo["navegador_ultimo"] = request.headers.get("User-Agent", "")[:260]
+        eventos = [x for x in dados.get("eventos", []) if isinstance(x, dict)]
+        eventos.append({
+            "conta_id": conta_id,
+            "qra": alvo.get("qra"),
+            "passaporte": alvo.get("passaporte"),
+            "evento": evento,
+            "area": area_limpa,
+            "rota": request.path[:200],
+            "data": agora,
+            "dispositivo": fp,
+        })
+        dados["eventos"] = eventos[-5000:]
+        _v62_salvar_dados(dados)
+    except Exception as erro:
+        print(f"⚠️ V62 registro de acesso: {type(erro).__name__}: {erro}", flush=True)
+
+
+def _v62_area_request(request: web.Request) -> str:
+    caminho = request.path
+    if caminho == LIVE_OVERLAY_PATH:
+        return "painel-live"
+    if caminho.startswith("/boletins"):
+        return "boletins"
+    if caminho.startswith("/pericias"):
+        return "pericias"
+    if caminho.startswith("/fichas"):
+        return "banco-dados"
+    if caminho.startswith("/arvore") or caminho.startswith("/api/arvore"):
+        return "arvore"
+    if caminho.startswith("/dossies"):
+        return "dossies"
+    return "central"
+
+
+def _v62_html_cadastro(destino: str, erro: str = "", origem: str = "") -> str:
+    destino_html = html.escape(_v62_caminho_seguro(destino), quote=True)
+    erro_html = f'<div class="erro">{html.escape(erro)}</div>' if erro else ""
+    origem_html = html.escape(origem or "Central Operacional")
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Identificação Operacional • DICOR</title><style>
+:root{{--g:#d7a93d;--g2:#f2d47d;--bg:#070806;--p:#10120d;--l:#493b1d;--t:#f7f1db;--m:#a39c87}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
+background:radial-gradient(circle at 50% -20%,#4b391266,transparent 45%),var(--bg);color:var(--t);font-family:Inter,Arial}}
+.box{{width:min(470px,100%);background:linear-gradient(145deg,#14160f,#0b0c09);border:1px solid var(--l);
+border-radius:24px;padding:34px;box-shadow:0 28px 90px #000b}}.top{{display:flex;gap:16px;align-items:center;margin-bottom:24px}}
+.top img{{width:75px;height:82px;object-fit:contain;filter:drop-shadow(0 0 20px #d7a93d44)}}small{{color:var(--g);letter-spacing:1.8px}}
+h1{{margin:5px 0;font:31px Georgia,serif}}p{{color:var(--m);line-height:1.55}}label{{display:block;color:#d5c89d;font-size:12px;margin-top:16px}}
+input{{width:100%;margin-top:7px;padding:14px;background:#080906;color:#fff5d0;border:1px solid #40361d;border-radius:11px;font-size:16px;outline:none}}
+input:focus{{border-color:var(--g)}}button{{width:100%;margin-top:22px;border:0;border-radius:11px;padding:14px;
+background:linear-gradient(135deg,var(--g2),var(--g));font-weight:900;cursor:pointer}}.aviso{{border-left:3px solid var(--g);
+background:#18160d;padding:12px;margin-top:18px;color:#c9c0a5;font-size:13px}}.erro{{background:#381717;border:1px solid #7c3939;
+color:#ffd0d0;padding:11px;border-radius:10px;margin:13px 0}}.origem{{color:#7e7868;font-size:11px;margin-top:16px}}
+</style></head><body><form class="box" method="post" action="/cadastro-operador">
+<div class="top"><img src="/central/brasao-dicor.png"><div><small>IDENTIFICAÇÃO OPERACIONAL</small><h1>Registro de agente</h1></div></div>
+<p>Antes de acessar os registros da Central, identifique seu personagem. O cadastro é solicitado somente neste primeiro acesso e fica salvo neste navegador.</p>
+{erro_html}<input type="hidden" name="next" value="{destino_html}">
+<label>QRA</label><input name="qra" maxlength="45" placeholder="Ex.: Baiano" autocomplete="nickname" required>
+<label>Passaporte</label><input name="passaporte" maxlength="12" inputmode="numeric" placeholder="Ex.: 6027" required>
+<div class="aviso">Os acessos ficam registrados para controle interno da Polícia Federal.</div>
+<button type="submit">ENTRAR EM SERVIÇO</button><div class="origem">Destino: {origem_html}</div>
+</form></body></html>'''
+
+
+async def v62_cadastro_operador_get(request: web.Request) -> web.Response:
+    destino = _v62_caminho_seguro(request.query.get("next"), "/")
+    conta = _v62_conta_request(request)
+    if conta:
+        _v62_registrar_evento(request, conta, _v62_area_request(request), evento="SESSAO_EXISTENTE")
+        raise web.HTTPFound(destino)
+    origem = "Painel de Live" if destino.startswith(LIVE_OVERLAY_PATH) else "Central Operacional"
+    return web.Response(
+        text=_v62_html_cadastro(destino, origem=origem),
+        content_type="text/html",
+        charset="utf-8",
+    )
+
+
+async def v62_cadastro_operador_post(request: web.Request) -> web.Response:
+    try:
+        form = await request.post()
+    except Exception:
+        form = {}
+    destino = _v62_caminho_seguro(form.get("next"), "/")
+    qra = re.sub(r"\s+", " ", str(form.get("qra") or "")).strip()[:45]
+    passaporte = re.sub(r"\D+", "", str(form.get("passaporte") or ""))[:12]
+    origem = "Painel de Live" if destino.startswith(LIVE_OVERLAY_PATH) else "Central Operacional"
+    if len(qra) < 2 or not passaporte:
+        return web.Response(
+            text=_v62_html_cadastro(
+                destino,
+                erro="Informe um QRA válido e um passaporte numérico.",
+                origem=origem,
+            ),
+            content_type="text/html",
+            charset="utf-8",
+            status=400,
+        )
+
+    dados = _v62_carregar_dados()
+    contas = [x for x in dados.get("contas", []) if isinstance(x, dict)]
+    agora = _v62_agora_iso()
+    fp = _central_fingerprint(request)
+    conta = next((x for x in contas if str(x.get("passaporte")) == passaporte), None)
+    if conta is None:
+        conta = {
+            "id": secrets.token_hex(16),
+            "qra": qra,
+            "passaporte": passaporte,
+            "qra_historico": [],
+            "primeiro_acesso": agora,
+            "ultimo_acesso": agora,
+            "acessos": {},
+            "dispositivos": [fp],
+        }
+        contas.append(conta)
+    else:
+        qra_antigo = str(conta.get("qra") or "")
+        if qra_antigo and qra_antigo.casefold() != qra.casefold():
+            historico = list(conta.get("qra_historico") or [])
+            if qra_antigo not in historico:
+                historico.append(qra_antigo)
+            conta["qra_historico"] = historico[-20:]
+        conta["qra"] = qra
+        conta["ultimo_acesso"] = agora
+        dispositivos = list(conta.get("dispositivos") or [])
+        if fp not in dispositivos:
+            dispositivos.append(fp)
+        conta["dispositivos"] = dispositivos[-20:]
+
+    dados["contas"] = contas
+    _v62_salvar_dados(dados)
+    _v62_registrar_evento(request, conta, "cadastro", evento="CADASTRO_OU_LOGIN")
+
+    resposta = web.HTTPFound(destino)
+    resposta.set_cookie(
+        V62_OPERADOR_COOKIE,
+        _v62_criar_token_operador(request, str(conta["id"])),
+        max_age=V62_OPERADOR_COOKIE_DIAS * 86400,
+        httponly=True,
+        secure=True,
+        samesite="Lax",
+        path="/",
+    )
+    return resposta
+
+
+def _v62_owner_assinatura(payload: str) -> str:
+    return hmac.new(
+        f"{CENTRAL_DICOR_COOKIE_SECRET}|DONO-V62".encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _v62_owner_valido(request: web.Request) -> bool:
+    token = str(request.cookies.get(V62_DONO_COOKIE, "") or "")
+    if "." not in token:
+        return False
+    try:
+        corpo, assinatura = token.rsplit(".", 1)
+        if not hmac.compare_digest(assinatura, _v62_owner_assinatura(corpo)):
+            return False
+        emitido = int(corpo.split(".", 1)[0])
+        return 0 <= int(time.time()) - emitido <= 30 * 86400
+    except Exception:
+        return False
+
+
+def _v62_html_admin_login(erro: str = "") -> str:
+    bloco = f'<div class="erro">{html.escape(erro)}</div>' if erro else ""
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Acessos restritos</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#070806;color:#f5efda;font-family:Arial}}
+form{{width:min(420px,calc(100% - 30px));background:#10120d;border:1px solid #4a3b1c;border-radius:20px;padding:30px}}
+h1{{margin-top:0}}input,button{{width:100%;box-sizing:border-box;padding:14px;border-radius:10px;margin-top:12px}}
+input{{background:#080906;border:1px solid #493b1d;color:white}}button{{border:0;background:#d7a93d;font-weight:900}}.erro{{color:#ffcaca;background:#3b1717;padding:10px}}</style></head>
+<body><form method="post" action="/registro-acessos"><h1>Controle restrito de acessos</h1>
+<p>Área exclusiva do responsável pela plataforma.</p>{bloco}<input type="password" name="senha" placeholder="Senha do responsável" required>
+<button>ACESSAR REGISTROS</button></form></body></html>'''
+
+
+def _v62_html_admin() -> str:
+    dados = _v62_carregar_dados()
+    contas = sorted(
+        [x for x in dados.get("contas", []) if isinstance(x, dict)],
+        key=lambda x: str(x.get("ultimo_acesso") or ""),
+        reverse=True,
+    )
+    linhas = []
+    for conta in contas:
+        acessos = conta.get("acessos") if isinstance(conta.get("acessos"), dict) else {}
+        linhas.append(
+            "<tr>"
+            f"<td>{html.escape(str(conta.get('qra') or 'N/I'))}</td>"
+            f"<td>{html.escape(str(conta.get('passaporte') or 'N/I'))}</td>"
+            f"<td>{html.escape(str(conta.get('primeiro_acesso') or ''))[:25]}</td>"
+            f"<td>{html.escape(str(conta.get('ultimo_acesso') or ''))[:25]}</td>"
+            f"<td>{len(conta.get('dispositivos') or [])}</td>"
+            f"<td>{int(acessos.get('painel-live', 0) or 0)}</td>"
+            f"<td>{int(acessos.get('boletins', 0) or 0)}</td>"
+            f"<td>{int(acessos.get('pericias', 0) or 0)}</td>"
+            f"<td>{html.escape(str(conta.get('ultimo_modulo') or ''))}</td>"
+            "</tr>"
+        )
+    corpo = "".join(linhas) or "<tr><td colspan='9'>Nenhum operador registrado.</td></tr>"
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Registros de acesso • DICOR</title><style>
+body{{margin:0;background:#070806;color:#f5efda;font-family:Inter,Arial}}main{{max-width:1450px;margin:auto;padding:35px 20px}}
+h1{{color:#efd473}}.box{{overflow:auto;border:1px solid #493b1d;border-radius:16px;background:#10120d}}
+table{{width:100%;border-collapse:collapse;min-width:1000px}}th,td{{padding:12px;border-bottom:1px solid #2e2919;text-align:left}}
+th{{color:#efd473;background:#15170f;position:sticky;top:0}}a{{color:#efd473}}small{{color:#99917e}}
+</style></head><body><main><h1>🔐 Registros operacionais restritos</h1>
+<p><small>{len(contas)} conta(s) cadastrada(s). Esta página não aparece no menu público.</small></p>
+<p><a href="/registro-acessos.json">Baixar JSON</a></p><div class="box"><table><thead><tr>
+<th>QRA</th><th>Passaporte</th><th>Primeiro acesso</th><th>Último acesso</th><th>Dispositivos</th>
+<th>Live</th><th>Boletins</th><th>Perícias</th><th>Último módulo</th></tr></thead><tbody>{corpo}</tbody></table></div></main></body></html>'''
+
+
+async def v62_admin_acessos_get(request: web.Request) -> web.Response:
+    if not _v62_owner_valido(request):
+        return web.Response(text=_v62_html_admin_login(), content_type="text/html", charset="utf-8")
+    return web.Response(text=_v62_html_admin(), content_type="text/html", charset="utf-8")
+
+
+async def v62_admin_acessos_post(request: web.Request) -> web.Response:
+    try:
+        form = await request.post()
+    except Exception:
+        form = {}
+    senha = str(form.get("senha") or "")
+    if not V62_DONO_PASSWORD:
+        return web.Response(
+            text=_v62_html_admin_login(
+                "Defina PLATAFORMA_DONO_PASSWORD no Railway para liberar esta área."
+            ),
+            content_type="text/html",
+            charset="utf-8",
+            status=503,
+        )
+    if not hmac.compare_digest(senha.encode(), V62_DONO_PASSWORD.encode()):
+        return web.Response(
+            text=_v62_html_admin_login("Senha incorreta."),
+            content_type="text/html",
+            charset="utf-8",
+            status=401,
+        )
+    corpo = f"{int(time.time())}.{secrets.token_hex(12)}"
+    resposta = web.HTTPFound("/registro-acessos")
+    resposta.set_cookie(
+        V62_DONO_COOKIE,
+        f"{corpo}.{_v62_owner_assinatura(corpo)}",
+        max_age=30 * 86400,
+        httponly=True,
+        secure=True,
+        samesite="Strict",
+        path="/",
+    )
+    return resposta
+
+
+async def v62_admin_acessos_json(request: web.Request) -> web.Response:
+    if not _v62_owner_valido(request):
+        raise web.HTTPNotFound()
+    return web.json_response(
+        _v62_carregar_dados(),
+        headers={"Content-Disposition": 'attachment; filename="acessos_operacionais.json"'},
+    )
+
+
+def _v62_card_portal(
+    icone: str, titulo: str, descricao: str, link: str, botao: str,
+    quantidade: Optional[int] = None, privado: bool = False
+) -> str:
+    classe = "card private" if privado else "card"
+    numero = f'<strong>{int(quantidade)}</strong>' if quantidade is not None else ""
+    return (
+        f'<article class="{classe}"><div class="ico">{icone}</div><h3>{html.escape(titulo)}</h3>'
+        f'{numero}<p>{html.escape(descricao)}</p>'
+        f'<a href="{html.escape(link, quote=True)}">{html.escape(botao)}</a></article>'
+    )
+
+
+async def central_portal_http(request: web.Request) -> web.Response:
+    qtd_bo = len(_v44_boletins_ativos_snapshot())
+    qtd_procurados = len(_v43_procurados_ativos())
+    qtd_pericias = _v50_contar_pericias_pendentes()
+    conta = _v62_conta_request(request)
+    operador = (
+        f"OPERADOR: {html.escape(str(conta.get('qra')))} • PASSAPORTE {html.escape(str(conta.get('passaporte')))}"
+        if conta else
+        "IDENTIFICAÇÃO SOLICITADA NO PRIMEIRO ACESSO"
+    )
+    cards = "".join([
+        _v62_card_portal(
+            "📋", "Boletins Ativos",
+            "Ocorrências que continuam em andamento e exigem acompanhamento da equipe.",
+            "/boletins", "Abrir boletins", qtd_bo,
+        ),
+        _v62_card_portal(
+            "🎯", "Procurados Ativos",
+            "Lista oficial dos indivíduos procurados em Capital Morada do Valley.",
+            "/catalogo", "Consultar procurados", qtd_procurados,
+        ),
+        _v62_card_portal(
+            "🧪", "Perícias Pendentes",
+            "Laudos e coletas que ainda aguardam análise, vínculo ou conclusão.",
+            "/pericias", "Abrir perícias", qtd_pericias,
+        ),
+        _v62_card_portal(
+            "🗃️", "Banco de Dados",
+            "Fichas, veículos, organizações, evidências e histórico investigativo.",
+            "/fichas", "Acessar banco", None, True,
+        ),
+        _v62_card_portal(
+            "🧬", "Árvore de Inteligência",
+            "Conexões entre indivíduos, veículos, ocorrências e organizações.",
+            "/arvore", "Abrir vínculos", None, True,
+        ),
+    ])
+    css = ''':root{--g:#d7a93d;--g2:#f2d47d;--bg:#070806;--p:#10120d;--l:#3b321a;--t:#f7f1db;--m:#96917e}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#3a2d0c55,transparent 42%),var(--bg);color:var(--t);font-family:Inter,Arial;min-height:100vh}
+header{height:108px;border-bottom:1px solid var(--l);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07f4}
+.brand{grid-column:2;display:flex;align-items:center;gap:15px}.brand img{width:74px;height:80px;object-fit:contain;filter:drop-shadow(0 0 20px #d7a93d40)}
+.brand h1{margin:0;font-size:20px;letter-spacing:2px}.brand small{color:var(--g);letter-spacing:1.5px}.nav{justify-self:end;display:flex;gap:16px;flex-wrap:wrap}
+.nav a{color:#e8dcab;text-decoration:none;font-size:13px}.nav a:hover,.nav .active{color:var(--g2)}
+main{max-width:1120px;margin:auto;padding:58px 24px 75px}.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:34px;align-items:center;margin-bottom:44px}
+.label{font-size:11px;letter-spacing:2px;color:var(--g)}.hero h2{font:52px/1.04 Georgia;margin:10px 0 18px}.hero h2 span{color:var(--g2)}
+.hero p{color:#bbb49c;font-size:17px;line-height:1.65}.mark{height:260px;border:1px solid var(--l);border-radius:28px;background:linear-gradient(145deg,#17180f,#0b0c09);display:grid;place-items:center}
+.mark img{width:185px;height:195px;object-fit:contain}.operator{margin-top:15px;color:#d2bd73;font-size:11px;letter-spacing:1.1px}.section{font-size:11px;letter-spacing:2px;color:var(--g);margin-bottom:15px}
+.grid{display:flex;flex-wrap:wrap;justify-content:center;gap:17px}.card{flex:1 1 310px;max-width:350px;min-height:230px;padding:25px;border:1px solid #2e2919;border-radius:18px;background:linear-gradient(155deg,#15170f,#0c0d0a);position:relative}
+.card:hover{border-color:#8b712d;transform:translateY(-3px)}.ico{font-size:30px}.card h3{margin:18px 0 7px}.card strong{display:block;font-size:36px;color:var(--g2)}
+.card p{color:var(--m);line-height:1.5;min-height:66px}.card a{display:inline-flex;text-decoration:none;color:#111;background:linear-gradient(135deg,var(--g2),var(--g));padding:10px 14px;border-radius:9px;font-weight:800}
+.private:after{content:'ACESSO RESTRITO';position:absolute;right:15px;top:15px;color:#bfa85d;font-size:9px;letter-spacing:1.2px;border:1px solid #5b4b22;border-radius:99px;padding:5px 8px}
+footer{text-align:center;color:#625f52;font-size:11px;padding:0 20px 42px}@media(max-width:900px){header{height:auto;grid-template-columns:1fr;padding:15px}.brand{grid-column:1}.nav{justify-self:start;margin-top:12px}.hero{grid-template-columns:1fr}.mark{display:none}}
+@media(max-width:650px){.hero h2{font-size:36px}.card{max-width:none}}'''
+    pagina = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DICOR • Central de Inteligência</title><style>{css}</style></head><body>
+<header><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><h1>DICOR • CENTRAL DE INTELIGÊNCIA</h1>
+<small>POLÍCIA FEDERAL • CAPITAL MORADA DO VALLEY</small></div></div>
+<nav class="nav"><a class="active" href="/">Central</a><a href="/boletins">Boletins</a><a href="/catalogo">Procurados</a>
+<a href="/pericias">Perícias</a><a href="/fichas">Banco de Dados</a><a href="/arvore">Árvore</a></nav></header>
+<main><section class="hero"><div><div class="label">CENTRAL OPERACIONAL</div>
+<h2>Toda operação começa com <span>informação.</span></h2>
+<p>Acompanhe ocorrências em andamento, consulte alvos, revise perícias e cruze vínculos antes da próxima QRU.
+A Central DICOR mantém a equipe alinhada e o histórico da cidade ao alcance dos agentes em serviço.</p>
+<div class="operator">{operador}</div></div><div class="mark"><img src="/central/brasao-dicor.png"></div></section>
+<div class="section">MÓDULOS DA CENTRAL</div><section class="grid">{cards}</section></main>
+<footer>DICOR • POLÍCIA FEDERAL • AMBIENTE FICTÍCIO DE GTA RP</footer></body></html>'''
+    return web.Response(text=pagina, content_type="text/html", charset="utf-8")
+
+
+def _v23_pericias_html() -> str:
+    registros = carregar_json(CENTRAL_PERICIAS_SNAPSHOT_JSON, [])
+    if isinstance(registros, dict):
+        registros = registros.get("pericias") or registros.get("registros") or []
+    pendentes = [x for x in registros if isinstance(x, dict) and _v44_pericia_pendente(x)]
+    cards = []
+    for pericia in pendentes:
+        numero = str(pericia.get("numero") or pericia.get("id") or "S/N")
+        titulo = str(pericia.get("titulo") or pericia.get("tipo") or "Perícia pendente")
+        texto = html.escape(
+            _v37_limpar_texto_central(
+                str(pericia.get("texto") or pericia.get("descricao") or "Sem descrição.")
+            )
+        ).replace("\n", "<br>")
+        urls = []
+        for item in pericia.get("midias", []) or pericia.get("imagens", []) or []:
+            url = _v21_midia_url(item) if "_v21_midia_url" in globals() else str(item or "")
+            if url and url not in urls:
+                urls.append(url)
+        galeria = "".join(
+            f'<a href="{html.escape(url, quote=True)}" target="_blank">'
+            f'<img src="{html.escape(url, quote=True)}" loading="lazy"></a>'
+            for url in urls[:8]
+        )
+        fonte = str(pericia.get("mensagem_url") or pericia.get("jump_url") or "")
+        botao = (
+            f'<a class="abrir" href="{html.escape(fonte, quote=True)}" target="_blank">Abrir perícia no Discord</a>'
+            if fonte else ""
+        )
+        cards.append(
+            f'<article><div class="cab"><div><small>PERÍCIA PENDENTE</small>'
+            f'<h2>{html.escape(titulo)}</h2></div><b>Nº {html.escape(numero)}</b></div>'
+            f'<div class="texto">{texto}</div>'
+            f'{f"<div class=media>{galeria}</div>" if galeria else ""}{botao}</article>'
+        )
+    corpo = "".join(cards) or '<div class="vazio">Nenhuma perícia pendente no momento.</div>'
+    css = '''*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% -15%,#4b391233,transparent 40%),#070806;color:#f7f1db;font-family:Inter,Arial}
+.top{height:106px;border-bottom:1px solid #493b1d;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 4vw;background:#090a07f4}
+.brand{grid-column:2;display:flex;align-items:center;gap:14px}.brand img{width:68px;height:76px;object-fit:contain}.brand b{letter-spacing:1.6px}.brand small{display:block;color:#d7a93d;margin-top:4px}
+.top>a{justify-self:end;color:#efd473;text-decoration:none}.wrap{width:min(1160px,calc(100% - 34px));margin:0 auto;padding:48px 0 75px}
+.hero{max-width:760px;margin:0 auto 32px;text-align:center}.hero small{color:#d7a93d;letter-spacing:1.7px}.hero h1{font:43px Georgia,serif;margin:10px 0}.hero p{color:#aaa28b;line-height:1.6}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start;justify-content:center}
+article{width:100%;background:linear-gradient(145deg,#12140f,#0c0d0a);border:1px solid #493b1d;border-radius:18px;padding:23px;box-shadow:0 16px 45px #0004}
+.cab{display:flex;justify-content:space-between;gap:15px;border-bottom:1px solid #302918;padding-bottom:13px}.cab small{color:#d7a93d}.cab h2{font-size:21px;margin:6px 0 0}.cab b{color:#efd473;white-space:nowrap}
+.texto{line-height:1.58;color:#d9d3c0;padding-top:15px;max-height:290px;overflow:auto;word-break:break-word}
+.media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:15px}.media img{width:100%;height:210px;object-fit:contain;background:#050604;border:1px solid #493b1d;border-radius:10px}
+.abrir{display:inline-block;margin-top:15px;color:#f1d373;border:1px solid #6b5726;padding:9px 12px;border-radius:9px;text-decoration:none}.vazio{grid-column:1/-1;text-align:center;border:1px solid #493b1d;border-radius:16px;padding:28px;color:#aaa28b}
+@media(max-width:820px){.top{height:auto;grid-template-columns:1fr;padding:15px}.brand{grid-column:1}.top>a{justify-self:start;margin-top:10px}.grid{grid-template-columns:1fr}.wrap{padding-top:32px}}
+@media(max-width:520px){.media{grid-template-columns:1fr}.hero h1{font-size:34px}}'''
+    return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Perícias Pendentes • DICOR</title><style>{css}</style></head><body>
+<header class="top"><div></div><div class="brand"><img src="/central/brasao-dicor.png"><div><b>DICOR • CENTRAL DE PERÍCIAS</b>
+<small>DOCUMENTAÇÃO TÉCNICA OPERACIONAL</small></div></div><a href="/">VOLTAR À CENTRAL</a></header>
+<main class="wrap"><section class="hero"><small>ACOMPANHAMENTO PERICIAL</small><h1>Perícias que exigem atuação</h1>
+<p>Laudos, coletas e provas que ainda aguardam análise, vínculo ou conclusão pela equipe responsável.</p></section>
+<section class="grid">{corpo}</section></main></body></html>'''
+
+
+# OCR: os arquivos usados por threads não são mais apagados junto com /tmp.
+def _banco_ocr_variantes(caminho: str) -> Tuple[List[str], List[str]]:
+    origem_path = Path(str(caminho or ""))
+    if not origem_path.exists() or not origem_path.is_file():
+        return [], []
+    if PILImage is None:
+        return [str(origem_path)], []
+    temporarios: List[str] = []
+    variantes: List[str] = []
+    try:
+        from PIL import ImageOps, ImageEnhance, ImageFilter
+        with PILImage.open(origem_path) as origem:
+            img = ImageOps.exif_transpose(origem).convert("RGB")
+        img.thumbnail((1500, 1500), PILImage.Resampling.LANCZOS)
+        V62_OCR_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        p_full = V62_OCR_STAGING_DIR / f"ocr-{int(time.time()*1000)}-{secrets.token_hex(4)}.jpg"
+        img.save(p_full, "JPEG", quality=90, optimize=True)
+        variantes.append(str(p_full))
+        temporarios.append(str(p_full))
+        w, h = img.size
+        if w >= 420 and h >= 320:
+            crop = img.crop((0, int(h * 0.38), w, h))
+            crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+            crop = ImageEnhance.Contrast(crop).enhance(1.7)
+            crop = crop.filter(ImageFilter.SHARPEN)
+            p_crop = V62_OCR_STAGING_DIR / f"ocr-crop-{int(time.time()*1000)}-{secrets.token_hex(4)}.png"
+            crop.save(p_crop, "PNG", optimize=True)
+            variantes.append(str(p_crop))
+            temporarios.append(str(p_crop))
+            crop.close()
+        img.close()
+    except FileNotFoundError:
+        return [], []
+    except Exception as erro:
+        print(f"⚠️ V62 OCR variantes: {type(erro).__name__}: {erro}", flush=True)
+        return ([str(origem_path)] if origem_path.exists() else []), []
+    return variantes, temporarios
+
+
+_V62_PROCESSAR_MIDIA_ANTERIOR = _v53_prisao_processar_uma_midia
+
+
+async def _v53_prisao_processar_uma_midia(
+    descritor: Dict[str, Any], pasta: Path, semaforo: asyncio.Semaphore
+) -> Optional[Dict[str, Any]]:
+    async with semaforo:
+        persistente: Optional[Path] = None
+        try:
+            caminho = await asyncio.wait_for(
+                _prisao_baixar_descritor(descritor, pasta),
+                timeout=V53_PRISAO_DOWNLOAD_TIMEOUT,
+            )
+            if caminho is None or not Path(caminho).exists():
+                return None
+            if not await asyncio.to_thread(_prisao_eh_imagem, caminho):
+                return None
+
+            sufixo = Path(caminho).suffix.lower() or ".png"
+            persistente = V62_OCR_STAGING_DIR / (
+                f"prisao-{int(time.time()*1000)}-{secrets.token_hex(5)}{sufixo}"
+            )
+            await asyncio.to_thread(shutil.copy2, str(caminho), str(persistente))
+
+            try:
+                ocr_texto, ocr_linhas = await asyncio.wait_for(
+                    asyncio.to_thread(_prisao_ocr_texto, persistente),
+                    timeout=V53_PRISAO_OCR_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # A thread pode continuar, mas o arquivo permanece no staging.
+                ocr_texto, ocr_linhas = "", []
+            item = dict(descritor)
+            item.update({
+                "path": persistente,
+                "ocr_texto": ocr_texto,
+                "ocr_linhas": ocr_linhas,
+            })
+            return item
+        except FileNotFoundError:
+            return None
+        except Exception as erro:
+            print(
+                f"⚠️ V62 mídia prisional {descritor.get('nome')}: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+            return None
+
+
+def _v62_limpar_staging_ocr() -> int:
+    removidos = 0
+    limite = time.time() - 8 * 3600
+    try:
+        for arquivo in V62_OCR_STAGING_DIR.iterdir():
+            if arquivo.is_file() and arquivo.stat().st_mtime < limite:
+                arquivo.unlink(missing_ok=True)
+                removidos += 1
+    except Exception:
+        pass
+    return removidos
+
+
+@web.middleware
+async def central_auth_middleware(request: web.Request, handler):
+    caminho = request.path
+    overlay_api = caminho in {LIVE_OVERLAY_API_PATH, LIVE_OVERLAY_STATE_PATH}
+    publicos = (
+        caminho in {
+            "/", "/index.html", "/acesso", "/sair", "/cadastro-operador",
+            "/registro-acessos", "/registro-acessos.json", "/health", "/healthz",
+        }
+        or caminho.startswith("/catalogo")
+        or caminho.startswith("/uploads/")
+        or caminho.startswith("/central/")
+        or caminho.startswith("/central-bo-media/")
+        or caminho.startswith("/central-pericias-media/")
+        or caminho.startswith("/central-dossies-preview/")
+        or overlay_api
+    )
+    if publicos:
+        return await handler(request)
+
+    conta = _v62_conta_request(request)
+    if not conta:
+        if caminho.startswith("/api/"):
+            return web.json_response(
+                {"ok": False, "erro": "Identificação operacional necessária."},
+                status=401,
+            )
+        destino = quote(str(request.rel_url), safe="/?=&")
+        raise web.HTTPFound(f"/cadastro-operador?next={destino}")
+
+    area = _v62_area_request(request)
+    _v62_registrar_evento(request, conta, area)
+
+    perfil_suficiente = caminho in {
+        LIVE_OVERLAY_PATH,
+        "/boletins", "/boletins.html",
+        "/pericias", "/pericias.html",
+    }
+    chave_live = str(request.query.get("livekey") or "")
+    acesso_live = bool(
+        LIVE_OVERLAY_VIEW_TOKEN
+        and secrets.compare_digest(chave_live, LIVE_OVERLAY_VIEW_TOKEN)
+        and caminho in {"/boletins", "/boletins.html", "/pericias", "/pericias.html"}
+    )
+    if perfil_suficiente or acesso_live or _central_token_valido(request):
+        return await handler(request)
+
+    if caminho.startswith("/api/"):
+        return web.json_response(
+            {"ok": False, "erro": "Acesso restrito. Autorize este dispositivo."},
+            status=401,
+        )
+    destino = quote(str(request.rel_url), safe="/?=&")
+    raise web.HTTPFound(f"/acesso?next={destino}")
+
+
+async def start_web_server():
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+    if _WEB_RUNNER_DICOR is not None:
+        return
+    for pasta in (
+        DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, DOSSIES_DIR, PUBLIC_BACKUPS_DIR,
+        CENTRAL_BO_MEDIA_DIR, CENTRAL_PERICIAS_MEDIA_DIR,
+        CENTRAL_DOSSIES_PREVIEW_DIR, V62_OCR_STAGING_DIR,
+    ):
+        Path(pasta).mkdir(parents=True, exist_ok=True)
+
+    app = web.Application(
+        client_max_size=100 * 1024 * 1024,
+        middlewares=[central_auth_middleware],
+    )
+    app.router.add_get("/", central_portal_http)
+    app.router.add_get("/index.html", central_portal_http)
+    app.router.add_get("/central/brasao-dicor.png", central_brasao_dicor_http)
+    app.router.add_get("/cadastro-operador", v62_cadastro_operador_get)
+    app.router.add_post("/cadastro-operador", v62_cadastro_operador_post)
+    app.router.add_get("/registro-acessos", v62_admin_acessos_get)
+    app.router.add_post("/registro-acessos", v62_admin_acessos_post)
+    app.router.add_get("/registro-acessos.json", v62_admin_acessos_json)
+    app.router.add_get("/acesso", central_login_get)
+    app.router.add_post("/acesso", central_login_post)
+    app.router.add_get("/sair", central_logout_http)
+    app.router.add_get("/catalogo", pagina_inicial)
+    app.router.add_get("/catalogo.html", pagina_inicial)
+    app.router.add_get("/arvore", arvore_pagina_http)
+    app.router.add_get("/arvore.html", arvore_pagina_http)
+    app.router.add_get("/api/arvore/{individuo_id}", arvore_api_http)
+    app.router.add_get("/fichas", central_fichas_http)
+    app.router.add_get("/boletins", central_boletins_http)
+    app.router.add_get("/boletins.html", central_boletins_http)
+    app.router.add_get("/pericias", central_pericias_http)
+    app.router.add_get("/pericias.html", central_pericias_http)
+    app.router.add_get("/dossies-central", central_dossies_http)
+    app.router.add_get(LIVE_OVERLAY_PATH, live_overlay_page_http)
+    app.router.add_get(LIVE_OVERLAY_STATE_PATH, live_overlay_state_http)
+    app.router.add_post(LIVE_OVERLAY_API_PATH, live_overlay_update_http)
+    app.router.add_get("/health", healthcheck_http)
+    app.router.add_get("/healthz", healthcheck_http)
+    app.router.add_get("/dossies/{caminho:.+}", baixar_dossie_http)
+    app.router.add_get("/backups/{caminho:.+}", baixar_backup_http)
+    app.router.add_post("/api/catalogo/apagar", api_apagar_procurado)
+    app.router.add_static("/uploads/", path=str(UPLOADS_DIR), show_index=False)
+    app.router.add_static("/central-bo-media/", path=str(CENTRAL_BO_MEDIA_DIR), show_index=False)
+    app.router.add_static("/central-pericias-media/", path=str(CENTRAL_PERICIAS_MEDIA_DIR), show_index=False)
+    app.router.add_static("/central-dossies-preview/", path=str(CENTRAL_DOSSIES_PREVIEW_DIR), show_index=False)
+
+    porta = int(os.getenv("PORT", str(PORT)) or PORT)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=porta)
+    await site.start()
+    _WEB_RUNNER_DICOR = runner
+    _WEB_SITE_DICOR = site
+    asyncio.create_task(asyncio.to_thread(gerar_catalogo_html))
+    print(
+        "✅ V62 web ativa: cadastro operacional único, registros restritos, "
+        "perícias centralizadas e painel de live protegido.",
+        flush=True,
+    )
+
+
+@tasks.loop(hours=6)
+async def _v62_limpeza_ocr_loop():
+    try:
+        await asyncio.to_thread(_v62_limpar_staging_ocr)
+    except Exception:
+        pass
+
+
+@bot.listen("on_ready")
+async def _v62_on_ready():
+    try:
+        removidos = await asyncio.to_thread(_v62_limpar_staging_ocr)
+        if not _v62_limpeza_ocr_loop.is_running():
+            _v62_limpeza_ocr_loop.start()
+        print(
+            f"✅ V62 OCR staging revisado: {removidos} arquivo(s) antigo(s) removido(s).",
+            flush=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+print(
+    "✅ V62 carregada — permissões do Banco, cadastro único, acessos restritos, "
+    "Perícias alinhadas, texto RP e OCR temporário corrigido.",
+    flush=True,
+)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
