@@ -57997,9 +57997,6 @@ print(
     flush=True,
 )
 
-if __name__ == '__main__':
-    asyncio.run(main())
-
 # =====================================================
 # PATCH V55 — MANDADOS/COMPARECIMENTOS SOMENTE COMO IMAGEM NO CHAT
 # =====================================================
@@ -58834,3 +58831,720 @@ async def _v52_processar_boletim(message: discord.Message) -> bool:
 
 
 print('✅ V57 carregada — fotos de procurados usam fallback do Discord e não param mais por RuntimeError.')
+
+# =====================================================
+# PATCH V58 — FLUXO DEFINITIVO DE FOTOS DE PROCURADOS
+# =====================================================
+# Correções:
+# - O cadastro iniciado pelo BO abre sempre um canal temporário privado.
+# - Fotos são aceitas automaticamente, sem botões de confirmação.
+# - A captura não depende do volume do Railway: guarda primeiro a URL do anexo.
+# - Na publicação oficial, as URLs são baixadas em memória e reenviadas como
+#   anexos permanentes no canal oficial de procurados.
+# - O canal do BO não recebe etapas, status ou mensagens de erro.
+# - Erros técnicos são enviados somente aos logs.
+# - Corrige versões anteriores que estavam posicionadas depois do main().
+
+_V58_VIEWS_REGISTRADAS = False
+_V58_FOTO_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _v58_lock(canal_id: int) -> asyncio.Lock:
+    chave = int(canal_id or 0)
+    lock = _V58_FOTO_LOCKS.get(chave)
+    if lock is None:
+        lock = asyncio.Lock()
+        _V58_FOTO_LOCKS[chave] = lock
+    return lock
+
+
+def _v58_url_anexo(anexo: discord.Attachment) -> str:
+    for valor in (getattr(anexo, 'url', None), getattr(anexo, 'proxy_url', None)):
+        url = str(valor or '').strip()
+        if url.startswith(('https://', 'http://')):
+            return url
+    return ''
+
+
+def _arquivo_upload_procurado_existe(valor: Any) -> bool:
+    """Aceita arquivo local existente, data URI ou URL HTTPS válida.
+
+    A URL é convertida em anexo permanente no momento da publicação oficial.
+    """
+    referencia = str(valor or '').strip()
+    if not referencia:
+        return False
+    if referencia.startswith(('data:', 'https://', 'http://')):
+        return True
+    try:
+        local = _v10_resolver_foto(referencia)
+        return bool(local and local.exists() and local.stat().st_size > 0)
+    except Exception:
+        return False
+
+
+def _fotos_procurado_validas(dados: Dict[str, Any]) -> bool:
+    return (
+        _arquivo_upload_procurado_existe(dados.get('foto_individuo'))
+        and _arquivo_upload_procurado_existe(dados.get('foto_rg'))
+    )
+
+
+async def _v52_salvar_foto(anexo: discord.Attachment, prefixo: str) -> str:
+    """Captura instantânea e infalível para o fluxo.
+
+    Não bloqueia o cadastro tentando gravar no volume. O anexo é reenviado para
+    o canal oficial no fim do processo, tornando-se persistente naquele canal.
+    """
+    url = _v58_url_anexo(anexo)
+    if not url:
+        raise RuntimeError('ANEXO_SEM_URL_DISCORD')
+    return url
+
+
+async def _v58_ler_referencia_foto(referencia: Any) -> tuple[bytes, str]:
+    texto = str(referencia or '').strip()
+    if not texto:
+        raise RuntimeError('REFERENCIA_DE_FOTO_VAZIA')
+
+    local = None
+    try:
+        local = _v10_resolver_foto(texto)
+    except Exception:
+        local = None
+    if local is not None and local.exists() and local.stat().st_size > 0:
+        return await asyncio.to_thread(local.read_bytes), (local.suffix.lower() or '.png')
+
+    if not texto.startswith(('https://', 'http://')):
+        raise RuntimeError('FOTO_NAO_LOCALIZADA')
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; DICOR-Intelligence/1.0)',
+        'Accept': 'image/*,*/*;q=0.8',
+        'Referer': 'https://discord.com/',
+    }
+    async with ClientSession(timeout=ClientTimeout(total=45), headers=headers) as session:
+        async with session.get(texto, allow_redirects=True) as resposta:
+            if resposta.status != 200:
+                raise RuntimeError(f'FOTO_HTTP_{resposta.status}')
+            dados = await resposta.read()
+            if not dados:
+                raise RuntimeError('FOTO_SEM_BYTES')
+            content_type = str(resposta.headers.get('Content-Type') or '').lower()
+    sufixo = Path(urlparse(texto).path).suffix.lower()
+    if sufixo not in {'.png', '.jpg', '.jpeg', '.webp', '.gif'}:
+        if 'png' in content_type:
+            sufixo = '.png'
+        elif 'webp' in content_type:
+            sufixo = '.webp'
+        elif 'gif' in content_type:
+            sufixo = '.gif'
+        else:
+            sufixo = '.jpg'
+    return dados, sufixo
+
+
+async def postar_procurado_oficial(registro: Dict[str, Any]) -> Optional[discord.Message]:
+    """Publica as duas fotos mesmo quando o volume do Railway está indisponível."""
+    canal = await obter_canal_por_id(int(PROCURADOS_CHANNEL_ID or 0))
+    if canal is None or not hasattr(canal, 'send'):
+        raise RuntimeError('CANAL_OFICIAL_PROCURADOS_NAO_ENCONTRADO')
+
+    try:
+        (dados_pessoa, ext_pessoa), (dados_rg, ext_rg) = await asyncio.gather(
+            _v58_ler_referencia_foto(registro.get('foto_individuo')),
+            _v58_ler_referencia_foto(registro.get('foto_rg')),
+        )
+    except Exception as erro:
+        await enviar_log(
+            f'❌ V58 falha ao preparar fotos para publicação | RG `{registro.get("rg")}` | '
+            f'{type(erro).__name__}: {erro}'
+        )
+        raise
+
+    rg_nome = re.sub(
+        r'[^0-9A-Za-z_-]+', '-', str(registro.get('rg') or 'sem-rg')
+    ).strip('-') or 'sem-rg'
+    buffer_pessoa = io.BytesIO(dados_pessoa)
+    buffer_rg = io.BytesIO(dados_rg)
+    buffer_pessoa.seek(0)
+    buffer_rg.seek(0)
+    arquivos = [
+        discord.File(buffer_pessoa, filename=f'foto_individuo_{rg_nome}{ext_pessoa}'),
+        discord.File(buffer_rg, filename=f'foto_rg_{rg_nome}{ext_rg}'),
+    ]
+    try:
+        mensagem = await canal.send(
+            content=cortar_discord(criar_texto_procurado(registro), 1900),
+            files=arquivos,
+            allowed_mentions=discord.AllowedMentions(
+                users=False, roles=False, everyone=False
+            ),
+        )
+    finally:
+        buffer_pessoa.close()
+        buffer_rg.close()
+
+    conferida = mensagem
+    try:
+        if len(getattr(conferida, 'attachments', []) or []) < 2:
+            conferida = await canal.fetch_message(int(mensagem.id))
+    except Exception:
+        conferida = mensagem
+
+    anexos = list(getattr(conferida, 'attachments', []) or [])
+    if len(anexos) < 2:
+        try:
+            await mensagem.delete()
+        except Exception:
+            pass
+        raise RuntimeError('DISCORD_NAO_CONFIRMOU_DUAS_FOTOS')
+
+    # O catálogo passa a usar as URLs da mensagem oficial, não as temporárias.
+    registro['foto_individuo'] = str(anexos[0].url)
+    registro['foto_rg'] = str(anexos[1].url)
+    registro['foto_individuo_msg_id'] = mensagem.id
+    registro['foto_rg_msg_id'] = mensagem.id
+    return conferida
+
+
+async def _v52_processar_boletim(message: discord.Message) -> bool:
+    """Desativa definitivamente o processamento de fotos dentro do canal do BO."""
+    return False
+
+
+async def _v58_editar_prompt(canal: discord.TextChannel, prompt_id: int, **kwargs) -> None:
+    if not prompt_id:
+        return
+    try:
+        prompt = await canal.fetch_message(int(prompt_id))
+        await prompt.edit(**kwargs)
+    except Exception:
+        pass
+
+
+async def _v52_processar_painel(message: discord.Message) -> bool:
+    """Captura automática das fotos somente no canal temporário privado."""
+    canal = message.channel
+    if not isinstance(canal, discord.TextChannel):
+        return False
+    dados = cadastros_pendentes.get(int(canal.id))
+    if not isinstance(dados, dict) or not dados.get('_fluxo_fotos_v58'):
+        return False
+
+    etapa = str(dados.get('etapa_fotos') or '')
+    etapas_validas = {
+        'aguardando_foto_individuo', 'corrigir_foto_individuo',
+        'aguardando_foto_rg', 'corrigir_foto_rg',
+    }
+    if etapa not in etapas_validas:
+        return False
+    if (
+        int(message.author.id) != int(dados.get('autor_id') or 0)
+        and not usuario_e_administrador(message.author)
+    ):
+        return False
+
+    imagens = _v52_imagens_mensagem(message)
+    if not imagens:
+        return False
+    if len(imagens) != 1:
+        # Sem mensagem de erro no canal; apenas registra para diagnóstico.
+        await enviar_log(
+            f'⚠️ V58 recebeu {len(imagens)} imagens na mesma etapa | '
+            f'canal `{canal.id}` | usuário `{message.author.id}`'
+        )
+        return True
+
+    async with _v58_lock(canal.id):
+        try:
+            url = _v58_url_anexo(imagens[0])
+            if not url:
+                raise RuntimeError('ANEXO_SEM_URL')
+
+            prompt_id = int(
+                dados.get('foto_individuo_prompt_id')
+                or dados.get('foto_rg_prompt_id')
+                or 0
+            )
+            if etapa in {'aguardando_foto_individuo', 'corrigir_foto_individuo'}:
+                dados.update({
+                    'foto_individuo': url,
+                    'foto_individuo_msg_id': int(message.id),
+                    'foto_individuo_anexo_id': int(getattr(imagens[0], 'id', 0) or 0),
+                    'foto_individuo_confirmada_em': agora_br(),
+                    'foto_individuo_confirmada_por_id': int(message.author.id),
+                    'etapa_fotos': 'aguardando_foto_rg',
+                })
+                cadastros_pendentes[canal.id] = dados
+                salvar_cadastros_pendentes()
+                await _v58_editar_prompt(
+                    canal,
+                    prompt_id,
+                    content=(
+                        '✅ **Foto do indivíduo recebida.**\n\n'
+                        '🪪 Agora envie **somente a foto do RG**.\n'
+                        'O sistema reconhecerá automaticamente.'
+                    ),
+                    view=None,
+                )
+                dados['foto_rg_prompt_id'] = prompt_id
+                cadastros_pendentes[canal.id] = dados
+                salvar_cadastros_pendentes()
+                try:
+                    await message.add_reaction('✅')
+                except Exception:
+                    pass
+                return True
+
+            dados.update({
+                'foto_rg': url,
+                'foto_rg_msg_id': int(message.id),
+                'foto_rg_anexo_id': int(getattr(imagens[0], 'id', 0) or 0),
+                'foto_rg_confirmada_em': agora_br(),
+                'foto_rg_confirmada_por_id': int(message.author.id),
+                'etapa_fotos': 'fotos_confirmadas',
+            })
+            cadastros_pendentes[canal.id] = dados
+            salvar_cadastros_pendentes()
+            await _v58_editar_prompt(
+                canal,
+                prompt_id,
+                content=(
+                    '✅ **As duas fotos foram recebidas.**\n'
+                    'Clique em **Finalizar Cadastro** para publicar ou enviar à autorização.'
+                ),
+                view=FinalizarProcuradoView(),
+            )
+            try:
+                await message.add_reaction('✅')
+            except Exception:
+                pass
+            return True
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f'❌ V58 falha silenciosa na captura de foto | canal `{canal.id}` | '
+                f'mensagem `{message.id}` | etapa `{etapa}` | '
+                f'{type(erro).__name__}: {erro}\n```py\n'
+                f'{traceback.format_exc()[-2600:]}\n```'
+            )
+            # Não publica erro no canal. O prompt continua ativo para reenvio.
+            return True
+
+
+class PesquisaCrimesView(View):
+    """Versão final: ao terminar, inicia captura automática sem botões de foto."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _sessao_id(self, interaction: discord.Interaction) -> str:
+        return str(getattr(interaction.message, 'id', ''))
+
+    @discord.ui.button(
+        label='Pesquisar Crime', emoji='🔎', style=discord.ButtonStyle.blurple,
+        custom_id='dic_pesquisar_crime_v1'
+    )
+    async def pesquisar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message(
+                '❌ Sessão de crimes não encontrada.', ephemeral=True
+            )
+        await interaction.response.send_modal(PesquisaCrimeModal(sid))
+
+    @discord.ui.button(
+        label='Remover Último', emoji='↩️', style=discord.ButtonStyle.secondary,
+        custom_id='dic_remover_ultimo_crime_v1'
+    )
+    async def remover(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message(
+                '❌ Sessão não encontrada.', ephemeral=True
+            )
+        if (
+            interaction.user.id != int(sessao.get('autor_id') or 0)
+            and not usuario_e_administrador(interaction.user)
+        ):
+            return await interaction.response.send_message(
+                '❌ Esta sessão pertence a outro usuário.', ephemeral=True
+            )
+        artigos = list(sessao.get('artigos') or [])
+        if artigos:
+            artigos.pop()
+        sessao['artigos'] = artigos
+        _salvar_sessao_crime(sid, sessao)
+        await interaction.response.edit_message(
+            content=_texto_painel_pesquisa_crimes(sessao), view=self
+        )
+
+    @discord.ui.button(
+        label='Finalizar Crimes', emoji='✅', style=discord.ButtonStyle.green,
+        custom_id='dic_finalizar_crimes_v1'
+    )
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        sid = self._sessao_id(interaction)
+        sessao = _obter_sessao_crime(sid)
+        if not sessao:
+            return await interaction.response.send_message(
+                '❌ Sessão não encontrada.', ephemeral=True
+            )
+        if (
+            interaction.user.id != int(sessao.get('autor_id') or 0)
+            and not usuario_e_administrador(interaction.user)
+        ):
+            return await interaction.response.send_message(
+                '❌ Esta sessão pertence a outro usuário.', ephemeral=True
+            )
+        artigos = list(sessao.get('artigos') or [])
+        if not artigos:
+            return await interaction.response.send_message(
+                '❌ Pesquise e selecione pelo menos um crime.', ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        canal = interaction.channel
+        dados = cadastros_pendentes.get(int(getattr(canal, 'id', 0) or 0), {})
+        if not isinstance(canal, discord.TextChannel) or not isinstance(dados, dict):
+            return await interaction.followup.send(
+                '❌ Canal temporário não localizado.', ephemeral=True
+            )
+
+        dados['crimes'] = _formatar_crimes_selecionados(artigos)
+        dados['crimes_artigos'] = artigos
+        dados['etapa_fotos'] = 'aguardando_foto_individuo'
+        dados['_fluxo_fotos_v58'] = True
+        cadastros_pendentes[canal.id] = dados
+        salvar_cadastros_pendentes()
+
+        await interaction.message.edit(
+            content=_texto_painel_pesquisa_crimes(sessao) + '\n\n✅ **Seleção finalizada.**',
+            view=None,
+        )
+        prompt = await canal.send(
+            '📸 **FOTOS OBRIGATÓRIAS — ETAPA 1 DE 2**\n\n'
+            'Envie **somente a foto do indivíduo** neste canal.\n'
+            'Não precisa clicar em nenhum botão: o sistema aceitará automaticamente.',
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        dados['foto_individuo_prompt_id'] = int(prompt.id)
+        cadastros_pendentes[canal.id] = dados
+        salvar_cadastros_pendentes()
+        _apagar_sessao_crime(sid)
+        await interaction.followup.send(
+            '✅ Crimes finalizados. Envie a foto do indivíduo neste canal privado.',
+            ephemeral=True,
+        )
+
+
+class ProcuradoBoletimModal(Modal, title='Cadastrar como Procurado'):
+    nome = TextInput(label='Nome', max_length=120, required=True)
+    rg = TextInput(label='RG', max_length=50, required=True)
+    ultimo_avistamento = TextInput(
+        label='Último avistamento',
+        placeholder='Ex.: Portugal, Vanilla ou comunidade',
+        style=discord.TextStyle.paragraph,
+        max_length=700,
+        required=True,
+    )
+    detalhes = TextInput(
+        label='Características / outras informações',
+        style=discord.TextStyle.paragraph,
+        max_length=900,
+        required=False,
+    )
+
+    def __init__(
+        self,
+        dados: Optional[Dict[str, str]] = None,
+        *,
+        atendimento_id: Optional[str] = None,
+    ):
+        super().__init__()
+        self.atendimento_id = str(atendimento_id or '')
+        dados = dados or {}
+        valores = [
+            (self.nome, dados.get('nome', '')),
+            (self.rg, dados.get('rg', '')),
+            (
+                self.ultimo_avistamento,
+                dados.get('ultimo_avistamento') or dados.get('outras') or '',
+            ),
+            (
+                self.detalhes,
+                dados.get('caracteristicas')
+                or dados.get('outras_informacoes')
+                or '',
+            ),
+        ]
+        for campo, valor in valores:
+            try:
+                campo.default = str(valor or '')[:campo.max_length]
+            except Exception:
+                pass
+
+    async def on_submit(self, interaction: discord.Interaction):
+        etapa = 'validar dados'
+        canal = None
+        try:
+            nome = str(self.nome.value or '').strip()
+            rg = _banco_normalizar_rg(str(self.rg.value or ''))
+            ultimo = str(self.ultimo_avistamento.value or '').strip()
+            detalhes = str(self.detalhes.value or '').strip() or 'Não informado'
+            if not nome or not rg or not ultimo:
+                return await interaction.response.send_message(
+                    '❌ Nome, RG e último avistamento são obrigatórios.',
+                    ephemeral=True,
+                )
+            existente = procurar_por_rg(rg)
+            if existente:
+                return await interaction.response.send_message(
+                    '⚠️ Este RG já está cadastrado como procurado.',
+                    view=AbrirEdicaoProcuradoView(existente),
+                    ephemeral=True,
+                )
+
+            atendimento = _v56_atendimento_por_id(self.atendimento_id)
+            if not atendimento:
+                atendimento = await garantir_atendimento_interaction(interaction)
+            if not atendimento:
+                return await interaction.response.send_message(
+                    '❌ Atendimento do boletim não encontrado.', ephemeral=True
+                )
+            if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+                return await interaction.response.send_message(
+                    '❌ Apenas o responsável atual ou Inspetor+ pode cadastrar.',
+                    ephemeral=True,
+                )
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            guild = interaction.guild
+            if guild is None:
+                raise RuntimeError('SERVIDOR_NAO_LOCALIZADO')
+
+            etapa = 'criar canal temporário'
+            categoria = (
+                guild.get_channel(int(PROCURADOS_TEMP_CATEGORY_ID or 0))
+                if int(PROCURADOS_TEMP_CATEGORY_ID or 0) else None
+            )
+            if not isinstance(categoria, discord.CategoryChannel):
+                categoria = getattr(interaction.channel, 'category', None)
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                ),
+            }
+            if guild.me:
+                overwrites[guild.me] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True,
+                    manage_messages=True,
+                    attach_files=True,
+                    embed_links=True,
+                )
+            for cargo_id in set(CARGOS_ADMIN_IDS):
+                cargo = guild.get_role(int(cargo_id))
+                if cargo:
+                    overwrites[cargo] = discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                        embed_links=True,
+                    )
+
+            canal = await guild.create_text_channel(
+                name=f'📸・procurado-{slugify(nome)[:48]}',
+                category=categoria if isinstance(categoria, discord.CategoryChannel) else None,
+                overwrites=overwrites,
+                reason=f'Cadastro privado de procurado via BO por {interaction.user}',
+            )
+
+            etapa = 'salvar sessão'
+            dados = {
+                'nome': nome,
+                'rg': rg,
+                'ultimo_avistamento': ultimo,
+                'caracteristicas': detalhes,
+                'outras': detalhes,
+                'outras_informacoes': detalhes,
+                'numero_boletim': atendimento.get('numero'),
+                '_atendimento_id': atendimento.get('id'),
+                '_canal_bo_origem_id': getattr(interaction.channel, 'id', None),
+                '_fluxo_fotos_v58': True,
+                'autor_id': int(interaction.user.id),
+                'autor_nome': str(interaction.user),
+                'etapa_fotos': 'aguardando_crimes',
+            }
+            cadastros_pendentes[int(canal.id)] = dados
+            salvar_cadastros_pendentes()
+
+            painel = await canal.send('🔎 Preparando pesquisa de crimes...')
+            sessao = {
+                'tipo': 'painel',
+                'canal_id': int(canal.id),
+                'painel_id': int(painel.id),
+                'autor_id': int(interaction.user.id),
+                'nome': nome,
+                'rg': rg,
+                'artigos': [],
+            }
+            _salvar_sessao_crime(str(painel.id), sessao)
+            await painel.edit(
+                content=_texto_painel_pesquisa_crimes(sessao),
+                view=PesquisaCrimesView(),
+            )
+            await interaction.followup.send(
+                f'✅ Canal temporário criado: {canal.mention}\n'
+                'Todo o fluxo de crimes e fotos acontecerá nele.',
+                ephemeral=True,
+            )
+            await enviar_log(
+                f'🚨 V58 canal privado de procurado criado | BO `{atendimento.get("numero")}` | '
+                f'RG `{rg}` | canal `{canal.id}` | usuário `{interaction.user.id}`'
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f'❌ V58 erro ao iniciar procurado | etapa `{etapa}` | '
+                f'usuário `{getattr(interaction.user, "id", 0)}` | '
+                f'{type(erro).__name__}: {erro}\n```py\n'
+                f'{traceback.format_exc()[-2600:]}\n```'
+            )
+            if canal is not None:
+                try:
+                    await canal.delete(reason='Falha ao iniciar fluxo V58')
+                except Exception:
+                    pass
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        '❌ Não foi possível iniciar o canal temporário. O erro foi enviado aos logs.',
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        '❌ Não foi possível iniciar o canal temporário. O erro foi enviado aos logs.',
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
+
+
+class V58CadastrarProcuradoInterceptView(View):
+    """Intercepta inclusive botões antigos já publicados nos boletins."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Cadastrar como Procurado',
+        emoji='🚨',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_bo_cadastrar_procurado',
+    )
+    async def cadastrar(self, interaction: discord.Interaction, button: Button):
+        atendimento = await garantir_atendimento_interaction(interaction)
+        if not atendimento:
+            return await interaction.response.send_message(
+                '❌ Atendimento não encontrado.', ephemeral=True
+            )
+        if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+            return await interaction.response.send_message(
+                '❌ Apenas o responsável atual ou Inspetor+ pode cadastrar.',
+                ephemeral=True,
+            )
+        texto = ''
+        try:
+            canal_origem = interaction.guild.get_channel(
+                int(atendimento.get('canal_origem_id') or 0)
+            )
+            if canal_origem and atendimento.get('mensagem_original_id'):
+                msg = await canal_origem.fetch_message(
+                    int(atendimento.get('mensagem_original_id'))
+                )
+                texto = coletar_texto_embed(msg)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ V58 não pré-preencheu o procurado do BO '
+                f'`{atendimento.get("numero")}`: {erro}'
+            )
+        await interaction.response.send_modal(
+            ProcuradoBoletimModal(
+                extrair_dados_procurado_de_texto(texto),
+                atendimento_id=str(atendimento.get('id') or ''),
+            )
+        )
+
+
+class V58FluxoLegadoFotoView(View):
+    """Evita RuntimeError nos botões antigos sem publicar mensagens no BO."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Confirmar Foto do Indivíduo',
+        emoji='👤',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_bo_confirmar_foto_individuo_separada_v2',
+    )
+    async def individuo(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            'ℹ️ Este fluxo antigo foi substituído. Clique novamente em '
+            '**Cadastrar como Procurado** para abrir o canal temporário corrigido.',
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label='Confirmar Foto do RG',
+        emoji='🪪',
+        style=discord.ButtonStyle.danger,
+        custom_id='dic_bo_confirmar_foto_rg_separada_v2',
+    )
+    async def rg(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            'ℹ️ Este fluxo antigo foi substituído. Clique novamente em '
+            '**Cadastrar como Procurado** para abrir o canal temporário corrigido.',
+            ephemeral=True,
+        )
+
+
+@bot.listen('on_ready')
+async def v58_registrar_views_definitivas() -> None:
+    global _V58_VIEWS_REGISTRADAS
+    if _V58_VIEWS_REGISTRADAS:
+        return
+    try:
+        # Registradas por último para assumir os custom_ids das mensagens antigas.
+        bot.add_view(PesquisaCrimesView())
+        bot.add_view(V58CadastrarProcuradoInterceptView())
+        bot.add_view(V58FluxoLegadoFotoView())
+        _V58_VIEWS_REGISTRADAS = True
+        print(
+            '✅ V58 views registradas: procurados via BO usam canal temporário e fotos automáticas.',
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V58 falha ao registrar views: {type(erro).__name__}: {erro}'
+        )
+
+
+print(
+    '✅ V58 carregada — patches executados antes do main; fotos sem volume, '
+    'canal temporário e erros somente nos logs.',
+    flush=True,
+)
+if __name__ == '__main__':
+    asyncio.run(main())
