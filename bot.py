@@ -58241,3 +58241,515 @@ async def _enviar_comparecimento_fallback_canal_atual(
     return registro
 
 print('✅ V55 carregada — mandados/comparecimentos agora saem somente em imagem no chat.')
+
+
+# =====================================================
+# PATCH V56 — CADASTRO DE PROCURADO DO BOLETIM EM CANAL PRIVADO
+# =====================================================
+# - Corrige o modal "Cadastrar como Procurado".
+# - O fluxo de crimes e fotos não é mais publicado no canal do BO.
+# - Cria canal temporário privado para o solicitante e Inspetor+.
+# - Mensagens de andamento ficam no canal provisório e respostas azuis privadas.
+# - Erros completos vão para logs/Railway.
+# - O canal do BO não recebe painel, pedidos de foto ou confirmação final.
+
+def _v56_atendimento_por_id(atendimento_id: Any) -> Optional[Dict[str, Any]]:
+    alvo = str(atendimento_id or "").strip()
+    if not alvo:
+        return None
+    return next(
+        (a for a in carregar_atendimentos_boletins() if str(a.get("id")) == alvo),
+        None,
+    )
+
+
+async def _v56_criar_canal_privado_procurado(
+    interaction: discord.Interaction,
+    nome: str,
+) -> discord.TextChannel:
+    guild = interaction.guild
+    if guild is None:
+        raise RuntimeError("Servidor não localizado.")
+
+    categoria = (
+        guild.get_channel(PROCURADOS_TEMP_CATEGORY_ID)
+        if PROCURADOS_TEMP_CATEGORY_ID else None
+    )
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            attach_files=True,
+            embed_links=True,
+            read_message_history=True,
+        ),
+    }
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_messages=True,
+            attach_files=True,
+            embed_links=True,
+            read_message_history=True,
+        )
+
+    for cargo_id in set(CARGOS_ADMIN_IDS):
+        cargo = guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                attach_files=True,
+                embed_links=True,
+                read_message_history=True,
+            )
+
+    nome_canal = f"🚨・procurado-{slugify(nome)[:45]}"
+    return await guild.create_text_channel(
+        name=nome_canal,
+        category=categoria if isinstance(categoria, discord.CategoryChannel) else None,
+        overwrites=overwrites,
+        reason=f"Fluxo privado de procurado solicitado por {interaction.user}",
+    )
+
+
+class ProcuradoBoletimModal(Modal, title="Cadastrar como Procurado"):
+    nome = TextInput(label="Nome", max_length=120, required=True)
+    rg = TextInput(label="RG", max_length=50, required=True)
+    ultimo_avistamento = TextInput(
+        label="Último avistamento",
+        placeholder="Ex.: Portugal, Vanilla ou comunidade",
+        style=discord.TextStyle.paragraph,
+        max_length=700,
+        required=True,
+    )
+    detalhes = TextInput(
+        label="Características / outras informações",
+        style=discord.TextStyle.paragraph,
+        max_length=900,
+        required=False,
+    )
+
+    def __init__(self, dados: Optional[Dict[str, str]] = None):
+        super().__init__()
+        dados = dados or {}
+        valores = (
+            (self.nome, dados.get("nome", "")),
+            (self.rg, dados.get("rg", "")),
+            (
+                self.ultimo_avistamento,
+                dados.get("ultimo_avistamento") or dados.get("outras") or "",
+            ),
+            (
+                self.detalhes,
+                dados.get("caracteristicas")
+                or dados.get("outras_informacoes")
+                or "",
+            ),
+        )
+        for campo, valor in valores:
+            try:
+                campo.default = str(valor or "")[: campo.max_length]
+            except Exception:
+                pass
+
+    async def on_submit(self, interaction: discord.Interaction):
+        canal_privado = None
+        etapa = "início"
+        try:
+            nome = str(self.nome.value or "").strip()
+            rg = _banco_normalizar_rg(str(self.rg.value or ""))
+            ultimo = str(self.ultimo_avistamento.value or "").strip()
+            detalhes = (
+                str(self.detalhes.value or "Não informado").strip()
+                or "Não informado"
+            )
+
+            if not nome or not rg or not ultimo:
+                return await interaction.response.send_message(
+                    "❌ Nome, RG e último avistamento são obrigatórios.",
+                    ephemeral=True,
+                )
+
+            existente = procurar_por_rg(rg)
+            if existente:
+                return await interaction.response.send_message(
+                    "⚠️ Este RG já está cadastrado como procurado.",
+                    view=AbrirEdicaoProcuradoView(existente),
+                    ephemeral=True,
+                )
+
+            etapa = "localizar atendimento"
+            atendimento = await garantir_atendimento_interaction(interaction)
+            if not atendimento:
+                return await interaction.response.send_message(
+                    "❌ Não consegui localizar o boletim deste botão.",
+                    ephemeral=True,
+                )
+            if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+                return await interaction.response.send_message(
+                    "❌ Apenas o responsável atual ou Inspetor+ pode usar esta ação.",
+                    ephemeral=True,
+                )
+
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+            etapa = "criar canal privado"
+            canal_privado = await _v56_criar_canal_privado_procurado(
+                interaction, nome
+            )
+
+            dados = {
+                "nome": nome,
+                "rg": rg,
+                "ultimo_avistamento": ultimo,
+                "caracteristicas": detalhes,
+                "outras": detalhes,
+                "outras_informacoes": detalhes,
+                "_atendimento_id": atendimento.get("id"),
+                "_boletim_numero": atendimento.get("numero"),
+                "_canal_bo_origem_id": getattr(interaction.channel, "id", None),
+                "_canal_fluxo_id": canal_privado.id,
+                "autor_id": interaction.user.id,
+                "autor_nome": str(interaction.user),
+                "etapa_fotos": "aguardando_crimes",
+            }
+            cadastros_pendentes[canal_privado.id] = dados
+            salvar_cadastros_pendentes()
+
+            etapa = "abrir pesquisa de crimes"
+            painel = await canal_privado.send(
+                "🔎 Preparando pesquisa de crimes...",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            sessao = {
+                "tipo": "boletim_privado",
+                "canal_id": canal_privado.id,
+                "painel_id": painel.id,
+                "autor_id": interaction.user.id,
+                "nome": nome,
+                "rg": rg,
+                "artigos": [],
+                "dados": dados,
+            }
+            _salvar_sessao_crime(str(painel.id), sessao)
+            await painel.edit(
+                content=_texto_painel_pesquisa_crimes(sessao),
+                view=PesquisaCrimesView(),
+            )
+
+            await interaction.followup.send(
+                f"✅ Cadastro iniciado em canal privado: {canal_privado.mention}\n"
+                "O canal do boletim não receberá mensagens do fluxo.",
+                ephemeral=True,
+            )
+            await enviar_log(
+                f"🚨 Fluxo privado de procurado criado | BO `{atendimento.get('numero')}` | "
+                f"RG `{rg}` | canal `{canal_privado.id}` | usuário `{interaction.user.id}`"
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ Erro no modal Cadastrar como Procurado | etapa `{etapa}` | "
+                f"usuário `{getattr(interaction.user, 'id', 0)}` | "
+                f"{type(erro).__name__}: {erro}\n```py\n"
+                f"{traceback.format_exc()[-2500:]}\n```"
+            )
+            if canal_privado is not None:
+                try:
+                    await canal_privado.send(
+                        "❌ O cadastro encontrou um erro interno. A equipe técnica já recebeu o diagnóstico."
+                    )
+                except Exception:
+                    pass
+            mensagem = (
+                f"❌ Não foi possível iniciar o cadastro na etapa **{etapa}**. "
+                "O erro já foi registrado."
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(mensagem, ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        mensagem, ephemeral=True
+                    )
+            except Exception:
+                pass
+
+
+# Finalização da pesquisa de crimes adaptada ao canal privado.
+_V56_PESQUISA_FINALIZAR_ANTERIOR = PesquisaCrimesView.finalizar
+
+async def _v56_pesquisa_crimes_finalizar(
+    self,
+    interaction: discord.Interaction,
+    button: Button,
+):
+    sid = self._sessao_id(interaction)
+    sessao = _obter_sessao_crime(sid)
+    if not sessao or sessao.get("tipo") != "boletim_privado":
+        return await _V56_PESQUISA_FINALIZAR_ANTERIOR(
+            self, interaction, button
+        )
+
+    if (
+        interaction.user.id != int(sessao.get("autor_id") or 0)
+        and not usuario_e_administrador(interaction.user)
+    ):
+        return await interaction.response.send_message(
+            "❌ Esta sessão pertence a outro usuário.", ephemeral=True
+        )
+
+    artigos = list(sessao.get("artigos") or [])
+    if not artigos:
+        return await interaction.response.send_message(
+            "❌ Pesquise e selecione pelo menos um crime.", ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    dados = dict(sessao.get("dados") or {})
+    dados["crimes"] = _formatar_crimes_selecionados(artigos)
+    dados["crimes_artigos"] = artigos
+    dados["etapa_fotos"] = "aguardando_foto_individuo"
+    cadastros_pendentes[interaction.channel.id] = dados
+    salvar_cadastros_pendentes()
+
+    try:
+        await interaction.message.edit(
+            content=_texto_painel_pesquisa_crimes(sessao)
+            + "\n\n✅ **Seleção finalizada.**",
+            view=None,
+        )
+    except Exception:
+        pass
+
+    await solicitar_autorizacao_procurado_boletim(interaction, dados)
+    _apagar_sessao_crime(sid)
+    await interaction.followup.send(
+        "✅ Crimes finalizados. Envie agora a foto do indivíduo neste canal privado.",
+        ephemeral=True,
+    )
+
+
+PesquisaCrimesView.finalizar = _v56_pesquisa_crimes_finalizar
+
+
+async def solicitar_autorizacao_procurado_boletim(
+    interaction: discord.Interaction,
+    dados: Dict[str, str],
+) -> None:
+    membro = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro):
+        if interaction.response.is_done():
+            return await interaction.followup.send(
+                "❌ Você não possui cargo autorizado para esta ação.",
+                ephemeral=True,
+            )
+        return await interaction.response.send_message(
+            "❌ Você não possui cargo autorizado para esta ação.",
+            ephemeral=True,
+        )
+
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    atendimento = _v56_atendimento_por_id(dados.get("_atendimento_id"))
+    if not atendimento:
+        atendimento = await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        return await interaction.followup.send(
+            "❌ Atendimento do boletim não encontrado.", ephemeral=True
+        )
+
+    if not _usuario_pode_operar_atendimento_boletim(interaction, atendimento):
+        return await interaction.followup.send(
+            "❌ Apenas o responsável atual ou Inspetor+ pode solicitar.",
+            ephemeral=True,
+        )
+
+    existente = procurar_por_rg(dados.get("rg"))
+    if existente:
+        return await interaction.followup.send(
+            "⚠️ Este RG já está cadastrado como procurado.",
+            view=AbrirEdicaoProcuradoView(existente),
+            ephemeral=True,
+        )
+
+    pedido_id = _novo_id_pedido_boletim("PRQ", interaction)
+    pedido = {
+        "id": pedido_id,
+        "dados": dict(dados),
+        "status": "aguardando_foto_individuo",
+        "solicitante_id": membro.id,
+        "solicitante_nome": str(membro),
+        "solicitado_em": agora_br(),
+        "canal_fluxo_id": getattr(interaction.channel, "id", None),
+    }
+    _guardar_pedido_atendimento(
+        atendimento, "procurado_pedidos", pedido_id, pedido
+    )
+    atendimento.update(
+        {
+            "procurado_solicitado": dict(dados),
+            "procurado_status": "aguardando_foto_individuo",
+            "procurado_solicitado_por_id": membro.id,
+            "procurado_solicitado_por_nome": str(membro),
+            "procurado_solicitado_em": agora_br(),
+        }
+    )
+    atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+
+    prompt = await interaction.channel.send(
+        "👤 **ETAPA 1 DE 2 — FOTO DO INDIVÍDUO**\n"
+        f"🔖 **Pedido:** `{pedido_id}`\n"
+        f"**Nome:** {dados.get('nome', 'Não informado')}\n"
+        f"**RG:** `{dados.get('rg', 'Não informado')}`\n"
+        f"📍 **Último avistamento:** {dados.get('ultimo_avistamento')}\n\n"
+        "Envie uma nova mensagem contendo somente a foto do indivíduo.\n"
+        "Depois clique em **Confirmar Foto do Indivíduo**.",
+        view=FotoIndividuoProcuradoBoletimView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    pedido["foto_individuo_prompt_id"] = prompt.id
+    _guardar_pedido_atendimento(
+        atendimento, "procurado_pedidos", pedido_id, pedido
+    )
+    atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+
+
+async def _validar_acesso_pedido_procurado_boletim(
+    interaction: discord.Interaction,
+) -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
+    dados_canal = cadastros_pendentes.get(
+        int(getattr(interaction.channel, "id", 0) or 0), {}
+    )
+    atendimento = _v56_atendimento_por_id(dados_canal.get("_atendimento_id"))
+    if not atendimento:
+        atendimento = await garantir_atendimento_interaction(interaction)
+
+    if not atendimento:
+        await interaction.followup.send(
+            "❌ Atendimento do boletim não encontrado.", ephemeral=True
+        )
+        return None, None, None
+
+    solicitante_id = int(dados_canal.get("autor_id") or 0)
+    if (
+        interaction.user.id != solicitante_id
+        and not usuario_e_administrador(interaction.user)
+    ):
+        await interaction.followup.send(
+            "❌ Apenas quem iniciou o fluxo ou Inspetor+ pode continuar.",
+            ephemeral=True,
+        )
+        return None, None, None
+
+    pedido_id, pedido = _pedido_boletim_por_mensagem(
+        atendimento, getattr(interaction, "message", None)
+    )
+    if not pedido_id or not pedido:
+        # Fallback: procura pedido ativo vinculado ao canal privado.
+        pedidos = atendimento.get("procurado_pedidos") or {}
+        if isinstance(pedidos, dict):
+            for pid, item in pedidos.items():
+                if int(item.get("canal_fluxo_id") or 0) == int(
+                    getattr(interaction.channel, "id", 0) or 0
+                ):
+                    pedido_id, pedido = str(pid), item
+                    break
+
+    if not pedido_id or not pedido:
+        await interaction.followup.send(
+            "❌ Não consegui localizar este pedido de procurado.",
+            ephemeral=True,
+        )
+        return None, None, None
+
+    return atendimento, pedido_id, pedido
+
+
+# Publicação final sem mensagem no canal do BO.
+async def _publicar_procurado_boletim_aprovado(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+) -> str:
+    if not dados.get("foto_individuo"):
+        raise RuntimeError("FOTO_INDIVIDUO_AUSENTE")
+    if not dados.get("foto_rg"):
+        raise RuntimeError("FOTO_RG_AUSENTE")
+
+    ultimo = str(
+        dados.get("ultimo_avistamento") or dados.get("outras") or ""
+    ).strip()
+    if not ultimo:
+        raise RuntimeError("ULTIMO_AVISTAMENTO_AUSENTE")
+    if procurar_por_rg(dados.get("rg")):
+        raise RuntimeError("Já existe procurado cadastrado com esse RG.")
+
+    registro = {
+        "id": data_caso(),
+        "caso": f"DICOR-{data_caso()}",
+        "data": agora_br(),
+        "status": "A PROCURAR",
+        "nome": dados.get("nome", "Não informado"),
+        "rg": dados.get("rg", "Não informado"),
+        "caracteristicas": dados.get("caracteristicas", "Não informado"),
+        "crimes": dados.get("crimes", "Não informado"),
+        "numero_boletim": atendimento.get("numero"),
+        "boletim": atendimento.get("numero"),
+        "ultimo_avistamento": ultimo,
+        "informacoes": dados.get("outras_informacoes")
+        or dados.get("outras")
+        or "Não informado",
+        "foto_individuo": dados.get("foto_individuo"),
+        "foto_rg": dados.get("foto_rg"),
+        "autor_id": dados.get("_solicitante_id")
+        or atendimento.get("procurado_solicitado_por_id"),
+        "autor_nome": dados.get("_solicitante_nome")
+        or atendimento.get("procurado_solicitado_por_nome"),
+        "autorizado_por_id": autorizador.id,
+        "autorizado_por_nome": str(autorizador),
+        "autorizado_por_cargo": cargo_autorizador(autorizador),
+        "autorizado_em": agora_br(),
+        "agente_boletim_id": atendimento.get("agente_id"),
+        "agente_boletim_nome": atendimento.get("agente_nome"),
+        "mensagem_id": None,
+        "mensagem_url": None,
+    }
+
+    mensagem = await postar_procurado_oficial(registro)
+    if not mensagem:
+        raise RuntimeError("Não foi possível publicar no canal oficial.")
+
+    registro["mensagem_id"] = mensagem.id
+    registro["mensagem_url"] = mensagem.jump_url
+    await salvar_procurado_catalogo(registro)
+
+    atendimento.update(
+        {
+            "procurado_status": "publicado",
+            "procurado_publicacao_id": mensagem.id,
+            "procurado_publicacao_url": mensagem.jump_url,
+            "procurado_autorizado_por_id": autorizador.id,
+            "procurado_autorizado_por_nome": str(autorizador),
+            "procurado_autorizado_por_cargo": cargo_autorizador(autorizador),
+            "procurado_autorizado_em": agora_br(),
+        }
+    )
+    atualizar_atendimento_boletim("id", atendimento.get("id"), atendimento)
+
+    await enviar_log(
+        f"🚨 Procurado publicado via BO `{atendimento.get('numero')}` | "
+        f"RG `{dados.get('rg')}` | mensagem `{mensagem.id}` | "
+        "canal do BO preservado sem mensagens do fluxo."
+    )
+    return mensagem.jump_url
+
+
+print(
+    "✅ V56 carregada — cadastro de procurado corrigido e fluxo movido para canal privado."
+)
