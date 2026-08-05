@@ -16709,29 +16709,74 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
         return y
 
     def assinaturas(y: float) -> float:
-        regs = obter_assinaturas_dossie(dados)
-        col_w = (largura_util - 0.30 * cm) / 2
-        y = quebra(y, 2.85 * cm)
-        for idx, ass in enumerate(regs[:2]):
-            x = margem_x + idx * (col_w + 0.10 * cm)
-            c.setFillColor(colors.HexColor('#F7F3E9'))
-            c.setStrokeColor(cores['linha'])
-            c.roundRect(x, y - 2.40 * cm, col_w, 2.30 * cm, 4, fill=1, stroke=1)
-            arq = limpar_imagem_assinatura_dossie(ass.get('imagem')) or ass.get('imagem')
-            if arq and Path(str(arq)).exists():
-                desenhar_imagem(arq, x + 0.12 * cm, y - 1.12 * cm, col_w - 0.24 * cm, 0.95 * cm)
-            else:
-                c.setFillColor(cores['texto_suave'])
-                c.setFont('Courier-Oblique', 8.5)
-                c.drawCentredString(x + col_w / 2, y - 0.75 * cm, seguro(ass.get('nome') or ass.get('texto'))[:34])
-            c.setStrokeColor(cores['texto_suave'])
-            c.line(x + 0.20 * cm, y - 1.33 * cm, x + col_w - 0.20 * cm, y - 1.33 * cm)
-            c.setFillColor(cores['texto'])
-            c.setFont('Courier-Bold', 8.5)
-            c.drawCentredString(x + col_w / 2, y - 1.70 * cm, seguro(ass.get('titulo'))[:35])
-            c.setFont('Courier', 7.8)
-            c.drawCentredString(x + col_w / 2, y - 2.02 * cm, seguro(ass.get('nome') or ass.get('texto'), '')[:42])
-        return y - 2.60 * cm
+        registros = obter_assinaturas_dossie(dados)
+        assinatura = registros[0] if registros else {
+            "titulo": "DIRETOR",
+            "nome": "Arthur Fleker",
+            "texto": "",
+            "imagem": None,
+        }
+
+        y = quebra(y, 3.15 * cm)
+        caixa_w = min(largura_util - 1.60 * cm, 11.80 * cm)
+        caixa_h = 2.65 * cm
+        x = (largura - caixa_w) / 2
+
+        c.setFillColor(colors.HexColor("#F7F3E9"))
+        c.setStrokeColor(cores["linha"])
+        c.roundRect(
+            x,
+            y - caixa_h,
+            caixa_w,
+            caixa_h,
+            5,
+            fill=1,
+            stroke=1,
+        )
+
+        arquivo = (
+            limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
+            or assinatura.get("imagem")
+        )
+        if arquivo and Path(str(arquivo)).exists():
+            desenhar_imagem(
+                arquivo,
+                x + 0.35 * cm,
+                y - 1.34 * cm,
+                caixa_w - 0.70 * cm,
+                1.20 * cm,
+            )
+        else:
+            c.setFillColor(cores["texto_suave"])
+            c.setFont("Courier-Oblique", 10.2)
+            c.drawCentredString(
+                largura / 2,
+                y - 0.92 * cm,
+                "Arthur Fleker",
+            )
+
+        c.setStrokeColor(cores["texto_suave"])
+        c.line(
+            x + 0.55 * cm,
+            y - 1.53 * cm,
+            x + caixa_w - 0.55 * cm,
+            y - 1.53 * cm,
+        )
+
+        c.setFillColor(cores["texto"])
+        c.setFont("Courier-Bold", 10.2)
+        c.drawCentredString(
+            largura / 2,
+            y - 1.93 * cm,
+            "ARTHUR FLEKER",
+        )
+        c.setFont("Courier", 9.2)
+        c.drawCentredString(
+            largura / 2,
+            y - 2.28 * cm,
+            "DIRETOR",
+        )
+        return y - 2.95 * cm
 
     # Capa / identificação
     titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
@@ -63454,6 +63499,396 @@ async def _v67_on_ready():
 print(
     "✅ V67 carregada — escolha guiada do RG correto, validação de RG inexistente, "
     "arquivamento seguro de ficha vazia e opção de homônimos.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V68 — ASSINATURA INSTITUCIONAL ÚNICA: ARTHUR FLEKER
+# =====================================================
+# Regra definitiva:
+# - Mandados/comparecimentos: somente Arthur Fleker — Diretor.
+# - Dossiês PDF e DOCX: somente Arthur Fleker — Diretor.
+# - Inspetor/Vice/Diretor que autorizou continua nos logs e histórico.
+# - A autoridade que clicou não substitui a assinatura institucional.
+
+ARTHUR_FLEKER_NOME = "Arthur Fleker"
+ARTHUR_FLEKER_CARGO = "Diretor"
+ARTHUR_FLEKER_SLOT = "delegado_dicor"
+ARTHUR_FLEKER_USER_ID = env_int("ARTHUR_FLEKER_USER_ID", 0)
+ARTHUR_FLEKER_ASSINATURA_PATH = os.getenv(
+    "ARTHUR_FLEKER_ASSINATURA_PATH",
+    "",
+).strip()
+
+
+def _v68_assinatura_arthur() -> Dict[str, Any]:
+    """
+    Localiza a imagem oficial do Diretor.
+
+    Ordem:
+    1. Caminho configurado em ARTHUR_FLEKER_ASSINATURA_PATH;
+    2. Cadastro feito pelo comando /assinaturaarthur;
+    3. Assinatura antiga do Diretor DICOR;
+    4. Assinatura antiga do Diretor Geral.
+    """
+    caminho_configurado = caminho_arquivo_configurado(
+        ARTHUR_FLEKER_ASSINATURA_PATH,
+        [
+            "assinatura_arthur_fleker.png",
+            "assinatura_arthur_fleker.jpg",
+            "assinatura_arthur_fleker.jpeg",
+            "assinatura_delegado_dicor.png",
+            "assinatura_delegado_dicor.jpg",
+            "assinatura_delegado_geral.png",
+            "assinatura_delegado_geral.jpg",
+        ],
+    )
+
+    dados = carregar_assinaturas_dossie()
+    registro: Dict[str, Any] = {}
+
+    for chave in (
+        "diretor_arthur",
+        ARTHUR_FLEKER_SLOT,
+        "delegado_geral",
+    ):
+        candidato = dict(dados.get(chave) or {})
+        caminho = caminho_assinatura_registrada(candidato)
+        if caminho and Path(str(caminho)).exists():
+            registro = candidato
+            caminho_configurado = Path(str(caminho))
+            break
+
+    return {
+        "slot": ARTHUR_FLEKER_SLOT,
+        "usuario_id": (
+            ARTHUR_FLEKER_USER_ID
+            or int(registro.get("usuario_id") or 0)
+        ),
+        "titulo": "DIRETOR",
+        "nome": ARTHUR_FLEKER_NOME,
+        "cargo": ARTHUR_FLEKER_CARGO,
+        "texto": ARTHUR_FLEKER_NOME,
+        "imagem": (
+            str(caminho_configurado)
+            if caminho_configurado
+            else ""
+        ),
+        "arquivo": (
+            str(caminho_configurado)
+            if caminho_configurado
+            else ""
+        ),
+        "data": registro.get("data") or "",
+        "backup_channel_id": registro.get("backup_channel_id"),
+        "backup_message_id": registro.get("backup_message_id"),
+        "backup_url": registro.get("backup_url"),
+    }
+
+
+def obter_assinaturas_dossie(
+    dados: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Todos os dossiês possuem somente a assinatura de Arthur Fleker."""
+    return [_v68_assinatura_arthur()]
+
+
+def obter_assinatura_comparecimento(
+    usuario_id: Any,
+) -> Dict[str, Any]:
+    """
+    A assinatura do mandado nunca muda conforme quem autorizou.
+    O usuario_id é mantido apenas por compatibilidade com o fluxo.
+    """
+    return dict(_v68_assinatura_arthur())
+
+
+def resolver_slot_assinatura_autorizador(
+    member: Optional[discord.Member],
+) -> Optional[str]:
+    """Toda autorização documental usa o slot institucional do Diretor."""
+    return ARTHUR_FLEKER_SLOT
+
+
+def pdf_add_assinaturas_dossie(
+    story: List[Any],
+    dados: Dict[str, Any],
+    style_center,
+) -> None:
+    """Versão compatível com modelos antigos: uma assinatura centralizada."""
+    assinatura = _v68_assinatura_arthur()
+    imagem = (
+        limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
+        or assinatura.get("imagem")
+    )
+    conteudo: Any = Spacer(1, 1.25 * cm)
+
+    if imagem and Path(str(imagem)).exists():
+        conteudo = pdf_img_fit(
+            str(imagem),
+            10.0 * cm,
+            2.40 * cm,
+        ) or conteudo
+    elif assinatura.get("texto"):
+        conteudo = pdf_paragrafo(
+            str(assinatura.get("texto")),
+            style_center,
+        )
+
+    tabela = Table(
+        [
+            [conteudo],
+            [""],
+            [pdf_paragrafo("ARTHUR FLEKER", style_center)],
+            [pdf_paragrafo("DIRETOR", style_center)],
+        ],
+        colWidths=[11.5 * cm],
+        hAlign="CENTER",
+    )
+    tabela.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEABOVE", (0, 1), (-1, 1), 0.8, colors.HexColor("#333333")),
+        ("PADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(tabela)
+
+
+def docx_add_assinaturas_dossie(
+    doc,
+    dados: Dict[str, Any],
+) -> None:
+    """Dossiê DOCX com uma única assinatura centralizada."""
+    assinatura = _v68_assinatura_arthur()
+    tabela = doc.add_table(rows=4, cols=1)
+
+    try:
+        tabela.alignment = WD_TABLE_ALIGNMENT.CENTER
+    except Exception:
+        pass
+
+    paragrafo_imagem = tabela.cell(0, 0).paragraphs[0]
+    try:
+        paragrafo_imagem.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    except Exception:
+        pass
+
+    imagem = (
+        limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
+        if assinatura.get("imagem")
+        else None
+    )
+
+    if imagem and Path(str(imagem)).exists():
+        try:
+            paragrafo_imagem.add_run().add_picture(
+                str(imagem),
+                width=Inches(3.35),
+            )
+        except Exception:
+            paragrafo_imagem.add_run(ARTHUR_FLEKER_NOME)
+    else:
+        run = paragrafo_imagem.add_run(ARTHUR_FLEKER_NOME)
+        try:
+            run.italic = True
+            run.font.size = Pt(15)
+            run.font.name = "Segoe Script"
+        except Exception:
+            pass
+
+    textos = (
+        "________________________________________",
+        "ARTHUR FLEKER",
+        "DIRETOR",
+    )
+    for linha, valor in enumerate(textos, start=1):
+        p = tabela.cell(linha, 0).paragraphs[0]
+        p.text = valor
+        try:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = linha >= 2
+                run.font.size = Pt(10 if linha >= 2 else 9)
+        except Exception:
+            pass
+
+
+@app_commands.choices(
+    acao=[
+        app_commands.Choice(
+            name="Cadastrar/Substituir",
+            value="salvar",
+        ),
+        app_commands.Choice(
+            name="Visualizar",
+            value="visualizar",
+        ),
+    ]
+)
+@bot.tree.command(
+    name="assinaturaarthur",
+    description="Define a assinatura única de Arthur Fleker para mandados e dossiês.",
+)
+@app_commands.describe(
+    acao="Cadastrar ou visualizar a assinatura",
+    imagem="Imagem oficial da assinatura em PNG/JPG/WEBP",
+    pessoa="Conta Discord de Arthur Fleker, opcional",
+)
+async def assinaturaarthur(
+    interaction: discord.Interaction,
+    acao: app_commands.Choice[str],
+    imagem: Optional[discord.Attachment] = None,
+    pessoa: Optional[discord.Member] = None,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode alterar a assinatura institucional.",
+            ephemeral=True,
+        )
+
+    dados = carregar_assinaturas_dossie()
+    registro = dict(dados.get(ARTHUR_FLEKER_SLOT) or {})
+
+    if acao.value == "visualizar":
+        assinatura = _v68_assinatura_arthur()
+        caminho = assinatura.get("arquivo")
+        texto = (
+            "✍️ **ASSINATURA INSTITUCIONAL ÚNICA**\n"
+            f"**Nome:** {ARTHUR_FLEKER_NOME}\n"
+            f"**Cargo:** {ARTHUR_FLEKER_CARGO}\n"
+            "Usada em: todos os mandados e todos os dossiês."
+        )
+        if caminho and Path(str(caminho)).exists():
+            arquivo = discord.File(
+                str(caminho),
+                filename=(
+                    "assinatura_arthur_fleker"
+                    + Path(str(caminho)).suffix
+                ),
+            )
+            return await interaction.response.send_message(
+                texto,
+                file=arquivo,
+                ephemeral=True,
+            )
+        return await interaction.response.send_message(
+            texto + "\n⚠️ A imagem ainda não foi cadastrada.",
+            ephemeral=True,
+        )
+
+    if imagem is None:
+        return await interaction.response.send_message(
+            "❌ Anexe a imagem da assinatura de Arthur Fleker.",
+            ephemeral=True,
+        )
+
+    extensao = Path(imagem.filename or "").suffix.lower()
+    if not (
+        (imagem.content_type or "").startswith("image/")
+        or extensao in {".png", ".jpg", ".jpeg", ".webp"}
+    ):
+        return await interaction.response.send_message(
+            "❌ Envie uma imagem PNG, JPG, JPEG ou WEBP.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    ASSINATURAS_DOSSIE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if extensao not in {".png", ".jpg", ".jpeg", ".webp"}:
+        extensao = ".png"
+
+    destino = (
+        ASSINATURAS_DOSSIE_DIR
+        / f"assinatura_arthur_fleker{extensao}"
+    )
+    await imagem.save(str(destino))
+
+    usuario_arthur = pessoa
+    dados[ARTHUR_FLEKER_SLOT] = {
+        **registro,
+        "nome": ARTHUR_FLEKER_NOME,
+        "usuario_id": (
+            usuario_arthur.id
+            if usuario_arthur
+            else ARTHUR_FLEKER_USER_ID
+        ),
+        "cargo": ARTHUR_FLEKER_CARGO,
+        "arquivo": caminho_relativo_base(destino),
+        "data": agora_br(),
+        "alterado_por_id": interaction.user.id,
+        "alterado_por_nome": str(interaction.user),
+        "assinatura_unica": True,
+    }
+    salvar_assinaturas_dossie(dados)
+
+    try:
+        backup = await _espelhar_assinatura_no_discord(
+            interaction.guild,
+            ARTHUR_FLEKER_SLOT,
+            dados[ARTHUR_FLEKER_SLOT],
+            destino,
+        )
+        if backup:
+            dados[ARTHUR_FLEKER_SLOT].update(backup)
+            salvar_assinaturas_dossie(dados)
+    except Exception as erro:
+        await enviar_log(
+            "⚠️ Assinatura de Arthur salva, "
+            f"mas o backup falhou: {erro}"
+        )
+
+    await enviar_log(
+        "✍️ Assinatura institucional única atualizada | "
+        f"Arthur Fleker | por `{interaction.user.id}` | {agora_br()}"
+    )
+    await interaction.followup.send(
+        "✅ Assinatura de **Arthur Fleker — Diretor** cadastrada.\n"
+        "Ela será a única assinatura usada em todos os mandados e dossiês.",
+        ephemeral=True,
+    )
+
+
+@bot.listen("on_ready")
+async def _v68_normalizar_assinatura_diretor():
+    """
+    Normaliza metadados antigos sem apagar as outras imagens armazenadas.
+    As assinaturas antigas deixam apenas de ser utilizadas nos documentos.
+    """
+    try:
+        await asyncio.sleep(12)
+        dados = carregar_assinaturas_dossie()
+        atual = dict(dados.get(ARTHUR_FLEKER_SLOT) or {})
+        if atual:
+            atual["nome"] = ARTHUR_FLEKER_NOME
+            atual["cargo"] = ARTHUR_FLEKER_CARGO
+            atual["assinatura_unica"] = True
+            if ARTHUR_FLEKER_USER_ID:
+                atual["usuario_id"] = ARTHUR_FLEKER_USER_ID
+            dados[ARTHUR_FLEKER_SLOT] = atual
+            salvar_assinaturas_dossie(dados)
+
+        print(
+            "✅ V68: documentos configurados para usar somente "
+            "Arthur Fleker — Diretor.",
+            flush=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+print(
+    "✅ V68 carregada — assinatura única de Arthur Fleker em "
+    "mandados e dossiês; autorizador preservado somente nos registros.",
     flush=True,
 )
 
