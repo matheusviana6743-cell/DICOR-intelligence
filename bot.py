@@ -57765,10 +57765,10 @@ async def _auditoria_executar(motivo: str = "automática") -> Dict[str, int]:
                 mensagem = await _auditoria_obter_mensagem(canal, int((anterior or {}).get("mensagem_id") or 0))
                 try:
                     if mensagem:
-                        await mensagem.edit(embed=_auditoria_embed_issue(issue), view=AuditoriaIssueView())
+                        await mensagem.edit(embed=_auditoria_embed_issue(issue), view=_v67_view_issue(issue))
                         stats["atualizadas"] += 1
                     else:
-                        mensagem = await canal.send(embed=_auditoria_embed_issue(issue), view=AuditoriaIssueView())
+                        mensagem = await canal.send(embed=_auditoria_embed_issue(issue), view=_v67_view_issue(issue))
                         stats["novas"] += 1
                         await asyncio.sleep(0.12)
                     with _banco_conexao() as db:
@@ -62317,7 +62317,7 @@ async def _v66_atualizar_alertas_existentes():
                 }
                 await mensagem.edit(
                     embed=_auditoria_embed_issue(issue),
-                    view=AuditoriaIssueView(),
+                    view=_v67_view_issue(issue),
                 )
                 atualizados += 1
                 await asyncio.sleep(0.08)
@@ -62336,6 +62336,1124 @@ async def _v66_atualizar_alertas_existentes():
 print(
     "✅ V66 carregada — Auditoria agora permite corrigir o nome do RG incorreto "
     "diretamente pelo alerta.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V67 — AUDITORIA COM ESCOLHA GUIADA DO RG CORRETO
+# =====================================================
+# Melhorias:
+# - Confirma no SQLite quais RGs realmente possuem ficha.
+# - Não alerta quando somente um RG válido existe.
+# - Mostra vínculos de cada RG antes da correção.
+# - Permite escolher o RG correto por menu.
+# - Permite arquivar somente fichas comprovadamente vazias.
+# - Permite declarar homônimos ou corrigir o nome do outro RG.
+# - Nenhuma ficha com vínculos é removida automaticamente.
+
+
+def _v67_extrair_rgs(registro: Dict[str, Any]) -> List[str]:
+    """Extrai somente os RGs declarados na linha própria do alerta."""
+    linhas = _v66_auditoria_linhas(registro)
+    saida: List[str] = []
+
+    for linha in linhas:
+        texto_linha = str(linha or "")
+        if "RG" not in texto_linha.upper():
+            continue
+
+        # Prioriza valores entre crases para não capturar o número "2"
+        # presente no título "Nome associado a 2 RGs".
+        encontrados = re.findall(r"`([0-9]{2,12})`", texto_linha)
+        if not encontrados and "RGs:" in texto_linha:
+            parte = texto_linha.split(":", 1)[-1]
+            encontrados = re.findall(r"\b([0-9]{2,12})\b", parte)
+
+        for valor in encontrados:
+            rg = _auditoria_rg(valor)
+            if rg and rg not in saida:
+                saida.append(rg)
+
+    return saida[:20]
+
+
+# Corrige também qualquer uso residual da extração antiga.
+_v66_extrair_rgs = _v67_extrair_rgs
+
+
+def _v67_diagnosticos_rgs_sync(rgs: List[str]) -> List[Dict[str, Any]]:
+    inicializar_banco_dicor()
+    saida: List[Dict[str, Any]] = []
+
+    with _banco_conexao() as db:
+        for rg_bruto in rgs:
+            rg = _auditoria_rg(rg_bruto)
+            if not rg:
+                continue
+
+            row = db.execute(
+                "SELECT * FROM individuos WHERE rg=?",
+                (rg,),
+            ).fetchone()
+
+            if not row:
+                saida.append({
+                    "rg": rg,
+                    "existe": False,
+                    "vazia": True,
+                    "nome": "",
+                    "id": 0,
+                    "veiculos": 0,
+                    "prisoes": 0,
+                    "fontes": 0,
+                    "organizacoes": 0,
+                    "dados_extras": 0,
+                })
+                continue
+
+            ficha = dict(row)
+            individuo_id = int(ficha.get("id") or 0)
+
+            veiculos = int(db.execute(
+                "SELECT COUNT(*) FROM veiculos WHERE proprietario_rg=?",
+                (rg,),
+            ).fetchone()[0])
+
+            prisoes = int(db.execute(
+                """
+                SELECT COUNT(*) FROM historico_prisoes
+                WHERE individuo_id=? OR rg_texto=?
+                """,
+                (individuo_id, rg),
+            ).fetchone()[0])
+
+            fontes = int(db.execute(
+                "SELECT COUNT(*) FROM fontes_ficha_individuo WHERE individuo_id=?",
+                (individuo_id,),
+            ).fetchone()[0])
+
+            organizacoes = int(db.execute(
+                """
+                SELECT COUNT(*) FROM faccao_membros
+                WHERE individuo_id=? OR rg=?
+                """,
+                (individuo_id, rg),
+            ).fetchone()[0])
+
+            campos_extras = (
+                "apelido",
+                "telefone",
+                "faccao_atual",
+                "cargo_faccao",
+                "observacoes",
+                "foto_individuo_path",
+                "foto_rg_path",
+                "foto_individuo_url",
+                "foto_rg_url",
+                "mesa_nome",
+            )
+            dados_extras = sum(
+                1 for campo in campos_extras
+                if str(ficha.get(campo) or "").strip()
+            )
+
+            total_vinculos = veiculos + prisoes + fontes + organizacoes
+            vazia = total_vinculos == 0 and dados_extras == 0
+
+            saida.append({
+                "rg": rg,
+                "existe": True,
+                "vazia": vazia,
+                "nome": str(ficha.get("nome") or "Sem nome"),
+                "id": individuo_id,
+                "veiculos": veiculos,
+                "prisoes": prisoes,
+                "fontes": fontes,
+                "organizacoes": organizacoes,
+                "dados_extras": dados_extras,
+                "origem": str(ficha.get("origem") or "N/I"),
+                "criado_em": str(ficha.get("criado_em") or ""),
+            })
+
+    return saida
+
+
+def _v67_resumo_diagnostico(item: Dict[str, Any]) -> str:
+    if not item.get("existe"):
+        return "RG inexistente no banco"
+
+    partes = []
+    if int(item.get("veiculos") or 0):
+        partes.append(f"{item['veiculos']} veículo(s)")
+    if int(item.get("prisoes") or 0):
+        partes.append(f"{item['prisoes']} prisão(ões)")
+    if int(item.get("fontes") or 0):
+        partes.append(f"{item['fontes']} fonte(s)")
+    if int(item.get("organizacoes") or 0):
+        partes.append(f"{item['organizacoes']} organização(ões)")
+    if int(item.get("dados_extras") or 0):
+        partes.append(f"{item['dados_extras']} dado(s) adicional(is)")
+
+    if not partes:
+        partes.append("ficha sem vínculos")
+    return " • ".join(partes)
+
+
+# A auditoria passa a validar a existência real dos RGs antes de alertar.
+_V67_COLETAR_AUDITORIA_ANTERIOR = _auditoria_coletar_sync
+
+
+def _auditoria_coletar_sync() -> Dict[str, Any]:
+    resultado = _V67_COLETAR_AUDITORIA_ANTERIOR()
+    issues = dict(resultado.get("issues") or {})
+
+    for chave, issue in list(issues.items()):
+        if str(issue.get("tipo") or "") != "NOME_COM_RGS_DIFERENTES":
+            continue
+
+        rgs = _v67_extrair_rgs({
+            "detalhes_json": json.dumps(
+                issue.get("linhas") or [],
+                ensure_ascii=False,
+            ),
+            "titulo": issue.get("titulo"),
+        })
+        diagnosticos = _v67_diagnosticos_rgs_sync(rgs)
+        validos = [x for x in diagnosticos if x.get("existe")]
+
+        # Se apenas um RG realmente existe, o alerta era falso positivo
+        # ou ficou obsoleto. Ele deixa de ser emitido e será resolvido
+        # automaticamente pela rotina normal da auditoria.
+        if len(validos) < 2:
+            issues.pop(chave, None)
+            continue
+
+        nome = _v66_extrair_nome_conflito({
+            "detalhes_json": json.dumps(
+                issue.get("linhas") or [],
+                ensure_ascii=False,
+            )
+        })
+
+        linhas = [
+            f"**Nome detectado:** {nome or 'Não informado'}",
+            "**RGs confirmados no banco:**",
+        ]
+        for item in validos:
+            status = "ficha vazia" if item.get("vazia") else "ficha com registros"
+            linhas.append(
+                f"• RG `{item['rg']}` — **{item['nome']}** • "
+                f"{_v67_resumo_diagnostico(item)} • {status}"
+            )
+
+        inexistentes = [x["rg"] for x in diagnosticos if not x.get("existe")]
+        if inexistentes:
+            linhas.append(
+                "⚠️ RG(s) descartado(s) por não existirem no banco: "
+                + ", ".join(f"`{x}`" for x in inexistentes)
+            )
+
+        linhas.append(
+            "Use **Corrigir cadastro** para escolher o RG correto, "
+            "declarar homônimos ou corrigir o outro cadastro."
+        )
+
+        novo = _auditoria_issue(
+            chave,
+            "NOME_COM_RGS_DIFERENTES",
+            "IMPORTANTE",
+            f"Nome associado a {len(validos)} RGs válidos",
+            linhas,
+        )
+        issues[chave] = novo
+
+    resultado["issues"] = issues
+    return resultado
+
+
+def _v67_marcar_issue_sync(
+    mensagem_id: int,
+    status: str,
+    usuario_id: int,
+) -> Optional[Dict[str, Any]]:
+    _auditoria_inicializar_banco()
+    agora = _auditoria_agora_iso()
+    with _banco_conexao() as db:
+        row = db.execute(
+            "SELECT * FROM auditoria_inconsistencias WHERE mensagem_id=?",
+            (int(mensagem_id or 0),),
+        ).fetchone()
+        if not row:
+            return None
+
+        db.execute(
+            """
+            UPDATE auditoria_inconsistencias
+            SET status=?, resolvida_em=?, revisado_por_id=?, revisado_em=?
+            WHERE mensagem_id=?
+            """,
+            (
+                str(status),
+                agora if status == "RESOLVIDA" else "",
+                int(usuario_id or 0),
+                agora,
+                int(mensagem_id or 0),
+            ),
+        )
+    return dict(row)
+
+
+def _v67_arquivar_fichas_vazias_sync(
+    *,
+    rg_correto: str,
+    rgs_conflito: List[str],
+    chave_auditoria: str,
+    autor_id: int,
+) -> Dict[str, Any]:
+    inicializar_banco_dicor()
+    rg_correto = _auditoria_rg(rg_correto)
+    diagnosticos = _v67_diagnosticos_rgs_sync(rgs_conflito)
+
+    correto = next(
+        (x for x in diagnosticos if x.get("rg") == rg_correto and x.get("existe")),
+        None,
+    )
+    if not correto:
+        raise ValueError("O RG escolhido como correto não possui ficha no banco.")
+
+    outros = [x for x in diagnosticos if x.get("rg") != rg_correto]
+    bloqueados = [
+        x for x in outros
+        if x.get("existe") and not x.get("vazia")
+    ]
+    if bloqueados:
+        detalhes = ", ".join(
+            f"{x['rg']} ({_v67_resumo_diagnostico(x)})"
+            for x in bloqueados
+        )
+        raise ValueError(
+            "Não é seguro arquivar porque outro RG possui registros: "
+            + detalhes
+        )
+
+    agora = _banco_agora_iso()
+    arquivados: List[str] = []
+    inexistentes: List[str] = []
+
+    with _banco_conexao() as db:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auditoria_fichas_arquivadas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rg TEXT NOT NULL,
+                nome TEXT NOT NULL,
+                dados_json TEXT NOT NULL,
+                motivo TEXT NOT NULL,
+                chave_auditoria TEXT NOT NULL,
+                arquivado_por_id INTEGER NOT NULL DEFAULT 0,
+                arquivado_em TEXT NOT NULL
+            )
+            """
+        )
+
+        for item in outros:
+            rg = str(item.get("rg") or "")
+            if not item.get("existe"):
+                inexistentes.append(rg)
+                continue
+            if not item.get("vazia"):
+                continue
+
+            row = db.execute(
+                "SELECT * FROM individuos WHERE rg=?",
+                (rg,),
+            ).fetchone()
+            if not row:
+                inexistentes.append(rg)
+                continue
+
+            ficha = dict(row)
+            db.execute(
+                """
+                INSERT INTO auditoria_fichas_arquivadas
+                (rg, nome, dados_json, motivo, chave_auditoria,
+                 arquivado_por_id, arquivado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rg,
+                    str(ficha.get("nome") or ""),
+                    json.dumps(ficha, ensure_ascii=False, default=str),
+                    f"Ficha vazia duplicada; RG mantido: {rg_correto}",
+                    str(chave_auditoria or ""),
+                    int(autor_id or 0),
+                    agora,
+                ),
+            )
+
+            _banco_historico(
+                "individuo",
+                rg,
+                "ARQUIVAMENTO_AUDITORIA",
+                (
+                    f"Ficha vazia arquivada. RG correto mantido: {rg_correto}. "
+                    f"Chave: {chave_auditoria}."
+                ),
+                int(autor_id or 0),
+                db=db,
+            )
+            db.execute(
+                "DELETE FROM individuos WHERE rg=?",
+                (rg,),
+            )
+            arquivados.append(rg)
+
+    return {
+        "rg_correto": rg_correto,
+        "arquivados": arquivados,
+        "inexistentes": inexistentes,
+    }
+
+
+class V67RenomearOutroModal(discord.ui.Modal):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        rg_alvo: str,
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        super().__init__(title=f"Corrigir nome do RG {rg_alvo}")
+        self.registro = dict(registro)
+        self.rg_alvo = _auditoria_rg(rg_alvo)
+        self.mensagem_id = int(mensagem_id or 0)
+        self.canal_id = int(canal_id or 0)
+
+        self.nome_correto = discord.ui.TextInput(
+            label="NOME CORRETO DESTE RG",
+            placeholder="Digite o nome verdadeiro desta pessoa",
+            min_length=3,
+            max_length=120,
+            required=True,
+        )
+        self.confirmacao = discord.ui.TextInput(
+            label="CONFIRMAÇÃO",
+            placeholder="Digite CONFIRMAR",
+            min_length=9,
+            max_length=9,
+            required=True,
+        )
+        self.add_item(self.nome_correto)
+        self.add_item(self.confirmacao)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas Inspetor+ pode corrigir cadastros.",
+                ephemeral=True,
+            )
+        if str(self.confirmacao.value or "").strip().upper() != "CONFIRMAR":
+            return await interaction.response.send_message(
+                "❌ Digite **CONFIRMAR** para aplicar.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultado = await asyncio.to_thread(
+                _v66_corrigir_nome_rg_sync,
+                chave_auditoria=str(self.registro.get("chave") or ""),
+                rg_alvo=self.rg_alvo,
+                nome_correto=str(self.nome_correto.value or ""),
+                autor_id=int(interaction.user.id),
+            )
+            await asyncio.to_thread(
+                _v67_marcar_issue_sync,
+                self.mensagem_id,
+                "RESOLVIDA",
+                int(interaction.user.id),
+            )
+            await _v66_editar_alerta_resolvido(
+                self.canal_id,
+                self.mensagem_id,
+                self.registro,
+            )
+            await interaction.followup.send(
+                "✅ Nome corrigido.\n"
+                f"**RG:** `{resultado['rg']}`\n"
+                f"**Anterior:** {resultado['nome_antigo']}\n"
+                f"**Correto:** {resultado['nome_novo']}",
+                ephemeral=True,
+            )
+            _auditoria_solicitar_varredura("nome corrigido pelo auditor V67")
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V67 falha ao renomear RG `{self.rg_alvo}` | "
+                f"{type(erro).__name__}: {erro}\n"
+                f"```py\n{traceback.format_exc()[-2500:]}\n```"
+            )
+            await interaction.followup.send(
+                f"❌ Não foi possível corrigir: `{str(erro)[:350]}`",
+                ephemeral=True,
+            )
+
+
+class V67EscolherOutroRGSelect(discord.ui.Select):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        rg_correto: str,
+        diagnosticos: List[Dict[str, Any]],
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        self.registro = dict(registro)
+        self.rg_correto = _auditoria_rg(rg_correto)
+        self.diagnosticos = list(diagnosticos)
+        self.mensagem_id = int(mensagem_id or 0)
+        self.canal_id = int(canal_id or 0)
+
+        outros = [
+            x for x in diagnosticos
+            if x.get("existe") and x.get("rg") != self.rg_correto
+        ]
+        options = [
+            discord.SelectOption(
+                label=f"RG {x['rg']} • {x['nome']}"[:100],
+                value=str(x["rg"]),
+                description=_v67_resumo_diagnostico(x)[:100],
+                emoji="✏️",
+            )
+            for x in outros[:25]
+        ]
+        super().__init__(
+            placeholder="Escolha qual outro RG terá o nome corrigido",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(
+            V67RenomearOutroModal(
+                registro=self.registro,
+                rg_alvo=self.values[0],
+                mensagem_id=self.mensagem_id,
+                canal_id=self.canal_id,
+            )
+        )
+
+
+class V67EscolherOutroRGView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        rg_correto: str,
+        diagnosticos: List[Dict[str, Any]],
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.add_item(
+            V67EscolherOutroRGSelect(
+                registro=registro,
+                rg_correto=rg_correto,
+                diagnosticos=diagnosticos,
+                mensagem_id=mensagem_id,
+                canal_id=canal_id,
+            )
+        )
+
+
+class V67ConfirmarRGView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        rg_correto: str,
+        diagnosticos: List[Dict[str, Any]],
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.registro = dict(registro)
+        self.rg_correto = _auditoria_rg(rg_correto)
+        self.diagnosticos = list(diagnosticos)
+        self.mensagem_id = int(mensagem_id or 0)
+        self.canal_id = int(canal_id or 0)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _auditoria_autorizado(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode concluir esta correção.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Manter este RG",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        row=0,
+    )
+    async def manter(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rgs = [str(x.get("rg") or "") for x in self.diagnosticos]
+            resultado = await asyncio.to_thread(
+                _v67_arquivar_fichas_vazias_sync,
+                rg_correto=self.rg_correto,
+                rgs_conflito=rgs,
+                chave_auditoria=str(self.registro.get("chave") or ""),
+                autor_id=int(interaction.user.id),
+            )
+
+            await asyncio.to_thread(
+                _v67_marcar_issue_sync,
+                self.mensagem_id,
+                "RESOLVIDA",
+                int(interaction.user.id),
+            )
+            await _v66_editar_alerta_resolvido(
+                self.canal_id,
+                self.mensagem_id,
+                self.registro,
+            )
+
+            detalhes = []
+            if resultado["arquivados"]:
+                detalhes.append(
+                    "Ficha(s) vazia(s) arquivada(s): "
+                    + ", ".join(f"`{x}`" for x in resultado["arquivados"])
+                )
+            if resultado["inexistentes"]:
+                detalhes.append(
+                    "RG(s) inexistente(s) ignorado(s): "
+                    + ", ".join(f"`{x}`" for x in resultado["inexistentes"])
+                )
+            if not detalhes:
+                detalhes.append("Nenhuma ficha precisou ser removida.")
+
+            await interaction.followup.send(
+                f"✅ **RG correto mantido:** `{self.rg_correto}`\n"
+                + "\n".join(detalhes)
+                + "\n\nA auditoria será executada novamente.",
+                ephemeral=True,
+            )
+            await enviar_log(
+                f"✅ V67 RG correto mantido `{self.rg_correto}` | "
+                f"arquivados={resultado['arquivados']} | "
+                f"inexistentes={resultado['inexistentes']} | "
+                f"autor `{interaction.user.id}`"
+            )
+            _auditoria_solicitar_varredura("RG correto escolhido no auditor V67")
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V67 falha ao manter RG `{self.rg_correto}` | "
+                f"{type(erro).__name__}: {erro}\n"
+                f"```py\n{traceback.format_exc()[-2500:]}\n```"
+            )
+            await interaction.followup.send(
+                "❌ Não foi possível concluir com segurança.\n"
+                f"`{str(erro)[:500]}`\n\n"
+                "Nenhum cadastro foi removido.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label="Corrigir o outro RG",
+        emoji="✏️",
+        style=discord.ButtonStyle.primary,
+        row=0,
+    )
+    async def corrigir_outro(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        outros = [
+            x for x in self.diagnosticos
+            if x.get("existe") and x.get("rg") != self.rg_correto
+        ]
+        if not outros:
+            return await interaction.response.send_message(
+                "⚠️ Não existe outro RG válido para corrigir.",
+                ephemeral=True,
+            )
+        if len(outros) == 1:
+            return await interaction.response.send_modal(
+                V67RenomearOutroModal(
+                    registro=self.registro,
+                    rg_alvo=str(outros[0]["rg"]),
+                    mensagem_id=self.mensagem_id,
+                    canal_id=self.canal_id,
+                )
+            )
+
+        await interaction.response.send_message(
+            "Escolha qual outro RG está com o nome incorreto:",
+            view=V67EscolherOutroRGView(
+                registro=self.registro,
+                rg_correto=self.rg_correto,
+                diagnosticos=self.diagnosticos,
+                mensagem_id=self.mensagem_id,
+                canal_id=self.canal_id,
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="São pessoas diferentes",
+        emoji="👥",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def homonimos(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        registro = await asyncio.to_thread(
+            _v67_marcar_issue_sync,
+            self.mensagem_id,
+            "IGNORADA",
+            int(interaction.user.id),
+        )
+        if not registro:
+            return await interaction.followup.send(
+                "⚠️ Alerta não localizado.",
+                ephemeral=True,
+            )
+
+        issue = {
+            **registro,
+            "linhas": _v66_auditoria_linhas(registro),
+        }
+        try:
+            await interaction.message.edit(
+                embed=_auditoria_embed_issue(issue, estado="IGNORADA"),
+                view=None,
+            )
+        except Exception:
+            pass
+
+        await interaction.followup.send(
+            "✅ Caso registrado como pessoas diferentes com o mesmo nome. "
+            "O alerta só voltará se os dados mudarem.",
+            ephemeral=True,
+        )
+
+
+class V67EscolherRGCorretoSelect(discord.ui.Select):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        diagnosticos: List[Dict[str, Any]],
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        self.registro = dict(registro)
+        self.diagnosticos = list(diagnosticos)
+        self.mensagem_id = int(mensagem_id or 0)
+        self.canal_id = int(canal_id or 0)
+
+        validos = [x for x in diagnosticos if x.get("existe")]
+        options = [
+            discord.SelectOption(
+                label=f"RG {x['rg']} • {x['nome']}"[:100],
+                value=str(x["rg"]),
+                description=(
+                    ("Ficha vazia • " if x.get("vazia") else "")
+                    + _v67_resumo_diagnostico(x)
+                )[:100],
+                emoji="✅",
+            )
+            for x in validos[:25]
+        ]
+        super().__init__(
+            placeholder="Escolha qual RG é o cadastro correto",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        rg_correto = _auditoria_rg(self.values[0])
+        item = next(
+            x for x in self.diagnosticos
+            if x.get("rg") == rg_correto
+        )
+        outros = [
+            x for x in self.diagnosticos
+            if x.get("rg") != rg_correto
+        ]
+
+        embed = discord.Embed(
+            title="✅ CONFIRMAR RG CORRETO",
+            description=(
+                f"Você selecionou **{item.get('nome')}** — RG `{rg_correto}`.\n\n"
+                f"**Dados deste RG:** {_v67_resumo_diagnostico(item)}"
+            ),
+            color=discord.Color.green(),
+        )
+        if outros:
+            embed.add_field(
+                name="Outros RGs encontrados",
+                value="\n".join(
+                    f"• `{x.get('rg')}` — "
+                    + (
+                        f"{x.get('nome')} • {_v67_resumo_diagnostico(x)}"
+                        if x.get("existe")
+                        else "não existe no banco"
+                    )
+                    for x in outros
+                )[:1024],
+                inline=False,
+            )
+        embed.set_footer(
+            text=(
+                "Manter este RG só arquiva outros cadastros se eles estiverem "
+                "comprovadamente vazios."
+            )
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=V67ConfirmarRGView(
+                registro=self.registro,
+                rg_correto=rg_correto,
+                diagnosticos=self.diagnosticos,
+                mensagem_id=self.mensagem_id,
+                canal_id=self.canal_id,
+            ),
+        )
+
+
+class V67EscolherRGCorretoView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        registro: Dict[str, Any],
+        diagnosticos: List[Dict[str, Any]],
+        mensagem_id: int,
+        canal_id: int,
+    ):
+        super().__init__(timeout=300)
+        self.add_item(
+            V67EscolherRGCorretoSelect(
+                registro=registro,
+                diagnosticos=diagnosticos,
+                mensagem_id=mensagem_id,
+                canal_id=canal_id,
+            )
+        )
+
+
+async def _v67_abrir_correcao_guiada(
+    interaction: discord.Interaction,
+    mensagem_id: int,
+) -> None:
+    if not _auditoria_autorizado(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode corrigir cadastros.",
+            ephemeral=True,
+        )
+
+    registro = await asyncio.to_thread(
+        _v66_auditoria_registro_por_mensagem,
+        int(mensagem_id or 0),
+    )
+    if not registro:
+        return await interaction.response.send_message(
+            "⚠️ Registro de auditoria não localizado.",
+            ephemeral=True,
+        )
+
+    if str(registro.get("tipo") or "") != "NOME_COM_RGS_DIFERENTES":
+        return await interaction.response.send_message(
+            "⚠️ Este alerta não é de nomes associados a RGs diferentes. "
+            "Use **Revisar detalhes** para verificar o caso.",
+            ephemeral=True,
+        )
+
+    rgs = _v67_extrair_rgs(registro)
+    diagnosticos = await asyncio.to_thread(
+        _v67_diagnosticos_rgs_sync,
+        rgs,
+    )
+    validos = [x for x in diagnosticos if x.get("existe")]
+
+    if len(validos) < 2:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await asyncio.to_thread(
+            _v67_marcar_issue_sync,
+            int(mensagem_id or 0),
+            "RESOLVIDA",
+            int(interaction.user.id),
+        )
+        await _v66_editar_alerta_resolvido(
+            int(registro.get("canal_id") or 0),
+            int(registro.get("mensagem_id") or 0),
+            registro,
+        )
+        existentes = ", ".join(f"`{x['rg']}`" for x in validos) or "nenhum"
+        inexistentes = ", ".join(
+            f"`{x['rg']}`" for x in diagnosticos if not x.get("existe")
+        ) or "nenhum"
+        await interaction.followup.send(
+            "✅ **Falso positivo corrigido.**\n"
+            f"RGs realmente existentes: {existentes}\n"
+            f"RGs inexistentes descartados: {inexistentes}\n\n"
+            "Nenhuma ficha foi alterada.",
+            ephemeral=True,
+        )
+        _auditoria_solicitar_varredura("falso positivo de RG removido")
+        return
+
+    embed = discord.Embed(
+        title="✏️ ESCOLHA O RG CORRETO",
+        description=(
+            "O bot verificou diretamente o Banco da DICOR. "
+            "Selecione abaixo qual cadastro deve ser mantido como correto."
+        ),
+        color=discord.Color.from_rgb(36, 104, 190),
+    )
+    for item in diagnosticos:
+        if item.get("existe"):
+            embed.add_field(
+                name=f"RG {item['rg']} • {item['nome']}",
+                value=(
+                    f"{_v67_resumo_diagnostico(item)}\n"
+                    f"Status: **{'ficha vazia' if item.get('vazia') else 'ficha com registros'}**"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name=f"RG {item['rg']}",
+                value="❌ Não existe no Banco da DICOR.",
+                inline=False,
+            )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=V67EscolherRGCorretoView(
+            registro=registro,
+            diagnosticos=diagnosticos,
+            mensagem_id=int(registro.get("mensagem_id") or 0),
+            canal_id=int(registro.get("canal_id") or 0),
+        ),
+        ephemeral=True,
+    )
+
+
+# View persistente definitiva do auditor.
+class AuditoriaIssueView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Revisar detalhes",
+        emoji="🔍",
+        style=discord.ButtonStyle.secondary,
+        custom_id="auditoria:revisar",
+        row=0,
+    )
+    async def revisar(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas Inspetor+ pode revisar alertas.",
+                ephemeral=True,
+            )
+
+        mid = int(getattr(interaction.message, "id", 0) or 0)
+        registro = await asyncio.to_thread(
+            _v66_auditoria_registro_por_mensagem,
+            mid,
+        )
+        if not registro:
+            return await interaction.response.send_message(
+                "⚠️ Registro de auditoria não localizado.",
+                ephemeral=True,
+            )
+
+        linhas = _v66_auditoria_linhas(registro)
+        embed = discord.Embed(
+            title="🔍 REVISÃO DA INCONSISTÊNCIA",
+            description="\n".join(linhas)[:3900] or "Sem detalhes.",
+            color=_auditoria_cor(registro.get("prioridade")),
+        )
+        embed.add_field(
+            name="Tipo",
+            value=f"`{registro.get('tipo')}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Chave",
+            value=f"`{registro.get('chave')}`",
+            inline=False,
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Corrigir cadastro",
+        emoji="✏️",
+        style=discord.ButtonStyle.primary,
+        custom_id="auditoria:corrigir_cadastro:v66",
+        row=0,
+    )
+    async def corrigir(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        mid = int(getattr(interaction.message, "id", 0) or 0)
+        await _v67_abrir_correcao_guiada(interaction, mid)
+
+    @discord.ui.button(
+        label="Marcar como correto",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="auditoria:ignorar",
+        row=0,
+    )
+    async def ignorar(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not _auditoria_autorizado(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas Inspetor+ pode concluir a revisão.",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        mid = int(getattr(interaction.message, "id", 0) or 0)
+        registro = await asyncio.to_thread(
+            _v67_marcar_issue_sync,
+            mid,
+            "IGNORADA",
+            int(interaction.user.id),
+        )
+        if not registro:
+            return await interaction.followup.send(
+                "⚠️ Registro não localizado.",
+                ephemeral=True,
+            )
+
+        issue = {
+            **registro,
+            "linhas": _v66_auditoria_linhas(registro),
+        }
+        try:
+            await interaction.message.edit(
+                embed=_auditoria_embed_issue(issue, estado="IGNORADA"),
+                view=None,
+            )
+        except Exception:
+            pass
+
+        await interaction.followup.send(
+            "✅ Caso marcado como correto. Ele só será reaberto se os dados mudarem.",
+            ephemeral=True,
+        )
+
+
+
+
+def _v67_view_issue(issue: Dict[str, Any]) -> discord.ui.View:
+    """Mostra Corrigir cadastro somente no alerta compatível."""
+    view = AuditoriaIssueView()
+    if str(issue.get("tipo") or "") != "NOME_COM_RGS_DIFERENTES":
+        for item in list(view.children):
+            if str(getattr(item, "custom_id", "") or "") == "auditoria:corrigir_cadastro:v66":
+                view.remove_item(item)
+    return view
+
+
+@bot.listen("on_ready")
+async def _v67_on_ready():
+    try:
+        await asyncio.sleep(20)
+        _auditoria_solicitar_varredura(
+            "validação dos RGs e remoção de falsos positivos V67"
+        )
+
+        canal = await _auditoria_canal()
+        if canal is None:
+            return
+
+        _auditoria_inicializar_banco()
+        with _banco_conexao() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM auditoria_inconsistencias
+                WHERE status='ATIVA' AND mensagem_id<>0
+                ORDER BY ultima_deteccao DESC
+                LIMIT 250
+                """
+            ).fetchall()
+
+        atualizados = 0
+        for row in rows:
+            registro = dict(row)
+            mensagem = await _auditoria_obter_mensagem(
+                canal,
+                int(registro.get("mensagem_id") or 0),
+            )
+            if mensagem is None:
+                continue
+            try:
+                issue = {
+                    **registro,
+                    "linhas": _v66_auditoria_linhas(registro),
+                }
+                await mensagem.edit(
+                    embed=_auditoria_embed_issue(issue),
+                    view=_v67_view_issue(issue),
+                )
+                atualizados += 1
+                await asyncio.sleep(0.07)
+            except Exception:
+                continue
+
+        print(
+            f"✅ V67 Auditoria: {atualizados} alerta(s) atualizado(s); "
+            "RGs validados diretamente no banco.",
+            flush=True,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+print(
+    "✅ V67 carregada — escolha guiada do RG correto, validação de RG inexistente, "
+    "arquivamento seguro de ficha vazia e opção de homônimos.",
     flush=True,
 )
 
