@@ -322,55 +322,152 @@ for pasta in [DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, BACKUP_DIR, PUBLIC_BACKUPS_DIR,
 # Executa ainda durante a importação, antes dos painéis e da Central acessarem o banco.
 # Remove SOMENTE cópias de mídia/cache recriáveis; nunca JSONs, SQLite, dossiês ou backups.
 # =====================================================
-def _v27_liberar_espaco_antes_do_banco(minimo_livre_mb: int = 768, alvo_livre_mb: int = 1280) -> int:
-    try:
-        import shutil as _v27_shutil
-        base = Path(DATA_DIR)
-        uso = _v27_shutil.disk_usage(str(base))
-        if uso.free >= minimo_livre_mb * 1024 * 1024:
-            return 0
-        nomes_cache = {
-            "central_boletins_media", "central_pericias_media", "central_dossies_preview",
-            "catalogo_cache", "ocr_cache", "temp", "tmp", "cache"
-        }
-        pastas = []
-        for raiz in (Path(DATA_DIR), Path(PUBLIC_DIR)):
-            if not raiz.exists():
-                continue
-            for p in raiz.rglob('*'):
-                try:
-                    if p.is_dir() and (p.name.lower() in nomes_cache or p.name.lower().endswith('_cache')):
-                        pastas.append(p)
-                except Exception:
-                    pass
-        arquivos = []
-        for pasta in pastas:
-            for arq in pasta.rglob('*'):
-                try:
-                    if arq.is_file():
-                        st = arq.stat()
-                        arquivos.append((st.st_mtime, st.st_size, arq))
-                except Exception:
-                    pass
-        removidos = 0
-        for _, _, arq in sorted(arquivos):
-            try:
-                arq.unlink(missing_ok=True)
-                removidos += 1
-            except Exception:
-                continue
-            try:
-                if _v27_shutil.disk_usage(str(base)).free >= alvo_livre_mb * 1024 * 1024:
-                    break
-            except Exception:
-                break
-        print(f"✅ V27 pré-limpeza: {removidos} arquivo(s) de cache removido(s) antes do banco.", flush=True)
-        return removidos
-    except Exception as erro:
-        print(f"⚠️ V27 pré-limpeza não executada: {type(erro).__name__}: {erro}", flush=True)
+_V69_STORAGE_CLEANUP_LAST = 0.0
+_V69_STORAGE_CLEANUP_INTERVAL = max(
+    900,
+    env_int("DICOR_STORAGE_CLEANUP_INTERVAL_SECONDS", 1800),
+)
+_V69_STORAGE_CLEANUP_LOCK = threading.Lock()
+
+
+def _v69_pastas_cache_seguras() -> List[Path]:
+    """
+    Somente cópias recriáveis.
+    Não inclui banco, JSON, backups, dossiês, assinaturas, fichas ou
+    arquivos originais de boletim.
+    """
+    candidatos = [
+        globals().get("CENTRAL_BO_MEDIA_DIR"),
+        globals().get("CENTRAL_PERICIAS_MEDIA_DIR"),
+        globals().get("CENTRAL_DOSSIES_PREVIEW_DIR"),
+        globals().get("V62_OCR_STAGING_DIR"),
+        Path(DATA_DIR) / "ocr_staging_persistente",
+        Path(DATA_DIR) / "ocr_cache",
+        Path(DATA_DIR) / "catalogo_cache",
+        Path(PUBLIC_DIR) / "cache",
+    ]
+    saida: List[Path] = []
+    vistos: set[str] = set()
+    for valor in candidatos:
+        if not valor:
+            continue
+        pasta = Path(valor)
+        chave = str(pasta.resolve()) if pasta.exists() else str(pasta)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append(pasta)
+    return saida
+
+
+def _v69_uso_volume(pasta: Optional[Path] = None) -> Dict[str, int]:
+    import shutil
+    alvo = Path(pasta or DATA_DIR)
+    alvo.mkdir(parents=True, exist_ok=True)
+    uso = shutil.disk_usage(str(alvo))
+    return {
+        "total": int(uso.total),
+        "used": int(uso.used),
+        "free": int(uso.free),
+    }
+
+
+def _v27_liberar_espaco_antes_do_banco(
+    minimo_livre_mb: int = 48,
+    alvo_livre_mb: int = 96,
+    *,
+    forcar: bool = False,
+) -> int:
+    """
+    Limpeza emergencial com trava e intervalo.
+
+    Antes, esta função era disparada em praticamente toda conexão SQLite
+    quando havia menos de 128 MB livres. Isso provocava dezenas de rglob()
+    simultâneos, atraso do event loop e reinicialização no Railway.
+    """
+    global _V69_STORAGE_CLEANUP_LAST
+
+    agora = time.monotonic()
+    if (
+        not forcar
+        and agora - float(_V69_STORAGE_CLEANUP_LAST or 0.0)
+        < _V69_STORAGE_CLEANUP_INTERVAL
+    ):
         return 0
 
-_v27_liberar_espaco_antes_do_banco()
+    if not _V69_STORAGE_CLEANUP_LOCK.acquire(blocking=False):
+        return 0
+
+    try:
+        _V69_STORAGE_CLEANUP_LAST = agora
+        uso = _v69_uso_volume(Path(DATA_DIR))
+        minimo = max(24, int(minimo_livre_mb)) * 1024 * 1024
+        alvo = max(int(alvo_livre_mb), int(minimo_livre_mb)) * 1024 * 1024
+
+        if uso["free"] >= minimo and not forcar:
+            return 0
+
+        arquivos: List[Tuple[float, int, Path]] = []
+        for pasta in _v69_pastas_cache_seguras():
+            if not pasta.exists():
+                continue
+            try:
+                for arquivo in pasta.rglob("*"):
+                    try:
+                        if arquivo.is_file():
+                            stat = arquivo.stat()
+                            arquivos.append(
+                                (
+                                    float(stat.st_mtime),
+                                    int(stat.st_size),
+                                    arquivo,
+                                )
+                            )
+                    except (FileNotFoundError, PermissionError, OSError):
+                        continue
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+
+        removidos = 0
+        liberados = 0
+        for _, tamanho, arquivo in sorted(arquivos):
+            try:
+                arquivo.unlink(missing_ok=True)
+                removidos += 1
+                liberados += int(tamanho)
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+
+            # Verifica em lotes para não executar disk_usage a cada arquivo.
+            if removidos % 20 == 0:
+                try:
+                    if _v69_uso_volume(Path(DATA_DIR))["free"] >= alvo:
+                        break
+                except Exception:
+                    break
+
+        if removidos:
+            print(
+                "✅ V69 armazenamento: "
+                f"{removidos} cache(s) recriável(is) removido(s), "
+                f"{liberados / 1024 / 1024:.1f} MB liberados.",
+                flush=True,
+            )
+        return removidos
+
+    except Exception as erro:
+        print(
+            "⚠️ V69 manutenção de armazenamento falhou sem derrubar o bot: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return 0
+    finally:
+        _V69_STORAGE_CLEANUP_LOCK.release()
+
+
+# V69: nenhuma varredura recursiva é executada durante a importação.
+# A manutenção começa somente depois que o bot e o servidor HTTP estiverem online.
 
 # =====================================================
 # BOT
@@ -10715,40 +10812,68 @@ def _v26_storage_tem_espaco(pasta: Path, minimo_livre_mb: int = 384) -> bool:
     except Exception:
         return True
 
-def _v26_limpar_cache_midias(limite_mb: int = 1200) -> int:
-    """Remove somente mídias antigas geradas pela Central, nunca JSONs ou banco."""
-    pastas = [
-        globals().get('CENTRAL_BO_MEDIA_DIR'),
-        globals().get('CENTRAL_PERICIAS_MEDIA_DIR'),
-        globals().get('CENTRAL_DOSSIES_PREVIEW_DIR'),
-        globals().get('BOLETIM_ARQUIVOS_DIR'),
-    ]
-    arquivos = []
+def _v26_limpar_cache_midias(
+    limite_mb: int = 120,
+) -> int:
+    """
+    Mantém somente caches gerados pela Central dentro de um limite pequeno.
+
+    Nunca remove:
+    - SQLite ou JSON;
+    - imagens originais do Banco;
+    - dossiês ou mandados;
+    - assinaturas;
+    - backups;
+    - arquivos de evidência.
+    """
+    limite_configurado = env_int(
+        "DICOR_MEDIA_CACHE_MAX_MB",
+        int(limite_mb),
+    )
+    limite_bytes = max(48, limite_configurado) * 1024 * 1024
+
+    arquivos: List[Tuple[float, int, Path]] = []
     total = 0
-    for pasta in pastas:
-        if not pasta:
+
+    for pasta in _v69_pastas_cache_seguras():
+        if not pasta.exists():
             continue
-        p = Path(pasta)
-        if not p.exists():
+        try:
+            for arquivo in pasta.rglob("*"):
+                try:
+                    if not arquivo.is_file():
+                        continue
+                    stat = arquivo.stat()
+                    tamanho = int(stat.st_size)
+                    total += tamanho
+                    arquivos.append(
+                        (
+                            float(stat.st_mtime),
+                            tamanho,
+                            arquivo,
+                        )
+                    )
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+        except (FileNotFoundError, PermissionError, OSError):
             continue
-        for arq in p.rglob('*'):
-            try:
-                if arq.is_file():
-                    st = arq.stat(); total += st.st_size; arquivos.append((st.st_mtime, st.st_size, arq))
-            except Exception:
-                pass
-    limite = max(128, int(os.getenv('DICOR_MEDIA_CACHE_MAX_MB', str(limite_mb)) or limite_mb)) * 1024 * 1024
+
+    if total <= limite_bytes:
+        return 0
+
     removidos = 0
-    if total <= limite:
-        return removidos
-    for _, tamanho, arq in sorted(arquivos):
-        if total <= limite:
+    for _, tamanho, arquivo in sorted(arquivos):
+        if total <= limite_bytes:
             break
         try:
-            arq.unlink(); total -= tamanho; removidos += 1
-        except Exception:
-            pass
+            arquivo.unlink(missing_ok=True)
+            total -= int(tamanho)
+            removidos += 1
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+
     return removidos
+
 
 async def baixar_anexo_persistente(anexo: discord.Attachment, pasta: Path, prefixo: str) -> Optional[Path]:
     global _V26_STORAGE_ALERTADO
@@ -25870,22 +25995,39 @@ def _banco_limpar_texto(valor: Any, limite: int = 500) -> str:
 @contextmanager
 def _banco_conexao():
     BANCO_DADOS_SQLITE.parent.mkdir(parents=True, exist_ok=True)
-    # Tenta liberar cache antes de qualquer abertura do banco quando o volume estiver crítico.
+
+    # Checagem barata. A limpeza possui trava e intervalo de 30 minutos,
+    # portanto nunca é repetida em cada consulta ao banco.
     try:
-        if not _v26_storage_tem_espaco(BANCO_DADOS_SQLITE.parent, minimo_livre_mb=128):
-            _v27_liberar_espaco_antes_do_banco(128, 512)
+        uso = _v69_uso_volume(BANCO_DADOS_SQLITE.parent)
+        if uso["free"] < 48 * 1024 * 1024:
+            _v27_liberar_espaco_antes_do_banco(
+                48,
+                96,
+                forcar=False,
+            )
     except Exception:
         pass
-    conexao = sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=30)
+
+    conexao = sqlite3.connect(
+        str(BANCO_DADOS_SQLITE),
+        timeout=30,
+    )
     conexao.row_factory = sqlite3.Row
     conexao.execute("PRAGMA foreign_keys = ON")
     conexao.execute("PRAGMA busy_timeout = 30000")
     conexao.execute("PRAGMA temp_store = MEMORY")
-    # WAL cria arquivos -wal/-shm e pode falhar em volume lotado. Usa DELETE como fallback seguro.
+    conexao.execute("PRAGMA synchronous = NORMAL")
+
     try:
         conexao.execute("PRAGMA journal_mode = WAL")
     except sqlite3.OperationalError as erro:
-        if "disk i/o" not in str(erro).lower() and "full" not in str(erro).lower():
+        mensagem = str(erro).lower()
+        if (
+            "disk i/o" not in mensagem
+            and "full" not in mensagem
+            and "readonly" not in mensagem
+        ):
             conexao.close()
             raise
         try:
@@ -25894,6 +26036,7 @@ def _banco_conexao():
         except Exception:
             conexao.close()
             raise
+
     try:
         yield conexao
         conexao.commit()
@@ -25904,7 +26047,10 @@ def _banco_conexao():
             pass
         raise
     finally:
-        conexao.close()
+        try:
+            conexao.close()
+        except Exception:
+            pass
 
 
 def inicializar_banco_dicor() -> None:
@@ -63889,6 +64035,136 @@ async def _v68_normalizar_assinatura_diretor():
 print(
     "✅ V68 carregada — assinatura única de Arthur Fleker em "
     "mandados e dossiês; autorizador preservado somente nos registros.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V69 — ESTABILIDADE DO RAILWAY E CONTROLE DE VOLUME
+# =====================================================
+_V69_MONITOR_STORAGE_INICIADO = False
+
+
+@tasks.loop(hours=3)
+async def _v69_monitor_storage_loop():
+    try:
+        uso_antes = await asyncio.to_thread(
+            _v69_uso_volume,
+            Path(DATA_DIR),
+        )
+
+        # Limpeza normal apenas quando os caches ultrapassarem o limite.
+        removidos = await asyncio.to_thread(
+            _v26_limpar_cache_midias,
+            120,
+        )
+
+        # Limpeza emergencial somente com menos de 48 MB livres.
+        if uso_antes["free"] < 48 * 1024 * 1024:
+            removidos += await asyncio.to_thread(
+                _v27_liberar_espaco_antes_do_banco,
+                48,
+                96,
+                forcar=True,
+            )
+
+        if removidos:
+            uso_depois = await asyncio.to_thread(
+                _v69_uso_volume,
+                Path(DATA_DIR),
+            )
+            print(
+                "✅ V69 monitor: "
+                f"{removidos} arquivo(s) de cache removido(s); "
+                f"livre={uso_depois['free'] / 1024 / 1024:.1f} MB.",
+                flush=True,
+            )
+    except Exception as erro:
+        print(
+            "⚠️ V69 monitor de volume ignorou uma falha: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+@_v69_monitor_storage_loop.before_loop
+async def _v69_antes_monitor_storage():
+    await bot.wait_until_ready()
+    await asyncio.sleep(90)
+
+
+@bot.listen("on_ready")
+async def _v69_on_ready_storage():
+    global _V69_MONITOR_STORAGE_INICIADO
+
+    if _V69_MONITOR_STORAGE_INICIADO:
+        return
+    _V69_MONITOR_STORAGE_INICIADO = True
+
+    try:
+        uso = await asyncio.to_thread(
+            _v69_uso_volume,
+            Path(DATA_DIR),
+        )
+        print(
+            "✅ V69 volume: "
+            f"usado={uso['used'] / 1024 / 1024:.1f} MB • "
+            f"livre={uso['free'] / 1024 / 1024:.1f} MB • "
+            "limpeza repetitiva desativada.",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+    if not _v69_monitor_storage_loop.is_running():
+        _v69_monitor_storage_loop.start()
+
+
+@bot.tree.command(
+    name="statusarmazenamento",
+    description="Mostra o uso do Volume da DICOR sem executar limpeza.",
+)
+async def statusarmazenamento_v69(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar o armazenamento.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+    try:
+        uso = await asyncio.to_thread(
+            _v69_uso_volume,
+            Path(DATA_DIR),
+        )
+        percentual = (
+            (uso["used"] / uso["total"]) * 100
+            if uso["total"] else 0
+        )
+        await interaction.followup.send(
+            "💾 **ARMAZENAMENTO DICOR**\n"
+            f"**Uso:** `{percentual:.1f}%`\n"
+            f"**Utilizado:** `{uso['used'] / 1024 / 1024:.1f} MB`\n"
+            f"**Livre:** `{uso['free'] / 1024 / 1024:.1f} MB`\n\n"
+            "A manutenção automática verifica apenas caches recriáveis.",
+            ephemeral=True,
+        )
+    except Exception as erro:
+        await interaction.followup.send(
+            f"❌ Falha ao consultar: `{type(erro).__name__}: {erro}`",
+            ephemeral=True,
+        )
+
+
+print(
+    "✅ V69 carregada — limpeza por conexão removida, cache limitado, "
+    "monitor de volume leve e crash loop corrigido.",
     flush=True,
 )
 
