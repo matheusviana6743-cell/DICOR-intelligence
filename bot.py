@@ -22,6 +22,149 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote, urlparse
 
+# =====================================================
+# V70 — HEALTHCHECK DE BOOT IMEDIATO
+# =====================================================
+# O Railway começa a consultar /health logo após iniciar o container.
+# Este servidor mínimo usa apenas a biblioteca padrão e sobe antes de
+# importar Discord, ReportLab, Pillow e o restante do bot.
+
+import threading as _v70_threading
+from http.server import BaseHTTPRequestHandler as _V70BaseHandler
+from http.server import ThreadingHTTPServer as _V70ThreadingHTTPServer
+
+_V70_BOOT_SERVER = None
+_V70_BOOT_THREAD = None
+_V70_BOOT_LOCK = _v70_threading.RLock()
+
+
+class _V70ReusableHTTPServer(_V70ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class _V70HealthHandler(_V70BaseHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _responder(self, status: int, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self) -> None:
+        caminho = str(self.path or "").split("?", 1)[0]
+        if caminho in {"/health", "/healthz", "/"}:
+            self._responder(
+                200,
+                b'{"ok":true,"servico":"dicor-intelligence","estado":"iniciando"}',
+            )
+            return
+        self._responder(
+            503,
+            b'{"ok":false,"estado":"iniciando"}',
+        )
+
+    def do_HEAD(self) -> None:
+        caminho = str(self.path or "").split("?", 1)[0]
+        status = 200 if caminho in {"/health", "/healthz", "/"} else 503
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, formato: str, *args) -> None:
+        return
+
+
+def _v70_porta_railway() -> int:
+    valor = str(os.getenv("PORT", "") or "").strip()
+    try:
+        porta = int(valor)
+    except (TypeError, ValueError):
+        return 0
+    return porta if 0 < porta <= 65535 else 0
+
+
+def _v70_iniciar_health_bootstrap() -> bool:
+    global _V70_BOOT_SERVER, _V70_BOOT_THREAD
+
+    with _V70_BOOT_LOCK:
+        if _V70_BOOT_SERVER is not None:
+            return True
+
+        porta = _v70_porta_railway()
+        if not porta:
+            return False
+
+        try:
+            servidor = _V70ReusableHTTPServer(
+                ("0.0.0.0", porta),
+                _V70HealthHandler,
+            )
+        except OSError as erro:
+            print(
+                "⚠️ V70 não iniciou o healthcheck provisório: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+            return False
+
+        thread = _v70_threading.Thread(
+            target=servidor.serve_forever,
+            name="dicor-health-bootstrap",
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
+        _V70_BOOT_SERVER = servidor
+        _V70_BOOT_THREAD = thread
+        thread.start()
+
+        print(
+            f"✅ V70 healthcheck provisório ativo em 0.0.0.0:{porta}/health.",
+            flush=True,
+        )
+        return True
+
+
+def _v70_parar_health_bootstrap_sync() -> None:
+    global _V70_BOOT_SERVER, _V70_BOOT_THREAD
+
+    with _V70_BOOT_LOCK:
+        servidor = _V70_BOOT_SERVER
+        thread = _V70_BOOT_THREAD
+        _V70_BOOT_SERVER = None
+        _V70_BOOT_THREAD = None
+
+    if servidor is None:
+        return
+
+    try:
+        servidor.shutdown()
+    except Exception:
+        pass
+    try:
+        servidor.server_close()
+    except Exception:
+        pass
+    if thread is not None and thread.is_alive():
+        try:
+            thread.join(timeout=3.0)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    _v70_iniciar_health_bootstrap()
+
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -64165,6 +64308,90 @@ async def statusarmazenamento_v69(
 print(
     "✅ V69 carregada — limpeza por conexão removida, cache limitado, "
     "monitor de volume leve e crash loop corrigido.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V70 — ENTREGA DA PORTA E STARTUP NÃO BLOQUEANTE
+# =====================================================
+_V70_START_WEB_COMPLETO = start_web_server
+
+
+async def start_web_server():
+    """
+    Entrega a porta do servidor provisório para a Central completa.
+
+    O healthcheck provisório permanece respondendo durante toda a importação
+    do arquivo. Ele só é encerrado imediatamente antes do aiohttp assumir.
+    """
+    global _WEB_RUNNER_DICOR, _WEB_SITE_DICOR
+
+    if _WEB_RUNNER_DICOR is not None:
+        return
+
+    await asyncio.to_thread(_v70_parar_health_bootstrap_sync)
+    await asyncio.sleep(0.12)
+
+    ultimo_erro = None
+    for tentativa in range(1, 13):
+        try:
+            await _V70_START_WEB_COMPLETO()
+            print(
+                "✅ V70 Central completa assumiu a porta do healthcheck.",
+                flush=True,
+            )
+            return
+        except OSError as erro:
+            ultimo_erro = erro
+            mensagem = str(erro).lower()
+            if (
+                "address already in use" not in mensagem
+                and "endereço já está em uso" not in mensagem
+                and getattr(erro, "errno", None) not in {48, 98, 10048}
+            ):
+                raise
+            await asyncio.sleep(min(0.25 * tentativa, 1.5))
+
+    raise RuntimeError(
+        "A Central não conseguiu assumir a porta após encerrar "
+        f"o healthcheck provisório: {ultimo_erro}"
+    )
+
+
+def _v70_preparar_memoria_sync() -> None:
+    """
+    Prepara os arquivos persistentes fora do event loop para que /health
+    continue respondendo durante a inicialização.
+    """
+    carregar_boletins_pendentes_memoria()
+    carregar_cadastros_pendentes_memoria()
+    garantir_56_organizacoes()
+    garantir_senha_catalogo()
+
+
+async def main():
+    # A porta HTTP vem primeiro. O Discord e os dados carregam depois.
+    await start_web_server()
+
+    await asyncio.to_thread(_v70_preparar_memoria_sync)
+
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "COLE_O_TOKEN_DO_BOT_AQUI":
+        raise RuntimeError(
+            "DISCORD_TOKEN não foi configurado corretamente no Railway."
+        )
+
+    print(
+        "✅ V70 healthcheck aprovado; iniciando conexão com o Discord.",
+        flush=True,
+    )
+    await bot.start(DISCORD_TOKEN)
+
+
+print(
+    "✅ V70 carregada — /health sobe antes das dependências, "
+    "Central assume a porta e a preparação não bloqueia o servidor.",
     flush=True,
 )
 
