@@ -64397,5 +64397,527 @@ print(
 )
 
 
+
+# =====================================================
+# V72 — PAINEL DE GESTÃO DE CARGOS DICOR
+# =====================================================
+# Regras:
+# - Somente Inspetor, Vice-Diretor ou Diretor podem operar.
+# - Subir: Estagiário -> Investigador e [E.DICOR] -> [DICOR].
+# - Descer: Investigador -> Estagiário e [DICOR] -> [E.DICOR].
+# - Retirar: exige RG e motivo e expulsa o membro do servidor.
+# - Todas as ações são registradas no canal oficial de logs.
+
+V72_CARGO_ESTAGIARIO_ID = 1490200391239864352
+V72_CARGO_INVESTIGADOR_ID = 1490200390426165290
+V72_PREFIXO_ESTAGIARIO = "[E.DICOR]"
+V72_PREFIXO_INVESTIGADOR = "[DICOR]"
+V72_HISTORICO_GESTAO_JSON = DATA_DIR / "historico_gestao_cargos_dicor.json"
+
+
+def _v72_normalizar_rg(valor: Any) -> str:
+    rg = re.sub(r"\D+", "", str(valor or ""))
+    if not rg:
+        raise ValueError("Informe um RG válido.")
+    return rg[:12]
+
+
+def _v72_extrair_nome_passaporte(
+    membro: discord.Member,
+    rg_fallback: str,
+) -> Tuple[str, str]:
+    atual = str(membro.nick or membro.display_name or membro.name or "").strip()
+
+    # Remove somente os prefixos usados nos dois cargos deste painel.
+    sem_prefixo = re.sub(
+        r"^\s*\[(?:E\.)?DICOR\]\s*",
+        "",
+        atual,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if "|" in sem_prefixo:
+        nome_bruto, passaporte_bruto = sem_prefixo.rsplit("|", 1)
+    else:
+        nome_bruto, passaporte_bruto = sem_prefixo, ""
+
+    nome = re.sub(r"\s+", " ", nome_bruto).strip(" |-")
+    if not nome:
+        nome = re.sub(
+            r"^\s*\[(?:E\.)?DICOR\]\s*",
+            "",
+            str(membro.name or "Agente"),
+            flags=re.IGNORECASE,
+        ).strip()
+
+    passaporte_encontrado = re.search(r"\d{1,12}", passaporte_bruto)
+    passaporte = (
+        passaporte_encontrado.group(0)
+        if passaporte_encontrado
+        else rg_fallback
+    )
+    return nome[:55], passaporte[:12]
+
+
+def _v72_montar_apelido(
+    membro: discord.Member,
+    prefixo: str,
+    rg_fallback: str,
+) -> str:
+    nome, passaporte = _v72_extrair_nome_passaporte(membro, rg_fallback)
+    # O Discord limita apelidos a 32 caracteres.
+    espaco_fixo = len(prefixo) + len(passaporte) + len("  | ")
+    limite_nome = max(1, 32 - espaco_fixo)
+    nome = nome[:limite_nome].strip()
+    return f"{prefixo} {nome} | {passaporte}"[:32]
+
+
+def _v72_registrar_historico_sync(registro: Dict[str, Any]) -> None:
+    try:
+        dados = carregar_json(V72_HISTORICO_GESTAO_JSON, [])
+        if not isinstance(dados, list):
+            dados = []
+        dados.append(dict(registro))
+        salvar_json(V72_HISTORICO_GESTAO_JSON, dados[-3000:])
+    except Exception as erro:
+        print(
+            f"⚠️ V72 histórico local não salvo: {type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+def _v72_validar_hierarquia(
+    interaction: discord.Interaction,
+    alvo: discord.Member,
+    *,
+    para_expulsao: bool = False,
+) -> None:
+    guild = interaction.guild
+    executor = interaction.user
+    if guild is None or not isinstance(executor, discord.Member):
+        raise ValueError("Esta ação precisa ser executada dentro do servidor.")
+    if alvo.id == guild.owner_id:
+        raise ValueError("O proprietário do servidor não pode ser alterado pelo bot.")
+    if alvo.id == executor.id:
+        raise ValueError("Você não pode executar esta ação em você mesmo.")
+    if bot.user and alvo.id == bot.user.id:
+        raise ValueError("O bot não pode executar esta ação contra ele mesmo.")
+    if executor.id != guild.owner_id and alvo.top_role >= executor.top_role:
+        raise ValueError(
+            "Você não pode alterar um membro com cargo igual ou superior ao seu."
+        )
+    if guild.me is None or alvo.top_role >= guild.me.top_role:
+        raise ValueError(
+            "O cargo do bot precisa ficar acima do cargo do membro selecionado."
+        )
+    if para_expulsao and not alvo.kickable:
+        raise ValueError(
+            "O bot não consegue expulsar esse membro. Verifique a hierarquia de cargos."
+        )
+
+
+async def _v72_aplicar_acao(
+    interaction: discord.Interaction,
+    alvo: discord.Member,
+    acao: str,
+    rg: str,
+    motivo: str,
+) -> Dict[str, Any]:
+    if not usuario_e_administrador(interaction.user):
+        raise PermissionError("Apenas Inspetor+ pode executar esta ação.")
+
+    guild = interaction.guild
+    if guild is None:
+        raise ValueError("Servidor não localizado.")
+
+    rg_limpo = _v72_normalizar_rg(rg)
+    motivo_limpo = re.sub(r"\s+", " ", str(motivo or "")).strip()
+    if len(motivo_limpo) < 3:
+        raise ValueError("Informe um motivo com pelo menos 3 caracteres.")
+
+    cargo_estagiario = guild.get_role(V72_CARGO_ESTAGIARIO_ID)
+    cargo_investigador = guild.get_role(V72_CARGO_INVESTIGADOR_ID)
+    if cargo_estagiario is None or cargo_investigador is None:
+        raise RuntimeError(
+            "Um dos cargos configurados não foi encontrado no servidor."
+        )
+
+    antes_apelido = alvo.nick or alvo.display_name
+    antes_cargos = [cargo.id for cargo in alvo.roles]
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    executor = interaction.user
+
+    if acao == "subir":
+        _v72_validar_hierarquia(interaction, alvo)
+        if cargo_estagiario not in alvo.roles:
+            raise ValueError("O membro selecionado não possui o cargo Estagiário.")
+
+        novos_cargos = [
+            cargo for cargo in alvo.roles
+            if cargo.id != V72_CARGO_ESTAGIARIO_ID
+        ]
+        if cargo_investigador not in novos_cargos:
+            novos_cargos.append(cargo_investigador)
+
+        novo_apelido = _v72_montar_apelido(
+            alvo,
+            V72_PREFIXO_INVESTIGADOR,
+            rg_limpo,
+        )
+        await alvo.edit(
+            roles=novos_cargos,
+            nick=novo_apelido,
+            reason=(
+                f"Promoção DICOR por {executor} ({executor.id}) | "
+                f"RG {rg_limpo} | {motivo_limpo}"
+            )[:512],
+        )
+        titulo = "PROMOÇÃO — ESTAGIÁRIO PARA INVESTIGADOR"
+
+    elif acao == "descer":
+        _v72_validar_hierarquia(interaction, alvo)
+        if cargo_investigador not in alvo.roles:
+            raise ValueError("O membro selecionado não possui o cargo Investigador.")
+
+        novos_cargos = [
+            cargo for cargo in alvo.roles
+            if cargo.id != V72_CARGO_INVESTIGADOR_ID
+        ]
+        if cargo_estagiario not in novos_cargos:
+            novos_cargos.append(cargo_estagiario)
+
+        novo_apelido = _v72_montar_apelido(
+            alvo,
+            V72_PREFIXO_ESTAGIARIO,
+            rg_limpo,
+        )
+        await alvo.edit(
+            roles=novos_cargos,
+            nick=novo_apelido,
+            reason=(
+                f"Rebaixamento DICOR por {executor} ({executor.id}) | "
+                f"RG {rg_limpo} | {motivo_limpo}"
+            )[:512],
+        )
+        titulo = "REBAIXAMENTO — INVESTIGADOR PARA ESTAGIÁRIO"
+
+    elif acao == "retirar":
+        _v72_validar_hierarquia(
+            interaction,
+            alvo,
+            para_expulsao=True,
+        )
+        novo_apelido = "EXPULSO DO SERVIDOR"
+        titulo = "RETIRADA DA DICOR — EXPULSÃO DO SERVIDOR"
+
+        # A expulsão só é registrada como concluída após o Discord confirmar o kick.
+
+        await guild.kick(
+            alvo,
+            reason=(
+                f"Retirada DICOR por {executor} ({executor.id}) | "
+                f"RG {rg_limpo} | {motivo_limpo}"
+            )[:512],
+        )
+
+    else:
+        raise ValueError("Ação de gestão desconhecida.")
+
+    registro = {
+        "acao": acao,
+        "titulo": titulo,
+        "alvo_id": alvo.id,
+        "alvo_usuario": str(alvo),
+        "alvo_apelido_anterior": antes_apelido,
+        "alvo_apelido_novo": novo_apelido,
+        "cargos_anteriores": antes_cargos,
+        "rg": rg_limpo,
+        "motivo": motivo_limpo,
+        "executor_id": executor.id,
+        "executor_usuario": str(executor),
+        "data": agora,
+        "status": "CONCLUIDA",
+    }
+    await asyncio.to_thread(_v72_registrar_historico_sync, registro)
+
+    await enviar_log(
+        f"🛡️ **{titulo}**\n"
+        f"**Membro:** {alvo} (`{alvo.id}`)\n"
+        f"**RG:** `{rg_limpo}`\n"
+        f"**Apelido anterior:** `{antes_apelido}`\n"
+        f"**Novo estado:** `{novo_apelido}`\n"
+        f"**Motivo:** {motivo_limpo}\n"
+        f"**Responsável:** {executor.mention} (`{executor.id}`)"
+    )
+    return registro
+
+
+class V72GestaoModal(discord.ui.Modal):
+    def __init__(self, alvo: discord.Member, acao: str):
+        titulos = {
+            "subir": "Subir para Investigador",
+            "descer": "Descer para Estagiário",
+            "retirar": "Retirar da DICOR",
+        }
+        super().__init__(title=titulos.get(acao, "Gestão DICOR"))
+        self.alvo = alvo
+        self.acao = acao
+
+        self.rg = discord.ui.TextInput(
+            label="RG DO MEMBRO",
+            placeholder="Ex.: 28905",
+            min_length=1,
+            max_length=12,
+            required=True,
+        )
+        self.motivo = discord.ui.TextInput(
+            label="MOTIVO",
+            placeholder="Informe o motivo da alteração",
+            style=discord.TextStyle.paragraph,
+            min_length=3,
+            max_length=700,
+            required=True,
+        )
+        self.add_item(self.rg)
+        self.add_item(self.motivo)
+
+        if acao == "retirar":
+            self.confirmacao = discord.ui.TextInput(
+                label="CONFIRMAÇÃO DA EXPULSÃO",
+                placeholder="Digite EXPULSAR",
+                min_length=8,
+                max_length=8,
+                required=True,
+            )
+            self.add_item(self.confirmacao)
+        else:
+            self.confirmacao = None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.acao == "retirar":
+            valor = str(self.confirmacao.value or "").strip().upper()
+            if valor != "EXPULSAR":
+                return await interaction.response.send_message(
+                    "❌ Digite **EXPULSAR** para confirmar a retirada do servidor.",
+                    ephemeral=True,
+                )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            registro = await _v72_aplicar_acao(
+                interaction,
+                self.alvo,
+                self.acao,
+                str(self.rg.value or ""),
+                str(self.motivo.value or ""),
+            )
+
+            textos = {
+                "subir": (
+                    "✅ Membro promovido para **Investigador**.\n"
+                    "Cargo e apelido foram atualizados."
+                ),
+                "descer": (
+                    "✅ Membro rebaixado para **Estagiário**.\n"
+                    "Cargo e apelido foram atualizados."
+                ),
+                "retirar": (
+                    "✅ Membro retirado da DICOR e expulso do servidor."
+                ),
+            }
+            await interaction.followup.send(
+                f"{textos[self.acao]}\n"
+                f"**Membro:** {registro['alvo_usuario']}\n"
+                f"**RG:** `{registro['rg']}`\n"
+                f"**Motivo:** {registro['motivo']}",
+                ephemeral=True,
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V72 falha na gestão de cargo | ação `{self.acao}` | "
+                f"alvo `{self.alvo.id}` | executor "
+                f"`{getattr(interaction.user, 'id', 0)}` | "
+                f"{type(erro).__name__}: {erro}\n"
+                f"```py\n{traceback.format_exc()[-2200:]}\n```"
+            )
+            await interaction.followup.send(
+                f"❌ Não foi possível concluir: `{str(erro)[:450]}`",
+                ephemeral=True,
+            )
+
+
+class V72SelecionarMembro(discord.ui.UserSelect):
+    def __init__(self, acao: str):
+        self.acao = acao
+        descricoes = {
+            "subir": "Selecione o Estagiário que será promovido",
+            "descer": "Selecione o Investigador que será rebaixado",
+            "retirar": "Selecione o membro que será retirado",
+        }
+        super().__init__(
+            placeholder=descricoes.get(acao, "Selecione o membro"),
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Apenas Inspetor+ pode utilizar este painel.",
+                ephemeral=True,
+            )
+
+        selecionado = self.values[0]
+        if not isinstance(selecionado, discord.Member):
+            membro = interaction.guild.get_member(selecionado.id) if interaction.guild else None
+        else:
+            membro = selecionado
+
+        if membro is None:
+            return await interaction.response.send_message(
+                "❌ O membro selecionado não foi localizado no servidor.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_modal(
+            V72GestaoModal(membro, self.acao)
+        )
+
+
+class V72SelecionarMembroView(discord.ui.View):
+    def __init__(self, acao: str):
+        super().__init__(timeout=180)
+        self.add_item(V72SelecionarMembro(acao))
+
+
+class V72PainelGestaoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if usuario_e_administrador(interaction.user):
+            return True
+        await interaction.response.send_message(
+            "❌ Apenas **Inspetor, Vice-Diretor ou Diretor** pode usar este painel.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Subir para Investigador",
+        emoji="⬆️",
+        style=discord.ButtonStyle.success,
+        custom_id="dicor:gestao:subir:v72",
+        row=0,
+    )
+    async def subir(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_message(
+            "Selecione o **Estagiário** que será promovido:",
+            view=V72SelecionarMembroView("subir"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Descer para Estagiário",
+        emoji="⬇️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="dicor:gestao:descer:v72",
+        row=0,
+    )
+    async def descer(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_message(
+            "Selecione o **Investigador** que será rebaixado:",
+            view=V72SelecionarMembroView("descer"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Retirar da DICOR",
+        emoji="🚫",
+        style=discord.ButtonStyle.danger,
+        custom_id="dicor:gestao:retirar:v72",
+        row=1,
+    )
+    async def retirar(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_message(
+            "Selecione o membro que será **retirado e expulso do servidor**:",
+            view=V72SelecionarMembroView("retirar"),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="painelgestaodicor",
+    description="Envia o painel de promoção, rebaixamento e retirada da DICOR.",
+)
+async def painelgestaodicor(interaction: discord.Interaction) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode publicar este painel.",
+            ephemeral=True,
+        )
+
+    embed = discord.Embed(
+        title="🛡️ GESTÃO DE EFETIVO — DICOR",
+        description=(
+            "Painel restrito para movimentações internas do efetivo.\n\n"
+            "⬆️ **Subir para Investigador**\n"
+            "Remove Estagiário, adiciona Investigador e altera "
+            "`[E.DICOR]` para `[DICOR]`.\n\n"
+            "⬇️ **Descer para Estagiário**\n"
+            "Remove Investigador, adiciona Estagiário e altera "
+            "`[DICOR]` para `[E.DICOR]`.\n\n"
+            "🚫 **Retirar da DICOR**\n"
+            "Solicita RG, motivo e confirmação antes de expulsar o membro."
+        ),
+        color=discord.Color.from_rgb(32, 63, 96),
+    )
+    embed.set_footer(
+        text="Todas as ações ficam registradas nos logs oficiais."
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=V72PainelGestaoView(),
+    )
+
+
+_V72_SETUP_ANTERIOR = bot.setup_hook
+
+
+async def _v72_setup_hook(self):
+    await _V72_SETUP_ANTERIOR()
+    try:
+        bot.add_view(V72PainelGestaoView())
+    except Exception as erro:
+        print(
+            f"⚠️ V72 não registrou a view persistente: {erro}",
+            flush=True,
+        )
+
+
+bot.setup_hook = _v13_types.MethodType(_v72_setup_hook, bot)
+
+
+print(
+    "✅ V72 carregada — painel de promoção, rebaixamento e retirada "
+    "da DICOR com RG, motivo, apelido automático e logs.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
