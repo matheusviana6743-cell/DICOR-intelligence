@@ -64919,5 +64919,1103 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V73 — BO MENSAL, BO SEM FOTOS, PROMOÇÃO E ACESSO ÚNICO
+# =====================================================
+# 1. A numeração dos boletins reinicia em 001 a cada mês.
+# 2. Mensagens encaminhadas são a fonte oficial da numeração mensal.
+# 3. Boletins criados pelo bot recebem o próximo número livre do mês.
+# 4. A reconciliação corrige registros, tópicos e mensagens editáveis atuais.
+# 5. Fotos/anexos não são mais enviados ou copiados para boletins.
+# 6. Promoção para Investigador gera anúncio no canal oficial.
+# 7. A Central usa apenas QRA + passaporte; a senha comum foi removida.
+
+V73_PROMOCOES_CHANNEL_ID = 1490200487105134752
+V73_BO_CONTADOR_MENSAL_JSON = DATA_DIR / 'boletins_contador_mensal.json'
+V73_BO_RECONCILIACAO_JSON = DATA_DIR / 'boletins_reconciliacao_mensal.json'
+V73_BO_NUM_LOCK = threading.RLock()
+V73_BO_RECONCILIACAO_LOCK = asyncio.Lock()
+V73_BO_RECONCILIADO_READY = False
+
+
+def _v73_agora_br_dt() -> datetime.datetime:
+    return datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=-3))
+    )
+
+
+def _v73_competencia_atual() -> str:
+    return _v73_agora_br_dt().strftime('%Y-%m')
+
+
+def _v73_competencia_valor(valor: Any) -> str:
+    texto = str(valor or '').strip()
+    if not texto:
+        return ''
+
+    achado = re.search(r'\b(20\d{2})[-/](0[1-9]|1[0-2])\b', texto)
+    if achado:
+        return f'{achado.group(1)}-{achado.group(2)}'
+
+    achado = re.search(
+        r'\b\d{1,2}[/-](0?[1-9]|1[0-2])[/-](20\d{2})\b',
+        texto,
+    )
+    if achado:
+        return f'{achado.group(2)}-{int(achado.group(1)):02d}'
+
+    try:
+        dt = datetime.datetime.fromisoformat(texto.replace('Z', '+00:00'))
+        return dt.astimezone(
+            datetime.timezone(datetime.timedelta(hours=-3))
+        ).strftime('%Y-%m')
+    except Exception:
+        return ''
+
+
+def _v73_competencia_registro(registro: Dict[str, Any]) -> str:
+    for chave in (
+        'competencia_boletim', 'competencia', 'mes_referencia',
+        'criado_em', 'data_criacao', 'registrado_em', 'data_registro',
+        'data', 'data_fato', 'atualizado_em',
+    ):
+        competencia = _v73_competencia_valor(registro.get(chave))
+        if competencia:
+            return competencia
+    return ''
+
+
+def _v73_numero_int(valor: Any) -> int:
+    try:
+        return int(_v44_numero_inteiro_bo(valor))
+    except Exception:
+        texto = str(valor or '')
+        achado = re.search(r'(\d{1,8})(?!.*\d)', texto)
+        return int(achado.group(1)) if achado else 0
+
+
+def _v73_numero(numero: int) -> str:
+    return f'BO-DICOR-{max(0, int(numero)):03d}'
+
+
+def _v73_iterar_registros(fonte: Any) -> List[Dict[str, Any]]:
+    if isinstance(fonte, list):
+        return [x for x in fonte if isinstance(x, dict)]
+    if isinstance(fonte, dict):
+        return [x for x in fonte.values() if isinstance(x, dict)]
+    return []
+
+
+def _v73_maior_numero_local_mes(competencia: str) -> int:
+    maior = 0
+    fontes: List[Any] = [
+        carregar_boletins() or [],
+        carregar_atendimentos_boletins() or [],
+        carregar_json(BOLETINS_PENDENTES_JSON, {}) or {},
+    ]
+    snapshot = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    if isinstance(snapshot, dict):
+        fontes.append(snapshot.get('boletins') or [])
+
+    for fonte in fontes:
+        for item in _v73_iterar_registros(fonte):
+            comp = _v73_competencia_registro(item)
+            if comp and comp != competencia:
+                continue
+            # Registros antigos sem data não podem bloquear o contador mensal.
+            if not comp:
+                continue
+            for chave in (
+                'numero', 'numero_boletim', 'boletim', 'titulo', 'texto',
+            ):
+                maior = max(maior, _v73_numero_int(item.get(chave)))
+
+    contador = carregar_json(V73_BO_CONTADOR_MENSAL_JSON, {})
+    if isinstance(contador, dict):
+        try:
+            maior = max(maior, int((contador.get('meses') or {}).get(competencia) or 0))
+        except Exception:
+            pass
+    return maior
+
+
+def _v73_salvar_contador_mes(competencia: str, ultimo: int) -> None:
+    dados = carregar_json(V73_BO_CONTADOR_MENSAL_JSON, {})
+    if not isinstance(dados, dict):
+        dados = {}
+    meses = dados.get('meses')
+    if not isinstance(meses, dict):
+        meses = {}
+    meses[str(competencia)] = max(0, int(ultimo))
+    dados.update({
+        'meses': meses,
+        'competencia_atual': str(competencia),
+        'ultimo': max(0, int(ultimo)),
+        'modelo': 'mensal_v73',
+        'atualizado_em': agora_br(),
+    })
+    salvar_json(V73_BO_CONTADOR_MENSAL_JSON, dados)
+    # Mantém o arquivo antigo compatível, sem usar o número global.
+    salvar_json(BOLETINS_CONTADOR_JSON, {
+        'ultimo': max(0, int(ultimo)),
+        'competencia': str(competencia),
+        'modelo': 'mensal_v73',
+        'atualizado_em': agora_br(),
+    })
+
+
+def gerar_numero_boletim() -> str:
+    competencia = _v73_competencia_atual()
+    with V73_BO_NUM_LOCK:
+        ultimo = _v73_maior_numero_local_mes(competencia) + 1
+        _v73_salvar_contador_mes(competencia, ultimo)
+    return _v73_numero(ultimo)
+
+
+def buscar_boletim_numero(numero: str) -> Optional[Dict[str, Any]]:
+    alvo = _v73_numero_int(numero)
+    if not alvo:
+        return None
+    competencia = _v73_competencia_atual()
+    candidatos: List[Dict[str, Any]] = []
+    for registro in carregar_boletins() or []:
+        if not isinstance(registro, dict):
+            continue
+        if _v73_numero_int(registro.get('numero')) != alvo:
+            continue
+        candidatos.append(registro)
+
+    atuais = [
+        x for x in candidatos
+        if _v73_competencia_registro(x) == competencia
+    ]
+    if atuais:
+        return atuais[-1]
+    # Fora da criação/publicação, ainda permite consultar o registro mais novo.
+    return candidatos[-1] if candidatos else None
+
+
+def _v73_substituir_numero_texto(
+    texto: str,
+    numero_novo: int,
+) -> str:
+    if not texto:
+        return texto
+    canonico = _v73_numero(numero_novo)
+    curto = f'{int(numero_novo):03d}'
+    resultado = str(texto)
+    resultado = re.sub(
+        r'(?i)BO\s*[-_ ]*DICOR\s*[-_ ]*\d{1,8}',
+        canonico,
+        resultado,
+    )
+    resultado = re.sub(
+        r'(?i)(BOLETIM(?:\s+DE\s+OCORR[ÊE]NCIA)?\s*[—–:\-]?\s*(?:N[º°O.]*)?\s*)\d{1,8}',
+        lambda m: m.group(1) + curto,
+        resultado,
+    )
+    resultado = re.sub(
+        r'(?i)(N[ÚU]MERO\s+DO\s+BOLETIM\s*:\s*)[^\n]+',
+        lambda m: m.group(1) + canonico,
+        resultado,
+    )
+    return resultado
+
+
+def _v73_item_corresponde_mensagem(
+    item: Dict[str, Any],
+    mensagem_id: int,
+    numero_antigo: int,
+    competencia: str,
+) -> bool:
+    for chave in (
+        'mensagem_id', 'mensagem_origem_id', 'source_message_id',
+        'publicacao_id', 'boletim_mensagem_id',
+    ):
+        try:
+            if int(item.get(chave) or 0) == int(mensagem_id):
+                return True
+        except Exception:
+            pass
+
+    comp = _v73_competencia_registro(item)
+    return bool(
+        comp == competencia
+        and numero_antigo
+        and any(
+            _v73_numero_int(item.get(chave)) == numero_antigo
+            for chave in ('numero', 'numero_boletim', 'boletim')
+        )
+    )
+
+
+def _v73_atualizar_item_numero(
+    item: Dict[str, Any],
+    numero_novo: int,
+    competencia: str,
+) -> None:
+    canonico = _v73_numero(numero_novo)
+    item['numero'] = canonico
+    item['competencia_boletim'] = competencia
+    item['competencia'] = competencia
+    for chave in ('numero_boletim', 'boletim'):
+        if chave in item:
+            item[chave] = canonico
+    for chave in (
+        'titulo', 'texto', 'texto_original', 'conteudo', 'descricao',
+        'historico_texto',
+    ):
+        if isinstance(item.get(chave), str):
+            item[chave] = _v73_substituir_numero_texto(
+                item[chave],
+                numero_novo,
+            )
+
+
+async def _v73_editar_mensagem_numero(
+    mensagem: discord.Message,
+    numero_novo: int,
+) -> bool:
+    if not bot.user or int(getattr(mensagem.author, 'id', 0)) != int(bot.user.id):
+        return False
+
+    conteudo_novo = _v73_substituir_numero_texto(
+        str(mensagem.content or ''),
+        numero_novo,
+    )
+    embeds_novos: List[discord.Embed] = []
+    mudou_embed = False
+    for embed in list(mensagem.embeds or []):
+        copia = discord.Embed.from_dict(embed.to_dict())
+        titulo = _v73_substituir_numero_texto(str(copia.title or ''), numero_novo)
+        descricao = _v73_substituir_numero_texto(str(copia.description or ''), numero_novo)
+        if titulo != str(copia.title or ''):
+            copia.title = titulo
+            mudou_embed = True
+        if descricao != str(copia.description or ''):
+            copia.description = descricao
+            mudou_embed = True
+        for indice, campo in enumerate(list(copia.fields)):
+            nome = _v73_substituir_numero_texto(str(campo.name), numero_novo)
+            valor = _v73_substituir_numero_texto(str(campo.value), numero_novo)
+            if nome != campo.name or valor != campo.value:
+                copia.set_field_at(
+                    indice,
+                    name=nome,
+                    value=valor,
+                    inline=campo.inline,
+                )
+                mudou_embed = True
+        embeds_novos.append(copia)
+
+    if conteudo_novo == str(mensagem.content or '') and not mudou_embed:
+        return False
+    try:
+        await mensagem.edit(
+            content=conteudo_novo,
+            embeds=embeds_novos if mensagem.embeds else [],
+        )
+        return True
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ V73 não conseguiu editar a numeração da mensagem '
+            f'`{mensagem.id}`: {type(erro).__name__}: {erro}'
+        )
+        return False
+
+
+async def _v73_renomear_area_bo(
+    area_id: int,
+    numero_novo: int,
+) -> bool:
+    if not area_id:
+        return False
+    canal = bot.get_channel(int(area_id))
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(int(area_id))
+        except Exception:
+            return False
+    nome_atual = str(getattr(canal, 'name', '') or '')
+    if not nome_atual:
+        return False
+    curto = f'{int(numero_novo):03d}'
+    nome_novo = re.sub(
+        r'(?i)(boletim(?:-de-ocorrencia)?(?:-n[oº°]?)?[-_ ]*)\d{1,8}',
+        lambda m: m.group(1) + curto,
+        nome_atual,
+    )
+    if nome_novo == nome_atual:
+        nome_novo = re.sub(r'\d{1,8}(?!.*\d)', curto, nome_atual)
+    if nome_novo == nome_atual:
+        return False
+    try:
+        await canal.edit(
+            name=nome_novo[:100],
+            reason='Reconciliação mensal da numeração dos boletins V73',
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _v73_reconciliar_boletins_mes(
+    competencia: Optional[str] = None,
+) -> Dict[str, int]:
+    competencia = competencia or _v73_competencia_atual()
+    async with V73_BO_RECONCILIACAO_LOCK:
+        canal = bot.get_channel(int(BOLETINS_CHANNEL_ID))
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(int(BOLETINS_CHANNEL_ID))
+            except Exception:
+                canal = None
+        if canal is None or not hasattr(canal, 'history'):
+            raise RuntimeError('Canal oficial de boletins não localizado.')
+
+        mensagens_inicio: List[discord.Message] = []
+        async for mensagem in canal.history(limit=None, oldest_first=True):
+            criado = getattr(mensagem, 'created_at', None)
+            if criado is None:
+                continue
+            comp_msg = criado.astimezone(
+                datetime.timezone(datetime.timedelta(hours=-3))
+            ).strftime('%Y-%m')
+            if comp_msg != competencia:
+                continue
+            try:
+                valido = eh_boletim_valido_para_atendimento(mensagem)
+            except Exception:
+                valido = bool(
+                    _v73_numero_int(
+                        _pericia_texto_mensagem(mensagem)
+                        if '_pericia_texto_mensagem' in globals()
+                        else mensagem.content
+                    )
+                )
+            if valido:
+                mensagens_inicio.append(mensagem)
+
+        proximo = 1
+        mapa: List[Dict[str, Any]] = []
+        editadas = 0
+        atualizados = 0
+        renomeados = 0
+        numeros_usados: set[int] = set()
+
+        for mensagem in mensagens_inicio:
+            texto_msg = (
+                _pericia_texto_mensagem(mensagem)
+                if '_pericia_texto_mensagem' in globals()
+                else str(mensagem.content or '')
+            )
+            numero_antigo = _v73_numero_int(texto_msg)
+            mensagem_do_bot = bool(
+                bot.user
+                and int(getattr(mensagem.author, 'id', 0)) == int(bot.user.id)
+            )
+
+            if not mensagem_do_bot and numero_antigo > 0:
+                # A mensagem encaminhada é a fonte oficial do número mensal.
+                numero_novo = numero_antigo
+                numeros_usados.add(numero_novo)
+                proximo = max(proximo, numero_novo + 1)
+            else:
+                while proximo in numeros_usados:
+                    proximo += 1
+                numero_novo = proximo
+                numeros_usados.add(numero_novo)
+                proximo += 1
+
+            if mensagem_do_bot and numero_antigo != numero_novo:
+                if await _v73_editar_mensagem_numero(mensagem, numero_novo):
+                    editadas += 1
+
+            mapa.append({
+                'mensagem_id': int(mensagem.id),
+                'numero_antigo': int(numero_antigo or 0),
+                'numero_novo': int(numero_novo),
+                'mensagem_do_bot': mensagem_do_bot,
+            })
+
+        boletins = carregar_boletins() or []
+        atendimentos = carregar_atendimentos_boletins() or []
+        pendentes = carregar_json(BOLETINS_PENDENTES_JSON, {}) or {}
+        if not isinstance(pendentes, dict):
+            pendentes = {}
+
+        areas_renomear: List[Tuple[int, int]] = []
+        for alteracao in mapa:
+            mensagem_id = alteracao['mensagem_id']
+            antigo = alteracao['numero_antigo']
+            novo = alteracao['numero_novo']
+
+            for item in boletins:
+                if isinstance(item, dict) and _v73_item_corresponde_mensagem(
+                    item, mensagem_id, antigo, competencia
+                ):
+                    _v73_atualizar_item_numero(item, novo, competencia)
+                    atualizados += 1
+
+            for item in atendimentos:
+                if isinstance(item, dict) and _v73_item_corresponde_mensagem(
+                    item, mensagem_id, antigo, competencia
+                ):
+                    _v73_atualizar_item_numero(item, novo, competencia)
+                    atualizados += 1
+                    for chave_area in (
+                        'area_id', 'topico_id', 'thread_id', 'canal_id',
+                    ):
+                        try:
+                            area_id = int(item.get(chave_area) or 0)
+                        except Exception:
+                            area_id = 0
+                        if area_id:
+                            areas_renomear.append((area_id, novo))
+                            break
+
+        salvar_boletins(boletins)
+        salvar_atendimentos_boletins(atendimentos)
+
+        # Rascunhos do mês recebem números depois dos já publicados.
+        maior_publicado = max(numeros_usados or {0})
+        rascunhos_mes: List[Tuple[str, Dict[str, Any]]] = []
+        for chave, item in pendentes.items():
+            if not isinstance(item, dict):
+                continue
+            comp = _v73_competencia_registro(item) or competencia
+            if comp == competencia:
+                rascunhos_mes.append((str(chave), item))
+        rascunhos_mes.sort(
+            key=lambda par: str(
+                par[1].get('criado_em')
+                or par[1].get('data_criacao')
+                or par[0]
+            )
+        )
+        for _, item in rascunhos_mes:
+            maior_publicado += 1
+            _v73_atualizar_item_numero(item, maior_publicado, competencia)
+        salvar_json(BOLETINS_PENDENTES_JSON, pendentes)
+        carregar_boletins_pendentes_memoria()
+
+        for area_id, novo in list(dict.fromkeys(areas_renomear)):
+            if await _v73_renomear_area_bo(area_id, novo):
+                renomeados += 1
+
+        ultimo = max(maior_publicado, max(numeros_usados or {0}))
+        _v73_salvar_contador_mes(competencia, ultimo)
+        salvar_json(V73_BO_RECONCILIACAO_JSON, {
+            'competencia': competencia,
+            'ultimo': ultimo,
+            'mensagens_encontradas': len(mensagens_inicio),
+            'mensagens_editadas': editadas,
+            'registros_atualizados': atualizados,
+            'topicos_renomeados': renomeados,
+            'mapa': mapa,
+            'executado_em': agora_br(),
+        })
+
+        # O snapshot é refeito sem fotos após a numeração ser reconciliada.
+        try:
+            await _v21_snapshot_boletins_do_canal()
+        except Exception:
+            pass
+
+        return {
+            'mensagens': len(mensagens_inicio),
+            'editadas': editadas,
+            'registros': atualizados,
+            'topicos': renomeados,
+            'ultimo': ultimo,
+        }
+
+
+# -----------------------------------------------------
+# BOLETINS SEM FOTOS/ANEXOS
+# -----------------------------------------------------
+def formatar_boletim(dados: Dict[str, Any], previa: bool = False) -> str:
+    secoes: List[str] = []
+    tipo = str(dados.get('tipo_identificacao', '') or '').lower()
+    if tipo in {'individuo', 'ambos'}:
+        secao = formatar_secao_individuo(dados.get('dados_individuo', {}))
+        if secao:
+            secoes.append(secao)
+    if tipo in {'veiculo', 'ambos'}:
+        secao = formatar_secao_veiculo(dados.get('dados_veiculo', {}))
+        if secao:
+            secoes.append(secao)
+
+    identificacoes = '\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n'.join(secoes)
+    identificacoes = (
+        '\n\n━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+        + identificacoes
+        + '\n\n━━━━━━━━━━━━━━━━━━━━━━━\n'
+        if identificacoes
+        else '\n\n━━━━━━━━━━━━━━━━━━━━━━━\n'
+    )
+    numero = str(dados.get('numero', ''))
+    comunicante = str(
+        dados.get('comunicante_mention')
+        or f"<@{dados.get('comunicante_id', 0)}>"
+    )
+    return (
+        f"📋 **BOLETIM DE OCORRÊNCIA — {numero_curto_boletim(numero)}**\n\n"
+        f"**Comunicante:** {comunicante}\n"
+        f"**RG:** {dados.get('rg') or 'Não informado'}\n\n"
+        f"**Data do fato:** {dados.get('data_fato') or data_atual_br()}\n"
+        f"**Horário aproximado:** {dados.get('horario_fato') or horario_atual_br()}\n"
+        f"**Local:** {dados.get('local') or 'Não informado'}\n\n"
+        f"**RELATO:**\n\n{dados.get('relato') or 'Não informado'}"
+        f"{identificacoes}\n"
+        f"**CONCLUSÃO:**\n\n"
+        f"{dados.get('conclusao') or 'A conclusão ainda não foi gerada.'}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**Número do boletim:** {numero}\n"
+        f"**Competência:** {_v73_competencia_atual()}\n"
+        f"**Registrado por:** {comunicante}\n"
+        f"**Data do registro:** {data_atual_br()} — {horario_atual_br()}\n"
+        f"> 👮 Criado por: {comunicante}"
+    )
+
+
+async def enviar_etapa_provas(
+    interaction: discord.Interaction,
+    dados: Dict[str, Any],
+) -> None:
+    """A etapa de fotos foi removida; segue direto para a prévia."""
+    canal = interaction.channel
+    if not isinstance(canal, discord.TextChannel):
+        return await responder_interacao(
+            interaction,
+            '❌ Canal inválido.',
+            ephemeral=True,
+        )
+    dados['etapa'] = 'PREVIA'
+    dados['anexos'] = []
+    dados['competencia_boletim'] = _v73_competencia_atual()
+    boletins_pendentes[canal.id] = dados
+    salvar_boletins_pendentes()
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    await enviar_previa_boletim(canal, dados)
+    await interaction.followup.send(
+        '✅ Dados concluídos. A etapa de fotos foi removida; confira a prévia.',
+        ephemeral=True,
+    )
+
+
+async def coletar_anexos_boletim(
+    canal: discord.TextChannel,
+) -> List[discord.Attachment]:
+    return []
+
+
+async def enviar_anexos_boletim(
+    canal_oficial: discord.abc.Messageable,
+    anexos: List[discord.Attachment],
+    numero: str,
+) -> List[Dict[str, Any]]:
+    return []
+
+
+async def publicar_boletim_core(interaction: discord.Interaction) -> None:
+    canal_temp = interaction.channel
+    if not isinstance(canal_temp, discord.TextChannel):
+        return await responder_interacao(
+            interaction, '❌ Canal inválido.', ephemeral=True
+        )
+    dados = obter_rascunho_boletim(interaction)
+    if not dados:
+        return await responder_interacao(
+            interaction,
+            '❌ Boletim não encontrado ou você não tem permissão.',
+            ephemeral=True,
+        )
+    if dados.get('publicando'):
+        return await responder_interacao(
+            interaction,
+            '⏳ Este boletim já está sendo publicado.',
+            ephemeral=True,
+        )
+
+    dados['competencia_boletim'] = (
+        _v73_competencia_registro(dados) or _v73_competencia_atual()
+    )
+    existente = buscar_boletim_numero(str(dados.get('numero', '')))
+    if existente and _v73_competencia_registro(existente) == dados['competencia_boletim']:
+        return await responder_interacao(
+            interaction,
+            '⚠️ Este número já foi publicado nesta competência.',
+            ephemeral=True,
+        )
+
+    dados['publicando'] = True
+    dados['anexos'] = []
+    boletins_pendentes[canal_temp.id] = dados
+    salvar_boletins_pendentes()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        canal_oficial = bot.get_channel(int(BOLETINS_CHANNEL_ID))
+        if canal_oficial is None:
+            canal_oficial = await bot.fetch_channel(int(BOLETINS_CHANNEL_ID))
+        if not isinstance(canal_oficial, discord.TextChannel):
+            raise RuntimeError('O canal oficial de boletins não foi encontrado.')
+
+        partes = dividir_texto_discord(formatar_boletim(dados, previa=False))
+        mensagens_publicadas: List[discord.Message] = []
+        for parte in partes:
+            mensagem = await canal_oficial.send(
+                parte,
+                allowed_mentions=discord.AllowedMentions(
+                    users=False, roles=False, everyone=False
+                ),
+            )
+            mensagens_publicadas.append(mensagem)
+
+        principal = mensagens_publicadas[0]
+        registro = dict(dados)
+        registro.pop('preview_message_ids', None)
+        registro.pop('publicando', None)
+        registro.update({
+            'status': 'PUBLICADO',
+            'mensagem_id': principal.id,
+            'mensagem_url': principal.jump_url,
+            'mensagens_oficiais': [
+                {'id': m.id, 'url': m.jump_url}
+                for m in mensagens_publicadas
+            ],
+            'anexos': [],
+            'data_criacao': _v73_agora_br_dt().isoformat(),
+            'competencia': dados['competencia_boletim'],
+            'competencia_boletim': dados['competencia_boletim'],
+            'criado_por_id': registro.get('comunicante_id'),
+            'criado_por_nome': registro.get('comunicante_nome'),
+            'publicado_por_id': interaction.user.id,
+            'publicado_por_nome': str(interaction.user),
+            'canal_provisorio_id': canal_temp.id,
+        })
+
+        boletins = carregar_boletins() or []
+        duplicado = any(
+            isinstance(item, dict)
+            and _v73_numero_int(item.get('numero'))
+                == _v73_numero_int(registro.get('numero'))
+            and _v73_competencia_registro(item)
+                == registro['competencia_boletim']
+            for item in boletins
+        )
+        if not duplicado:
+            boletins.append(registro)
+            salvar_boletins(boletins)
+
+        boletins_pendentes.pop(canal_temp.id, None)
+        salvar_boletins_pendentes()
+        await enviar_log(
+            f"📋 Boletim publicado sem anexos: {registro.get('numero')} | "
+            f"Competência: {registro.get('competencia_boletim')} | "
+            f"Mensagem: {principal.jump_url}"
+        )
+        await interaction.followup.send(
+            f'✅ Boletim publicado: {principal.jump_url}',
+            ephemeral=True,
+        )
+        await canal_temp.send(
+            '✅ Boletim publicado sem fotos. Este canal será apagado em 5 segundos.'
+        )
+        await asyncio.sleep(5)
+        await canal_temp.delete()
+    except Exception as erro:
+        dados['publicando'] = False
+        boletins_pendentes[canal_temp.id] = dados
+        salvar_boletins_pendentes()
+        await enviar_log(
+            f'❌ Erro ao publicar boletim {dados.get("numero")}: '
+            f'{type(erro).__name__}: {erro}'
+        )
+        await interaction.followup.send(
+            f'❌ Não foi possível publicar: `{str(erro)[:450]}`\n'
+            'O canal e o rascunho foram mantidos.',
+            ephemeral=True,
+        )
+
+
+async def _bo_copiar_mensagens_no_topico(
+    atendimento: Dict[str, Any],
+    mensagens: List[discord.Message],
+) -> int:
+    """V73: não copia fotos nem mensagens extras para o tópico do BO."""
+    return 0
+
+
+async def liberar_fotos_em_topicos_antigos_boletins() -> int:
+    return 0
+
+
+async def _v19_sincronizar_boletins_completos() -> Dict[str, int]:
+    """Sincroniza somente texto/metadados; nunca replica anexos."""
+    canal = await _v18_resolver_canal_id(BOLETINS_CHANNEL_ID)
+    if canal is None or not hasattr(canal, 'history'):
+        return {'boletins': 0, 'fotos': 0}
+    mensagens = [m async for m in canal.history(limit=3000, oldest_first=True)]
+    grupos: List[List[discord.Message]] = []
+    atual: List[discord.Message] = []
+    for msg in mensagens:
+        if eh_boletim_valido_para_atendimento(msg):
+            if atual:
+                grupos.append(atual)
+            atual = [msg]
+        elif atual and str(msg.content or '').strip():
+            atual.append(msg)
+    if atual:
+        grupos.append(atual)
+
+    total = 0
+    for grupo in grupos:
+        numero = extrair_numero_boletim_seguro(
+            _pericia_texto_mensagem(grupo[0])
+        )
+        if not numero:
+            continue
+        atendimento = _v18_buscar_atendimento_bo(numero)
+        if not atendimento:
+            continue
+        textos: List[str] = []
+        for msg in grupo:
+            texto = _pericia_texto_mensagem(msg).strip()
+            if texto and texto not in textos:
+                textos.append(texto)
+        atendimento['texto_original'] = '\n\n'.join(textos)[:30000]
+        atendimento['ultima_sincronizacao_central'] = agora_br()
+        atendimento['fotos_copiadas_topico'] = 0
+        atendimento['anexos_salvos'] = []
+        atendimento['fotos_salvas'] = []
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+        total += 1
+    return {'boletins': total, 'fotos': 0}
+
+
+async def _v21_snapshot_boletins_do_canal() -> Dict[str, int]:
+    """Snapshot textual dos BOs. Fotos nunca são baixadas ou vinculadas."""
+    canal = await _v18_resolver_canal_id(BOLETINS_CHANNEL_ID)
+    if canal is None or not hasattr(canal, 'history'):
+        return {'boletins': 0, 'arquivos': 0}
+
+    mensagens = [m async for m in canal.history(limit=None, oldest_first=True)]
+    grupos: List[List[discord.Message]] = []
+    atual: List[discord.Message] = []
+    for msg in mensagens:
+        texto = _pericia_texto_mensagem(msg)
+        numero = _v21_numero_bo_texto(texto)
+        inicio = bool(numero) and eh_boletim_valido_para_atendimento(msg)
+        if inicio:
+            if atual:
+                grupos.append(atual)
+            atual = [msg]
+        elif atual and str(texto or '').strip():
+            atual.append(msg)
+    if atual:
+        grupos.append(atual)
+
+    registros: List[Dict[str, Any]] = []
+    for grupo in grupos:
+        inicio = grupo[0]
+        texto_inicio = _pericia_texto_mensagem(inicio)
+        numero = _v21_numero_bo_texto(texto_inicio)
+        if not numero:
+            continue
+        textos: List[str] = []
+        for msg in grupo:
+            txt = _pericia_texto_mensagem(msg).strip()
+            if txt and txt not in textos:
+                textos.append(txt)
+        criado = getattr(
+            inicio,
+            'created_at',
+            datetime.datetime.now(datetime.timezone.utc),
+        )
+        competencia = criado.astimezone(
+            datetime.timezone(datetime.timedelta(hours=-3))
+        ).strftime('%Y-%m')
+        registros.append({
+            'numero': numero,
+            'competencia': competencia,
+            'competencia_boletim': competencia,
+            'status': _v21_status_numero(numero),
+            'texto': '\n\n'.join(textos)[:60000],
+            'midias': [],
+            'mensagem_id': int(inicio.id),
+            'mensagem_url': inicio.jump_url,
+            'canal_id': int(getattr(canal, 'id', BOLETINS_CHANNEL_ID)),
+            'criado_em': criado.isoformat(),
+            'autor': str(getattr(inicio, 'author', 'Não informado')),
+        })
+
+    salvar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {
+        'origem_canal_id': int(BOLETINS_CHANNEL_ID),
+        'atualizado_em': agora_br(),
+        'sem_fotos': True,
+        'boletins': registros,
+    })
+    return {'boletins': len(registros), 'arquivos': 0}
+
+
+def _v44_boletins_ativos_snapshot() -> List[Dict[str, Any]]:
+    payload = carregar_json(CENTRAL_BO_CANAL_SNAPSHOT_JSON, {})
+    registros = payload.get('boletins', []) if isinstance(payload, dict) else []
+    unicos: Dict[str, Dict[str, Any]] = {}
+    for item in registros if isinstance(registros, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if _v19_status_bo_final(str(item.get('status') or 'EM ABERTO')):
+            continue
+        copia = dict(item)
+        copia['midias'] = []
+        competencia = _v73_competencia_registro(copia) or 'sem-mes'
+        numero = _v73_numero_int(copia.get('numero') or copia.get('texto'))
+        if numero:
+            copia['numero'] = _v73_numero(numero)
+        chave = f'{competencia}:{numero or copia.get("mensagem_id")}'
+        unicos[chave] = copia
+    return sorted(
+        unicos.values(),
+        key=lambda x: str(x.get('criado_em') or ''),
+        reverse=True,
+    )
+
+
+# -----------------------------------------------------
+# ANÚNCIO DE PROMOÇÃO
+# -----------------------------------------------------
+_V73_APLICAR_GESTAO_ANTERIOR = _v72_aplicar_acao
+
+
+async def _v73_enviar_anuncio_promocao(
+    interaction: discord.Interaction,
+    alvo: discord.Member,
+    registro: Dict[str, Any],
+) -> None:
+    canal = bot.get_channel(V73_PROMOCOES_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(V73_PROMOCOES_CHANNEL_ID)
+        except Exception:
+            canal = None
+    if canal is None or not hasattr(canal, 'send'):
+        await enviar_log(
+            f'⚠️ Canal de promoções `{V73_PROMOCOES_CHANNEL_ID}` não localizado.'
+        )
+        return
+
+    embed = discord.Embed(
+        title='🎖️ PROMOÇÃO DE EFETIVO — DICOR',
+        description=(
+            f'Parabéns, {alvo.mention}!\n\n'
+            'Seu comprometimento e desempenho foram reconhecidos. '
+            'A partir de agora, você assume oficialmente a função de '
+            '**Investigador da DICOR**.'
+        ),
+        color=discord.Color.from_rgb(212, 169, 55),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name='👤 Agente promovido',
+        value=f'{alvo.mention}\n`{registro.get("alvo_apelido_novo")}`',
+        inline=False,
+    )
+    embed.add_field(
+        name='📈 Movimentação',
+        value='Estagiário DICOR ➜ **Investigador DICOR**',
+        inline=True,
+    )
+    embed.add_field(
+        name='🪪 RG',
+        value=f'`{registro.get("rg")}`',
+        inline=True,
+    )
+    embed.add_field(
+        name='📝 Motivo',
+        value=str(registro.get('motivo') or 'Mérito e desempenho.')[:1024],
+        inline=False,
+    )
+    embed.set_footer(
+        text='Polícia Federal • DICOR • Capital Morada do Valley'
+    )
+    try:
+        embed.set_thumbnail(url=alvo.display_avatar.url)
+    except Exception:
+        pass
+
+    mensagem = await canal.send(
+        content=f'🎉 {alvo.mention}',
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
+    await enviar_log(
+        f'🎖️ Promoção anunciada | membro `{alvo.id}` | '
+        f'canal `{V73_PROMOCOES_CHANNEL_ID}` | mensagem `{mensagem.id}`'
+    )
+
+
+async def _v72_aplicar_acao(
+    interaction: discord.Interaction,
+    alvo: discord.Member,
+    acao: str,
+    rg: str,
+    motivo: str,
+) -> Dict[str, Any]:
+    registro = await _V73_APLICAR_GESTAO_ANTERIOR(
+        interaction, alvo, acao, rg, motivo
+    )
+    if acao == 'subir':
+        try:
+            await _v73_enviar_anuncio_promocao(interaction, alvo, registro)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ Promoção aplicada, mas o anúncio falhou | '
+                f'{type(erro).__name__}: {erro}'
+            )
+    return registro
+
+
+# -----------------------------------------------------
+# CENTRAL: QRA + PASSAPORTE COMO ÚNICO LOGIN OPERACIONAL
+# -----------------------------------------------------
+@web.middleware
+async def central_auth_middleware(
+    request: web.Request,
+    handler,
+):
+    caminho = request.path
+    publicos = (
+        caminho in {
+            '/', '/index.html', '/cadastro-operador',
+            '/registro-acessos', '/registro-acessos.json',
+            '/health', '/healthz', '/acesso', '/sair',
+            LIVE_OVERLAY_STATE_PATH, LIVE_OVERLAY_API_PATH,
+        }
+        or caminho.startswith('/uploads/')
+        or caminho.startswith('/central/')
+        or caminho.startswith('/central-bo-media/')
+        or caminho.startswith('/central-pericias-media/')
+        or caminho.startswith('/central-dossies-preview/')
+    )
+    if publicos:
+        return await handler(request)
+
+    conta = _v62_conta_request(request)
+    if not conta:
+        if caminho.startswith('/api/'):
+            return web.json_response(
+                {'ok': False, 'erro': 'Informe QRA e passaporte.'},
+                status=401,
+            )
+        destino = quote(str(request.rel_url), safe='/?=&')
+        raise web.HTTPFound(
+            f'/cadastro-operador?next={destino}'
+        )
+
+    _v62_registrar_evento(
+        request,
+        conta,
+        _v62_area_request(request),
+    )
+    # QRA + passaporte liberam todos os módulos operacionais.
+    # A senha continua somente dentro de /registro-acessos.
+    return await handler(request)
+
+
+async def central_login_get(request: web.Request) -> web.Response:
+    destino = _v62_caminho_seguro(request.query.get('next'), '/')
+    if _v62_conta_request(request):
+        raise web.HTTPFound(destino)
+    raise web.HTTPFound(
+        '/cadastro-operador?next=' + quote(destino, safe='/?=&')
+    )
+
+
+async def central_login_post(request: web.Request) -> web.Response:
+    return await central_login_get(request)
+
+
+async def central_logout_http(request: web.Request) -> web.Response:
+    resposta = web.HTTPFound('/')
+    resposta.del_cookie(CENTRAL_DICOR_COOKIE_NAME, path='/')
+    resposta.del_cookie(V62_OPERADOR_COOKIE, path='/')
+    return resposta
+
+
+@bot.tree.command(
+    name='reconciliarnumeracaobo',
+    description='Corrige a numeração mensal dos boletins atuais.',
+)
+async def reconciliarnumeracaobo_v73(
+    interaction: discord.Interaction,
+) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Apenas Inspetor+ pode reconciliar os boletins.',
+            ephemeral=True,
+        )
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        resultado = await _v73_reconciliar_boletins_mes()
+        await interaction.followup.send(
+            '✅ **Numeração mensal reconciliada.**\n'
+            f"Mensagens encontradas: `{resultado['mensagens']}`\n"
+            f"Mensagens do bot corrigidas: `{resultado['editadas']}`\n"
+            f"Registros ajustados: `{resultado['registros']}`\n"
+            f"Tópicos renomeados: `{resultado['topicos']}`\n"
+            f"Próximo número: `{resultado['ultimo'] + 1:03d}`",
+            ephemeral=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V73 reconciliação manual falhou: '
+            f'{type(erro).__name__}: {erro}\n'
+            f'```py\n{traceback.format_exc()[-2500:]}\n```'
+        )
+        await interaction.followup.send(
+            f'❌ Não foi possível reconciliar: `{str(erro)[:450]}`',
+            ephemeral=True,
+        )
+
+
+@bot.listen('on_ready')
+async def _v73_on_ready():
+    global V73_BO_RECONCILIADO_READY
+    if V73_BO_RECONCILIADO_READY:
+        return
+    V73_BO_RECONCILIADO_READY = True
+    await asyncio.sleep(24)
+    try:
+        resultado = await _v73_reconciliar_boletins_mes()
+        print(
+            '✅ V73 boletins mensais: '
+            f"{resultado['mensagens']} mensagem(ns), "
+            f"{resultado['editadas']} edição(ões), "
+            f"{resultado['registros']} registro(s), "
+            f"próximo {resultado['ultimo'] + 1:03d}; fotos desativadas.",
+            flush=True,
+        )
+    except Exception as erro:
+        print(
+            f'⚠️ V73 reconciliação automática: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+
+
+print(
+    '✅ V73 carregada — numeração mensal reconciliada, BO sem fotos, '
+    'anúncio de promoção e Central somente com QRA/passaporte.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
