@@ -29,6 +29,7 @@ from urllib.parse import quote, urlparse
 # Este servidor mínimo usa apenas a biblioteca padrão e sobe antes de
 # importar Discord, ReportLab, Pillow e o restante do bot.
 
+import threading
 import threading as _v70_threading
 from http.server import BaseHTTPRequestHandler as _V70BaseHandler
 from http.server import ThreadingHTTPServer as _V70ThreadingHTTPServer
