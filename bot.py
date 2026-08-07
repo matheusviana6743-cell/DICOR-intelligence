@@ -66194,5 +66194,616 @@ print(
 )
 
 
+
+# =====================================================
+# V75 — ESTABILIDADE REAL DO RAILWAY
+# =====================================================
+# Objetivos:
+# 1. impedir pico de CPU/RAM no on_ready;
+# 2. não executar várias atualizações equivalentes simultaneamente;
+# 3. manter todas as funções, apenas escalonando sua inicialização;
+# 4. parar o spam de "Message edited" da auditoria;
+# 5. monitorar RAM/event loop;
+# 6. nunca apagar BOs, perícias, evidências ou fotos originais para liberar espaço.
+
+import gc as _v75_gc
+import signal as _v75_signal
+
+_V75_STARTUP_EXECUTADO = False
+_V75_RECURSOS_CONTADOR = 0
+_V75_ULTIMA_RAM_MB = 0.0
+
+
+# -----------------------------------------------------
+# 1) Remove SOMENTE listeners on_ready redundantes.
+# As funções continuam existindo e são chamadas abaixo,
+# de maneira controlada e escalonada.
+# -----------------------------------------------------
+_V75_LISTENERS_ESCALONADOS = (
+    "_v17_on_ready_catalogo",
+    "_v19_iniciar_sync_boletins",
+    "_v21_iniciar_snapshot_canal_bo",
+    "_v23_iniciar_sincronizacao",
+    "_v38_on_ready",
+    "_v39_on_ready",
+    "_v43_ativos_ready",
+    "v52_iniciar_recuperacao_e_views",
+    "v53_iniciar_revisao_prisional",
+    "_v61_on_ready",
+    "_v65_on_ready",
+    "_v66_atualizar_alertas_existentes",
+    "_v67_on_ready",
+    "_v73_on_ready",
+)
+
+_V75_LISTENERS_REMOVIDOS: List[str] = []
+
+for _v75_nome in _V75_LISTENERS_ESCALONADOS:
+    _v75_func = globals().get(_v75_nome)
+    if _v75_func is None:
+        continue
+    try:
+        bot.remove_listener(_v75_func, "on_ready")
+        _V75_LISTENERS_REMOVIDOS.append(_v75_nome)
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------
+# 2) Cache de disco: somente conteúdo realmente temporário.
+# Não permite apagar mídia de BO/perícia/evidência.
+# -----------------------------------------------------
+def _v69_pastas_cache_seguras() -> List[Path]:
+    candidatos = [
+        globals().get("V62_OCR_STAGING_DIR"),
+        Path(DATA_DIR) / "ocr_staging_persistente",
+        Path(DATA_DIR) / "ocr_cache",
+        Path(DATA_DIR) / "catalogo_cache",
+        Path(PUBLIC_DIR) / "cache",
+        # Apenas PRÉVIA recriável de dossiê. O dossiê final não entra.
+        globals().get("CENTRAL_DOSSIES_PREVIEW_DIR"),
+    ]
+
+    saida: List[Path] = []
+    vistos: set[str] = set()
+
+    for valor in candidatos:
+        if not valor:
+            continue
+        pasta = Path(valor)
+        try:
+            chave = str(pasta.resolve())
+        except Exception:
+            chave = str(pasta)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append(pasta)
+
+    return saida
+
+
+# -----------------------------------------------------
+# 3) Auditoria não reage a mensagens produzidas por bots.
+# Alterações no banco já disparam auditoria pelos wrappers.
+# -----------------------------------------------------
+try:
+    bot.remove_listener(_auditoria_observar_canais, "on_message")
+except Exception:
+    pass
+
+
+@bot.listen("on_message")
+async def _v75_auditoria_observar_canais(message: discord.Message) -> None:
+    try:
+        if not message.guild:
+            return
+        if getattr(message.author, "bot", False):
+            return
+
+        canais = {
+            int(globals().get("HISTORICO_PRISAO_CHANNEL_ID", 0) or 0),
+            int(globals().get("PROCURADOS_CHANNEL_ID", 0) or 0),
+            int(globals().get("BOLETINS_CHANNEL_ID", 0) or 0),
+            int(globals().get("BANCO_PERICIA_CHANNEL_ID", 0) or 0),
+            int(globals().get("PERICIA_FLUXO_CHANNEL_ID", 0) or 0),
+            int(globals().get("PERICIAS_CHANNEL_ID", 0) or 0),
+        }
+
+        canal_id = int(getattr(message.channel, "id", 0) or 0)
+        if canal_id and canal_id in canais:
+            _auditoria_solicitar_varredura(
+                f"atividade humana no canal {canal_id}"
+            )
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------
+# 4) Resumo da auditoria: só edita quando os números mudam.
+# Isso evita spam no bot de logs por "Message edited".
+# -----------------------------------------------------
+async def _auditoria_atualizar_resumo(
+    canal: discord.TextChannel,
+    motivo: str,
+    stats: Dict[str, int],
+) -> None:
+    _auditoria_inicializar_banco()
+
+    with _banco_conexao() as db:
+        contagens = {
+            str(row[0]): int(row[1])
+            for row in db.execute(
+                """
+                SELECT prioridade, COUNT(*)
+                FROM auditoria_inconsistencias
+                WHERE status='ATIVA'
+                GROUP BY prioridade
+                """
+            ).fetchall()
+        }
+        ignoradas = int(
+            db.execute(
+                """
+                SELECT COUNT(*) FROM auditoria_inconsistencias
+                WHERE status='IGNORADA'
+                """
+            ).fetchone()[0]
+        )
+        resolvidas = int(
+            db.execute(
+                """
+                SELECT COUNT(*) FROM auditoria_inconsistencias
+                WHERE status='RESOLVIDA'
+                """
+            ).fetchone()[0]
+        )
+
+    assinatura = json.dumps(
+        {
+            "criticos": contagens.get("CRITICO", 0),
+            "importantes": contagens.get("IMPORTANTE", 0),
+            "atencao": contagens.get("ATENCAO", 0),
+            "ignoradas": ignoradas,
+            "resolvidas": resolvidas,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    assinatura_anterior = str(
+        _auditoria_meta_obter("v75_resumo_assinatura") or ""
+    )
+
+    mid = int(
+        _auditoria_meta_obter("mensagem_resumo_id") or 0
+    )
+    mensagem = await _auditoria_obter_mensagem(canal, mid)
+
+    # Se o painel existe e nada mudou, não faz edit.
+    if mensagem is not None and assinatura == assinatura_anterior:
+        return
+
+    embed = discord.Embed(
+        title="🛡️ AUDITORIA AUTOMÁTICA DO BANCO",
+        description=(
+            "Verificação automática de inconsistências. "
+            "Nenhuma ficha é apagada ou corrigida sem confirmação.\n"
+            f"**Última alteração detectada:** {motivo}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name="🔴 Críticos",
+        value=str(contagens.get("CRITICO", 0)),
+        inline=True,
+    )
+    embed.add_field(
+        name="🟠 Importantes",
+        value=str(contagens.get("IMPORTANTE", 0)),
+        inline=True,
+    )
+    embed.add_field(
+        name="🟡 Atenção",
+        value=str(contagens.get("ATENCAO", 0)),
+        inline=True,
+    )
+    embed.add_field(
+        name="☑️ Revisados como corretos",
+        value=str(ignoradas),
+        inline=True,
+    )
+    embed.add_field(
+        name="✅ Resolvidos",
+        value=str(resolvidas),
+        inline=True,
+    )
+    embed.add_field(
+        name="⏱️ Próxima varredura",
+        value=f"Em até {AUDITORIA_INTERVALO_HORAS} hora(s)",
+        inline=True,
+    )
+    embed.set_footer(
+        text=(
+            f"Canal oficial {AUDITORIA_INCONSISTENCIAS_CHANNEL_ID} "
+            "• atualização somente quando houver mudança"
+        )
+    )
+
+    if mensagem is not None:
+        try:
+            await mensagem.edit(
+                embed=embed,
+                view=AuditoriaResumoView(),
+            )
+            _auditoria_meta_salvar(
+                "v75_resumo_assinatura",
+                assinatura,
+            )
+            return
+        except Exception:
+            pass
+
+    try:
+        mensagem = await canal.send(
+            embed=embed,
+            view=AuditoriaResumoView(),
+        )
+        _auditoria_meta_salvar(
+            "mensagem_resumo_id",
+            mensagem.id,
+        )
+        _auditoria_meta_salvar(
+            "v75_resumo_assinatura",
+            assinatura,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
+# -----------------------------------------------------
+# 5) Atualiza views antigas da auditoria apenas quando necessário.
+# -----------------------------------------------------
+def _v75_custom_ids_componentes(
+    componentes: Any,
+) -> set[str]:
+    ids: set[str] = set()
+
+    def andar(item: Any) -> None:
+        custom_id = getattr(item, "custom_id", None)
+        if custom_id:
+            ids.add(str(custom_id))
+        filhos = getattr(item, "children", None)
+        if filhos:
+            for filho in filhos:
+                andar(filho)
+
+    for componente in componentes or []:
+        andar(componente)
+    return ids
+
+
+async def _v75_atualizar_views_auditoria_somente_se_preciso() -> int:
+    canal = await _auditoria_canal()
+    if canal is None:
+        return 0
+
+    _auditoria_inicializar_banco()
+
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT * FROM auditoria_inconsistencias
+            WHERE status='ATIVA' AND mensagem_id<>0
+            ORDER BY ultima_deteccao DESC
+            LIMIT 80
+            """
+        ).fetchall()
+
+    atualizados = 0
+
+    for row in rows:
+        registro = dict(row)
+        mensagem = await _auditoria_obter_mensagem(
+            canal,
+            int(registro.get("mensagem_id") or 0),
+        )
+        if mensagem is None:
+            continue
+
+        tipo = str(registro.get("tipo") or "")
+        ids = _v75_custom_ids_componentes(
+            getattr(mensagem, "components", []),
+        )
+
+        esperado = "auditoria:revisar"
+        precisa = esperado not in ids
+
+        if (
+            tipo == "NOME_COM_RGS_DIFERENTES"
+            and "auditoria:corrigir_cadastro:v66" not in ids
+        ):
+            precisa = True
+
+        if not precisa:
+            continue
+
+        try:
+            issue = {
+                **registro,
+                "linhas": _v66_auditoria_linhas(registro),
+            }
+            await mensagem.edit(
+                embed=_auditoria_embed_issue(issue),
+                view=_v67_view_issue(issue),
+            )
+            atualizados += 1
+            await asyncio.sleep(0.20)
+        except Exception:
+            continue
+
+    return atualizados
+
+
+# -----------------------------------------------------
+# 6) Startup escalonado.
+# -----------------------------------------------------
+async def _v75_etapa(
+    nome: str,
+    func,
+    *,
+    thread: bool = False,
+) -> Any:
+    inicio = time.monotonic()
+    try:
+        if thread:
+            resultado = await asyncio.to_thread(func)
+        else:
+            resultado = func()
+            if inspect.isawaitable(resultado):
+                resultado = await resultado
+
+        print(
+            f"✅ V75 startup: {nome} concluído em "
+            f"{time.monotonic() - inicio:.2f}s.",
+            flush=True,
+        )
+        return resultado
+    except Exception as erro:
+        print(
+            f"⚠️ V75 startup: {nome} ignorou falha "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return None
+
+
+async def _v75_startup_escalonado() -> None:
+    # Deixa Discord/HTTP estabilizarem.
+    await asyncio.sleep(12)
+
+    # 1. Painel do Banco — uma única atualização.
+    await _v75_etapa(
+        "painel do Banco",
+        _v61_atualizar_paineis_banco,
+    )
+
+    await asyncio.sleep(8)
+
+    # 2. Catálogo rápido.
+    await _v75_etapa(
+        "catálogo",
+        gerar_catalogo_html,
+        thread=True,
+    )
+
+    await asyncio.sleep(10)
+
+    # 3. Snapshot dos BOs.
+    await _v75_etapa(
+        "iniciar snapshot dos BOs",
+        _v21_iniciar_snapshot_canal_bo,
+    )
+
+    await asyncio.sleep(25)
+
+    # 4. Perícias em momento diferente dos BOs.
+    await _v75_etapa(
+        "iniciar sincronização das perícias",
+        _v23_iniciar_sincronizacao,
+    )
+
+    await asyncio.sleep(20)
+
+    # 5. Sincronização textual dos boletins.
+    await _v75_etapa(
+        "sincronização dos boletins",
+        _v19_iniciar_sync_boletins,
+    )
+
+    await asyncio.sleep(20)
+
+    # 6. Recuperação de procurados.
+    await _v75_etapa(
+        "recuperação de procurados pendentes",
+        v52_iniciar_recuperacao_e_views,
+    )
+
+    await asyncio.sleep(20)
+
+    # 7. Histórico prisional.
+    await _v75_etapa(
+        "histórico prisional",
+        v53_iniciar_revisao_prisional,
+    )
+
+    await asyncio.sleep(25)
+
+    # 8. Numeração mensal.
+    resultado_bo = await _v75_etapa(
+        "reconciliação mensal dos BOs",
+        _v73_reconciliar_boletins_mes,
+    )
+    if isinstance(resultado_bo, dict):
+        print(
+            "✅ V75 BO mensal: "
+            f"{resultado_bo.get('mensagens', 0)} mensagem(ns), "
+            f"{resultado_bo.get('editadas', 0)} edição(ões), "
+            f"{resultado_bo.get('registros', 0)} registro(s).",
+            flush=True,
+        )
+
+    await asyncio.sleep(25)
+
+    # 9. Auditoria: somente views que realmente precisam.
+    qtd_views = await _v75_etapa(
+        "views da auditoria",
+        _v75_atualizar_views_auditoria_somente_se_preciso,
+    )
+    print(
+        f"✅ V75 auditoria: {int(qtd_views or 0)} "
+        "mensagem(ns) realmente precisaram ser editadas.",
+        flush=True,
+    )
+
+    # 10. Varredura normal.
+    _auditoria_solicitar_varredura(
+        "inicialização estabilizada V75"
+    )
+
+    await asyncio.sleep(30)
+
+    # 11. OCR/fotos do catálogo por último.
+    if (
+        globals().get("_V17_ANALISE_FOTOS_TASK") is None
+        or globals().get("_V17_ANALISE_FOTOS_TASK").done()
+    ):
+        globals()["_V17_ANALISE_FOTOS_TASK"] = asyncio.create_task(
+            _v17_analise_fotos_background(),
+            name="v75-catalogo-fotos-bg",
+        )
+
+    print(
+        "✅ V75 startup escalonado concluído; "
+        "nenhuma rotina pesada iniciou simultaneamente.",
+        flush=True,
+    )
+
+
+@bot.listen("on_ready")
+async def _v75_on_ready() -> None:
+    global _V75_STARTUP_EXECUTADO
+
+    if _V75_STARTUP_EXECUTADO:
+        return
+    _V75_STARTUP_EXECUTADO = True
+
+    asyncio.create_task(
+        _v75_startup_escalonado(),
+        name="v75-startup-escalonado",
+    )
+
+    print(
+        "✅ V75 on_ready: tarefas pesadas foram colocadas em fila escalonada.",
+        flush=True,
+    )
+
+
+# -----------------------------------------------------
+# 7) Monitor de RAM sem armazenar dados extras.
+# -----------------------------------------------------
+def _v75_ram_atual_mb() -> float:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                if linha.startswith("VmRSS:"):
+                    partes = linha.split()
+                    return float(partes[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+@tasks.loop(minutes=3)
+async def _v75_monitor_recursos() -> None:
+    global _V75_RECURSOS_CONTADOR, _V75_ULTIMA_RAM_MB
+
+    try:
+        _V75_RECURSOS_CONTADOR += 1
+        ram = await asyncio.to_thread(
+            _v75_ram_atual_mb,
+        )
+        _V75_ULTIMA_RAM_MB = ram
+
+        # Coleta preventiva quando RAM começar a subir muito.
+        if ram >= 330:
+            await asyncio.to_thread(_v75_gc.collect)
+
+        # Log a cada ~15 min, ou imediatamente se RAM estiver alta.
+        if _V75_RECURSOS_CONTADOR % 5 == 0 or ram >= 330:
+            print(
+                f"📊 V75 recursos: RAM={ram:.1f} MB • "
+                f"event_loop_lag={float(globals().get('_V13_ULTIMO_LAG', 0.0)):.2f}s.",
+                flush=True,
+            )
+    except Exception as erro:
+        print(
+            f"⚠️ V75 monitor de recursos: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+@_v75_monitor_recursos.before_loop
+async def _v75_antes_monitor_recursos() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)
+
+
+@bot.listen("on_ready")
+async def _v75_iniciar_monitor_recursos() -> None:
+    if not _v75_monitor_recursos.is_running():
+        _v75_monitor_recursos.start()
+
+
+# -----------------------------------------------------
+# 8) Registro de SIGTERM.
+# Se Railway encerrar normalmente para redeploy, fica claro no log.
+# SIGKILL/OOM não pode ser capturado pelo Python.
+# -----------------------------------------------------
+def _v75_instalar_sinais() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _sigterm():
+            print(
+                "🛑 V75 recebeu SIGTERM do Railway/sistema.",
+                flush=True,
+            )
+
+        loop.add_signal_handler(
+            _v75_signal.SIGTERM,
+            _sigterm,
+        )
+    except Exception:
+        pass
+
+
+_V75_MAIN_ANTERIOR = main
+
+
+async def main():
+    _v75_instalar_sinais()
+    await _V75_MAIN_ANTERIOR()
+
+
+print(
+    "✅ V75 carregada — startup escalonado, auditoria sem edits repetidos, "
+    "monitor de RAM e mídia de BO/perícia protegida da limpeza.",
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
