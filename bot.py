@@ -66017,5 +66017,182 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V74 — SUPERVISOR DE PROCESSO / ANTI-"COMPLETED"
+# =====================================================
+# Se discord.py encerrar a tarefa principal sem uma ordem explícita,
+# o processo não termina silenciosamente. O supervisor mantém o HTTP
+# ativo, registra o motivo e reinicia o próprio processo de forma limpa.
+
+V74_RESTART_DELAY = max(
+    5,
+    env_int("DICOR_RESTART_DELAY_SECONDS", 8),
+)
+V74_HEARTBEAT_INTERVAL = max(
+    60,
+    env_int("DICOR_HEARTBEAT_SECONDS", 300),
+)
+
+
+async def _v74_heartbeat():
+    while True:
+        try:
+            await asyncio.sleep(V74_HEARTBEAT_INTERVAL)
+            estado = (
+                "READY"
+                if bot.is_ready()
+                else "CONECTANDO"
+            )
+            latencia = (
+                round(float(getattr(bot, "latency", 0.0)) * 1000)
+                if bot.is_ready()
+                else -1
+            )
+            print(
+                f"💓 V74 heartbeat: {estado} • "
+                f"latência={latencia}ms • "
+                f"guilds={len(getattr(bot, 'guilds', []) or [])}",
+                flush=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as erro:
+            print(
+                f"⚠️ V74 heartbeat ignorou falha: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+
+def _v74_reiniciar_processo_sync(motivo: str) -> None:
+    """
+    Reinicia somente o processo Python dentro do mesmo container.
+    Não toca no volume nem nos dados persistentes.
+    """
+    import sys
+
+    motivo_limpo = str(motivo or "encerramento inesperado")[:700]
+    print(
+        "♻️ V74 reiniciando processo: "
+        f"{motivo_limpo}",
+        flush=True,
+    )
+
+    try:
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+            ],
+        )
+    except Exception as erro:
+        print(
+            f"❌ V74 não conseguiu executar auto-restart: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        raise
+
+
+async def _v74_supervisionar_discord() -> None:
+    """
+    discord.py normalmente reconecta sozinho.
+    Portanto bot.start() só deveria retornar quando o cliente é fechado.
+    Se isso acontecer sem o processo estar sendo desligado, reiniciamos
+    a aplicação inteira para restaurar todos os listeners/views.
+    """
+    inicio = time.monotonic()
+
+    try:
+        await bot.start(
+            DISCORD_TOKEN,
+            reconnect=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except discord.LoginFailure as erro:
+        print(
+            f"❌ V74 Discord token recusado: {erro}",
+            flush=True,
+        )
+        # Mantém /health online para permitir diagnóstico.
+        await asyncio.Event().wait()
+        return
+    except Exception as erro:
+        traceback.print_exc()
+        print(
+            "❌ V74 conexão principal do Discord encerrou com erro: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        await asyncio.sleep(V74_RESTART_DELAY)
+        await asyncio.to_thread(
+            _v74_reiniciar_processo_sync,
+            f"{type(erro).__name__}: {erro}",
+        )
+        return
+
+    duracao = time.monotonic() - inicio
+
+    # Não existe encerramento normal desejado para este serviço.
+    print(
+        "⚠️ V74 bot.start() retornou inesperadamente após "
+        f"{duracao:.1f}s. O serviço não será marcado como Completed.",
+        flush=True,
+    )
+    await asyncio.sleep(V74_RESTART_DELAY)
+    await asyncio.to_thread(
+        _v74_reiniciar_processo_sync,
+        "bot.start() retornou sem exceção",
+    )
+
+
+async def main():
+    # 1. Healthcheck/central primeiro.
+    await start_web_server()
+
+    # 2. Preparação pesada fora do event loop.
+    await asyncio.to_thread(
+        _v70_preparar_memoria_sync,
+    )
+
+    if not DISCORD_TOKEN or DISCORD_TOKEN == "COLE_O_TOKEN_DO_BOT_AQUI":
+        print(
+            "❌ V74 DISCORD_TOKEN ausente. "
+            "A Central permanecerá online para diagnóstico.",
+            flush=True,
+        )
+        await asyncio.Event().wait()
+        return
+
+    print(
+        "✅ V74 supervisor ativo; conectando ao Discord.",
+        flush=True,
+    )
+
+    heartbeat = asyncio.create_task(
+        _v74_heartbeat(),
+        name="dicor-v74-heartbeat",
+    )
+
+    try:
+        await _v74_supervisionar_discord()
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+
+
+print(
+    "✅ V74 carregada — supervisor anti-Completed, "
+    "heartbeat e reinício limpo da conexão principal ativos.",
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
