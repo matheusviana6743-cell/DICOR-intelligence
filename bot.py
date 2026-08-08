@@ -68411,7 +68411,17 @@ def _v81_upload_seguro(
     caminho: Path,
     categoria: str,
 ) -> Dict[str, Any]:
+    """
+    V84:
+    1. calcula hash;
+    2. verifica por LIST se já existe;
+    3. se não existir, faz PUT/upload;
+    4. confirma novamente por LIST;
+    5. grava índice;
+    6. só então a rotina chamadora pode apagar o local.
+    """
     caminho = Path(caminho)
+
     if not caminho.exists() or not caminho.is_file():
         raise FileNotFoundError(str(caminho))
 
@@ -68421,77 +68431,85 @@ def _v81_upload_seguro(
 
     tamanho = int(caminho.stat().st_size)
     sha256 = _v78_hash_file(caminho)
-
-    existente = _v78_index_get_by_path(caminho)
-    if existente:
-        try:
-            confirmacao_existente = _v83_confirmar_objeto_b2(
-                cliente,
-                str(existente["object_key"]),
-                tamanho,
-            )
-            if confirmacao_existente.get("ok"):
-                return {
-                    "key": existente["object_key"],
-                    "pointer": _v78_pointer(
-                        existente["object_key"]
-                    ),
-                    "size": tamanho,
-                    "sha256": sha256,
-                    "reutilizado": True,
-                    "confirmado_por": str(
-                        confirmacao_existente.get("metodo") or ""
-                    ),
-                }
-        except Exception:
-            pass
-
     mime = (
         _v78_mimetypes.guess_type(caminho.name)[0]
         or "application/octet-stream"
     )
-    key = _v78_categoria_key(categoria, caminho, sha256)
 
-    kwargs: Dict[str, Any] = {
-        "ExtraArgs": {
-            "ContentType": mime,
-            "Metadata": {
-                "sha256": sha256[:64],
-                "origem": "dicor-intelligence",
-            },
-        }
-    }
-    if _V81_TRANSFER_CONFIG is not None:
-        kwargs["Config"] = _V81_TRANSFER_CONFIG
+    # Primeiro respeita o índice de versões anteriores.
+    existente = _v78_index_get_by_path(caminho)
+    if existente:
+        key_existente = str(existente.get("object_key") or "")
+        if key_existente:
+            confirmacao = _v84_confirmar_objeto_b2(
+                cliente,
+                key_existente,
+                tamanho,
+            )
+            if confirmacao.get("ok"):
+                return {
+                    "key": key_existente,
+                    "pointer": _v78_pointer(key_existente),
+                    "size": tamanho,
+                    "sha256": sha256,
+                    "reutilizado": True,
+                    "confirmado_por": "LIST",
+                }
 
-    cliente.upload_file(
-        str(caminho),
-        V78_R2_BUCKET,
-        key,
-        **kwargs,
+    # Para novos uploads, key determinística.
+    key = _v84_key_deterministica(
+        categoria,
+        caminho,
+        sha256,
     )
 
-    confirmacao = _v83_confirmar_objeto_b2(
+    # Se um retry antigo já subiu esse conteúdo, não envia de novo.
+    confirmacao_previa = _v84_confirmar_objeto_b2(
         cliente,
         key,
         tamanho,
     )
 
-    if not confirmacao.get("ok"):
-        # NÃO apaga o objeto remoto aqui: ele pode ter sido enviado
-        # corretamente e apenas a leitura/consulta pode estar bloqueada.
-        # Mais importante: o arquivo LOCAL também não será apagado.
-        detalhes = " | ".join(
-            str(x) for x in (confirmacao.get("erros") or [])
-        )
-        raise RuntimeError(
-            "Upload B2 não pôde ser confirmado com segurança. "
-            f"local={tamanho}. Detalhes: {detalhes[:1400]}"
+    if not confirmacao_previa.get("ok"):
+        kwargs: Dict[str, Any] = {
+            "ExtraArgs": {
+                "ContentType": mime,
+                "Metadata": {
+                    "sha256": sha256[:64],
+                    "origem": "dicor-intelligence",
+                },
+            }
+        }
+
+        if _V81_TRANSFER_CONFIG is not None:
+            kwargs["Config"] = _V81_TRANSFER_CONFIG
+
+        cliente.upload_file(
+            str(caminho),
+            V78_R2_BUCKET,
+            key,
+            **kwargs,
         )
 
-    metodo_confirmacao = str(
-        confirmacao.get("metodo") or "DESCONHECIDO"
-    )
+        confirmacao_final = _v84_confirmar_objeto_b2(
+            cliente,
+            key,
+            tamanho,
+        )
+
+        if not confirmacao_final.get("ok"):
+            detalhes = " | ".join(
+                str(x)
+                for x in (confirmacao_final.get("erros") or [])
+            )
+            raise RuntimeError(
+                "Upload enviado, mas o LIST não confirmou com segurança. "
+                f"Detalhes: {detalhes[:1200]}"
+            )
+
+        reutilizado = False
+    else:
+        reutilizado = True
 
     _v78_index_save(
         local_path=caminho,
@@ -68507,8 +68525,8 @@ def _v81_upload_seguro(
         "pointer": _v78_pointer(key),
         "size": tamanho,
         "sha256": sha256,
-        "reutilizado": False,
-        "confirmado_por": metodo_confirmacao,
+        "reutilizado": reutilizado,
+        "confirmado_por": "LIST",
     }
 
 
@@ -68532,135 +68550,97 @@ def _v82_erro_b2_fatal(erro: BaseException) -> bool:
     return any(sinal in msg for sinal in sinais)
 
 
-def _v83_confirmar_objeto_b2(
+def _v84_confirmar_objeto_b2(
     cliente: Any,
     key: str,
     tamanho_esperado: int,
 ) -> Dict[str, Any]:
     """
-    Confirma o upload sem depender exclusivamente de HeadObject.
-
-    Ordem:
-    1) HEAD normal;
-    2) LIST com Prefix e comparação exata de Key + Size;
-    3) GET Range 0-0 e leitura de ContentRange/ContentLength.
-
-    O arquivo local só pode ser apagado se uma dessas formas confirmar.
+    Confirma o objeto exclusivamente por LIST.
+    Não usa HEAD e não usa GET.
+    Só confirma se a key for EXATAMENTE igual e o tamanho remoto bater.
     """
-    erros: List[str] = []
-
-    # 1) HEAD
-    try:
-        head = cliente.head_object(
-            Bucket=V78_R2_BUCKET,
-            Key=key,
-        )
-        remoto = int(head.get("ContentLength") or 0)
-        if remoto == int(tamanho_esperado):
-            return {
-                "ok": True,
-                "metodo": "HEAD",
-                "tamanho": remoto,
-            }
-        erros.append(
-            f"HEAD tamanho divergente: {remoto} != {tamanho_esperado}"
-        )
-    except Exception as erro:
-        erros.append(
-            f"HEAD {type(erro).__name__}: {erro}"
-        )
-
-    # 2) LIST OBJECTS V2
     try:
         resposta = cliente.list_objects_v2(
             Bucket=V78_R2_BUCKET,
             Prefix=key,
-            MaxKeys=10,
+            MaxKeys=5,
         )
-        for item in resposta.get("Contents") or []:
-            if str(item.get("Key") or "") != key:
-                continue
-            remoto = int(item.get("Size") or 0)
-            if remoto == int(tamanho_esperado):
-                return {
-                    "ok": True,
-                    "metodo": "LIST",
-                    "tamanho": remoto,
-                }
-            erros.append(
-                f"LIST tamanho divergente: {remoto} != {tamanho_esperado}"
-            )
     except Exception as erro:
-        erros.append(
-            f"LIST {type(erro).__name__}: {erro}"
-        )
+        return {
+            "ok": False,
+            "metodo": "LIST",
+            "tamanho": 0,
+            "erros": [
+                f"LIST {type(erro).__name__}: {erro}"
+            ],
+        }
 
-    # 3) GET de apenas 1 byte para evitar baixar o arquivo inteiro.
-    try:
-        resposta = cliente.get_object(
-            Bucket=V78_R2_BUCKET,
-            Key=key,
-            Range="bytes=0-0",
-        )
-        corpo = resposta.get("Body")
-        try:
-            if corpo is not None:
-                corpo.read(1)
-        finally:
-            try:
-                if corpo is not None:
-                    corpo.close()
-            except Exception:
-                pass
+    for item in resposta.get("Contents") or []:
+        remoto_key = str(item.get("Key") or "")
+        if remoto_key != key:
+            continue
 
-        content_range = str(
-            resposta.get("ContentRange")
-            or resposta.get("ResponseMetadata", {})
-                .get("HTTPHeaders", {})
-                .get("content-range", "")
-            or ""
-        )
+        remoto_tamanho = int(item.get("Size") or 0)
 
-        total = 0
-        match = re.search(r"/(\d+)\s*$", content_range)
-        if match:
-            total = int(match.group(1))
-
-        # Alguns endpoints podem devolver o tamanho total nos headers.
-        if total <= 0:
-            headers = (
-                resposta.get("ResponseMetadata", {})
-                .get("HTTPHeaders", {})
-            )
-            raw_total = headers.get("x-bz-content-sha1-size")
-            if raw_total:
-                try:
-                    total = int(raw_total)
-                except Exception:
-                    total = 0
-
-        if total == int(tamanho_esperado):
+        if remoto_tamanho == int(tamanho_esperado):
             return {
                 "ok": True,
-                "metodo": "GET_RANGE",
-                "tamanho": total,
+                "metodo": "LIST",
+                "tamanho": remoto_tamanho,
             }
 
-        erros.append(
-            f"GET_RANGE não confirmou o tamanho total "
-            f"({total} != {tamanho_esperado})"
-        )
-    except Exception as erro:
-        erros.append(
-            f"GET_RANGE {type(erro).__name__}: {erro}"
-        )
+        return {
+            "ok": False,
+            "metodo": "LIST",
+            "tamanho": remoto_tamanho,
+            "erros": [
+                "Objeto encontrado, mas o tamanho não bate: "
+                f"{remoto_tamanho} != {tamanho_esperado}"
+            ],
+        }
 
     return {
         "ok": False,
-        "metodo": "",
+        "metodo": "LIST",
         "tamanho": 0,
-        "erros": erros[-6:],
+        "erros": [
+            "A key exata não apareceu no LIST após o upload."
+        ],
     }
+
+
+def _v84_key_deterministica(
+    categoria: str,
+    caminho: Path,
+    sha256: str,
+) -> str:
+    """
+    A mesma origem/conteúdo gera sempre a mesma key.
+    Isso impede criar cópias novas quando há retry/restart.
+    """
+    categoria_segura = re.sub(
+        r"[^0-9A-Za-z._/-]+",
+        "-",
+        str(categoria or "arquivos").strip("/"),
+    ).strip("/") or "arquivos"
+
+    nome = re.sub(
+        r"[^0-9A-Za-z._-]+",
+        "_",
+        caminho.name,
+    )[:140] or "arquivo"
+
+    prefixo = (
+        V78_R2_PREFIX + "/"
+        if V78_R2_PREFIX
+        else ""
+    )
+
+    return (
+        f"{prefixo}{categoria_segura}/"
+        f"{sha256[:2]}/{sha256}-{nome}"
+    )
 
 
 def _v81_processar_um(
@@ -68931,9 +68911,9 @@ def _v81_iniciar_worker() -> bool:
 
 @bot.tree.command(
     name="testeb2",
-    description="Diagnostica PUT, HEAD, LIST, GET e DELETE no Backblaze B2.",
+    description="Testa apenas o que a migração realmente usa no B2.",
 )
-async def testeb2_v83(
+async def testeb2_v84(
     interaction: discord.Interaction,
 ):
     if not usuario_e_administrador(interaction.user):
@@ -68942,7 +68922,10 @@ async def testeb2_v83(
             ephemeral=True,
         )
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
 
     if not _v78_r2_configurado():
         return await interaction.followup.send(
@@ -68951,178 +68934,87 @@ async def testeb2_v83(
         )
 
     cliente = _v78_r2_client()
-    key_id = str(V79_B2_ACCESS_KEY_ID or "")
-    key_fingerprint = (
-        ("…" + key_id[-6:])
-        if len(key_id) > 6
-        else key_id
-    )
 
     chave = (
         f"{V78_R2_PREFIX + '/' if V78_R2_PREFIX else ''}"
-        f"_diagnostico/v83-{int(time.time())}-{secrets.token_hex(3)}.txt"
+        f"_diagnostico/v84-{int(time.time())}-{secrets.token_hex(3)}.txt"
     )
     conteudo = (
-        f"DICOR B2 V83 {datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+        "DICOR V84 "
+        + datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
     ).encode("utf-8")
 
-    resultados = {
-        "PUT": False,
-        "HEAD": False,
-        "LIST": False,
-        "GET": False,
-        "DELETE": False,
-    }
-    erros: Dict[str, str] = {}
+    put_ok = False
+    list_ok = False
+    delete_ok = False
+    erro = ""
 
     try:
-        try:
-            resp = await asyncio.to_thread(
-                cliente.put_object,
-                Bucket=V78_R2_BUCKET,
-                Key=chave,
-                Body=conteudo,
-                ContentType="text/plain",
+        await asyncio.to_thread(
+            cliente.put_object,
+            Bucket=V78_R2_BUCKET,
+            Key=chave,
+            Body=conteudo,
+            ContentType="text/plain",
+        )
+        put_ok = True
+
+        confirmacao = await asyncio.to_thread(
+            _v84_confirmar_objeto_b2,
+            cliente,
+            chave,
+            len(conteudo),
+        )
+        list_ok = bool(confirmacao.get("ok"))
+
+        if not list_ok:
+            erro = " | ".join(
+                str(x)
+                for x in (confirmacao.get("erros") or [])
             )
-            resultados["PUT"] = bool(
-                resp.get("ETag")
-                or resp.get("ResponseMetadata", {})
-                    .get("HTTPStatusCode") in {200, 201}
-            )
-        except Exception as erro:
-            erros["PUT"] = f"{type(erro).__name__}: {erro}"
 
-        if resultados["PUT"]:
-            try:
-                head = await asyncio.to_thread(
-                    cliente.head_object,
-                    Bucket=V78_R2_BUCKET,
-                    Key=chave,
-                )
-                resultados["HEAD"] = (
-                    int(head.get("ContentLength") or -1)
-                    == len(conteudo)
-                )
-            except Exception as erro:
-                erros["HEAD"] = f"{type(erro).__name__}: {erro}"
-
-            try:
-                listado = await asyncio.to_thread(
-                    cliente.list_objects_v2,
-                    Bucket=V78_R2_BUCKET,
-                    Prefix=chave,
-                    MaxKeys=10,
-                )
-                resultados["LIST"] = any(
-                    str(item.get("Key") or "") == chave
-                    and int(item.get("Size") or -1) == len(conteudo)
-                    for item in (listado.get("Contents") or [])
-                )
-            except Exception as erro:
-                erros["LIST"] = f"{type(erro).__name__}: {erro}"
-
-            try:
-                get_resp = await asyncio.to_thread(
-                    cliente.get_object,
-                    Bucket=V78_R2_BUCKET,
-                    Key=chave,
-                    Range="bytes=0-0",
-                )
-                body = get_resp.get("Body")
-                try:
-                    if body is not None:
-                        body.read(1)
-                    resultados["GET"] = True
-                finally:
-                    try:
-                        if body is not None:
-                            body.close()
-                    except Exception:
-                        pass
-            except Exception as erro:
-                erros["GET"] = f"{type(erro).__name__}: {erro}"
-
-        try:
-            if resultados["PUT"]:
-                await asyncio.to_thread(
-                    cliente.delete_object,
-                    Bucket=V78_R2_BUCKET,
-                    Key=chave,
-                )
-                resultados["DELETE"] = True
-        except Exception as erro:
-            erros["DELETE"] = f"{type(erro).__name__}: {erro}"
+    except Exception as exc:
+        erro = f"{type(exc).__name__}: {exc}"
 
     finally:
-        # segunda tentativa silenciosa de limpeza
-        if resultados["PUT"] and not resultados["DELETE"]:
+        if put_ok:
             try:
                 await asyncio.to_thread(
                     cliente.delete_object,
                     Bucket=V78_R2_BUCKET,
                     Key=chave,
                 )
-            except Exception:
-                pass
+                delete_ok = True
+            except Exception as exc:
+                if not erro:
+                    erro = (
+                        f"DELETE {type(exc).__name__}: {exc}"
+                    )
 
-    # Para a V83, HEAD pode falhar isoladamente desde que LIST ou GET
-    # consigam confirmar leitura/existência do objeto.
-    leitura_util = resultados["HEAD"] or resultados["LIST"] or resultados["GET"]
-    pronto = (
-        resultados["PUT"]
-        and leitura_util
-        and resultados["DELETE"]
-    )
-
-    linhas = [
-        ("✅" if pronto else "⚠️")
-        + " **DIAGNÓSTICO B2 V83**",
-        f"**Key ID em uso no Railway:** `{key_fingerprint}`",
-        f"• PUT/escrita: {'✅' if resultados['PUT'] else '❌'}",
-        f"• HEAD: {'✅' if resultados['HEAD'] else '❌'}",
-        f"• LIST: {'✅' if resultados['LIST'] else '❌'}",
-        f"• GET: {'✅' if resultados['GET'] else '❌'}",
-        f"• DELETE: {'✅' if resultados['DELETE'] else '❌'}",
-    ]
+    pronto = put_ok and list_ok and delete_ok
 
     if pronto:
-        metodo = (
-            "HEAD"
-            if resultados["HEAD"]
-            else "LIST"
-            if resultados["LIST"]
-            else "GET"
+        await interaction.followup.send(
+            "✅ **B2 PRONTO**\n"
+            "• Enviar arquivo: ✅\n"
+            "• Confirmar por LIST: ✅\n"
+            "• Remover arquivo de teste: ✅\n\n"
+            "A migração está liberada. "
+            "A V84 não usa HEAD nem GET.",
+            ephemeral=True,
         )
-        linhas += [
-            "",
-            f"✅ O B2 está utilizável. A V83 pode confirmar uploads por **{metodo}**.",
-        ]
-        if not resultados["HEAD"]:
-            linhas.append(
-                "ℹ️ O HEAD está sendo recusado isoladamente, então a migração "
-                "usa o fallback seguro em vez de falhar."
-            )
-    else:
-        linhas += [
-            "",
-            "❌ Ainda não há uma forma segura de confirmar o upload. "
-            "A migração continuará protegendo os arquivos locais.",
-        ]
-
-    if erros:
-        linhas.append("")
-        linhas.append("**Diagnóstico:**")
-        for fase, erro in list(erros.items())[:5]:
-            linhas.append(
-                f"`{fase}` → `{erro[:260]}`"
-            )
+        return
 
     await interaction.followup.send(
-        "\n".join(linhas)[:1900],
+        "❌ **TESTE B2 FALHOU**\n"
+        f"• Enviar arquivo: {'✅' if put_ok else '❌'}\n"
+        f"• Confirmar por LIST: {'✅' if list_ok else '❌'}\n"
+        f"• Remover teste: {'✅' if delete_ok else '❌'}\n"
+        f"• Erro: `{erro[:700]}`",
         ephemeral=True,
     )
-
-
 
 
 @bot.tree.command(
@@ -69422,6 +69314,12 @@ print(
 print(
     "✅ V83 carregada — confirmação B2 com fallback HEAD → LIST → GET, "
     "diagnóstico de credencial e proteção local ativos.",
+    flush=True,
+)
+
+
+print(
+    "✅ V84 LIST-ONLY ativa — PUT -> LIST exato -> índice -> exclusão local.",
     flush=True,
 )
 
