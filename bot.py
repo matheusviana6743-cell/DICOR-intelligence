@@ -69324,5 +69324,899 @@ print(
 )
 
 
+
+# =====================================================
+# V85 — EVENT LOOP ESTÁVEL / I/O FORA DO LOOP
+# =====================================================
+# Objetivos:
+# - manter TODAS as funções existentes;
+# - eliminar pausas de disco/cache dentro do event loop;
+# - impedir BO, perícia e auditoria pesada simultâneas;
+# - reduzir falsos positivos do watchdog V13;
+# - preservar integralmente a V84/B2 LIST-only.
+
+_V85_MAINTENANCE_LOCK = asyncio.Lock()
+_V85_CACHE_LAST_RUN = 0.0
+_V85_CACHE_TASK: Optional[asyncio.Task] = None
+_V85_EVENT_LAST_WARN = 0.0
+
+V85_EVENT_LOOP_WARN_SECONDS = max(
+    3.5,
+    float(os.getenv("DICOR_EVENT_LOOP_WARN_SECONDS", "5.0") or 5.0),
+)
+V85_EVENT_LOOP_WARN_COOLDOWN = max(
+    60.0,
+    float(os.getenv("DICOR_EVENT_LOOP_WARN_COOLDOWN", "180") or 180.0),
+)
+V85_CACHE_CLEAN_INTERVAL = max(
+    300.0,
+    float(os.getenv("DICOR_CACHE_CLEAN_INTERVAL_SECONDS", "900") or 900.0),
+)
+
+
+# -----------------------------------------------------
+# 1) WATCHDOG: alerta apenas quando for atraso realmente grave.
+# O V13 antigo alertava com 2s e gerava falso positivo em CPU compartilhada.
+# -----------------------------------------------------
+async def _v13_watchdog_event_loop() -> None:
+    global _V13_ULTIMO_LAG, _V85_EVENT_LAST_WARN
+
+    loop = asyncio.get_running_loop()
+    esperado = loop.time() + 1.0
+
+    while not bot.is_closed():
+        await asyncio.sleep(1.0)
+
+        agora = loop.time()
+        atraso = max(0.0, agora - esperado)
+        esperado = agora + 1.0
+        _V13_ULTIMO_LAG = atraso
+
+        if atraso < V85_EVENT_LOOP_WARN_SECONDS:
+            continue
+
+        momento = time.monotonic()
+        if momento - _V85_EVENT_LAST_WARN < V85_EVENT_LOOP_WARN_COOLDOWN:
+            continue
+
+        _V85_EVENT_LAST_WARN = momento
+        print(
+            f"⚠️ V85 EVENT LOOP: atraso real de {atraso:.2f}s. "
+            "O bot continua online; tarefas pesadas estão sendo isoladas.",
+            flush=True,
+        )
+
+
+# -----------------------------------------------------
+# 2) LIMPEZA DE CACHE: nunca mais faz rglob pesado no event loop.
+# -----------------------------------------------------
+def _v85_limpar_cache_midias_sync(
+    limite_mb: int = 120,
+) -> int:
+    limite_configurado = env_int(
+        "DICOR_MEDIA_CACHE_MAX_MB",
+        int(limite_mb),
+    )
+    limite_bytes = max(48, limite_configurado) * 1024 * 1024
+
+    arquivos: List[Tuple[float, int, Path]] = []
+    total = 0
+
+    for pasta in _v69_pastas_cache_seguras():
+        if not pasta.exists():
+            continue
+
+        try:
+            for raiz, _, nomes in os.walk(str(pasta)):
+                for nome in nomes:
+                    arquivo = Path(raiz) / nome
+                    try:
+                        stat = arquivo.stat()
+                        tamanho = int(stat.st_size)
+                        total += tamanho
+                        arquivos.append(
+                            (
+                                float(stat.st_mtime),
+                                tamanho,
+                                arquivo,
+                            )
+                        )
+                    except (
+                        FileNotFoundError,
+                        PermissionError,
+                        OSError,
+                    ):
+                        continue
+        except (
+            FileNotFoundError,
+            PermissionError,
+            OSError,
+        ):
+            continue
+
+    if total <= limite_bytes:
+        return 0
+
+    removidos = 0
+
+    for _, tamanho, arquivo in sorted(arquivos):
+        if total <= limite_bytes:
+            break
+
+        try:
+            arquivo.unlink(missing_ok=True)
+            total -= int(tamanho)
+            removidos += 1
+        except (
+            FileNotFoundError,
+            PermissionError,
+            OSError,
+        ):
+            continue
+
+    return removidos
+
+
+async def _v85_cache_cleanup_background(
+    limite_mb: int,
+) -> None:
+    global _V85_CACHE_TASK
+
+    try:
+        removidos = await asyncio.to_thread(
+            _v85_limpar_cache_midias_sync,
+            int(limite_mb),
+        )
+        if removidos:
+            print(
+                f"🧹 V85 cache: {removidos} temporário(s) removido(s) "
+                "fora do event loop.",
+                flush=True,
+            )
+    except Exception as erro:
+        print(
+            f"⚠️ V85 cache ignorou falha: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+    finally:
+        _V85_CACHE_TASK = None
+
+
+def _v26_limpar_cache_midias(
+    limite_mb: int = 120,
+) -> int:
+    """
+    Compatível com todas as chamadas antigas.
+    Se estiver no event loop, agenda a limpeza em thread e retorna na hora.
+    """
+    global _V85_CACHE_LAST_RUN, _V85_CACHE_TASK
+
+    agora = time.monotonic()
+
+    if (
+        agora - _V85_CACHE_LAST_RUN
+        < V85_CACHE_CLEAN_INTERVAL
+    ):
+        return 0
+
+    _V85_CACHE_LAST_RUN = agora
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Já estamos fora do event loop.
+        return _v85_limpar_cache_midias_sync(
+            int(limite_mb)
+        )
+
+    if (
+        _V85_CACHE_TASK is None
+        or _V85_CACHE_TASK.done()
+    ):
+        _V85_CACHE_TASK = loop.create_task(
+            _v85_cache_cleanup_background(
+                int(limite_mb)
+            ),
+            name="v85-cache-clean-thread",
+        )
+
+    return 0
+
+
+# -----------------------------------------------------
+# 3) GRAVAÇÃO DE ANEXOS: bytes no disco via thread.
+# Mantém todos os fallbacks anteriores do Discord/CDN.
+# -----------------------------------------------------
+def _v85_escrever_bytes_confirmado(
+    caminho: Path,
+    bruto: bytes,
+) -> bool:
+    caminho.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    caminho.write_bytes(bruto)
+    return (
+        caminho.exists()
+        and caminho.stat().st_size > 0
+    )
+
+
+async def baixar_anexo_persistente(
+    anexo: discord.Attachment,
+    pasta: Path,
+    prefixo: str,
+) -> Optional[Path]:
+    global _V26_STORAGE_ALERTADO
+
+    pasta = Path(pasta)
+
+    # Apenas agenda; não escaneia o volume aqui.
+    try:
+        _v26_limpar_cache_midias()
+    except Exception:
+        pass
+
+    tem_espaco = await asyncio.to_thread(
+        _v26_storage_tem_espaco,
+        pasta,
+    )
+
+    if not tem_espaco:
+        if not _V26_STORAGE_ALERTADO:
+            _V26_STORAGE_ALERTADO = True
+            try:
+                await enviar_log(
+                    "⚠️ Sincronização de mídias pausada: "
+                    "armazenamento quase cheio. O restante do bot continua online."
+                )
+            except Exception:
+                pass
+        return None
+
+    await asyncio.to_thread(
+        pasta.mkdir,
+        parents=True,
+        exist_ok=True,
+    )
+
+    nome_seguro = (
+        nome_arquivo_seguro(
+            getattr(anexo, "filename", "arquivo")
+        )
+        or "arquivo"
+    )
+
+    caminho = pasta / (
+        f"{data_caso()}-{slugify(prefixo)}-"
+        f"{secrets.token_hex(4)}-{nome_seguro}"
+    )
+
+    ultimo_erro: Optional[str] = None
+
+    async def _gravar_bytes(
+        dados: Any,
+    ) -> bool:
+        nonlocal ultimo_erro
+
+        try:
+            bruto = bytes(dados or b"")
+            if not bruto:
+                return False
+
+            return await asyncio.to_thread(
+                _v85_escrever_bytes_confirmado,
+                caminho,
+                bruto,
+            )
+        except Exception as erro_gravacao:
+            ultimo_erro = (
+                "gravação: "
+                f"{type(erro_gravacao).__name__}: {erro_gravacao}"
+            )
+            return False
+
+    # API do Discord.
+    for usar_cache in (True, False):
+        try:
+            try:
+                dados = await anexo.read(
+                    use_cached=usar_cache
+                )
+            except TypeError:
+                dados = await anexo.read()
+
+            if await _gravar_bytes(dados):
+                return caminho
+
+        except discord.HTTPException as erro:
+            ultimo_erro = (
+                f"Discord HTTP "
+                f"{getattr(erro, 'status', '?')}: {erro}"
+            )
+        except Exception as erro:
+            ultimo_erro = (
+                f"{type(erro).__name__}: {erro}"
+            )
+
+    # Fallback CDN.
+    urls: List[str] = []
+
+    for valor in (
+        getattr(anexo, "proxy_url", None),
+        getattr(anexo, "url", None),
+    ):
+        url = str(valor or "").strip()
+        if not url:
+            continue
+
+        variantes = [url]
+
+        if "cdn.discordapp.com/attachments/" in url:
+            variantes.append(
+                url.replace(
+                    "cdn.discordapp.com/attachments/",
+                    "media.discordapp.net/attachments/",
+                    1,
+                )
+            )
+        elif "media.discordapp.net/attachments/" in url:
+            variantes.append(
+                url.replace(
+                    "media.discordapp.net/attachments/",
+                    "cdn.discordapp.com/attachments/",
+                    1,
+                )
+            )
+
+        for item in variantes:
+            if item not in urls:
+                urls.append(item)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(compatible; DICOR-Intelligence/1.0)"
+        ),
+        "Accept": "*/*",
+        "Referer": "https://discord.com/",
+    }
+
+    try:
+        async with ClientSession(
+            timeout=ClientTimeout(total=90),
+            headers=headers,
+        ) as session:
+            for url in urls:
+                try:
+                    async with session.get(
+                        url,
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status != 200:
+                            ultimo_erro = (
+                                f"HTTP {resp.status} em "
+                                f"{urlparse(url).netloc or 'CDN'}"
+                            )
+                            continue
+
+                        dados = await resp.read()
+
+                        if await _gravar_bytes(dados):
+                            return caminho
+
+                except Exception as erro:
+                    ultimo_erro = (
+                        f"{type(erro).__name__}: {erro}"
+                    )
+
+    except Exception as erro:
+        ultimo_erro = (
+            f"sessão HTTP: "
+            f"{type(erro).__name__}: {erro}"
+        )
+
+    try:
+        await asyncio.to_thread(
+            caminho.unlink,
+            missing_ok=True,
+        )
+    except Exception:
+        pass
+
+    if (
+        "No space left on device"
+        in str(ultimo_erro)
+        or "Errno 28" in str(ultimo_erro)
+    ):
+        if not _V26_STORAGE_ALERTADO:
+            _V26_STORAGE_ALERTADO = True
+            try:
+                await enviar_log(
+                    "⚠️ Armazenamento local cheio. "
+                    "Downloads foram pausados para manter o bot online."
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            await enviar_log(
+                f"⚠️ Falha ao baixar anexo "
+                f"`{getattr(anexo, 'filename', 'arquivo')}` "
+                f"(`{getattr(anexo, 'id', 'sem-id')}`): "
+                f"{ultimo_erro or 'arquivo sem dados'}"
+            )
+        except Exception:
+            pass
+
+    return None
+
+
+# -----------------------------------------------------
+# 4) IMAGEM DE EMBED/PERÍCIA: gravação fora do event loop.
+# -----------------------------------------------------
+async def _v24_baixar_url_imagem(
+    url: str,
+    prefixo: str,
+) -> str:
+    try:
+        if not url or not str(url).startswith("http"):
+            return ""
+
+        ext = Path(
+            str(url).split("?", 1)[0]
+        ).suffix.lower()
+
+        if ext not in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+        }:
+            ext = ".png"
+
+        nome = (
+            f"{prefixo}_"
+            f"{hashlib.sha256(str(url).encode()).hexdigest()[:18]}"
+            f"{ext}"
+        )
+        destino = CENTRAL_PERICIAS_MEDIA_DIR / nome
+
+        existe = await asyncio.to_thread(
+            destino.exists
+        )
+
+        if not existe:
+            async with ClientSession(
+                timeout=ClientTimeout(total=25)
+            ) as sess:
+                async with sess.get(str(url)) as resp:
+                    if resp.status >= 400:
+                        return ""
+
+                    dados = await resp.read()
+
+            await asyncio.to_thread(
+                _v85_escrever_bytes_confirmado,
+                destino,
+                bytes(dados),
+            )
+
+        return (
+            "/central-pericias-media/"
+            + quote(destino.name)
+        )
+
+    except Exception:
+        return ""
+
+
+# -----------------------------------------------------
+# 5) CENTRAL BO: I/O de JSON/status fora do event loop.
+# -----------------------------------------------------
+async def _v21_snapshot_boletins_do_canal() -> Dict[str, int]:
+    async with _V85_MAINTENANCE_LOCK:
+        if "_v18_resolver_canal_id" in globals():
+            canal = await _v18_resolver_canal_id(
+                BOLETINS_CHANNEL_ID
+            )
+        else:
+            canal = bot.get_channel(
+                BOLETINS_CHANNEL_ID
+            )
+            if canal is None:
+                canal = await bot.fetch_channel(
+                    BOLETINS_CHANNEL_ID
+                )
+
+        if (
+            canal is None
+            or not hasattr(canal, "history")
+        ):
+            return {
+                "boletins": 0,
+                "arquivos": 0,
+            }
+
+        mensagens = [
+            m async for m in canal.history(
+                limit=None,
+                oldest_first=True,
+            )
+        ]
+
+        grupos: List[List[discord.Message]] = []
+        atual: List[discord.Message] = []
+
+        for msg in mensagens:
+            texto_msg = (
+                _pericia_texto_mensagem(msg)
+                if "_pericia_texto_mensagem" in globals()
+                else str(msg.content or "")
+            )
+            numero = _v21_numero_bo_texto(
+                texto_msg
+            )
+
+            inicio = bool(numero) and (
+                eh_boletim_valido_para_atendimento(msg)
+                if "eh_boletim_valido_para_atendimento" in globals()
+                else True
+            )
+
+            if inicio:
+                if atual:
+                    grupos.append(atual)
+                atual = [msg]
+            elif atual:
+                atual.append(msg)
+
+        if atual:
+            grupos.append(atual)
+
+        registros: List[Dict[str, Any]] = []
+        arquivos_total = 0
+
+        for grupo in grupos:
+            texto_inicio = (
+                _pericia_texto_mensagem(grupo[0])
+                if "_pericia_texto_mensagem" in globals()
+                else str(grupo[0].content or "")
+            )
+
+            numero = _v21_numero_bo_texto(
+                texto_inicio
+            )
+
+            if not numero:
+                continue
+
+            textos: List[str] = []
+            midias: List[str] = []
+
+            for msg in grupo:
+                txt = (
+                    _pericia_texto_mensagem(msg)
+                    if "_pericia_texto_mensagem" in globals()
+                    else str(msg.content or "")
+                ).strip()
+
+                if txt and txt not in textos:
+                    textos.append(txt)
+
+                for anexo in list(
+                    getattr(msg, "attachments", [])
+                    or []
+                ):
+                    try:
+                        salvo = await _v21_salvar_anexo_bo(
+                            anexo,
+                            numero,
+                        )
+                        if (
+                            salvo
+                            and salvo not in midias
+                        ):
+                            midias.append(salvo)
+                            arquivos_total += 1
+                    except Exception:
+                        traceback.print_exc()
+
+                for emb in list(
+                    getattr(msg, "embeds", [])
+                    or []
+                ):
+                    url = str(
+                        getattr(
+                            getattr(emb, "image", None),
+                            "url",
+                            "",
+                        )
+                        or getattr(
+                            getattr(emb, "thumbnail", None),
+                            "url",
+                            "",
+                        )
+                        or ""
+                    )
+                    if url and url not in midias:
+                        midias.append(url)
+
+            status = await asyncio.to_thread(
+                _v21_status_numero,
+                numero,
+            )
+
+            registros.append(
+                {
+                    "numero": numero,
+                    "status": status,
+                    "texto": "\n\n".join(textos)[
+                        :60000
+                    ],
+                    "midias": midias,
+                    "mensagem_id": int(
+                        grupo[0].id
+                    ),
+                    "canal_id": int(
+                        getattr(
+                            canal,
+                            "id",
+                            BOLETINS_CHANNEL_ID,
+                        )
+                    ),
+                    "criado_em": getattr(
+                        grupo[0],
+                        "created_at",
+                        datetime.datetime.now(
+                            datetime.timezone.utc
+                        ),
+                    ).isoformat(),
+                    "autor": str(
+                        getattr(
+                            grupo[0],
+                            "author",
+                            "Não informado",
+                        )
+                    ),
+                }
+            )
+
+            # Cede o loop entre boletins grandes.
+            await asyncio.sleep(0)
+
+        payload = {
+            "origem_canal_id": int(
+                BOLETINS_CHANNEL_ID
+            ),
+            "atualizado_em": agora_br(),
+            "boletins": registros,
+        }
+
+        await asyncio.to_thread(
+            salvar_json,
+            CENTRAL_BO_CANAL_SNAPSHOT_JSON,
+            payload,
+        )
+
+        return {
+            "boletins": len(registros),
+            "arquivos": arquivos_total,
+        }
+
+
+# -----------------------------------------------------
+# 6) CENTRAL PERÍCIAS: serializa com BO/auditoria e salva JSON em thread.
+# -----------------------------------------------------
+async def _v23_sincronizar_pericias() -> Dict[str, int]:
+    async with _V85_MAINTENANCE_LOCK:
+        canal = bot.get_channel(
+            PERICIAS_CHANNEL_ID
+        )
+
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(
+                    PERICIAS_CHANNEL_ID
+                )
+            except Exception:
+                canal = None
+
+        if (
+            canal is None
+            or not hasattr(canal, "history")
+        ):
+            return {
+                "pericias": 0,
+                "fotos": 0,
+            }
+
+        mensagens = [
+            m async for m in canal.history(
+                limit=5000,
+                oldest_first=True,
+            )
+        ]
+
+        grupos: List[List[discord.Message]] = []
+        atual: List[discord.Message] = []
+
+        for m in mensagens:
+            texto_msg = (
+                _pericia_texto_mensagem(m)
+                if "_pericia_texto_mensagem" in globals()
+                else str(m.content or "")
+            )
+
+            if _v23_pericia_inicio(texto_msg):
+                if atual:
+                    grupos.append(atual)
+                atual = [m]
+            elif atual and (
+                m.attachments
+                or str(texto_msg).strip()
+                or m.embeds
+            ):
+                atual.append(m)
+
+        if atual:
+            grupos.append(atual)
+
+        saida: List[Dict[str, Any]] = []
+        fotos = 0
+
+        for idx, grupo in enumerate(
+            grupos,
+            1,
+        ):
+            textos: List[str] = []
+            midias: List[str] = []
+
+            for m in grupo:
+                tx = (
+                    _pericia_texto_mensagem(m)
+                    if "_pericia_texto_mensagem" in globals()
+                    else str(m.content or "")
+                ).strip()
+
+                if tx and tx not in textos:
+                    textos.append(tx)
+
+                for anexo in m.attachments:
+                    url = await _v23_baixar_attachment(
+                        anexo,
+                        f"p{idx}",
+                    )
+                    if (
+                        url
+                        and url not in midias
+                    ):
+                        midias.append(url)
+                        fotos += 1
+
+                for embed_item in (
+                    m.embeds
+                    or []
+                ):
+                    for obj in (
+                        getattr(
+                            embed_item,
+                            "image",
+                            None,
+                        ),
+                        getattr(
+                            embed_item,
+                            "thumbnail",
+                            None,
+                        ),
+                    ):
+                        url = str(
+                            getattr(
+                                obj,
+                                "url",
+                                "",
+                            )
+                            or ""
+                        )
+
+                        if not url:
+                            continue
+
+                        local = (
+                            await _v24_baixar_url_imagem(
+                                url,
+                                f"pe{idx}",
+                            )
+                        )
+
+                        if (
+                            local
+                            and local not in midias
+                        ):
+                            midias.append(local)
+                            fotos += 1
+
+            texto_pericia = "\n\n".join(
+                textos
+            )
+
+            numero_match = re.search(
+                r"(?:PER[IÍ]CIA|LAUDO)"
+                r"[^0-9]{0,15}(\d{1,8})",
+                texto_pericia,
+                re.I,
+            )
+
+            saida.append(
+                {
+                    "numero": (
+                        numero_match.group(1)
+                        if numero_match
+                        else str(idx)
+                    ),
+                    "texto": texto_pericia,
+                    "midias": midias,
+                    "mensagem_url": str(
+                        getattr(
+                            grupo[0],
+                            "jump_url",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "data": str(
+                        getattr(
+                            grupo[0],
+                            "created_at",
+                            "",
+                        )
+                        or ""
+                    ),
+                }
+            )
+
+            await asyncio.sleep(0)
+
+        await asyncio.to_thread(
+            salvar_json,
+            CENTRAL_PERICIAS_SNAPSHOT_JSON,
+            saida,
+        )
+
+        return {
+            "pericias": len(saida),
+            "fotos": fotos,
+        }
+
+
+# -----------------------------------------------------
+# 7) AUDITORIA: não concorre com BO/perícia.
+# Não remove nem muda a lógica da auditoria.
+# -----------------------------------------------------
+_V85_AUDITORIA_EXECUTAR_ANTERIOR = (
+    _auditoria_executar
+)
+
+
+async def _auditoria_executar(
+    motivo: str = "automática",
+) -> Dict[str, int]:
+    async with _V85_MAINTENANCE_LOCK:
+        return await (
+            _V85_AUDITORIA_EXECUTAR_ANTERIOR(
+                motivo
+            )
+        )
+
+
+print(
+    "✅ V85 carregada — I/O pesado isolado em threads, "
+    "BO/perícia/auditoria serializados e watchdog sem falso positivo de 2s.",
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
