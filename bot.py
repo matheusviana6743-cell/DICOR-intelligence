@@ -68230,57 +68230,368 @@ async def storageb2_v79(
     )
 
 
+# -----------------------------------------------------
+# V80 — MIGRAÇÃO B2 EM SEGUNDO PLANO
+# -----------------------------------------------------
+# Um único comando pode migrar até 500 MB, mas internamente o trabalho
+# é dividido em lotes menores. Assim o Discord recebe resposta imediata
+# e o event loop não fica preso em uma operação longa.
+
+_V80_B2_TASK: Optional[asyncio.Task] = None
+_V80_B2_STATE: Dict[str, Any] = {
+    "ativo": False,
+    "solicitado_mb": 0,
+    "processado_mb": 0.0,
+    "liberado_mb": 0.0,
+    "enviados": 0,
+    "falhas": 0,
+    "referencias": 0,
+    "lotes": 0,
+    "inicio": "",
+    "fim": "",
+    "status": "PARADO",
+    "erro": "",
+    "autor_id": 0,
+}
+
+
+def _v80_estado_reset(
+    *,
+    solicitado_mb: int,
+    autor_id: int,
+) -> None:
+    _V80_B2_STATE.clear()
+    _V80_B2_STATE.update({
+        "ativo": True,
+        "solicitado_mb": int(solicitado_mb),
+        "processado_mb": 0.0,
+        "liberado_mb": 0.0,
+        "enviados": 0,
+        "falhas": 0,
+        "referencias": 0,
+        "lotes": 0,
+        "inicio": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        "fim": "",
+        "status": "INICIANDO",
+        "erro": "",
+        "autor_id": int(autor_id or 0),
+    })
+
+
+def _v80_estado_texto() -> str:
+    s = dict(_V80_B2_STATE)
+    if not s.get("ativo") and not s.get("inicio"):
+        return (
+            "💾 **MIGRAÇÃO B2**\n"
+            "Nenhuma migração foi executada nesta sessão."
+        )
+
+    status = str(s.get("status") or "N/I")
+    emoji = {
+        "INICIANDO": "⏳",
+        "MIGRANDO": "📤",
+        "CONCLUIDA": "✅",
+        "SEM_ARQUIVOS": "✅",
+        "FALHOU": "❌",
+        "CANCELADA": "🛑",
+    }.get(status, "ℹ️")
+
+    linhas = [
+        f"{emoji} **MIGRAÇÃO B2 — {status}**",
+        f"**Solicitado:** `{int(s.get('solicitado_mb') or 0)} MB`",
+        f"**Processado:** `{float(s.get('processado_mb') or 0.0):.1f} MB`",
+        f"**Espaço liberado:** `{float(s.get('liberado_mb') or 0.0):.1f} MB`",
+        f"**Arquivos enviados:** `{int(s.get('enviados') or 0)}`",
+        f"**Falhas:** `{int(s.get('falhas') or 0)}`",
+        f"**Referências atualizadas:** `{int(s.get('referencias') or 0)}`",
+        f"**Lotes concluídos:** `{int(s.get('lotes') or 0)}`",
+    ]
+    if s.get("erro"):
+        linhas.append(
+            f"**Último erro:** `{str(s['erro'])[:300]}`"
+        )
+    return "\n".join(linhas)
+
+
+async def _v80_editar_resposta_interacao(
+    interaction: discord.Interaction,
+    texto_msg: str,
+) -> None:
+    try:
+        await interaction.edit_original_response(
+            content=texto_msg,
+        )
+    except Exception:
+        # O token da interação pode expirar em migrações muito longas.
+        # O progresso permanece disponível em /statusmigracaob2.
+        pass
+
+
+async def _v80_migrar_background(
+    interaction: discord.Interaction,
+    total_mb: int,
+) -> None:
+    global _V80_B2_TASK
+
+    total_mb = max(32, min(500, int(total_mb)))
+    lote_mb = min(
+        80,
+        max(40, env_int("B2_FOREGROUND_BATCH_MB", 60)),
+    )
+
+    _v80_estado_reset(
+        solicitado_mb=total_mb,
+        autor_id=int(interaction.user.id),
+    )
+
+    antes_geral = None
+
+    try:
+        async with _V78_R2_MIGRATION_LOCK:
+            antes_geral = await asyncio.to_thread(
+                _v78_volume_percent_sync,
+            )
+
+            restante_mb = float(total_mb)
+            _V80_B2_STATE["status"] = "MIGRANDO"
+
+            while restante_mb >= 1:
+                tamanho_lote = int(
+                    min(float(lote_mb), restante_mb)
+                )
+
+                resultado = await asyncio.to_thread(
+                    _v78_migrar_batch_sync,
+                    tamanho_lote,
+                    apagar_local=True,
+                )
+
+                liberado_bytes = int(
+                    resultado.get("liberados_bytes") or 0
+                )
+                liberado_mb = liberado_bytes / 1024 / 1024
+
+                _V80_B2_STATE["lotes"] += 1
+                _V80_B2_STATE["enviados"] += int(
+                    resultado.get("enviados") or 0
+                )
+                _V80_B2_STATE["falhas"] += int(
+                    resultado.get("falhas") or 0
+                )
+                _V80_B2_STATE["referencias"] += int(
+                    resultado.get("referencias") or 0
+                )
+                _V80_B2_STATE["liberado_mb"] += liberado_mb
+                _V80_B2_STATE["processado_mb"] += liberado_mb
+
+                enviados_lote = int(
+                    resultado.get("enviados") or 0
+                )
+
+                # Não há mais candidatos seguros para migrar.
+                if enviados_lote <= 0:
+                    _V80_B2_STATE["status"] = (
+                        "SEM_ARQUIVOS"
+                        if int(_V80_B2_STATE["enviados"]) == 0
+                        else "CONCLUIDA"
+                    )
+                    break
+
+                restante_mb = max(
+                    0.0,
+                    float(total_mb)
+                    - float(_V80_B2_STATE["processado_mb"]),
+                )
+
+                volume_atual = await asyncio.to_thread(
+                    _v78_volume_percent_sync,
+                )
+
+                await _v80_editar_resposta_interacao(
+                    interaction,
+                    "📤 **MIGRAÇÃO B2 EM ANDAMENTO**\n"
+                    f"**Enviados:** `{_V80_B2_STATE['enviados']}` arquivo(s)\n"
+                    f"**Liberado:** `{_V80_B2_STATE['liberado_mb']:.1f} MB`\n"
+                    f"**Railway:** `{volume_atual['percent']:.1f}%` usado\n"
+                    f"**Lotes:** `{_V80_B2_STATE['lotes']}`\n\n"
+                    "Você pode continuar usando o bot normalmente.",
+                )
+
+                # Respira entre os lotes para não disputar CPU/IO com Discord.
+                await asyncio.sleep(2.0)
+
+                # Se já chegou próximo do total solicitado, encerra.
+                if restante_mb < 1:
+                    _V80_B2_STATE["status"] = "CONCLUIDA"
+                    break
+
+            if _V80_B2_STATE["status"] == "MIGRANDO":
+                _V80_B2_STATE["status"] = "CONCLUIDA"
+
+            depois = await asyncio.to_thread(
+                _v78_volume_percent_sync,
+            )
+
+        _V80_B2_STATE["fim"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+
+        await _v80_editar_resposta_interacao(
+            interaction,
+            "✅ **MIGRAÇÃO B2 CONCLUÍDA**\n"
+            f"**Enviados:** `{_V80_B2_STATE['enviados']}` arquivo(s)\n"
+            f"**Falhas:** `{_V80_B2_STATE['falhas']}`\n"
+            f"**Referências atualizadas:** `{_V80_B2_STATE['referencias']}`\n"
+            f"**Espaço liberado:** `{_V80_B2_STATE['liberado_mb']:.1f} MB`\n"
+            f"**Volume:** "
+            f"`{float((antes_geral or {}).get('percent', 0.0)):.1f}%` "
+            f"→ `{depois['percent']:.1f}%`\n\n"
+            "Cada arquivo local só foi removido depois da confirmação do B2.",
+        )
+
+        print(
+            "✅ V80 migração B2 concluída: "
+            f"{_V80_B2_STATE['enviados']} arquivo(s), "
+            f"{_V80_B2_STATE['liberado_mb']:.1f} MB liberados, "
+            f"{_V80_B2_STATE['falhas']} falha(s).",
+            flush=True,
+        )
+
+    except asyncio.CancelledError:
+        _V80_B2_STATE["status"] = "CANCELADA"
+        _V80_B2_STATE["ativo"] = False
+        _V80_B2_STATE["fim"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+        raise
+    except Exception as erro:
+        _V80_B2_STATE["status"] = "FALHOU"
+        _V80_B2_STATE["erro"] = (
+            f"{type(erro).__name__}: {erro}"
+        )
+        _V80_B2_STATE["fim"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+
+        traceback.print_exc()
+        try:
+            await enviar_log(
+                "❌ V80 migração B2 em segundo plano falhou | "
+                f"{type(erro).__name__}: {erro}\n"
+                f"```py\n{traceback.format_exc()[-2500:]}\n```"
+            )
+        except Exception:
+            pass
+
+        await _v80_editar_resposta_interacao(
+            interaction,
+            "❌ **MIGRAÇÃO B2 INTERROMPIDA**\n"
+            "Nenhum arquivo é apagado antes da confirmação do B2.\n"
+            f"**Erro:** `{type(erro).__name__}: {str(erro)[:350]}`\n\n"
+            "O diagnóstico completo foi enviado para os logs.",
+        )
+    finally:
+        _V80_B2_STATE["ativo"] = False
+        _V80_B2_TASK = None
+
+
 @bot.tree.command(
     name="migrarb2",
-    description="Migra arquivos pesados do Railway para o R2 com verificação.",
+    description="Migra arquivos pesados para o B2 em segundo plano.",
 )
 @app_commands.describe(
-    limite_mb="Máximo aproximado a migrar nesta execução (32–500 MB)",
+    limite_mb="Total máximo desta execução (32–500 MB)",
 )
-async def migrarb2_v79(
+async def migrarb2_v80(
     interaction: discord.Interaction,
     limite_mb: app_commands.Range[int, 32, 500] = 220,
 ):
+    global _V80_B2_TASK
+
+    # O máximo possível é feito antes de qualquer operação de disco/rede
+    # para que o Discord seja respondido dentro do prazo da interação.
     if not usuario_e_administrador(interaction.user):
         return await interaction.response.send_message(
             "❌ Apenas a Diretoria pode executar migração.",
             ephemeral=True,
         )
 
-    if not _v78_r2_configurado():
+    if _V80_B2_TASK is not None and not _V80_B2_TASK.done():
         return await interaction.response.send_message(
-            "❌ O R2 ainda não está configurado. "
-            "Defina as variáveis `B2_*` no Railway e instale `boto3`.",
+            "⏳ Já existe uma migração B2 em andamento.\n"
+            "Use `/statusmigracaob2` para acompanhar.",
             ephemeral=True,
         )
 
-    await interaction.response.defer(
+    if not _v78_r2_configurado():
+        return await interaction.response.send_message(
+            "❌ O Backblaze B2 não está configurado.",
+            ephemeral=True,
+        )
+
+    await interaction.response.send_message(
+        "⏳ **MIGRAÇÃO B2 INICIADA**\n"
+        f"Limite desta execução: `{int(limite_mb)} MB`.\n"
+        "Ela será feita em lotes pequenos em segundo plano para não travar o bot.\n"
+        "Use `/statusmigracaob2` para acompanhar.",
         ephemeral=True,
-        thinking=True,
     )
 
-    async with _V78_R2_MIGRATION_LOCK:
-        antes = await asyncio.to_thread(
-            _v78_volume_percent_sync,
-        )
-        resultado = await asyncio.to_thread(
-            _v78_migrar_batch_sync,
+    _V80_B2_TASK = asyncio.create_task(
+        _v80_migrar_background(
+            interaction,
             int(limite_mb),
-            apagar_local=True,
-        )
-        depois = await asyncio.to_thread(
-            _v78_volume_percent_sync,
+        ),
+        name="v80-migracao-b2-background",
+    )
+
+
+@bot.tree.command(
+    name="statusmigracaob2",
+    description="Mostra o progresso da migração atual para o Backblaze B2.",
+)
+async def statusmigracaob2_v80(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar a migração.",
+            ephemeral=True,
         )
 
-    await interaction.followup.send(
-        "✅ **MIGRAÇÃO B2 CONCLUÍDA**\n"
-        f"**Enviados:** `{resultado['enviados']}` arquivo(s)\n"
-        f"**Falhas:** `{resultado['falhas']}`\n"
-        f"**Referências atualizadas:** `{resultado['referencias']}`\n"
-        f"**Espaço liberado:** "
-        f"`{resultado['liberados_bytes'] / 1024 / 1024:.1f} MB`\n"
-        f"**Volume:** `{antes['percent']:.1f}%` → `{depois['percent']:.1f}%`\n\n"
-        "O arquivo local só é excluído após o B2 confirmar o upload.",
+    await interaction.response.send_message(
+        _v80_estado_texto(),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="cancelarmigracaob2",
+    description="Interrompe a migração B2 após o arquivo atual terminar.",
+)
+async def cancelarmigracaob2_v80(
+    interaction: discord.Interaction,
+):
+    global _V80_B2_TASK
+
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode cancelar a migração.",
+            ephemeral=True,
+        )
+
+    if _V80_B2_TASK is None or _V80_B2_TASK.done():
+        return await interaction.response.send_message(
+            "ℹ️ Não existe migração em andamento.",
+            ephemeral=True,
+        )
+
+    _V80_B2_TASK.cancel()
+    await interaction.response.send_message(
+        "🛑 Migração cancelada. "
+        "Arquivos já confirmados no B2 permanecem seguros.",
         ephemeral=True,
     )
 
@@ -68416,6 +68727,14 @@ print(
 print(
     "✅ V79 B2: backend configurado para Backblaze S3-Compatible API. "
     "Use /storageb2 antes de qualquer migração.",
+    flush=True,
+)
+
+
+
+print(
+    "✅ V80 carregada — /migrarb2 responde imediatamente e migra "
+    "em segundo plano com status e cancelamento.",
     flush=True,
 )
 
