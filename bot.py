@@ -68425,11 +68425,12 @@ def _v81_upload_seguro(
     existente = _v78_index_get_by_path(caminho)
     if existente:
         try:
-            head = cliente.head_object(
-                Bucket=V78_R2_BUCKET,
-                Key=existente["object_key"],
+            confirmacao_existente = _v83_confirmar_objeto_b2(
+                cliente,
+                str(existente["object_key"]),
+                tamanho,
             )
-            if int(head.get("ContentLength") or 0) == tamanho:
+            if confirmacao_existente.get("ok"):
                 return {
                     "key": existente["object_key"],
                     "pointer": _v78_pointer(
@@ -68438,6 +68439,9 @@ def _v81_upload_seguro(
                     "size": tamanho,
                     "sha256": sha256,
                     "reutilizado": True,
+                    "confirmado_por": str(
+                        confirmacao_existente.get("metodo") or ""
+                    ),
                 }
         except Exception:
             pass
@@ -68467,23 +68471,27 @@ def _v81_upload_seguro(
         **kwargs,
     )
 
-    head = cliente.head_object(
-        Bucket=V78_R2_BUCKET,
-        Key=key,
+    confirmacao = _v83_confirmar_objeto_b2(
+        cliente,
+        key,
+        tamanho,
     )
-    remoto = int(head.get("ContentLength") or 0)
 
-    if remoto != tamanho:
-        try:
-            cliente.delete_object(
-                Bucket=V78_R2_BUCKET,
-                Key=key,
-            )
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Upload B2 não confirmado: local={tamanho}, remoto={remoto}."
+    if not confirmacao.get("ok"):
+        # NÃO apaga o objeto remoto aqui: ele pode ter sido enviado
+        # corretamente e apenas a leitura/consulta pode estar bloqueada.
+        # Mais importante: o arquivo LOCAL também não será apagado.
+        detalhes = " | ".join(
+            str(x) for x in (confirmacao.get("erros") or [])
         )
+        raise RuntimeError(
+            "Upload B2 não pôde ser confirmado com segurança. "
+            f"local={tamanho}. Detalhes: {detalhes[:1400]}"
+        )
+
+    metodo_confirmacao = str(
+        confirmacao.get("metodo") or "DESCONHECIDO"
+    )
 
     _v78_index_save(
         local_path=caminho,
@@ -68500,6 +68508,7 @@ def _v81_upload_seguro(
         "size": tamanho,
         "sha256": sha256,
         "reutilizado": False,
+        "confirmado_por": metodo_confirmacao,
     }
 
 
@@ -68521,6 +68530,137 @@ def _v82_erro_b2_fatal(erro: BaseException) -> bool:
         "unauthorized",
     )
     return any(sinal in msg for sinal in sinais)
+
+
+def _v83_confirmar_objeto_b2(
+    cliente: Any,
+    key: str,
+    tamanho_esperado: int,
+) -> Dict[str, Any]:
+    """
+    Confirma o upload sem depender exclusivamente de HeadObject.
+
+    Ordem:
+    1) HEAD normal;
+    2) LIST com Prefix e comparação exata de Key + Size;
+    3) GET Range 0-0 e leitura de ContentRange/ContentLength.
+
+    O arquivo local só pode ser apagado se uma dessas formas confirmar.
+    """
+    erros: List[str] = []
+
+    # 1) HEAD
+    try:
+        head = cliente.head_object(
+            Bucket=V78_R2_BUCKET,
+            Key=key,
+        )
+        remoto = int(head.get("ContentLength") or 0)
+        if remoto == int(tamanho_esperado):
+            return {
+                "ok": True,
+                "metodo": "HEAD",
+                "tamanho": remoto,
+            }
+        erros.append(
+            f"HEAD tamanho divergente: {remoto} != {tamanho_esperado}"
+        )
+    except Exception as erro:
+        erros.append(
+            f"HEAD {type(erro).__name__}: {erro}"
+        )
+
+    # 2) LIST OBJECTS V2
+    try:
+        resposta = cliente.list_objects_v2(
+            Bucket=V78_R2_BUCKET,
+            Prefix=key,
+            MaxKeys=10,
+        )
+        for item in resposta.get("Contents") or []:
+            if str(item.get("Key") or "") != key:
+                continue
+            remoto = int(item.get("Size") or 0)
+            if remoto == int(tamanho_esperado):
+                return {
+                    "ok": True,
+                    "metodo": "LIST",
+                    "tamanho": remoto,
+                }
+            erros.append(
+                f"LIST tamanho divergente: {remoto} != {tamanho_esperado}"
+            )
+    except Exception as erro:
+        erros.append(
+            f"LIST {type(erro).__name__}: {erro}"
+        )
+
+    # 3) GET de apenas 1 byte para evitar baixar o arquivo inteiro.
+    try:
+        resposta = cliente.get_object(
+            Bucket=V78_R2_BUCKET,
+            Key=key,
+            Range="bytes=0-0",
+        )
+        corpo = resposta.get("Body")
+        try:
+            if corpo is not None:
+                corpo.read(1)
+        finally:
+            try:
+                if corpo is not None:
+                    corpo.close()
+            except Exception:
+                pass
+
+        content_range = str(
+            resposta.get("ContentRange")
+            or resposta.get("ResponseMetadata", {})
+                .get("HTTPHeaders", {})
+                .get("content-range", "")
+            or ""
+        )
+
+        total = 0
+        match = re.search(r"/(\d+)\s*$", content_range)
+        if match:
+            total = int(match.group(1))
+
+        # Alguns endpoints podem devolver o tamanho total nos headers.
+        if total <= 0:
+            headers = (
+                resposta.get("ResponseMetadata", {})
+                .get("HTTPHeaders", {})
+            )
+            raw_total = headers.get("x-bz-content-sha1-size")
+            if raw_total:
+                try:
+                    total = int(raw_total)
+                except Exception:
+                    total = 0
+
+        if total == int(tamanho_esperado):
+            return {
+                "ok": True,
+                "metodo": "GET_RANGE",
+                "tamanho": total,
+            }
+
+        erros.append(
+            f"GET_RANGE não confirmou o tamanho total "
+            f"({total} != {tamanho_esperado})"
+        )
+    except Exception as erro:
+        erros.append(
+            f"GET_RANGE {type(erro).__name__}: {erro}"
+        )
+
+    return {
+        "ok": False,
+        "metodo": "",
+        "tamanho": 0,
+        "erros": erros[-6:],
+    }
 
 
 def _v81_processar_um(
@@ -68791,9 +68931,9 @@ def _v81_iniciar_worker() -> bool:
 
 @bot.tree.command(
     name="testeb2",
-    description="Testa escrita, leitura e exclusão no Backblaze B2.",
+    description="Diagnostica PUT, HEAD, LIST, GET e DELETE no Backblaze B2.",
 )
-async def testeb2_v82(
+async def testeb2_v83(
     interaction: discord.Interaction,
 ):
     if not usuario_e_administrador(interaction.user):
@@ -68811,92 +68951,178 @@ async def testeb2_v82(
         )
 
     cliente = _v78_r2_client()
+    key_id = str(V79_B2_ACCESS_KEY_ID or "")
+    key_fingerprint = (
+        ("…" + key_id[-6:])
+        if len(key_id) > 6
+        else key_id
+    )
+
     chave = (
         f"{V78_R2_PREFIX + '/' if V78_R2_PREFIX else ''}"
-        f"_diagnostico/teste-{int(time.time())}-{secrets.token_hex(3)}.txt"
+        f"_diagnostico/v83-{int(time.time())}-{secrets.token_hex(3)}.txt"
     )
     conteudo = (
-        f"DICOR B2 V82 test "
-        f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+        f"DICOR B2 V83 {datetime.datetime.now(datetime.timezone.utc).isoformat()}"
     ).encode("utf-8")
 
-    escreveu = False
-    leu = False
-    apagou = False
-    erro_fase = ""
-    erro_texto = ""
+    resultados = {
+        "PUT": False,
+        "HEAD": False,
+        "LIST": False,
+        "GET": False,
+        "DELETE": False,
+    }
+    erros: Dict[str, str] = {}
 
     try:
-        erro_fase = "PUT"
-        resposta = await asyncio.to_thread(
-            cliente.put_object,
-            Bucket=V78_R2_BUCKET,
-            Key=chave,
-            Body=conteudo,
-            ContentType="text/plain",
-        )
-        escreveu = bool(
-            resposta.get("ETag")
-            or resposta.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            in {200, 201}
-        )
+        try:
+            resp = await asyncio.to_thread(
+                cliente.put_object,
+                Bucket=V78_R2_BUCKET,
+                Key=chave,
+                Body=conteudo,
+                ContentType="text/plain",
+            )
+            resultados["PUT"] = bool(
+                resp.get("ETag")
+                or resp.get("ResponseMetadata", {})
+                    .get("HTTPStatusCode") in {200, 201}
+            )
+        except Exception as erro:
+            erros["PUT"] = f"{type(erro).__name__}: {erro}"
 
-        erro_fase = "HEAD"
-        head = await asyncio.to_thread(
-            cliente.head_object,
-            Bucket=V78_R2_BUCKET,
-            Key=chave,
-        )
-        leu = int(head.get("ContentLength") or -1) == len(conteudo)
+        if resultados["PUT"]:
+            try:
+                head = await asyncio.to_thread(
+                    cliente.head_object,
+                    Bucket=V78_R2_BUCKET,
+                    Key=chave,
+                )
+                resultados["HEAD"] = (
+                    int(head.get("ContentLength") or -1)
+                    == len(conteudo)
+                )
+            except Exception as erro:
+                erros["HEAD"] = f"{type(erro).__name__}: {erro}"
 
-        erro_fase = "DELETE"
-        await asyncio.to_thread(
-            cliente.delete_object,
-            Bucket=V78_R2_BUCKET,
-            Key=chave,
-        )
-        apagou = True
+            try:
+                listado = await asyncio.to_thread(
+                    cliente.list_objects_v2,
+                    Bucket=V78_R2_BUCKET,
+                    Prefix=chave,
+                    MaxKeys=10,
+                )
+                resultados["LIST"] = any(
+                    str(item.get("Key") or "") == chave
+                    and int(item.get("Size") or -1) == len(conteudo)
+                    for item in (listado.get("Contents") or [])
+                )
+            except Exception as erro:
+                erros["LIST"] = f"{type(erro).__name__}: {erro}"
 
-    except Exception as erro:
-        erro_texto = f"{type(erro).__name__}: {erro}"
-        if escreveu and not apagou:
+            try:
+                get_resp = await asyncio.to_thread(
+                    cliente.get_object,
+                    Bucket=V78_R2_BUCKET,
+                    Key=chave,
+                    Range="bytes=0-0",
+                )
+                body = get_resp.get("Body")
+                try:
+                    if body is not None:
+                        body.read(1)
+                    resultados["GET"] = True
+                finally:
+                    try:
+                        if body is not None:
+                            body.close()
+                    except Exception:
+                        pass
+            except Exception as erro:
+                erros["GET"] = f"{type(erro).__name__}: {erro}"
+
+        try:
+            if resultados["PUT"]:
+                await asyncio.to_thread(
+                    cliente.delete_object,
+                    Bucket=V78_R2_BUCKET,
+                    Key=chave,
+                )
+                resultados["DELETE"] = True
+        except Exception as erro:
+            erros["DELETE"] = f"{type(erro).__name__}: {erro}"
+
+    finally:
+        # segunda tentativa silenciosa de limpeza
+        if resultados["PUT"] and not resultados["DELETE"]:
             try:
                 await asyncio.to_thread(
                     cliente.delete_object,
                     Bucket=V78_R2_BUCKET,
                     Key=chave,
                 )
-                apagou = True
             except Exception:
                 pass
 
-    if escreveu and leu and apagou and not erro_texto:
-        return await interaction.followup.send(
-            "✅ **TESTE B2 COMPLETO**\n"
-            "• Escrita: ✅\n"
-            "• Leitura/HEAD: ✅\n"
-            "• Exclusão: ✅\n\n"
-            "A chave está pronta para a migração.",
-            ephemeral=True,
-        )
+    # Para a V83, HEAD pode falhar isoladamente desde que LIST ou GET
+    # consigam confirmar leitura/existência do objeto.
+    leitura_util = resultados["HEAD"] or resultados["LIST"] or resultados["GET"]
+    pronto = (
+        resultados["PUT"]
+        and leitura_util
+        and resultados["DELETE"]
+    )
 
-    dica = ""
-    if "403" in erro_texto or "Forbidden" in erro_texto:
-        dica = (
-            "\n\n⚠️ **Permissão insuficiente.** A Application Key precisa "
-            "ser **Read and Write** no bucket `dicor-storage`."
+    linhas = [
+        ("✅" if pronto else "⚠️")
+        + " **DIAGNÓSTICO B2 V83**",
+        f"**Key ID em uso no Railway:** `{key_fingerprint}`",
+        f"• PUT/escrita: {'✅' if resultados['PUT'] else '❌'}",
+        f"• HEAD: {'✅' if resultados['HEAD'] else '❌'}",
+        f"• LIST: {'✅' if resultados['LIST'] else '❌'}",
+        f"• GET: {'✅' if resultados['GET'] else '❌'}",
+        f"• DELETE: {'✅' if resultados['DELETE'] else '❌'}",
+    ]
+
+    if pronto:
+        metodo = (
+            "HEAD"
+            if resultados["HEAD"]
+            else "LIST"
+            if resultados["LIST"]
+            else "GET"
         )
+        linhas += [
+            "",
+            f"✅ O B2 está utilizável. A V83 pode confirmar uploads por **{metodo}**.",
+        ]
+        if not resultados["HEAD"]:
+            linhas.append(
+                "ℹ️ O HEAD está sendo recusado isoladamente, então a migração "
+                "usa o fallback seguro em vez de falhar."
+            )
+    else:
+        linhas += [
+            "",
+            "❌ Ainda não há uma forma segura de confirmar o upload. "
+            "A migração continuará protegendo os arquivos locais.",
+        ]
+
+    if erros:
+        linhas.append("")
+        linhas.append("**Diagnóstico:**")
+        for fase, erro in list(erros.items())[:5]:
+            linhas.append(
+                f"`{fase}` → `{erro[:260]}`"
+            )
 
     await interaction.followup.send(
-        "❌ **TESTE B2 FALHOU**\n"
-        f"• Escrita: {'✅' if escreveu else '❌'}\n"
-        f"• Leitura/HEAD: {'✅' if leu else '❌'}\n"
-        f"• Exclusão: {'✅' if apagou else '❌'}\n"
-        f"• Fase que falhou: `{erro_fase}`\n"
-        f"• Erro: `{erro_texto[:500]}`"
-        + dica,
+        "\n".join(linhas)[:1900],
         ephemeral=True,
     )
+
+
 
 
 @bot.tree.command(
@@ -69189,6 +69415,13 @@ print(
 print(
     "✅ V82 carregada — teste de permissões B2 e parada automática "
     "em 403/AccessDenied ativos.",
+    flush=True,
+)
+
+
+print(
+    "✅ V83 carregada — confirmação B2 com fallback HEAD → LIST → GET, "
+    "diagnóstico de credencial e proteção local ativos.",
     flush=True,
 )
 
