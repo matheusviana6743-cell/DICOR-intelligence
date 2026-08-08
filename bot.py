@@ -67504,49 +67504,64 @@ _V78_EXTENSOES_PESADAS = {
 def _v78_candidatos_migracao_sync(
     limite_mb: int,
 ) -> List[Tuple[Path, str]]:
+    """Busca candidatos sem carregar a árvore inteira na RAM."""
     agora = time.time()
     limite = max(16, int(limite_mb)) * 1024 * 1024
     total = 0
     saida: List[Tuple[Path, str]] = []
+    max_arquivos = max(
+        20,
+        min(100, env_int("B2_MAX_FILES_PER_BATCH", 60)),
+    )
 
     for pasta, categoria, idade_min in _v78_diretorios_migraveis():
         if not pasta.exists():
             continue
 
         try:
-            arquivos = list(pasta.rglob("*"))
-        except Exception:
+            for raiz, dirs, nomes in os.walk(str(pasta)):
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower() not in {"assets_dossie", "assinaturas"}
+                ]
+
+                for nome in nomes:
+                    if len(saida) >= max_arquivos:
+                        return saida
+
+                    p = Path(raiz) / nome
+                    try:
+                        if p == V78_R2_INDEX_DB:
+                            continue
+                        if p.suffix.lower() not in _V78_EXTENSOES_PESADAS:
+                            continue
+
+                        st = p.stat()
+                        tamanho = int(st.st_size)
+                        if tamanho <= 0:
+                            continue
+                        if agora - float(st.st_mtime) < idade_min * 60:
+                            continue
+
+                        caminho_txt = str(p).replace("\\", "/").lower()
+                        if (
+                            "/assets_dossie/" in caminho_txt
+                            or "/assinaturas/" in caminho_txt
+                        ):
+                            continue
+
+                        if total + tamanho > limite and saida:
+                            return saida
+
+                        saida.append((p, categoria))
+                        total += tamanho
+
+                        if total >= limite:
+                            return saida
+                    except (FileNotFoundError, PermissionError, OSError):
+                        continue
+        except (FileNotFoundError, PermissionError, OSError):
             continue
-
-        arquivos_ordenados = []
-        for p in arquivos:
-            try:
-                if not p.is_file():
-                    continue
-                if p == V78_R2_INDEX_DB:
-                    continue
-                if p.suffix.lower() not in _V78_EXTENSOES_PESADAS:
-                    continue
-                stat = p.stat()
-                if stat.st_size <= 0:
-                    continue
-                if agora - stat.st_mtime < idade_min * 60:
-                    continue
-                # Assinaturas e modelos institucionais ficam no Railway.
-                texto_path = str(p).replace("\\", "/").lower()
-                if "/assets_dossie/" in texto_path or "/assinaturas" in texto_path:
-                    continue
-                arquivos_ordenados.append((stat.st_mtime, stat.st_size, p))
-            except Exception:
-                continue
-
-        for _, tamanho, p in sorted(arquivos_ordenados):
-            if total + tamanho > limite and saida:
-                return saida
-            total += tamanho
-            saida.append((p, categoria))
-            if total >= limite:
-                return saida
 
     return saida
 
@@ -68231,297 +68246,524 @@ async def storageb2_v79(
 
 
 # -----------------------------------------------------
-# V80 — MIGRAÇÃO B2 EM SEGUNDO PLANO
+# V81 — MIGRAÇÃO B2 RESILIENTE
 # -----------------------------------------------------
-# Um único comando pode migrar até 500 MB, mas internamente o trabalho
-# é dividido em lotes menores. Assim o Discord recebe resposta imediata
-# e o event loop não fica preso em uma operação longa.
+# - um arquivo por vez;
+# - progresso persistente após cada arquivo;
+# - retomada automática após restart;
+# - upload sem paralelismo interno;
+# - /statusmigracaob2 continua funcionando após reinício.
 
-_V80_B2_TASK: Optional[asyncio.Task] = None
-_V80_B2_STATE: Dict[str, Any] = {
-    "ativo": False,
-    "solicitado_mb": 0,
-    "processado_mb": 0.0,
-    "liberado_mb": 0.0,
-    "enviados": 0,
-    "falhas": 0,
-    "referencias": 0,
-    "lotes": 0,
-    "inicio": "",
-    "fim": "",
-    "status": "PARADO",
-    "erro": "",
-    "autor_id": 0,
-}
+try:
+    from boto3.s3.transfer import TransferConfig as _V81TransferConfig
+except Exception:
+    _V81TransferConfig = None
+
+_V81_TRANSFER_CONFIG = (
+    _V81TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,
+        multipart_chunksize=8 * 1024 * 1024,
+        max_concurrency=1,
+        use_threads=False,
+    )
+    if _V81TransferConfig is not None
+    else None
+)
+
+V81_STATE_FILE = DATA_DIR / "b2_migration_progress.json"
+_V81_TASK: Optional[asyncio.Task] = None
+_V81_LOCK = asyncio.Lock()
+_V81_STATE_LOCK = threading.RLock()
 
 
-def _v80_estado_reset(
-    *,
-    solicitado_mb: int,
-    autor_id: int,
-) -> None:
-    _V80_B2_STATE.clear()
-    _V80_B2_STATE.update({
-        "ativo": True,
-        "solicitado_mb": int(solicitado_mb),
-        "processado_mb": 0.0,
-        "liberado_mb": 0.0,
+def _v81_estado_padrao() -> Dict[str, Any]:
+    return {
+        "status": "PARADO",
+        "solicitado_bytes": 0,
+        "processado_bytes": 0,
+        "liberado_bytes": 0,
         "enviados": 0,
         "falhas": 0,
         "referencias": 0,
-        "lotes": 0,
-        "inicio": datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat(),
+        "inicio": "",
+        "atualizado": "",
         "fim": "",
-        "status": "INICIANDO",
-        "erro": "",
+        "autor_id": 0,
+        "ultimo_arquivo": "",
+        "ultimo_erro": "",
+    }
+
+
+def _v81_estado_ler() -> Dict[str, Any]:
+    with _V81_STATE_LOCK:
+        try:
+            if not V81_STATE_FILE.exists():
+                return _v81_estado_padrao()
+            dados = json.loads(
+                V81_STATE_FILE.read_text(encoding="utf-8")
+            )
+            base = _v81_estado_padrao()
+            if isinstance(dados, dict):
+                base.update(dados)
+            return base
+        except Exception:
+            return _v81_estado_padrao()
+
+
+def _v81_estado_salvar(estado: Dict[str, Any]) -> None:
+    with _V81_STATE_LOCK:
+        V81_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        estado = dict(estado)
+        estado["atualizado"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+
+        tmp = V81_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                estado,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(V81_STATE_FILE)
+
+
+def _v81_estado_patch(**campos: Any) -> Dict[str, Any]:
+    estado = _v81_estado_ler()
+    estado.update(campos)
+    _v81_estado_salvar(estado)
+    return estado
+
+
+def _v81_estado_iniciar(
+    limite_mb: int,
+    autor_id: int,
+) -> Dict[str, Any]:
+    agora = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat()
+
+    estado = _v81_estado_padrao()
+    estado.update({
+        "status": "MIGRANDO",
+        "solicitado_bytes": int(limite_mb) * 1024 * 1024,
+        "inicio": agora,
         "autor_id": int(autor_id or 0),
     })
+    _v81_estado_salvar(estado)
+    return estado
 
 
-def _v80_estado_texto() -> str:
-    s = dict(_V80_B2_STATE)
-    if not s.get("ativo") and not s.get("inicio"):
-        return (
-            "💾 **MIGRAÇÃO B2**\n"
-            "Nenhuma migração foi executada nesta sessão."
+def _v81_proximo_arquivo(
+    ignorar: set[str],
+) -> Optional[Tuple[Path, str]]:
+    agora = time.time()
+
+    for pasta, categoria, idade_min in _v78_diretorios_migraveis():
+        if not pasta.exists():
+            continue
+
+        try:
+            for raiz, dirs, nomes in os.walk(str(pasta)):
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower() not in {"assets_dossie", "assinaturas"}
+                ]
+
+                for nome in nomes:
+                    p = Path(raiz) / nome
+                    chave = _v78_abs(p)
+
+                    if chave in ignorar:
+                        continue
+
+                    try:
+                        if p in {V78_R2_INDEX_DB, V81_STATE_FILE}:
+                            continue
+                        if p.suffix.lower() not in _V78_EXTENSOES_PESADAS:
+                            continue
+
+                        st = p.stat()
+                        if int(st.st_size) <= 0:
+                            continue
+                        if agora - float(st.st_mtime) < idade_min * 60:
+                            continue
+
+                        txt = str(p).replace("\\", "/").lower()
+                        if (
+                            "/assets_dossie/" in txt
+                            or "/assinaturas/" in txt
+                        ):
+                            continue
+
+                        return p, categoria
+                    except (FileNotFoundError, PermissionError, OSError):
+                        continue
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+
+    return None
+
+
+def _v81_upload_seguro(
+    caminho: Path,
+    categoria: str,
+) -> Dict[str, Any]:
+    caminho = Path(caminho)
+    if not caminho.exists() or not caminho.is_file():
+        raise FileNotFoundError(str(caminho))
+
+    cliente = _v78_r2_client()
+    if cliente is None:
+        raise RuntimeError("Backblaze B2 não está configurado.")
+
+    tamanho = int(caminho.stat().st_size)
+    sha256 = _v78_hash_file(caminho)
+
+    existente = _v78_index_get_by_path(caminho)
+    if existente:
+        try:
+            head = cliente.head_object(
+                Bucket=V78_R2_BUCKET,
+                Key=existente["object_key"],
+            )
+            if int(head.get("ContentLength") or 0) == tamanho:
+                return {
+                    "key": existente["object_key"],
+                    "pointer": _v78_pointer(
+                        existente["object_key"]
+                    ),
+                    "size": tamanho,
+                    "sha256": sha256,
+                    "reutilizado": True,
+                }
+        except Exception:
+            pass
+
+    mime = (
+        _v78_mimetypes.guess_type(caminho.name)[0]
+        or "application/octet-stream"
+    )
+    key = _v78_categoria_key(categoria, caminho, sha256)
+
+    kwargs: Dict[str, Any] = {
+        "ExtraArgs": {
+            "ContentType": mime,
+            "Metadata": {
+                "sha256": sha256[:64],
+                "origem": "dicor-intelligence",
+            },
+        }
+    }
+    if _V81_TRANSFER_CONFIG is not None:
+        kwargs["Config"] = _V81_TRANSFER_CONFIG
+
+    cliente.upload_file(
+        str(caminho),
+        V78_R2_BUCKET,
+        key,
+        **kwargs,
+    )
+
+    head = cliente.head_object(
+        Bucket=V78_R2_BUCKET,
+        Key=key,
+    )
+    remoto = int(head.get("ContentLength") or 0)
+
+    if remoto != tamanho:
+        try:
+            cliente.delete_object(
+                Bucket=V78_R2_BUCKET,
+                Key=key,
+            )
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Upload B2 não confirmado: local={tamanho}, remoto={remoto}."
         )
 
-    status = str(s.get("status") or "N/I")
+    _v78_index_save(
+        local_path=caminho,
+        key=key,
+        categoria=categoria,
+        mime_type=mime,
+        tamanho=tamanho,
+        sha256=sha256,
+    )
+
+    return {
+        "key": key,
+        "pointer": _v78_pointer(key),
+        "size": tamanho,
+        "sha256": sha256,
+        "reutilizado": False,
+    }
+
+
+# Todas as rotinas B2 passam a usar o upload de baixa memória.
+_v78_upload_sync = _v81_upload_seguro
+
+
+def _v81_processar_um(
+    ignorar: set[str],
+) -> Dict[str, Any]:
+    candidato = _v81_proximo_arquivo(ignorar)
+
+    if candidato is None:
+        return {"encontrado": False}
+
+    caminho, categoria = candidato
+    tamanho = 0
+
+    try:
+        tamanho = int(caminho.stat().st_size)
+
+        resultado = _v81_upload_seguro(
+            caminho,
+            categoria,
+        )
+
+        referencias = _v78_reescrever_referencias_sync(
+            caminho,
+            str(resultado["pointer"]),
+        )
+
+        # Exclusão local só depois de confirmação remota + índice + refs.
+        caminho.unlink(missing_ok=True)
+
+        return {
+            "encontrado": True,
+            "ok": True,
+            "arquivo": str(caminho),
+            "tamanho": tamanho,
+            "referencias": int(referencias),
+        }
+
+    except FileNotFoundError:
+        ignorar.add(_v78_abs(caminho))
+        return {
+            "encontrado": True,
+            "ok": False,
+            "ignorar": True,
+        }
+
+    except Exception as erro:
+        ignorar.add(_v78_abs(caminho))
+        return {
+            "encontrado": True,
+            "ok": False,
+            "ignorar": False,
+            "arquivo": str(caminho),
+            "tamanho": tamanho,
+            "erro": f"{type(erro).__name__}: {erro}",
+        }
+
+
+def _v81_estado_texto() -> str:
+    e = _v81_estado_ler()
+
+    solicitado = int(e.get("solicitado_bytes") or 0)
+    processado = int(e.get("processado_bytes") or 0)
+    liberado = int(e.get("liberado_bytes") or 0)
+    status = str(e.get("status") or "PARADO")
+
+    pct = (
+        min(100.0, processado / solicitado * 100.0)
+        if solicitado > 0 else 0.0
+    )
+
     emoji = {
-        "INICIANDO": "⏳",
         "MIGRANDO": "📤",
         "CONCLUIDA": "✅",
         "SEM_ARQUIVOS": "✅",
-        "FALHOU": "❌",
         "CANCELADA": "🛑",
+        "FALHOU": "❌",
+        "PARADO": "ℹ️",
     }.get(status, "ℹ️")
 
     linhas = [
         f"{emoji} **MIGRAÇÃO B2 — {status}**",
-        f"**Solicitado:** `{int(s.get('solicitado_mb') or 0)} MB`",
-        f"**Processado:** `{float(s.get('processado_mb') or 0.0):.1f} MB`",
-        f"**Espaço liberado:** `{float(s.get('liberado_mb') or 0.0):.1f} MB`",
-        f"**Arquivos enviados:** `{int(s.get('enviados') or 0)}`",
-        f"**Falhas:** `{int(s.get('falhas') or 0)}`",
-        f"**Referências atualizadas:** `{int(s.get('referencias') or 0)}`",
-        f"**Lotes concluídos:** `{int(s.get('lotes') or 0)}`",
+        f"**Solicitado:** `{solicitado / 1024 / 1024:.1f} MB`",
+        f"**Processado:** `{processado / 1024 / 1024:.1f} MB` (`{pct:.1f}%`)",
+        f"**Espaço liberado:** `{liberado / 1024 / 1024:.1f} MB`",
+        f"**Arquivos concluídos:** `{int(e.get('enviados') or 0)}`",
+        f"**Falhas:** `{int(e.get('falhas') or 0)}`",
+        f"**Referências atualizadas:** `{int(e.get('referencias') or 0)}`",
     ]
-    if s.get("erro"):
+
+    if e.get("ultimo_arquivo"):
         linhas.append(
-            f"**Último erro:** `{str(s['erro'])[:300]}`"
+            f"**Último arquivo:** `{Path(str(e['ultimo_arquivo'])).name[:90]}`"
         )
+
+    if e.get("ultimo_erro"):
+        linhas.append(
+            f"**Último erro:** `{str(e['ultimo_erro'])[:240]}`"
+        )
+
+    if status == "MIGRANDO":
+        linhas.append(
+            "\n💾 Progresso salvo após cada arquivo. "
+            "Um restart do Railway não zera a migração."
+        )
+
     return "\n".join(linhas)
 
 
-async def _v80_editar_resposta_interacao(
-    interaction: discord.Interaction,
-    texto_msg: str,
-) -> None:
-    try:
-        await interaction.edit_original_response(
-            content=texto_msg,
-        )
-    except Exception:
-        # O token da interação pode expirar em migrações muito longas.
-        # O progresso permanece disponível em /statusmigracaob2.
-        pass
-
-
-async def _v80_migrar_background(
-    interaction: discord.Interaction,
-    total_mb: int,
-) -> None:
-    global _V80_B2_TASK
-
-    total_mb = max(32, min(500, int(total_mb)))
-    lote_mb = min(
-        80,
-        max(40, env_int("B2_FOREGROUND_BATCH_MB", 60)),
-    )
-
-    _v80_estado_reset(
-        solicitado_mb=total_mb,
-        autor_id=int(interaction.user.id),
-    )
-
-    antes_geral = None
+async def _v81_worker() -> None:
+    global _V81_TASK
+    ignorar: set[str] = set()
+    contador = 0
 
     try:
-        async with _V78_R2_MIGRATION_LOCK:
-            antes_geral = await asyncio.to_thread(
-                _v78_volume_percent_sync,
-            )
+        async with _V81_LOCK:
+            while True:
+                estado = await asyncio.to_thread(_v81_estado_ler)
 
-            restante_mb = float(total_mb)
-            _V80_B2_STATE["status"] = "MIGRANDO"
+                if str(estado.get("status")) != "MIGRANDO":
+                    break
 
-            while restante_mb >= 1:
-                tamanho_lote = int(
-                    min(float(lote_mb), restante_mb)
-                )
+                solicitado = int(estado.get("solicitado_bytes") or 0)
+                processado = int(estado.get("processado_bytes") or 0)
 
-                resultado = await asyncio.to_thread(
-                    _v78_migrar_batch_sync,
-                    tamanho_lote,
-                    apagar_local=True,
-                )
-
-                liberado_bytes = int(
-                    resultado.get("liberados_bytes") or 0
-                )
-                liberado_mb = liberado_bytes / 1024 / 1024
-
-                _V80_B2_STATE["lotes"] += 1
-                _V80_B2_STATE["enviados"] += int(
-                    resultado.get("enviados") or 0
-                )
-                _V80_B2_STATE["falhas"] += int(
-                    resultado.get("falhas") or 0
-                )
-                _V80_B2_STATE["referencias"] += int(
-                    resultado.get("referencias") or 0
-                )
-                _V80_B2_STATE["liberado_mb"] += liberado_mb
-                _V80_B2_STATE["processado_mb"] += liberado_mb
-
-                enviados_lote = int(
-                    resultado.get("enviados") or 0
-                )
-
-                # Não há mais candidatos seguros para migrar.
-                if enviados_lote <= 0:
-                    _V80_B2_STATE["status"] = (
-                        "SEM_ARQUIVOS"
-                        if int(_V80_B2_STATE["enviados"]) == 0
-                        else "CONCLUIDA"
+                if solicitado > 0 and processado >= solicitado:
+                    await asyncio.to_thread(
+                        _v81_estado_patch,
+                        status="CONCLUIDA",
+                        fim=datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
                     )
                     break
 
-                restante_mb = max(
-                    0.0,
-                    float(total_mb)
-                    - float(_V80_B2_STATE["processado_mb"]),
+                resultado = await asyncio.to_thread(
+                    _v81_processar_um,
+                    ignorar,
                 )
 
-                volume_atual = await asyncio.to_thread(
-                    _v78_volume_percent_sync,
-                )
-
-                await _v80_editar_resposta_interacao(
-                    interaction,
-                    "📤 **MIGRAÇÃO B2 EM ANDAMENTO**\n"
-                    f"**Enviados:** `{_V80_B2_STATE['enviados']}` arquivo(s)\n"
-                    f"**Liberado:** `{_V80_B2_STATE['liberado_mb']:.1f} MB`\n"
-                    f"**Railway:** `{volume_atual['percent']:.1f}%` usado\n"
-                    f"**Lotes:** `{_V80_B2_STATE['lotes']}`\n\n"
-                    "Você pode continuar usando o bot normalmente.",
-                )
-
-                # Respira entre os lotes para não disputar CPU/IO com Discord.
-                await asyncio.sleep(2.0)
-
-                # Se já chegou próximo do total solicitado, encerra.
-                if restante_mb < 1:
-                    _V80_B2_STATE["status"] = "CONCLUIDA"
+                if not resultado.get("encontrado"):
+                    await asyncio.to_thread(
+                        _v81_estado_patch,
+                        status=(
+                            "SEM_ARQUIVOS"
+                            if int(estado.get("enviados") or 0) == 0
+                            else "CONCLUIDA"
+                        ),
+                        fim=datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                    )
                     break
 
-            if _V80_B2_STATE["status"] == "MIGRANDO":
-                _V80_B2_STATE["status"] = "CONCLUIDA"
+                atual = await asyncio.to_thread(_v81_estado_ler)
 
-            depois = await asyncio.to_thread(
-                _v78_volume_percent_sync,
-            )
+                if resultado.get("ok"):
+                    tamanho = int(resultado.get("tamanho") or 0)
 
-        _V80_B2_STATE["fim"] = datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat()
+                    await asyncio.to_thread(
+                        _v81_estado_patch,
+                        processado_bytes=(
+                            int(atual.get("processado_bytes") or 0)
+                            + tamanho
+                        ),
+                        liberado_bytes=(
+                            int(atual.get("liberado_bytes") or 0)
+                            + tamanho
+                        ),
+                        enviados=(
+                            int(atual.get("enviados") or 0)
+                            + 1
+                        ),
+                        referencias=(
+                            int(atual.get("referencias") or 0)
+                            + int(resultado.get("referencias") or 0)
+                        ),
+                        ultimo_arquivo=str(
+                            resultado.get("arquivo") or ""
+                        ),
+                        ultimo_erro="",
+                    )
+                elif not resultado.get("ignorar"):
+                    await asyncio.to_thread(
+                        _v81_estado_patch,
+                        falhas=(
+                            int(atual.get("falhas") or 0)
+                            + 1
+                        ),
+                        ultimo_arquivo=str(
+                            resultado.get("arquivo") or ""
+                        ),
+                        ultimo_erro=str(
+                            resultado.get("erro") or ""
+                        )[:1000],
+                    )
 
-        await _v80_editar_resposta_interacao(
-            interaction,
-            "✅ **MIGRAÇÃO B2 CONCLUÍDA**\n"
-            f"**Enviados:** `{_V80_B2_STATE['enviados']}` arquivo(s)\n"
-            f"**Falhas:** `{_V80_B2_STATE['falhas']}`\n"
-            f"**Referências atualizadas:** `{_V80_B2_STATE['referencias']}`\n"
-            f"**Espaço liberado:** `{_V80_B2_STATE['liberado_mb']:.1f} MB`\n"
-            f"**Volume:** "
-            f"`{float((antes_geral or {}).get('percent', 0.0)):.1f}%` "
-            f"→ `{depois['percent']:.1f}%`\n\n"
-            "Cada arquivo local só foi removido depois da confirmação do B2.",
-        )
+                contador += 1
 
-        print(
-            "✅ V80 migração B2 concluída: "
-            f"{_V80_B2_STATE['enviados']} arquivo(s), "
-            f"{_V80_B2_STATE['liberado_mb']:.1f} MB liberados, "
-            f"{_V80_B2_STATE['falhas']} falha(s).",
-            flush=True,
-        )
+                if contador % 10 == 0:
+                    try:
+                        await asyncio.to_thread(_v75_gc.collect)
+                    except Exception:
+                        pass
+
+                # Deixa Discord/HTTP/auditoria respirarem.
+                await asyncio.sleep(0.25)
 
     except asyncio.CancelledError:
-        _V80_B2_STATE["status"] = "CANCELADA"
-        _V80_B2_STATE["ativo"] = False
-        _V80_B2_STATE["fim"] = datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat()
         raise
-    except Exception as erro:
-        _V80_B2_STATE["status"] = "FALHOU"
-        _V80_B2_STATE["erro"] = (
-            f"{type(erro).__name__}: {erro}"
-        )
-        _V80_B2_STATE["fim"] = datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat()
 
+    except Exception as erro:
         traceback.print_exc()
+        await asyncio.to_thread(
+            _v81_estado_patch,
+            status="FALHOU",
+            ultimo_erro=f"{type(erro).__name__}: {erro}",
+            fim=datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+        )
         try:
             await enviar_log(
-                "❌ V80 migração B2 em segundo plano falhou | "
-                f"{type(erro).__name__}: {erro}\n"
-                f"```py\n{traceback.format_exc()[-2500:]}\n```"
+                "❌ V81 migração B2 falhou | "
+                f"{type(erro).__name__}: {erro}"
             )
         except Exception:
             pass
 
-        await _v80_editar_resposta_interacao(
-            interaction,
-            "❌ **MIGRAÇÃO B2 INTERROMPIDA**\n"
-            "Nenhum arquivo é apagado antes da confirmação do B2.\n"
-            f"**Erro:** `{type(erro).__name__}: {str(erro)[:350]}`\n\n"
-            "O diagnóstico completo foi enviado para os logs.",
-        )
     finally:
-        _V80_B2_STATE["ativo"] = False
-        _V80_B2_TASK = None
+        _V81_TASK = None
+
+
+def _v81_iniciar_worker() -> bool:
+    global _V81_TASK
+
+    if _V81_TASK is not None and not _V81_TASK.done():
+        return False
+
+    _V81_TASK = asyncio.create_task(
+        _v81_worker(),
+        name="v81-b2-resiliente",
+    )
+    return True
 
 
 @bot.tree.command(
     name="migrarb2",
-    description="Migra arquivos pesados para o B2 em segundo plano.",
+    description="Migra para o B2 com retomada automática após restart.",
 )
 @app_commands.describe(
-    limite_mb="Total máximo desta execução (32–500 MB)",
+    limite_mb="Meta desta execução (32–500 MB)",
 )
-async def migrarb2_v80(
+async def migrarb2_v81(
     interaction: discord.Interaction,
-    limite_mb: app_commands.Range[int, 32, 500] = 220,
+    limite_mb: app_commands.Range[int, 32, 500] = 500,
 ):
-    global _V80_B2_TASK
-
-    # O máximo possível é feito antes de qualquer operação de disco/rede
-    # para que o Discord seja respondido dentro do prazo da interação.
     if not usuario_e_administrador(interaction.user):
         return await interaction.response.send_message(
             "❌ Apenas a Diretoria pode executar migração.",
-            ephemeral=True,
-        )
-
-    if _V80_B2_TASK is not None and not _V80_B2_TASK.done():
-        return await interaction.response.send_message(
-            "⏳ Já existe uma migração B2 em andamento.\n"
-            "Use `/statusmigracaob2` para acompanhar.",
             ephemeral=True,
         )
 
@@ -68531,69 +68773,118 @@ async def migrarb2_v80(
             ephemeral=True,
         )
 
-    await interaction.response.send_message(
-        "⏳ **MIGRAÇÃO B2 INICIADA**\n"
-        f"Limite desta execução: `{int(limite_mb)} MB`.\n"
-        "Ela será feita em lotes pequenos em segundo plano para não travar o bot.\n"
-        "Use `/statusmigracaob2` para acompanhar.",
-        ephemeral=True,
-    )
+    estado = await asyncio.to_thread(_v81_estado_ler)
 
-    _V80_B2_TASK = asyncio.create_task(
-        _v80_migrar_background(
-            interaction,
-            int(limite_mb),
-        ),
-        name="v80-migracao-b2-background",
+    if str(estado.get("status")) == "MIGRANDO":
+        _v81_iniciar_worker()
+        return await interaction.response.send_message(
+            "⏳ A migração já está ativa ou sendo retomada.\n"
+            "Use `/statusmigracaob2`.",
+            ephemeral=True,
+        )
+
+    await asyncio.to_thread(
+        _v81_estado_iniciar,
+        int(limite_mb),
+        int(interaction.user.id),
+    )
+    _v81_iniciar_worker()
+
+    await interaction.response.send_message(
+        "📤 **MIGRAÇÃO B2 INICIADA**\n"
+        f"Meta: `{int(limite_mb)} MB`.\n"
+        "Agora é **um arquivo por vez**, com progresso salvo após cada envio.\n"
+        "Se o Railway reiniciar, a tarefa volta automaticamente.\n\n"
+        "Acompanhe com `/statusmigracaob2`.",
+        ephemeral=True,
     )
 
 
 @bot.tree.command(
     name="statusmigracaob2",
-    description="Mostra o progresso da migração atual para o Backblaze B2.",
+    description="Mostra o progresso persistente da migração B2.",
 )
-async def statusmigracaob2_v80(
+async def statusmigracaob2_v81(
     interaction: discord.Interaction,
 ):
     if not usuario_e_administrador(interaction.user):
         return await interaction.response.send_message(
-            "❌ Apenas a Diretoria pode consultar a migração.",
+            "❌ Apenas a Diretoria pode consultar.",
             ephemeral=True,
         )
 
+    texto_status = await asyncio.to_thread(_v81_estado_texto)
+
     await interaction.response.send_message(
-        _v80_estado_texto(),
+        texto_status,
         ephemeral=True,
     )
 
 
 @bot.tree.command(
     name="cancelarmigracaob2",
-    description="Interrompe a migração B2 após o arquivo atual terminar.",
+    description="Cancela a migração B2 com segurança.",
 )
-async def cancelarmigracaob2_v80(
+async def cancelarmigracaob2_v81(
     interaction: discord.Interaction,
 ):
-    global _V80_B2_TASK
+    global _V81_TASK
 
     if not usuario_e_administrador(interaction.user):
         return await interaction.response.send_message(
-            "❌ Apenas a Diretoria pode cancelar a migração.",
+            "❌ Apenas a Diretoria pode cancelar.",
             ephemeral=True,
         )
 
-    if _V80_B2_TASK is None or _V80_B2_TASK.done():
+    estado = await asyncio.to_thread(_v81_estado_ler)
+
+    if str(estado.get("status")) != "MIGRANDO":
         return await interaction.response.send_message(
-            "ℹ️ Não existe migração em andamento.",
+            "ℹ️ Não existe migração ativa.",
             ephemeral=True,
         )
 
-    _V80_B2_TASK.cancel()
+    await asyncio.to_thread(
+        _v81_estado_patch,
+        status="CANCELADA",
+        fim=datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+    )
+
+    if _V81_TASK is not None and not _V81_TASK.done():
+        _V81_TASK.cancel()
+
     await interaction.response.send_message(
         "🛑 Migração cancelada. "
-        "Arquivos já confirmados no B2 permanecem seguros.",
+        "Tudo já confirmado no B2 permanece salvo.",
         ephemeral=True,
     )
+
+
+@bot.listen("on_ready")
+async def _v81_retomar_ready() -> None:
+    await asyncio.sleep(25)
+
+    try:
+        estado = await asyncio.to_thread(_v81_estado_ler)
+
+        if (
+            str(estado.get("status")) == "MIGRANDO"
+            and _v78_r2_configurado()
+        ):
+            if _v81_iniciar_worker():
+                print(
+                    "♻️ V81 B2: migração retomada automaticamente "
+                    "após reinício.",
+                    flush=True,
+                )
+    except Exception as erro:
+        print(
+            "⚠️ V81 retomada falhou sem derrubar o bot: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
 
 
 # -----------------------------------------------------
@@ -68735,6 +69026,13 @@ print(
 print(
     "✅ V80 carregada — /migrarb2 responde imediatamente e migra "
     "em segundo plano com status e cancelamento.",
+    flush=True,
+)
+
+
+print(
+    "✅ V81 carregada — B2 arquivo por arquivo, progresso persistente "
+    "e retomada automática após restart.",
     flush=True,
 )
 
