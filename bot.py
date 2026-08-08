@@ -68507,6 +68507,22 @@ def _v81_upload_seguro(
 _v78_upload_sync = _v81_upload_seguro
 
 
+def _v82_erro_b2_fatal(erro: BaseException) -> bool:
+    """Erros de permissão/configuração não devem ser repetidos."""
+    msg = f"{type(erro).__name__}: {erro}".lower()
+    sinais = (
+        "403",
+        "forbidden",
+        "accessdenied",
+        "access denied",
+        "invalidaccesskeyid",
+        "signaturedoesnotmatch",
+        "authorization",
+        "unauthorized",
+    )
+    return any(sinal in msg for sinal in sinais)
+
+
 def _v81_processar_um(
     ignorar: set[str],
 ) -> Dict[str, Any]:
@@ -68556,6 +68572,7 @@ def _v81_processar_um(
             "encontrado": True,
             "ok": False,
             "ignorar": False,
+            "fatal": _v82_erro_b2_fatal(erro),
             "arquivo": str(caminho),
             "tamanho": tamanho,
             "erro": f"{type(erro).__name__}: {erro}",
@@ -68687,12 +68704,34 @@ async def _v81_worker() -> None:
                         ultimo_erro="",
                     )
                 elif not resultado.get("ignorar"):
+                    novo_total_falhas = int(atual.get("falhas") or 0) + 1
+
+                    if resultado.get("fatal"):
+                        await asyncio.to_thread(
+                            _v81_estado_patch,
+                            status="FALHOU",
+                            falhas=novo_total_falhas,
+                            ultimo_arquivo=str(
+                                resultado.get("arquivo") or ""
+                            ),
+                            ultimo_erro=str(
+                                resultado.get("erro") or ""
+                            )[:1000],
+                            fim=datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
+                        )
+                        print(
+                            "⛔ V82 B2: migração interrompida por erro "
+                            "de autorização/configuração. Nenhum arquivo "
+                            "local desse item foi apagado.",
+                            flush=True,
+                        )
+                        break
+
                     await asyncio.to_thread(
                         _v81_estado_patch,
-                        falhas=(
-                            int(atual.get("falhas") or 0)
-                            + 1
-                        ),
+                        falhas=novo_total_falhas,
                         ultimo_arquivo=str(
                             resultado.get("arquivo") or ""
                         ),
@@ -68748,6 +68787,116 @@ def _v81_iniciar_worker() -> bool:
         name="v81-b2-resiliente",
     )
     return True
+
+
+@bot.tree.command(
+    name="testeb2",
+    description="Testa escrita, leitura e exclusão no Backblaze B2.",
+)
+async def testeb2_v82(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode executar este teste.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not _v78_r2_configurado():
+        return await interaction.followup.send(
+            "❌ O Backblaze B2 não está configurado.",
+            ephemeral=True,
+        )
+
+    cliente = _v78_r2_client()
+    chave = (
+        f"{V78_R2_PREFIX + '/' if V78_R2_PREFIX else ''}"
+        f"_diagnostico/teste-{int(time.time())}-{secrets.token_hex(3)}.txt"
+    )
+    conteudo = (
+        f"DICOR B2 V82 test "
+        f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+    ).encode("utf-8")
+
+    escreveu = False
+    leu = False
+    apagou = False
+    erro_fase = ""
+    erro_texto = ""
+
+    try:
+        erro_fase = "PUT"
+        resposta = await asyncio.to_thread(
+            cliente.put_object,
+            Bucket=V78_R2_BUCKET,
+            Key=chave,
+            Body=conteudo,
+            ContentType="text/plain",
+        )
+        escreveu = bool(
+            resposta.get("ETag")
+            or resposta.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            in {200, 201}
+        )
+
+        erro_fase = "HEAD"
+        head = await asyncio.to_thread(
+            cliente.head_object,
+            Bucket=V78_R2_BUCKET,
+            Key=chave,
+        )
+        leu = int(head.get("ContentLength") or -1) == len(conteudo)
+
+        erro_fase = "DELETE"
+        await asyncio.to_thread(
+            cliente.delete_object,
+            Bucket=V78_R2_BUCKET,
+            Key=chave,
+        )
+        apagou = True
+
+    except Exception as erro:
+        erro_texto = f"{type(erro).__name__}: {erro}"
+        if escreveu and not apagou:
+            try:
+                await asyncio.to_thread(
+                    cliente.delete_object,
+                    Bucket=V78_R2_BUCKET,
+                    Key=chave,
+                )
+                apagou = True
+            except Exception:
+                pass
+
+    if escreveu and leu and apagou and not erro_texto:
+        return await interaction.followup.send(
+            "✅ **TESTE B2 COMPLETO**\n"
+            "• Escrita: ✅\n"
+            "• Leitura/HEAD: ✅\n"
+            "• Exclusão: ✅\n\n"
+            "A chave está pronta para a migração.",
+            ephemeral=True,
+        )
+
+    dica = ""
+    if "403" in erro_texto or "Forbidden" in erro_texto:
+        dica = (
+            "\n\n⚠️ **Permissão insuficiente.** A Application Key precisa "
+            "ser **Read and Write** no bucket `dicor-storage`."
+        )
+
+    await interaction.followup.send(
+        "❌ **TESTE B2 FALHOU**\n"
+        f"• Escrita: {'✅' if escreveu else '❌'}\n"
+        f"• Leitura/HEAD: {'✅' if leu else '❌'}\n"
+        f"• Exclusão: {'✅' if apagou else '❌'}\n"
+        f"• Fase que falhou: `{erro_fase}`\n"
+        f"• Erro: `{erro_texto[:500]}`"
+        + dica,
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -69033,6 +69182,13 @@ print(
 print(
     "✅ V81 carregada — B2 arquivo por arquivo, progresso persistente "
     "e retomada automática após restart.",
+    flush=True,
+)
+
+
+print(
+    "✅ V82 carregada — teste de permissões B2 e parada automática "
+    "em 403/AccessDenied ativos.",
     flush=True,
 )
 
