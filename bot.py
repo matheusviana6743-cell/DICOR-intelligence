@@ -42975,7 +42975,7 @@ print(
 import tempfile
 
 # PATCH FINAL — HISTÓRICO DE PRISÃO INTEGRADO À FICHA GERAL
-# - Canal exclusivo: 1532097197292654622;
+# - Canal ativo desde 08/08/2026: 1535671619069018223;\n# - Canal anterior 1532097197292654622 preservado apenas como legado;
 # - Lê mensagens encaminhadas, inclusive message_snapshots da API;
 # - Processa texto + todas as imagens da mesma mensagem em um único lote;
 # - Confere Nome/RG digitados com o documento fotografado via OCR;
@@ -42987,7 +42987,10 @@ import tempfile
 from difflib import SequenceMatcher as _prisao_sequence_matcher
 from urllib.parse import quote as _prisao_quote, urlsplit as _prisao_urlsplit
 
-HISTORICO_PRISAO_CHANNEL_ID = int(os.getenv("HISTORICO_PRISAO_CHANNEL_ID", "1532097197292654622"))
+# V76: a partir de 08/08/2026, novas prisões chegam neste canal.
+HISTORICO_PRISAO_CHANNEL_ID = 1535671619069018223
+# Canal anterior mantido apenas como referência/histórico legado.
+HISTORICO_PRISAO_CHANNEL_ID_LEGADO = 1532097197292654622
 HISTORICO_PRISAO_SCAN_LIMIT = max(20, min(1000, int(os.getenv("HISTORICO_PRISAO_SCAN_LIMIT", "300"))))
 HISTORICO_PRISAO_MIGRAR_ANTIGOS = os.getenv("HISTORICO_PRISAO_MIGRAR_ANTIGOS", "1").strip().lower() not in {"0", "false", "nao", "não", "off"}
 HISTORICO_PRISAO_MIGRATION_LIMIT = max(0, int(os.getenv("HISTORICO_PRISAO_MIGRATION_LIMIT", "0")))  # 0 = todo o histórico
@@ -66804,6 +66807,30 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# V76 — NOVO CANAL OFICIAL DE PRISÕES
+# =====================================================
+# Novas mensagens prisionais são processadas somente no canal ativo.
+# O banco já preserva os registros antigos; o ID anterior fica documentado
+# para manutenção/reprocessamento histórico manual, sem receber novas prisões.
+
+@bot.listen("on_ready")
+async def _v76_confirmar_canal_prisoes():
+    try:
+        print(
+            f"✅ V76 prisões: canal ativo {HISTORICO_PRISAO_CHANNEL_ID} • "
+            f"legado {HISTORICO_PRISAO_CHANNEL_ID_LEGADO}.",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+print(
+    "✅ V76 carregada — novas prisões somente no canal 1535671619069018223.",
+    flush=True,
+)
 
 if __name__ == '__main__':
     asyncio.run(main())
