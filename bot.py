@@ -66855,26 +66855,26 @@ print(
 
 
 # =====================================================
-# V78 — STORAGE HÍBRIDO: RAILWAY + CLOUDFLARE R2
+# V79 — STORAGE HÍBRIDO: RAILWAY + BACKBLAZE B2
 # =====================================================
 # Arquitetura:
 # - SQLite/JSON/configurações continuam no Railway Volume.
-# - Arquivos pesados podem ser enviados ao Cloudflare R2.
+# - Arquivos pesados podem ser enviados ao Backblaze B2.
 # - O arquivo local só é apagado após upload + HEAD confirmando o tamanho.
 # - Um índice local pequeno permite recuperar qualquer arquivo migrado.
 # - Se o R2 estiver indisponível, o bot mantém fallback local.
 # - Cache de downloads do R2 usa /tmp, não o Railway Volume.
 #
 # Variáveis:
-# R2_ENABLED=1
-# R2_ACCOUNT_ID=...
-# R2_ACCESS_KEY_ID=...
-# R2_SECRET_ACCESS_KEY=...
-# R2_BUCKET=dicor-storage
-# R2_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com   (opcional)
-# R2_PREFIX=dicor
-# R2_PRESIGNED_SECONDS=604800
-# R2_AUTO_MIGRATE=1
+# B2_ENABLED=1
+# B2_ACCESS_KEY_ID=...
+# B2_SECRET_ACCESS_KEY=...
+# B2_BUCKET=dicor-storage
+# B2_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
+# B2_REGION=us-east-005
+# B2_PREFIX=dicor
+# B2_PRESIGNED_SECONDS=604800
+# B2_AUTO_MIGRATE=0  # primeiro teste; ative depois
 # =====================================================
 
 try:
@@ -66894,44 +66894,68 @@ def _v78_env_bool(nome: str, padrao: bool = False) -> bool:
     return valor in {"1", "true", "yes", "sim", "on"}
 
 
-V78_R2_ENABLED = _v78_env_bool("R2_ENABLED", False)
-V78_R2_AUTO_MIGRATE = _v78_env_bool("R2_AUTO_MIGRATE", True)
-V78_R2_ACCOUNT_ID = str(os.getenv("R2_ACCOUNT_ID", "") or "").strip()
-V78_R2_ACCESS_KEY_ID = str(os.getenv("R2_ACCESS_KEY_ID", "") or "").strip()
-V78_R2_SECRET_ACCESS_KEY = str(os.getenv("R2_SECRET_ACCESS_KEY", "") or "").strip()
-V78_R2_BUCKET = str(os.getenv("R2_BUCKET", "") or "").strip()
-V78_R2_PREFIX = str(os.getenv("R2_PREFIX", "dicor") or "dicor").strip().strip("/")
-V78_R2_ENDPOINT_URL = str(os.getenv("R2_ENDPOINT_URL", "") or "").strip()
-if not V78_R2_ENDPOINT_URL and V78_R2_ACCOUNT_ID:
-    V78_R2_ENDPOINT_URL = (
-        f"https://{V78_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    )
+V79_B2_ENABLED = _v78_env_bool("B2_ENABLED", False)
+V79_B2_AUTO_MIGRATE = _v78_env_bool("B2_AUTO_MIGRATE", False)
+V79_B2_ACCESS_KEY_ID = str(os.getenv("B2_ACCESS_KEY_ID", "") or "").strip()
+V79_B2_SECRET_ACCESS_KEY = str(os.getenv("B2_SECRET_ACCESS_KEY", "") or "").strip()
+V79_B2_BUCKET = str(os.getenv("B2_BUCKET", "") or "").strip()
+V79_B2_ENDPOINT_URL = str(os.getenv("B2_ENDPOINT_URL", "") or "").strip()
+V79_B2_REGION = str(os.getenv("B2_REGION", "") or "").strip()
+V79_B2_PREFIX = str(os.getenv("B2_PREFIX", "dicor") or "dicor").strip().strip("/")
 
-V78_R2_PRESIGNED_SECONDS = max(
+# Se a região não for informada, tenta obter do endpoint:
+# https://s3.us-east-005.backblazeb2.com
+if not V79_B2_REGION and V79_B2_ENDPOINT_URL:
+    _v79_match_region = re.search(
+        r"https?://s3\.([a-z0-9-]+)\.backblazeb2\.com",
+        V79_B2_ENDPOINT_URL,
+        flags=re.I,
+    )
+    if _v79_match_region:
+        V79_B2_REGION = _v79_match_region.group(1)
+
+V79_B2_PRESIGNED_SECONDS = max(
     300,
     min(
         604800,
-        env_int("R2_PRESIGNED_SECONDS", 604800),
+        env_int("B2_PRESIGNED_SECONDS", 604800),
     ),
 )
-V78_R2_AUTO_TRIGGER_PERCENT = max(
+V79_B2_AUTO_TRIGGER_PERCENT = max(
     50,
-    min(95, env_int("R2_AUTO_TRIGGER_PERCENT", 72)),
+    min(95, env_int("B2_AUTO_TRIGGER_PERCENT", 72)),
 )
-V78_R2_AUTO_TARGET_PERCENT = max(
+V79_B2_AUTO_TARGET_PERCENT = max(
     35,
     min(
-        V78_R2_AUTO_TRIGGER_PERCENT - 5,
-        env_int("R2_AUTO_TARGET_PERCENT", 58),
+        V79_B2_AUTO_TRIGGER_PERCENT - 5,
+        env_int("B2_AUTO_TARGET_PERCENT", 58),
     ),
 )
-V78_R2_BATCH_MB = max(32, env_int("R2_MIGRATION_BATCH_MB", 220))
+V79_B2_BATCH_MB = max(
+    32,
+    env_int("B2_MIGRATION_BATCH_MB", 180),
+)
 
-V78_R2_INDEX_DB = DATA_DIR / "r2_storage_index.sqlite"
+# Compatibilidade interna com a camada V78.
+# Mantém as funções já testadas e troca somente o backend/configuração.
+V78_R2_ENABLED = V79_B2_ENABLED
+V78_R2_AUTO_MIGRATE = V79_B2_AUTO_MIGRATE
+V78_R2_ACCESS_KEY_ID = V79_B2_ACCESS_KEY_ID
+V78_R2_SECRET_ACCESS_KEY = V79_B2_SECRET_ACCESS_KEY
+V78_R2_BUCKET = V79_B2_BUCKET
+V78_R2_PREFIX = V79_B2_PREFIX
+V78_R2_ENDPOINT_URL = V79_B2_ENDPOINT_URL
+V78_R2_PRESIGNED_SECONDS = V79_B2_PRESIGNED_SECONDS
+V78_R2_AUTO_TRIGGER_PERCENT = V79_B2_AUTO_TRIGGER_PERCENT
+V78_R2_AUTO_TARGET_PERCENT = V79_B2_AUTO_TARGET_PERCENT
+V78_R2_BATCH_MB = V79_B2_BATCH_MB
+
+V78_R2_INDEX_DB = DATA_DIR / "b2_storage_index.sqlite"
 V78_R2_CACHE_DIR = Path(
     os.getenv(
         "R2_CACHE_DIR",
-        str(Path(_v78_tempfile.gettempdir()) / "dicor-r2-cache"),
+        str(Path(_v78_tempfile.gettempdir()) / "dicor-b2-cache"),
     )
 )
 V78_R2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -66944,16 +66968,18 @@ _V78_R2_AUTO_STARTED = False
 
 def _v78_r2_configurado() -> bool:
     return bool(
-        V78_R2_ENABLED
+        V79_B2_ENABLED
         and _v78_boto3 is not None
-        and V78_R2_ENDPOINT_URL
-        and V78_R2_ACCESS_KEY_ID
-        and V78_R2_SECRET_ACCESS_KEY
-        and V78_R2_BUCKET
+        and V79_B2_ENDPOINT_URL
+        and V79_B2_REGION
+        and V79_B2_ACCESS_KEY_ID
+        and V79_B2_SECRET_ACCESS_KEY
+        and V79_B2_BUCKET
     )
 
 
 def _v78_r2_client():
+    """Cliente S3 compatível do Backblaze B2."""
     global _V78_R2_CLIENT
     if not _v78_r2_configurado():
         return None
@@ -66962,10 +66988,10 @@ def _v78_r2_client():
         if _V78_R2_CLIENT is None:
             kwargs = {
                 "service_name": "s3",
-                "endpoint_url": V78_R2_ENDPOINT_URL,
-                "aws_access_key_id": V78_R2_ACCESS_KEY_ID,
-                "aws_secret_access_key": V78_R2_SECRET_ACCESS_KEY,
-                "region_name": "auto",
+                "endpoint_url": V79_B2_ENDPOINT_URL,
+                "aws_access_key_id": V79_B2_ACCESS_KEY_ID,
+                "aws_secret_access_key": V79_B2_SECRET_ACCESS_KEY,
+                "region_name": V79_B2_REGION,
             }
             if _V78BotoConfig is not None:
                 kwargs["config"] = _V78BotoConfig(
@@ -66975,7 +67001,8 @@ def _v78_r2_client():
                         "mode": "standard",
                     },
                     connect_timeout=10,
-                    read_timeout=45,
+                    read_timeout=60,
+                    s3={"addressing_style": "path"},
                 )
             _V78_R2_CLIENT = _v78_boto3.client(**kwargs)
         return _V78_R2_CLIENT
@@ -67016,12 +67043,15 @@ def _v78_abs(valor: Any) -> str:
 
 
 def _v78_pointer(key: str) -> str:
-    return "r2://" + str(key or "").lstrip("/")
+    return "b2://" + str(key or "").lstrip("/")
 
 
 def _v78_key_pointer(valor: Any) -> str:
     texto = str(valor or "").strip()
-    if texto.startswith("r2://"):
+    if texto.startswith("b2://"):
+        return texto[5:].lstrip("/")
+    # Compatibilidade com testes/índices antigos da V78.
+    if texto.startswith(("b2://", "r2://")):
         return texto[5:].lstrip("/")
     return ""
 
@@ -67139,7 +67169,7 @@ def _v78_upload_sync(
     cliente = _v78_r2_client()
     if cliente is None:
         raise RuntimeError(
-            "Cloudflare R2 não está configurado ou boto3 não está instalado."
+            "Backblaze B2 não está configurado ou boto3 não está instalado."
         )
 
     tamanho = int(caminho.stat().st_size)
@@ -67259,7 +67289,7 @@ def _v78_materializar_sync(
         return None
 
     # Caminho local normal.
-    if not texto.startswith("r2://"):
+    if not texto.startswith(("b2://", "r2://")):
         try:
             p = Path(texto)
             if p.exists() and p.is_file():
@@ -67542,7 +67572,7 @@ def _v78_migrar_batch_sync(
 ) -> Dict[str, Any]:
     if not _v78_r2_configurado():
         raise RuntimeError(
-            "R2 não configurado. Defina as variáveis R2_* e instale boto3."
+            "B2 não configurado. Defina as variáveis B2_* e instale boto3."
         )
 
     candidatos = _v78_candidatos_migracao_sync(limite_mb)
@@ -67599,7 +67629,7 @@ _V78_SALVAR_ANEXO_PUBLICO_ANTES = salvar_anexo_publico
 
 def _catalogo_caminho_local(valor: Any) -> Optional[Path]:
     texto = str(valor or "").strip()
-    if texto.startswith("r2://"):
+    if texto.startswith(("b2://", "r2://")):
         return _v78_materializar_sync(texto)
     caminho = _V78_CATALOGO_CAMINHO_LOCAL_ANTES(valor)
     if caminho is not None:
@@ -67609,14 +67639,14 @@ def _catalogo_caminho_local(valor: Any) -> Optional[Path]:
 
 def _catalogo_foto_disponivel(valor: Any) -> bool:
     texto = str(valor or "").strip()
-    if texto.startswith("r2://"):
+    if texto.startswith(("b2://", "r2://")):
         return bool(_v78_presign_sync(texto))
     return _V78_CATALOGO_FOTO_DISPONIVEL_ANTES(valor)
 
 
 def _catalogo_url_local(valor: Any) -> str:
     texto = str(valor or "").strip()
-    if texto.startswith("r2://"):
+    if texto.startswith(("b2://", "r2://")):
         return _v78_presign_sync(texto)
     return _V78_CATALOGO_URL_LOCAL_ANTES(valor)
 
@@ -67663,7 +67693,7 @@ if "_procurado_caminho_foto_v8" in globals():
 
     def _procurado_caminho_foto_v8(valor: Any) -> Optional[Path]:
         texto = str(valor or "").strip()
-        if texto.startswith("r2://"):
+        if texto.startswith(("b2://", "r2://")):
             return _v78_materializar_sync(texto)
         caminho = _V78_PROCURADO_CAMINHO_ANTES(valor)
         if caminho is not None:
@@ -67685,13 +67715,13 @@ def _v78_resolver_pointer_em_dict(
     valor_path = str(item.get(path_key) or "").strip()
     valor_url = str(item.get(url_key) or "").strip()
 
-    if valor_path.startswith("r2://"):
+    if valor_path.startswith(("b2://", "r2://")):
         url = _v78_presign_sync(valor_path)
         if url:
             item[url_key] = url
         return
 
-    if valor_url.startswith("r2://"):
+    if valor_url.startswith(("b2://", "r2://")):
         url = _v78_presign_sync(valor_url)
         if url:
             item[url_key] = url
@@ -67736,7 +67766,7 @@ def _banco_ficha_geral_carregar(
     for original in list(perfil.get("arquivos") or []):
         arq = dict(original)
         caminho = str(arq.get("caminho") or "")
-        if caminho.startswith("r2://"):
+        if caminho.startswith(("b2://", "r2://")):
             arq["r2_url"] = _v78_presign_sync(caminho)
         elif not Path(caminho).exists():
             reg = _v78_index_get_by_path(caminho)
@@ -67753,7 +67783,7 @@ def _banco_ficha_geral_carregar(
         p = dict(original)
         for campo in ("foto_individuo_path", "foto_rg_path"):
             valor = str(p.get(campo) or "")
-            if valor.startswith("r2://"):
+            if valor.startswith(("b2://", "r2://")):
                 p[campo + "_url"] = _v78_presign_sync(valor)
         prisoes.append(p)
     if prisoes:
@@ -68042,7 +68072,7 @@ _V78_V21_MIDIA_URL_ANTES = _v21_midia_url
 def _v21_midia_url(item: Any) -> str:
     texto = str(item or "").strip()
 
-    if texto.startswith("r2://"):
+    if texto.startswith(("b2://", "r2://")):
         return _v78_presign_sync(texto)
 
     # Se o caminho já foi migrado e removido, busca no índice.
@@ -68136,10 +68166,10 @@ async def baixar_backup_http(
 # COMANDOS ADMINISTRATIVOS
 # -----------------------------------------------------
 @bot.tree.command(
-    name="storager2",
-    description="Mostra o status do Railway Volume e do Cloudflare R2.",
+    name="storageb2",
+    description="Mostra o status do Railway Volume e do Backblaze B2.",
 )
-async def storager2_v78(
+async def storageb2_v79(
     interaction: discord.Interaction,
 ):
     if not usuario_e_administrador(interaction.user):
@@ -68189,25 +68219,25 @@ async def storager2_v78(
         quantidade, total = 0, 0
 
     await interaction.followup.send(
-        "💾 **STORAGE DICOR V78**\n"
+        "💾 **STORAGE DICOR V79**\n"
         f"**Railway:** `{volume['percent']:.1f}%` usado • "
         f"`{volume['free_mb']:.1f} MB` livres\n"
-        f"**R2:** {r2_status}\n"
-        f"**Objetos indexados no R2:** `{quantidade}`\n"
+        f"**B2:** {r2_status}\n"
+        f"**Objetos indexados no B2:** `{quantidade}`\n"
         f"**Dados externos:** `{total / 1024 / 1024:.1f} MB`\n"
-        f"**Cache local R2:** `/tmp` (não usa o Volume)",
+        f"**Cache local B2:** `/tmp` (não usa o Volume)",
         ephemeral=True,
     )
 
 
 @bot.tree.command(
-    name="migrarr2",
+    name="migrarb2",
     description="Migra arquivos pesados do Railway para o R2 com verificação.",
 )
 @app_commands.describe(
     limite_mb="Máximo aproximado a migrar nesta execução (32–500 MB)",
 )
-async def migrarr2_v78(
+async def migrarb2_v79(
     interaction: discord.Interaction,
     limite_mb: app_commands.Range[int, 32, 500] = 220,
 ):
@@ -68220,7 +68250,7 @@ async def migrarr2_v78(
     if not _v78_r2_configurado():
         return await interaction.response.send_message(
             "❌ O R2 ainda não está configurado. "
-            "Defina as variáveis `R2_*` no Railway e instale `boto3`.",
+            "Defina as variáveis `B2_*` no Railway e instale `boto3`.",
             ephemeral=True,
         )
 
@@ -68243,14 +68273,14 @@ async def migrarr2_v78(
         )
 
     await interaction.followup.send(
-        "✅ **MIGRAÇÃO R2 CONCLUÍDA**\n"
+        "✅ **MIGRAÇÃO B2 CONCLUÍDA**\n"
         f"**Enviados:** `{resultado['enviados']}` arquivo(s)\n"
         f"**Falhas:** `{resultado['falhas']}`\n"
         f"**Referências atualizadas:** `{resultado['referencias']}`\n"
         f"**Espaço liberado:** "
         f"`{resultado['liberados_bytes'] / 1024 / 1024:.1f} MB`\n"
         f"**Volume:** `{antes['percent']:.1f}%` → `{depois['percent']:.1f}%`\n\n"
-        "O arquivo local só é excluído após o R2 confirmar o upload.",
+        "O arquivo local só é excluído após o B2 confirmar o upload.",
         ephemeral=True,
     )
 
@@ -68307,7 +68337,7 @@ async def _v78_auto_migracao_loop():
 
         if total_liberado:
             print(
-                "✅ V78 auto-R2: "
+                "✅ V79 auto-B2: "
                 f"{total_liberado / 1024 / 1024:.1f} MB liberados; "
                 f"volume={volume['percent']:.1f}%.",
                 flush=True,
@@ -68318,7 +68348,7 @@ async def _v78_auto_migracao_loop():
         )
     except Exception as erro:
         print(
-            "⚠️ V78 auto-R2 falhou sem interromper o bot: "
+            "⚠️ V79 auto-B2 falhou sem interromper o bot: "
             f"{type(erro).__name__}: {erro}",
             flush=True,
         )
@@ -68349,13 +68379,13 @@ async def _v78_on_ready():
                 Bucket=V78_R2_BUCKET,
             )
             print(
-                f"✅ V78 R2 conectado: bucket `{V78_R2_BUCKET}`. "
+                f"✅ V79 B2 conectado: bucket `{V78_R2_BUCKET}`. "
                 "Arquivos pesados podem sair do Railway Volume.",
                 flush=True,
             )
         except Exception as erro:
             print(
-                "⚠️ V78 R2 configurado, mas conexão falhou: "
+                "⚠️ V79 B2 configurado, mas conexão falhou: "
                 f"{type(erro).__name__}: {erro}. "
                 "Fallback local continua ativo.",
                 flush=True,
@@ -68367,7 +68397,7 @@ async def _v78_on_ready():
             else "variáveis R2 incompletas"
         )
         print(
-            f"ℹ️ V78 R2 em fallback local: {motivo}.",
+            f"ℹ️ V79 B2 em fallback local: {motivo}.",
             flush=True,
         )
 
@@ -68376,8 +68406,16 @@ async def _v78_on_ready():
 
 
 print(
-    "✅ V78 carregada — storage híbrido Railway + Cloudflare R2, "
-    "migração verificada, cache em /tmp e fallback local ativos.",
+    "✅ V79 carregada — Backblaze B2 + Railway, migração segura, "
+    "cache em /tmp e fallback local ativos.",
+    flush=True,
+)
+
+
+
+print(
+    "✅ V79 B2: backend configurado para Backblaze S3-Compatible API. "
+    "Use /storageb2 antes de qualquer migração.",
     flush=True,
 )
 
