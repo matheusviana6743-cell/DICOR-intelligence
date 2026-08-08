@@ -68234,7 +68234,7 @@ async def storageb2_v79(
         quantidade, total = 0, 0
 
     await interaction.followup.send(
-        "💾 **STORAGE DICOR V79**\n"
+        "💾 **STORAGE DICOR V86**\n"
         f"**Railway:** `{volume['percent']:.1f}%` usado • "
         f"`{volume['free_mb']:.1f} MB` livres\n"
         f"**B2:** {r2_status}\n"
@@ -70217,6 +70217,764 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# V86 — B2 DIRETO PARA NOVOS ARQUIVOS
+# =====================================================
+# Estratégia:
+# 1. fotos/anexos novos -> /tmp -> B2 -> ponteiro b2:// no banco;
+# 2. /data fica para SQLite, JSON, configurações e fallback;
+# 3. se o B2 estiver indisponível, usa a função local anterior;
+# 4. documentos que precisam ser gerados em disco são removidos do
+#    Volume por um offloader rápido após confirmação no B2.
+#
+# A V84 LIST-only continua sendo a confirmação do upload.
+# Não usa HEAD/GET para confirmar arquivos.
+
+V86_B2_DIRECT_ENABLED = _v78_env_bool(
+    "B2_DIRECT_UPLOAD",
+    True,
+)
+V86_GENERATED_OFFLOAD_SECONDS = max(
+    30,
+    env_int("B2_GENERATED_OFFLOAD_SECONDS", 60),
+)
+V86_GENERATED_MIN_AGE_SECONDS = max(
+    20,
+    env_int("B2_GENERATED_MIN_AGE_SECONDS", 45),
+)
+
+_V86_DIRECT_FALLBACKS = 0
+_V86_DIRECT_ENVIADOS = 0
+_V86_OFFLOAD_STARTED = False
+_V86_OFFLOAD_LOCK = asyncio.Lock()
+
+
+def _v86_b2_direto_ativo() -> bool:
+    return bool(
+        V86_B2_DIRECT_ENABLED
+        and _v78_r2_configurado()
+    )
+
+
+def _v86_tmp_path(
+    nome_original: str,
+    prefixo: str,
+) -> Path:
+    V78_R2_CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    nome = (
+        nome_arquivo_seguro(nome_original)
+        if "nome_arquivo_seguro" in globals()
+        else Path(str(nome_original or "arquivo")).name
+    )
+    nome = nome or "arquivo"
+
+    return (
+        V78_R2_CACHE_DIR
+        / (
+            f"v86-{slugify(prefixo)}-"
+            f"{int(time.time() * 1000)}-"
+            f"{secrets.token_hex(4)}-{nome}"
+        )
+    )
+
+
+async def _v86_attachment_tmp(
+    attachment: discord.Attachment,
+    prefixo: str,
+) -> Path:
+    tmp = _v86_tmp_path(
+        str(getattr(attachment, "filename", "arquivo") or "arquivo"),
+        prefixo,
+    )
+
+    try:
+        await attachment.save(
+            str(tmp),
+            use_cached=True,
+        )
+    except Exception:
+        dados = await attachment.read(
+            use_cached=False,
+        )
+        await asyncio.to_thread(
+            _v85_escrever_bytes_confirmado,
+            tmp,
+            bytes(dados),
+        )
+
+    existe = await asyncio.to_thread(
+        lambda: (
+            tmp.exists()
+            and tmp.is_file()
+            and tmp.stat().st_size > 0
+        )
+    )
+
+    if not existe:
+        raise RuntimeError(
+            "O anexo temporário ficou vazio."
+        )
+
+    return tmp
+
+
+async def _v86_attachment_para_b2(
+    attachment: discord.Attachment,
+    categoria: str,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_ENVIADOS
+
+    tmp: Optional[Path] = None
+
+    try:
+        tmp = await _v86_attachment_tmp(
+            attachment,
+            prefixo,
+        )
+
+        resultado = await asyncio.to_thread(
+            _v78_upload_sync,
+            tmp,
+            categoria,
+        )
+
+        pointer = str(
+            resultado.get("pointer") or ""
+        ).strip()
+
+        if not pointer.startswith("b2://"):
+            raise RuntimeError(
+                "O B2 não devolveu um ponteiro válido."
+            )
+
+        _V86_DIRECT_ENVIADOS += 1
+        return pointer
+
+    finally:
+        if tmp is not None:
+            try:
+                await asyncio.to_thread(
+                    tmp.unlink,
+                    missing_ok=True,
+                )
+            except Exception:
+                pass
+
+
+def _v86_bytes_para_b2_sync(
+    dados: bytes,
+    nome: str,
+    categoria: str,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_ENVIADOS
+
+    bruto = bytes(dados or b"")
+    if not bruto:
+        raise RuntimeError("Arquivo vazio.")
+
+    tmp = _v86_tmp_path(
+        nome,
+        prefixo,
+    )
+
+    try:
+        _v85_escrever_bytes_confirmado(
+            tmp,
+            bruto,
+        )
+
+        resultado = _v78_upload_sync(
+            tmp,
+            categoria,
+        )
+
+        pointer = str(
+            resultado.get("pointer") or ""
+        ).strip()
+
+        if not pointer.startswith("b2://"):
+            raise RuntimeError(
+                "Ponteiro B2 inválido."
+            )
+
+        _V86_DIRECT_ENVIADOS += 1
+        return pointer
+
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------
+# BANCO DE DADOS — fotos de pessoa/RG/veículo DIRETO B2
+# -----------------------------------------------------
+_V86_BANCO_SALVAR_ATTACHMENT_LOCAL = (
+    _banco_salvar_attachment
+)
+
+
+async def _banco_salvar_attachment(
+    attachment: discord.Attachment,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_FALLBACKS
+
+    if _v86_b2_direto_ativo():
+        try:
+            return await _v86_attachment_para_b2(
+                attachment,
+                "fichas/imagens",
+                prefixo,
+            )
+        except Exception as erro:
+            _V86_DIRECT_FALLBACKS += 1
+            print(
+                "⚠️ V86 B2 direto/ficha falhou; "
+                "usando fallback local: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    return await _V86_BANCO_SALVAR_ATTACHMENT_LOCAL(
+        attachment,
+        prefixo,
+    )
+
+
+# -----------------------------------------------------
+# PRISÕES — indivíduo, RG e mochila DIRETO B2
+# -----------------------------------------------------
+_V86_PRISAO_COMPRIMIR_LOCAL = (
+    _prisao_comprimir_para_upload
+)
+
+
+def _prisao_comprimir_para_upload(
+    caminho: Path,
+    rg: str,
+    tipo: str,
+) -> Tuple[Any, str]:
+    global _V86_DIRECT_FALLBACKS
+
+    if not _v86_b2_direto_ativo():
+        return _V86_PRISAO_COMPRIMIR_LOCAL(
+            caminho,
+            rg,
+            tipo,
+        )
+
+    try:
+        if PILImage is None:
+            raise RuntimeError(
+                "Pillow indisponível."
+            )
+
+        with PILImage.open(Path(caminho)) as origem:
+            imagem = origem.convert("RGB")
+            limite = (
+                (1600, 1600)
+                if tipo == "rg"
+                else (1400, 1400)
+            )
+            imagem.thumbnail(
+                limite,
+                PILImage.Resampling.LANCZOS,
+            )
+
+            buffer = io.BytesIO()
+            imagem.save(
+                buffer,
+                format="JPEG",
+                quality=84,
+                optimize=True,
+            )
+            dados = buffer.getvalue()
+
+        digest = hashlib.sha256(
+            dados
+        ).hexdigest()[:16]
+
+        nome = (
+            f"ficha-prisao-{slugify(rg)}-"
+            f"{tipo}-{digest}.jpg"
+        )
+
+        pointer = _v86_bytes_para_b2_sync(
+            dados,
+            nome,
+            f"prisoes/{slugify(rg)}",
+            f"prisao-{rg}-{tipo}",
+        )
+
+        # O primeiro retorno vai para os campos *_path e pode ser b2://.
+        # URL vazio faz o fluxo manter o URL original do Discord para exibição,
+        # evitando GET desnecessário no B2.
+        return pointer, ""
+
+    except Exception as erro:
+        _V86_DIRECT_FALLBACKS += 1
+        print(
+            "⚠️ V86 B2 direto/prisão falhou; "
+            "usando fallback local: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return _V86_PRISAO_COMPRIMIR_LOCAL(
+            caminho,
+            rg,
+            tipo,
+        )
+
+
+# -----------------------------------------------------
+# CENTRAL DE BO — backup do anexo DIRETO B2.
+# A página continua usando o URL original do Discord quando disponível.
+# -----------------------------------------------------
+_V86_V21_SALVAR_LOCAL = _v21_salvar_anexo_bo
+
+
+async def _v21_salvar_anexo_bo(
+    anexo: discord.Attachment,
+    numero: str,
+) -> str:
+    global _V86_DIRECT_FALLBACKS
+
+    if _v86_b2_direto_ativo():
+        try:
+            pointer = await _v86_attachment_para_b2(
+                anexo,
+                f"boletins/{slugify(numero)}",
+                f"bo-{numero}",
+            )
+
+            # Mantém o B2 como armazenamento oficial.
+            # _v21_midia_url já sabe resolver b2:// quando necessário.
+            return pointer
+
+        except Exception as erro:
+            _V86_DIRECT_FALLBACKS += 1
+            print(
+                "⚠️ V86 B2 direto/BO falhou; "
+                "usando fallback local: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    return await _V86_V21_SALVAR_LOCAL(
+        anexo,
+        numero,
+    )
+
+
+# -----------------------------------------------------
+# CENTRAL DE PERÍCIAS — anexos DIRETO B2
+# -----------------------------------------------------
+_V86_V23_BAIXAR_LOCAL = _v23_baixar_attachment
+
+
+async def _v23_baixar_attachment(
+    att: Any,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_FALLBACKS
+
+    if (
+        _v86_b2_direto_ativo()
+        and isinstance(att, discord.Attachment)
+    ):
+        try:
+            return await _v86_attachment_para_b2(
+                att,
+                "pericias/anexos",
+                prefixo,
+            )
+        except Exception as erro:
+            _V86_DIRECT_FALLBACKS += 1
+            print(
+                "⚠️ V86 B2 direto/perícia falhou; "
+                "usando fallback local: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    return await _V86_V23_BAIXAR_LOCAL(
+        att,
+        prefixo,
+    )
+
+
+# -----------------------------------------------------
+# IMAGENS DE EMBED — cópia B2; UI pode continuar com o URL do Discord.
+# -----------------------------------------------------
+_V86_V24_BAIXAR_URL_LOCAL = _v24_baixar_url_imagem
+
+
+async def _v24_baixar_url_imagem(
+    url: str,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_FALLBACKS
+
+    if (
+        _v86_b2_direto_ativo()
+        and str(url or "").startswith("http")
+    ):
+        try:
+            timeout = ClientTimeout(total=30)
+
+            async with ClientSession(
+                timeout=timeout
+            ) as sessao:
+                async with sessao.get(
+                    str(url),
+                    allow_redirects=True,
+                ) as resposta:
+                    if resposta.status >= 400:
+                        raise RuntimeError(
+                            f"HTTP {resposta.status}"
+                        )
+                    dados = await resposta.read()
+                    content_type = str(
+                        resposta.headers.get(
+                            "Content-Type",
+                            "",
+                        )
+                        or ""
+                    ).lower()
+
+            ext = Path(
+                str(url).split("?", 1)[0]
+            ).suffix.lower()
+
+            if ext not in {
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                ".gif",
+            }:
+                ext = (
+                    ".jpg"
+                    if "jpeg" in content_type
+                    else ".webp"
+                    if "webp" in content_type
+                    else ".gif"
+                    if "gif" in content_type
+                    else ".png"
+                )
+
+            nome = (
+                f"{slugify(prefixo)}-"
+                f"{hashlib.sha256(dados).hexdigest()[:18]}"
+                f"{ext}"
+            )
+
+            await asyncio.to_thread(
+                _v86_bytes_para_b2_sync,
+                bytes(dados),
+                nome,
+                "pericias/embeds",
+                prefixo,
+            )
+
+            # O Discord/CDN continua sendo a fonte visual primária.
+            return str(url)
+
+        except Exception as erro:
+            _V86_DIRECT_FALLBACKS += 1
+            print(
+                "⚠️ V86 B2 direto/embed falhou; "
+                "usando fallback local: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    return await _V86_V24_BAIXAR_URL_LOCAL(
+        url,
+        prefixo,
+    )
+
+
+# -----------------------------------------------------
+# ARQUIVOS TEMPORÁRIOS PARA REENVIO
+# Nunca ocupam o Volume: sempre /tmp.
+# -----------------------------------------------------
+_V86_BAIXAR_ANEXO_ANTES = baixar_anexo_persistente
+
+
+async def baixar_anexo_persistente(
+    anexo: discord.Attachment,
+    pasta: Path,
+    prefixo: str,
+) -> Optional[Path]:
+    # Essas cópias são usadas para OCR/reenvio/processamento imediato.
+    # Não precisam ficar em /data.
+    pasta_tmp = (
+        V78_R2_CACHE_DIR
+        / "staging"
+        / slugify(prefixo)
+    )
+
+    return await _V86_BAIXAR_ANEXO_ANTES(
+        anexo,
+        pasta_tmp,
+        prefixo,
+    )
+
+
+# -----------------------------------------------------
+# DOCUMENTOS GERADOS — offload rápido após criação.
+# Eles precisam ser montados localmente, então ficam no Volume apenas
+# durante a geração e saem logo após estarem fechados/estáveis.
+# -----------------------------------------------------
+def _v86_documentos_gerados_dirs() -> List[Tuple[Path, str]]:
+    candidatos = [
+        (globals().get("DOSSIES_DIR"), "documentos/dossies"),
+        (
+            globals().get("RELATORIOS_ARQUIVOS_DIR"),
+            "documentos/relatorios",
+        ),
+        (
+            globals().get("BOLETIM_ARQUIVOS_DIR"),
+            "documentos/boletins",
+        ),
+        (
+            globals().get("PUBLIC_BACKUPS_DIR"),
+            "backups",
+        ),
+    ]
+
+    saida: List[Tuple[Path, str]] = []
+    vistos: set[str] = set()
+
+    for pasta, categoria in candidatos:
+        if not pasta:
+            continue
+
+        p = Path(pasta)
+
+        try:
+            chave = str(p.resolve())
+        except Exception:
+            chave = str(p)
+
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+        saida.append(
+            (p, categoria)
+        )
+
+    return saida
+
+
+def _v86_offload_gerados_sync(
+    max_arquivos: int = 20,
+) -> Dict[str, int]:
+    if not _v86_b2_direto_ativo():
+        return {
+            "enviados": 0,
+            "falhas": 0,
+        }
+
+    agora = time.time()
+    enviados = 0
+    falhas = 0
+
+    for pasta, categoria in _v86_documentos_gerados_dirs():
+        if enviados >= max_arquivos:
+            break
+
+        if not pasta.exists():
+            continue
+
+        try:
+            for raiz, dirs, nomes in os.walk(
+                str(pasta)
+            ):
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower() not in {
+                        "assinaturas",
+                        "assets_dossie",
+                    }
+                ]
+
+                for nome in nomes:
+                    if enviados >= max_arquivos:
+                        break
+
+                    caminho = Path(raiz) / nome
+
+                    try:
+                        if (
+                            caminho.suffix.lower()
+                            not in _V78_EXTENSOES_PESADAS
+                        ):
+                            continue
+
+                        st = caminho.stat()
+
+                        if (
+                            agora - float(st.st_mtime)
+                            < V86_GENERATED_MIN_AGE_SECONDS
+                        ):
+                            continue
+
+                        if int(st.st_size) <= 0:
+                            continue
+
+                        resultado = _v78_upload_sync(
+                            caminho,
+                            categoria,
+                        )
+
+                        pointer = str(
+                            resultado.get("pointer") or ""
+                        )
+
+                        if not pointer.startswith("b2://"):
+                            raise RuntimeError(
+                                "Pointer inválido."
+                            )
+
+                        _v78_reescrever_referencias_sync(
+                            caminho,
+                            pointer,
+                        )
+
+                        caminho.unlink(
+                            missing_ok=True
+                        )
+                        enviados += 1
+
+                    except FileNotFoundError:
+                        continue
+                    except Exception as erro:
+                        falhas += 1
+                        if falhas <= 3:
+                            print(
+                                "⚠️ V86 offload documento: "
+                                f"{type(erro).__name__}: {erro}",
+                                flush=True,
+                            )
+
+        except Exception:
+            continue
+
+    return {
+        "enviados": enviados,
+        "falhas": falhas,
+    }
+
+
+@tasks.loop(
+    seconds=V86_GENERATED_OFFLOAD_SECONDS
+)
+async def _v86_offload_loop() -> None:
+    if not _v86_b2_direto_ativo():
+        return
+
+    if _V86_OFFLOAD_LOCK.locked():
+        return
+
+    async with _V86_OFFLOAD_LOCK:
+        resultado = await asyncio.to_thread(
+            _v86_offload_gerados_sync,
+            20,
+        )
+
+    if int(resultado.get("enviados") or 0):
+        print(
+            "☁️ V86 B2 direto: "
+            f"{resultado['enviados']} documento(s) gerado(s) "
+            "retirado(s) do Volume após confirmação.",
+            flush=True,
+        )
+
+
+@_v86_offload_loop.before_loop
+async def _v86_offload_before() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(45)
+
+
+@bot.listen("on_ready")
+async def _v86_iniciar_b2_direto() -> None:
+    global _V86_OFFLOAD_STARTED
+
+    if _V86_OFFLOAD_STARTED:
+        return
+
+    _V86_OFFLOAD_STARTED = True
+
+    if _v86_b2_direto_ativo():
+        print(
+            "☁️ V86 B2 DIRETO ATIVO: novos anexos/fotos vão para "
+            "o Backblaze sem ocupar /data; fallback local permanece ativo.",
+            flush=True,
+        )
+
+        if not _v86_offload_loop.is_running():
+            _v86_offload_loop.start()
+    else:
+        print(
+            "ℹ️ V86 B2 direto em fallback local: B2 não configurado "
+            "ou B2_DIRECT_UPLOAD=0.",
+            flush=True,
+        )
+
+
+# -----------------------------------------------------
+# STATUS NOVO
+# -----------------------------------------------------
+@bot.tree.command(
+    name="b2direto",
+    description="Mostra o status do envio direto para o Backblaze B2.",
+)
+async def b2direto_v86(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(
+        interaction.user
+    ):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar.",
+            ephemeral=True,
+        )
+
+    ativo = _v86_b2_direto_ativo()
+
+    await interaction.response.send_message(
+        "☁️ **B2 DIRETO — V86**\n"
+        f"**Modo direto:** {'✅ ATIVO' if ativo else '❌ INATIVO'}\n"
+        f"**Bucket:** `{V78_R2_BUCKET or 'não configurado'}`\n"
+        f"**Enviados diretamente nesta sessão:** `{_V86_DIRECT_ENVIADOS}`\n"
+        f"**Fallbacks locais nesta sessão:** `{_V86_DIRECT_FALLBACKS}`\n"
+        f"**Documentos gerados:** offload em até "
+        f"`{V86_GENERATED_OFFLOAD_SECONDS}s`\n\n"
+        "**Railway /data:** banco, JSON, configurações e fallback.\n"
+        "**/tmp:** OCR, compactação e staging temporário.",
+        ephemeral=True,
+    )
+
+
+print(
+    "✅ V86 carregada — novos arquivos no B2 direto, "
+    "staging em /tmp, fallback local e offload rápido de documentos.",
+    flush=True,
+)
 
 if __name__ == '__main__':
     asyncio.run(main())
