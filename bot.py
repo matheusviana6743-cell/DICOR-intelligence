@@ -66853,5 +66853,1534 @@ print(
 )
 
 
+
+# =====================================================
+# V78 — STORAGE HÍBRIDO: RAILWAY + CLOUDFLARE R2
+# =====================================================
+# Arquitetura:
+# - SQLite/JSON/configurações continuam no Railway Volume.
+# - Arquivos pesados podem ser enviados ao Cloudflare R2.
+# - O arquivo local só é apagado após upload + HEAD confirmando o tamanho.
+# - Um índice local pequeno permite recuperar qualquer arquivo migrado.
+# - Se o R2 estiver indisponível, o bot mantém fallback local.
+# - Cache de downloads do R2 usa /tmp, não o Railway Volume.
+#
+# Variáveis:
+# R2_ENABLED=1
+# R2_ACCOUNT_ID=...
+# R2_ACCESS_KEY_ID=...
+# R2_SECRET_ACCESS_KEY=...
+# R2_BUCKET=dicor-storage
+# R2_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com   (opcional)
+# R2_PREFIX=dicor
+# R2_PRESIGNED_SECONDS=604800
+# R2_AUTO_MIGRATE=1
+# =====================================================
+
+try:
+    import boto3 as _v78_boto3
+    from botocore.config import Config as _V78BotoConfig
+except Exception:
+    _v78_boto3 = None
+    _V78BotoConfig = None
+
+import mimetypes as _v78_mimetypes
+import hashlib as _v78_hashlib
+import tempfile as _v78_tempfile
+
+
+def _v78_env_bool(nome: str, padrao: bool = False) -> bool:
+    valor = str(os.getenv(nome, "1" if padrao else "0") or "").strip().lower()
+    return valor in {"1", "true", "yes", "sim", "on"}
+
+
+V78_R2_ENABLED = _v78_env_bool("R2_ENABLED", False)
+V78_R2_AUTO_MIGRATE = _v78_env_bool("R2_AUTO_MIGRATE", True)
+V78_R2_ACCOUNT_ID = str(os.getenv("R2_ACCOUNT_ID", "") or "").strip()
+V78_R2_ACCESS_KEY_ID = str(os.getenv("R2_ACCESS_KEY_ID", "") or "").strip()
+V78_R2_SECRET_ACCESS_KEY = str(os.getenv("R2_SECRET_ACCESS_KEY", "") or "").strip()
+V78_R2_BUCKET = str(os.getenv("R2_BUCKET", "") or "").strip()
+V78_R2_PREFIX = str(os.getenv("R2_PREFIX", "dicor") or "dicor").strip().strip("/")
+V78_R2_ENDPOINT_URL = str(os.getenv("R2_ENDPOINT_URL", "") or "").strip()
+if not V78_R2_ENDPOINT_URL and V78_R2_ACCOUNT_ID:
+    V78_R2_ENDPOINT_URL = (
+        f"https://{V78_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    )
+
+V78_R2_PRESIGNED_SECONDS = max(
+    300,
+    min(
+        604800,
+        env_int("R2_PRESIGNED_SECONDS", 604800),
+    ),
+)
+V78_R2_AUTO_TRIGGER_PERCENT = max(
+    50,
+    min(95, env_int("R2_AUTO_TRIGGER_PERCENT", 72)),
+)
+V78_R2_AUTO_TARGET_PERCENT = max(
+    35,
+    min(
+        V78_R2_AUTO_TRIGGER_PERCENT - 5,
+        env_int("R2_AUTO_TARGET_PERCENT", 58),
+    ),
+)
+V78_R2_BATCH_MB = max(32, env_int("R2_MIGRATION_BATCH_MB", 220))
+
+V78_R2_INDEX_DB = DATA_DIR / "r2_storage_index.sqlite"
+V78_R2_CACHE_DIR = Path(
+    os.getenv(
+        "R2_CACHE_DIR",
+        str(Path(_v78_tempfile.gettempdir()) / "dicor-r2-cache"),
+    )
+)
+V78_R2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+_V78_R2_CLIENT = None
+_V78_R2_CLIENT_LOCK = threading.RLock()
+_V78_R2_MIGRATION_LOCK = asyncio.Lock()
+_V78_R2_AUTO_STARTED = False
+
+
+def _v78_r2_configurado() -> bool:
+    return bool(
+        V78_R2_ENABLED
+        and _v78_boto3 is not None
+        and V78_R2_ENDPOINT_URL
+        and V78_R2_ACCESS_KEY_ID
+        and V78_R2_SECRET_ACCESS_KEY
+        and V78_R2_BUCKET
+    )
+
+
+def _v78_r2_client():
+    global _V78_R2_CLIENT
+    if not _v78_r2_configurado():
+        return None
+
+    with _V78_R2_CLIENT_LOCK:
+        if _V78_R2_CLIENT is None:
+            kwargs = {
+                "service_name": "s3",
+                "endpoint_url": V78_R2_ENDPOINT_URL,
+                "aws_access_key_id": V78_R2_ACCESS_KEY_ID,
+                "aws_secret_access_key": V78_R2_SECRET_ACCESS_KEY,
+                "region_name": "auto",
+            }
+            if _V78BotoConfig is not None:
+                kwargs["config"] = _V78BotoConfig(
+                    signature_version="s3v4",
+                    retries={
+                        "max_attempts": 5,
+                        "mode": "standard",
+                    },
+                    connect_timeout=10,
+                    read_timeout=45,
+                )
+            _V78_R2_CLIENT = _v78_boto3.client(**kwargs)
+        return _V78_R2_CLIENT
+
+
+def _v78_index_init() -> None:
+    V78_R2_INDEX_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(V78_R2_INDEX_DB), timeout=20) as db:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS objetos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                local_path TEXT NOT NULL UNIQUE,
+                object_key TEXT NOT NULL UNIQUE,
+                categoria TEXT NOT NULL,
+                nome TEXT NOT NULL,
+                mime_type TEXT DEFAULT '',
+                tamanho_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT DEFAULT '',
+                criado_em TEXT NOT NULL,
+                confirmado_em TEXT NOT NULL,
+                ultimo_acesso TEXT DEFAULT ''
+            )
+            """
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_r2_objetos_categoria "
+            "ON objetos(categoria, confirmado_em)"
+        )
+        db.commit()
+
+
+def _v78_abs(valor: Any) -> str:
+    try:
+        return str(Path(str(valor)).expanduser().resolve())
+    except Exception:
+        return str(valor or "")
+
+
+def _v78_pointer(key: str) -> str:
+    return "r2://" + str(key or "").lstrip("/")
+
+
+def _v78_key_pointer(valor: Any) -> str:
+    texto = str(valor or "").strip()
+    if texto.startswith("r2://"):
+        return texto[5:].lstrip("/")
+    return ""
+
+
+def _v78_index_get_by_path(valor: Any) -> Optional[Dict[str, Any]]:
+    _v78_index_init()
+    caminho = _v78_abs(valor)
+    try:
+        with sqlite3.connect(str(V78_R2_INDEX_DB), timeout=20) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM objetos WHERE local_path=? LIMIT 1",
+                (caminho,),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _v78_index_get_by_key(key: str) -> Optional[Dict[str, Any]]:
+    _v78_index_init()
+    try:
+        with sqlite3.connect(str(V78_R2_INDEX_DB), timeout=20) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM objetos WHERE object_key=? LIMIT 1",
+                (str(key or ""),),
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _v78_index_save(
+    *,
+    local_path: Path,
+    key: str,
+    categoria: str,
+    mime_type: str,
+    tamanho: int,
+    sha256: str,
+) -> None:
+    _v78_index_init()
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with sqlite3.connect(str(V78_R2_INDEX_DB), timeout=20) as db:
+        db.execute(
+            """
+            INSERT INTO objetos(
+                local_path, object_key, categoria, nome, mime_type,
+                tamanho_bytes, sha256, criado_em, confirmado_em
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(local_path) DO UPDATE SET
+                object_key=excluded.object_key,
+                categoria=excluded.categoria,
+                nome=excluded.nome,
+                mime_type=excluded.mime_type,
+                tamanho_bytes=excluded.tamanho_bytes,
+                sha256=excluded.sha256,
+                confirmado_em=excluded.confirmado_em
+            """,
+            (
+                _v78_abs(local_path),
+                str(key),
+                str(categoria),
+                local_path.name[:240],
+                str(mime_type or "")[:180],
+                int(tamanho),
+                str(sha256 or ""),
+                agora,
+                agora,
+            ),
+        )
+        db.commit()
+
+
+def _v78_hash_file(caminho: Path) -> str:
+    h = _v78_hashlib.sha256()
+    with open(caminho, "rb") as arquivo:
+        while True:
+            bloco = arquivo.read(1024 * 1024)
+            if not bloco:
+                break
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def _v78_categoria_key(categoria: str, caminho: Path, sha256: str) -> str:
+    data = datetime.datetime.now(datetime.timezone.utc)
+    categoria_segura = re.sub(
+        r"[^0-9A-Za-z._/-]+",
+        "-",
+        str(categoria or "arquivos").strip("/"),
+    ).strip("/") or "arquivos"
+    nome = re.sub(
+        r"[^0-9A-Za-z._-]+",
+        "_",
+        caminho.name,
+    )[:180] or "arquivo"
+    prefixo = (V78_R2_PREFIX + "/") if V78_R2_PREFIX else ""
+    return (
+        f"{prefixo}{categoria_segura}/"
+        f"{data:%Y/%m}/{sha256[:12]}-{secrets.token_hex(3)}-{nome}"
+    )
+
+
+def _v78_upload_sync(
+    caminho: Path,
+    categoria: str,
+) -> Dict[str, Any]:
+    caminho = Path(caminho)
+    if not caminho.exists() or not caminho.is_file():
+        raise FileNotFoundError(str(caminho))
+
+    cliente = _v78_r2_client()
+    if cliente is None:
+        raise RuntimeError(
+            "Cloudflare R2 não está configurado ou boto3 não está instalado."
+        )
+
+    tamanho = int(caminho.stat().st_size)
+    sha256 = _v78_hash_file(caminho)
+
+    existente = _v78_index_get_by_path(caminho)
+    if existente:
+        try:
+            head = cliente.head_object(
+                Bucket=V78_R2_BUCKET,
+                Key=existente["object_key"],
+            )
+            if int(head.get("ContentLength") or 0) == tamanho:
+                return {
+                    "key": existente["object_key"],
+                    "pointer": _v78_pointer(existente["object_key"]),
+                    "size": tamanho,
+                    "sha256": sha256,
+                    "reutilizado": True,
+                }
+        except Exception:
+            pass
+
+    mime = (
+        _v78_mimetypes.guess_type(caminho.name)[0]
+        or "application/octet-stream"
+    )
+    key = _v78_categoria_key(categoria, caminho, sha256)
+
+    cliente.upload_file(
+        str(caminho),
+        V78_R2_BUCKET,
+        key,
+        ExtraArgs={
+            "ContentType": mime,
+            "Metadata": {
+                "sha256": sha256[:64],
+                "origem": "dicor-intelligence",
+            },
+        },
+    )
+
+    head = cliente.head_object(
+        Bucket=V78_R2_BUCKET,
+        Key=key,
+    )
+    remoto = int(head.get("ContentLength") or 0)
+    if remoto != tamanho:
+        try:
+            cliente.delete_object(Bucket=V78_R2_BUCKET, Key=key)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Upload R2 não confirmado: local={tamanho}, remoto={remoto}."
+        )
+
+    _v78_index_save(
+        local_path=caminho,
+        key=key,
+        categoria=categoria,
+        mime_type=mime,
+        tamanho=tamanho,
+        sha256=sha256,
+    )
+    return {
+        "key": key,
+        "pointer": _v78_pointer(key),
+        "size": tamanho,
+        "sha256": sha256,
+        "reutilizado": False,
+    }
+
+
+def _v78_presign_sync(valor: Any) -> str:
+    texto = str(valor or "").strip()
+    if texto.startswith(("http://", "https://", "data:")):
+        return texto
+
+    key = _v78_key_pointer(texto)
+    if not key:
+        registro = _v78_index_get_by_path(texto)
+        if registro:
+            key = str(registro.get("object_key") or "")
+
+    if not key:
+        return ""
+
+    cliente = _v78_r2_client()
+    if cliente is None:
+        return ""
+
+    try:
+        return cliente.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": V78_R2_BUCKET,
+                "Key": key,
+            },
+            ExpiresIn=V78_R2_PRESIGNED_SECONDS,
+        )
+    except Exception:
+        return ""
+
+
+def _v78_cache_path(key: str, nome: str = "") -> Path:
+    ext = Path(nome).suffix if nome else Path(key).suffix
+    digest = _v78_hashlib.sha256(key.encode()).hexdigest()[:28]
+    return V78_R2_CACHE_DIR / f"{digest}{ext[:10]}"
+
+
+def _v78_materializar_sync(
+    valor: Any,
+    nome: str = "",
+) -> Optional[Path]:
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+
+    # Caminho local normal.
+    if not texto.startswith("r2://"):
+        try:
+            p = Path(texto)
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            pass
+
+        registro = _v78_index_get_by_path(texto)
+        if not registro:
+            return None
+        key = str(registro.get("object_key") or "")
+        nome = nome or str(registro.get("nome") or "")
+    else:
+        key = _v78_key_pointer(texto)
+        registro = _v78_index_get_by_key(key)
+        if registro:
+            nome = nome or str(registro.get("nome") or "")
+
+    if not key:
+        return None
+
+    destino = _v78_cache_path(key, nome)
+    try:
+        if destino.exists() and destino.stat().st_size > 0:
+            return destino
+    except Exception:
+        pass
+
+    cliente = _v78_r2_client()
+    if cliente is None:
+        return None
+
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    parcial = destino.with_suffix(destino.suffix + ".part")
+    try:
+        cliente.download_file(
+            V78_R2_BUCKET,
+            key,
+            str(parcial),
+        )
+        if not parcial.exists() or parcial.stat().st_size <= 0:
+            parcial.unlink(missing_ok=True)
+            return None
+        parcial.replace(destino)
+        return destino
+    except Exception:
+        try:
+            parcial.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
+def _v78_limpar_cache_tmp_sync(
+    *,
+    max_mb: int = 140,
+    idade_horas: int = 12,
+) -> int:
+    if not V78_R2_CACHE_DIR.exists():
+        return 0
+
+    arquivos = []
+    total = 0
+    agora = time.time()
+
+    for p in V78_R2_CACHE_DIR.glob("*"):
+        try:
+            if not p.is_file():
+                continue
+            s = p.stat()
+            total += int(s.st_size)
+            arquivos.append((s.st_mtime, int(s.st_size), p))
+        except Exception:
+            continue
+
+    limite = max(32, int(max_mb)) * 1024 * 1024
+    removidos = 0
+
+    for mtime, tamanho, p in sorted(arquivos):
+        velho = agora - mtime > idade_horas * 3600
+        if total <= limite and not velho:
+            continue
+        try:
+            p.unlink(missing_ok=True)
+            total -= tamanho
+            removidos += 1
+        except Exception:
+            pass
+
+    return removidos
+
+
+def _v78_mesmo_arquivo(a: Any, b: Path) -> bool:
+    try:
+        return Path(str(a)).resolve() == Path(b).resolve()
+    except Exception:
+        return str(a or "") == str(b)
+
+
+def _v78_reescrever_referencias_sync(
+    local: Path,
+    pointer: str,
+) -> int:
+    """
+    Troca referências conhecidas para r2:// somente depois do upload validado.
+    """
+    alteracoes = 0
+    local_s = str(local)
+    local_abs = _v78_abs(local)
+
+    try:
+        inicializar_banco_dicor()
+        with _banco_conexao() as db:
+            tabelas_campos = [
+                ("individuos", "foto_individuo_path"),
+                ("individuos", "foto_rg_path"),
+                ("veiculos", "foto_path"),
+                ("historico_prisoes", "foto_individuo_path"),
+                ("historico_prisoes", "foto_rg_path"),
+                ("arquivos_ficha_geral", "caminho"),
+            ]
+            for tabela, campo in tabelas_campos:
+                try:
+                    cur = db.execute(
+                        f"""
+                        UPDATE {tabela}
+                        SET {campo}=?
+                        WHERE {campo}=? OR {campo}=?
+                        """,
+                        (pointer, local_s, local_abs),
+                    )
+                    alteracoes += max(0, int(cur.rowcount or 0))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Procurados: normalmente armazenam /uploads/nome.
+    try:
+        lista = carregar_procurados()
+        mudou = False
+        rota_upload = f"/uploads/{local.name}"
+        for registro in lista:
+            if not isinstance(registro, dict):
+                continue
+            for campo in ("foto_individuo", "foto_rg"):
+                atual = str(registro.get(campo) or "").strip()
+                corresponde = atual in {
+                    local_s,
+                    local_abs,
+                    rota_upload,
+                    f"uploads/{local.name}",
+                }
+                if not corresponde:
+                    try:
+                        resolvido = _catalogo_caminho_local(atual)
+                        corresponde = (
+                            resolvido is not None
+                            and _v78_mesmo_arquivo(resolvido, local)
+                        )
+                    except Exception:
+                        corresponde = False
+                if corresponde:
+                    registro[campo] = pointer
+                    alteracoes += 1
+                    mudou = True
+        if mudou:
+            salvar_procurados(lista)
+    except Exception:
+        pass
+
+    return alteracoes
+
+
+def _v78_diretorios_migraveis() -> List[Tuple[Path, str, int]]:
+    candidatos: List[Tuple[Any, str, int]] = [
+        (globals().get("UPLOADS_DIR"), "catalogo", 2),
+        (globals().get("_BANCO_V3_UPLOAD_DIR"), "fichas/criacao", 30),
+        (globals().get("_BANCO_FICHA_GERAL_DIR"), "fichas/arquivos", 5),
+        (globals().get("DOSSIES_DIR"), "documentos/dossies", 90),
+        (globals().get("RELATORIOS_ARQUIVOS_DIR"), "documentos/relatorios", 90),
+        (globals().get("BOLETIM_ARQUIVOS_DIR"), "documentos/boletins", 90),
+        (globals().get("CENTRAL_PERICIAS_MEDIA_DIR"), "central/pericias", 15),
+        (globals().get("CENTRAL_BO_MEDIA_DIR"), "central/boletins", 15),
+        (globals().get("PUBLIC_BACKUPS_DIR"), "backups", 60),
+    ]
+
+    saida: List[Tuple[Path, str, int]] = []
+    vistos: set[str] = set()
+    for pasta, categoria, idade_min in candidatos:
+        if not pasta:
+            continue
+        p = Path(pasta)
+        try:
+            chave = str(p.resolve())
+        except Exception:
+            chave = str(p)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append((p, categoria, idade_min))
+    return saida
+
+
+_V78_EXTENSOES_PESADAS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+    ".pdf", ".docx", ".zip", ".mp4", ".mov", ".webm",
+    ".wav", ".mp3", ".ogg",
+}
+
+
+def _v78_candidatos_migracao_sync(
+    limite_mb: int,
+) -> List[Tuple[Path, str]]:
+    agora = time.time()
+    limite = max(16, int(limite_mb)) * 1024 * 1024
+    total = 0
+    saida: List[Tuple[Path, str]] = []
+
+    for pasta, categoria, idade_min in _v78_diretorios_migraveis():
+        if not pasta.exists():
+            continue
+
+        try:
+            arquivos = list(pasta.rglob("*"))
+        except Exception:
+            continue
+
+        arquivos_ordenados = []
+        for p in arquivos:
+            try:
+                if not p.is_file():
+                    continue
+                if p == V78_R2_INDEX_DB:
+                    continue
+                if p.suffix.lower() not in _V78_EXTENSOES_PESADAS:
+                    continue
+                stat = p.stat()
+                if stat.st_size <= 0:
+                    continue
+                if agora - stat.st_mtime < idade_min * 60:
+                    continue
+                # Assinaturas e modelos institucionais ficam no Railway.
+                texto_path = str(p).replace("\\", "/").lower()
+                if "/assets_dossie/" in texto_path or "/assinaturas" in texto_path:
+                    continue
+                arquivos_ordenados.append((stat.st_mtime, stat.st_size, p))
+            except Exception:
+                continue
+
+        for _, tamanho, p in sorted(arquivos_ordenados):
+            if total + tamanho > limite and saida:
+                return saida
+            total += tamanho
+            saida.append((p, categoria))
+            if total >= limite:
+                return saida
+
+    return saida
+
+
+def _v78_volume_percent_sync() -> Dict[str, float]:
+    uso = _v69_uso_volume(Path(DATA_DIR))
+    percentual = (
+        (uso["used"] / uso["total"]) * 100.0
+        if uso["total"] else 0.0
+    )
+    return {
+        "percent": percentual,
+        "used_mb": uso["used"] / 1024 / 1024,
+        "free_mb": uso["free"] / 1024 / 1024,
+        "total_mb": uso["total"] / 1024 / 1024,
+    }
+
+
+def _v78_migrar_batch_sync(
+    limite_mb: int,
+    *,
+    apagar_local: bool = True,
+) -> Dict[str, Any]:
+    if not _v78_r2_configurado():
+        raise RuntimeError(
+            "R2 não configurado. Defina as variáveis R2_* e instale boto3."
+        )
+
+    candidatos = _v78_candidatos_migracao_sync(limite_mb)
+    enviados = 0
+    liberados = 0
+    falhas = 0
+    referencias = 0
+
+    for caminho, categoria in candidatos:
+        try:
+            tamanho = int(caminho.stat().st_size)
+            resultado = _v78_upload_sync(caminho, categoria)
+            pointer = str(resultado["pointer"])
+
+            referencias += _v78_reescrever_referencias_sync(
+                caminho,
+                pointer,
+            )
+
+            # Só apaga depois de upload confirmado e referências conhecidas
+            # reescritas/índice salvo.
+            if apagar_local:
+                caminho.unlink(missing_ok=True)
+                liberados += tamanho
+
+            enviados += 1
+        except FileNotFoundError:
+            continue
+        except Exception as erro:
+            falhas += 1
+            print(
+                f"⚠️ V78 R2 não migrou {caminho}: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    return {
+        "enviados": enviados,
+        "falhas": falhas,
+        "liberados_bytes": liberados,
+        "referencias": referencias,
+        "candidatos": len(candidatos),
+    }
+
+
+# -----------------------------------------------------
+# CATÁLOGO / PROCURADOS
+# -----------------------------------------------------
+_V78_CATALOGO_CAMINHO_LOCAL_ANTES = _catalogo_caminho_local
+_V78_CATALOGO_FOTO_DISPONIVEL_ANTES = _catalogo_foto_disponivel
+_V78_CATALOGO_URL_LOCAL_ANTES = _catalogo_url_local
+_V78_SALVAR_ANEXO_PUBLICO_ANTES = salvar_anexo_publico
+
+
+def _catalogo_caminho_local(valor: Any) -> Optional[Path]:
+    texto = str(valor or "").strip()
+    if texto.startswith("r2://"):
+        return _v78_materializar_sync(texto)
+    caminho = _V78_CATALOGO_CAMINHO_LOCAL_ANTES(valor)
+    if caminho is not None:
+        return caminho
+    return _v78_materializar_sync(valor)
+
+
+def _catalogo_foto_disponivel(valor: Any) -> bool:
+    texto = str(valor or "").strip()
+    if texto.startswith("r2://"):
+        return bool(_v78_presign_sync(texto))
+    return _V78_CATALOGO_FOTO_DISPONIVEL_ANTES(valor)
+
+
+def _catalogo_url_local(valor: Any) -> str:
+    texto = str(valor or "").strip()
+    if texto.startswith("r2://"):
+        return _v78_presign_sync(texto)
+    return _V78_CATALOGO_URL_LOCAL_ANTES(valor)
+
+
+async def salvar_anexo_publico(
+    anexo: discord.Attachment,
+    prefixo: str,
+) -> str:
+    if not _v78_r2_configurado():
+        return await _V78_SALVAR_ANEXO_PUBLICO_ANTES(anexo, prefixo)
+
+    V78_R2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    nome_original = nome_arquivo_seguro(
+        getattr(anexo, "filename", "imagem.png")
+    ) or "imagem.png"
+    tmp = (
+        V78_R2_CACHE_DIR
+        / f"upload-{int(time.time()*1000)}-{secrets.token_hex(4)}-{nome_original}"
+    )
+
+    try:
+        try:
+            await anexo.save(str(tmp), use_cached=True)
+        except Exception:
+            dados = await anexo.read(use_cached=False)
+            tmp.write_bytes(bytes(dados))
+
+        resultado = await asyncio.to_thread(
+            _v78_upload_sync,
+            tmp,
+            "catalogo",
+        )
+        return str(resultado["pointer"])
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# Procurados precisam materializar a foto para anexar no Discord.
+if "_procurado_caminho_foto_v8" in globals():
+    _V78_PROCURADO_CAMINHO_ANTES = _procurado_caminho_foto_v8
+
+    def _procurado_caminho_foto_v8(valor: Any) -> Optional[Path]:
+        texto = str(valor or "").strip()
+        if texto.startswith("r2://"):
+            return _v78_materializar_sync(texto)
+        caminho = _V78_PROCURADO_CAMINHO_ANTES(valor)
+        if caminho is not None:
+            return caminho
+        return _v78_materializar_sync(valor)
+
+
+# -----------------------------------------------------
+# FICHA GERAL
+# -----------------------------------------------------
+_V78_FICHA_CARREGAR_ANTES = _banco_ficha_geral_carregar
+
+
+def _v78_resolver_pointer_em_dict(
+    item: Dict[str, Any],
+    path_key: str,
+    url_key: str,
+) -> None:
+    valor_path = str(item.get(path_key) or "").strip()
+    valor_url = str(item.get(url_key) or "").strip()
+
+    if valor_path.startswith("r2://"):
+        url = _v78_presign_sync(valor_path)
+        if url:
+            item[url_key] = url
+        return
+
+    if valor_url.startswith("r2://"):
+        url = _v78_presign_sync(valor_url)
+        if url:
+            item[url_key] = url
+
+
+def _banco_ficha_geral_carregar(
+    tipo: str,
+    registro_id: int,
+) -> Dict[str, Any]:
+    perfil = dict(
+        _V78_FICHA_CARREGAR_ANTES(tipo, registro_id)
+        or {}
+    )
+
+    ind = dict(perfil.get("individuo") or {})
+    if ind:
+        _v78_resolver_pointer_em_dict(
+            ind,
+            "foto_individuo_path",
+            "foto_individuo_url",
+        )
+        _v78_resolver_pointer_em_dict(
+            ind,
+            "foto_rg_path",
+            "foto_rg_url",
+        )
+        perfil["individuo"] = ind
+
+    veiculos = []
+    for original in list(perfil.get("veiculos") or []):
+        v = dict(original)
+        _v78_resolver_pointer_em_dict(
+            v,
+            "foto_path",
+            "foto_url",
+        )
+        veiculos.append(v)
+    if veiculos:
+        perfil["veiculos"] = veiculos
+
+    arquivos = []
+    for original in list(perfil.get("arquivos") or []):
+        arq = dict(original)
+        caminho = str(arq.get("caminho") or "")
+        if caminho.startswith("r2://"):
+            arq["r2_url"] = _v78_presign_sync(caminho)
+        elif not Path(caminho).exists():
+            reg = _v78_index_get_by_path(caminho)
+            if reg:
+                arq["r2_url"] = _v78_presign_sync(
+                    _v78_pointer(reg["object_key"])
+                )
+        arquivos.append(arq)
+    perfil["arquivos"] = arquivos
+
+    # Fotos prisionais antigas que foram migradas.
+    prisoes = []
+    for original in list(perfil.get("historico_prisoes") or []):
+        p = dict(original)
+        for campo in ("foto_individuo_path", "foto_rg_path"):
+            valor = str(p.get(campo) or "")
+            if valor.startswith("r2://"):
+                p[campo + "_url"] = _v78_presign_sync(valor)
+        prisoes.append(p)
+    if prisoes:
+        perfil["historico_prisoes"] = prisoes
+
+    return perfil
+
+
+_V78_ADICIONAR_ARQUIVOS_ANTES = _banco_ficha_geral_adicionar_arquivos
+_V78_VER_ARQUIVOS_ANTES = _banco_ficha_geral_ver_arquivos
+
+
+async def _banco_ficha_geral_adicionar_arquivos(
+    interaction: discord.Interaction,
+    tipo: str,
+    registro_id: int,
+) -> None:
+    # Sem R2, mantém o comportamento antigo.
+    if not _v78_r2_configurado():
+        return await _V78_ADICIONAR_ARQUIVOS_ANTES(
+            interaction,
+            tipo,
+            registro_id,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+    await interaction.followup.send(
+        "📎 **Envie uma única mensagem com as fotos ou documentos.**\n"
+        "• Até **10 arquivos**.\n"
+        "• Os arquivos serão guardados no armazenamento externo da DICOR.\n"
+        "• Prazo: **5 minutos**.",
+        ephemeral=True,
+    )
+
+    canal_id = int(getattr(interaction.channel, "id", 0) or 0)
+    usuario_id = int(interaction.user.id)
+
+    def check(msg: discord.Message) -> bool:
+        return (
+            int(getattr(msg.author, "id", 0) or 0) == usuario_id
+            and int(getattr(msg.channel, "id", 0) or 0) == canal_id
+            and bool(msg.attachments)
+        )
+
+    try:
+        msg = await bot.wait_for(
+            "message",
+            timeout=300,
+            check=check,
+        )
+    except asyncio.TimeoutError:
+        return await interaction.followup.send(
+            "⌛ Tempo esgotado.",
+            ephemeral=True,
+        )
+
+    perfil = await asyncio.to_thread(
+        _banco_ficha_geral_carregar,
+        tipo,
+        registro_id,
+    )
+    if not perfil:
+        return await interaction.followup.send(
+            "❌ A ficha não existe mais.",
+            ephemeral=True,
+        )
+
+    ind = dict(perfil.get("individuo") or {})
+    base = dict(perfil.get("veiculo_base") or {})
+    individuo_id = int(ind.get("id") or 0)
+    veiculo_id = int(base.get("id") or 0)
+    descricao = str(msg.content or "").strip()[:1000]
+
+    salvos = 0
+    ignorados = 0
+
+    for anexo in list(msg.attachments)[:10]:
+        tmp = None
+        try:
+            tamanho = int(getattr(anexo, "size", 0) or 0)
+            if tamanho > 25 * 1024 * 1024:
+                ignorados += 1
+                continue
+
+            nome_original = Path(
+                str(anexo.filename or "arquivo")
+            ).name
+            nome_seguro = re.sub(
+                r"[^0-9A-Za-z._-]+",
+                "_",
+                nome_original,
+            )[:140] or "arquivo"
+
+            tmp = (
+                V78_R2_CACHE_DIR
+                / f"ficha-{int(time.time()*1000)}-{secrets.token_hex(4)}-{nome_seguro}"
+            )
+            await anexo.save(str(tmp), use_cached=True)
+
+            categoria = (
+                f"fichas/individuo-{individuo_id}"
+                if individuo_id
+                else f"fichas/veiculo-{veiculo_id}"
+            )
+            resultado = await asyncio.to_thread(
+                _v78_upload_sync,
+                tmp,
+                categoria,
+            )
+            pointer = str(resultado["pointer"])
+
+            mime = str(
+                getattr(anexo, "content_type", "")
+                or _v78_mimetypes.guess_type(nome_original)[0]
+                or "application/octet-stream"
+            )
+
+            with _banco_conexao() as db:
+                db.execute(
+                    """
+                    INSERT INTO arquivos_ficha_geral
+                    (individuo_id, veiculo_id, nome_arquivo, caminho,
+                     url_original, descricao, mime_type, tamanho_bytes,
+                     criado_por_id, criado_em)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        individuo_id,
+                        veiculo_id,
+                        nome_original[:200],
+                        pointer,
+                        str(getattr(anexo, "url", "") or "")[:1000],
+                        descricao,
+                        mime[:120],
+                        tamanho,
+                        usuario_id,
+                        _banco_agora_iso(),
+                    ),
+                )
+                _banco_historico(
+                    "FICHA_GERAL",
+                    str(individuo_id or veiculo_id),
+                    "ARQUIVO_ADICIONADO_R2",
+                    f"Arquivo: {nome_original}",
+                    usuario_id,
+                    db,
+                )
+            salvos += 1
+        except Exception as erro:
+            print(
+                f"⚠️ V78 arquivo da ficha não salvo no R2: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+            ignorados += 1
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    atualizado = await asyncio.to_thread(
+        _banco_ficha_geral_carregar,
+        tipo,
+        registro_id,
+    )
+    await interaction.followup.send(
+        content=(
+            f"✅ **{salvos} arquivo(s) guardado(s) no armazenamento externo.**"
+            + (
+                f"\n⚠️ {ignorados} não foram aceitos."
+                if ignorados else ""
+            )
+        ),
+        embed=_banco_embed_ficha_geral(atualizado),
+        view=BancoFichaGeralView(
+            usuario_id,
+            atualizado,
+        ),
+        ephemeral=True,
+    )
+
+
+async def _banco_ficha_geral_ver_arquivos(
+    interaction: discord.Interaction,
+    perfil: Dict[str, Any],
+) -> None:
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    arquivos = list(
+        (
+            await asyncio.to_thread(
+                _banco_ficha_geral_carregar,
+                str(perfil.get("tipo") or "geral"),
+                int(perfil.get("registro_id") or 0),
+            )
+        ).get("arquivos")
+        or []
+    )
+
+    if not arquivos:
+        return await interaction.followup.send(
+            "📎 Esta ficha ainda não possui arquivos adicionais.",
+            ephemeral=True,
+        )
+
+    embed = discord.Embed(
+        title=f"📎 ARQUIVOS — {_banco_ficha_geral_titulo(perfil)}",
+        description=(
+            f"Total: **{len(arquivos)}** • "
+            "armazenamento híbrido DICOR."
+        ),
+        color=discord.Color.from_rgb(20, 72, 130),
+    )
+
+    linhas = []
+    anexos: List[discord.File] = []
+
+    for arq in arquivos[:20]:
+        tamanho = int(arq.get("tamanho_bytes") or 0)
+        url = str(arq.get("r2_url") or "")
+        nome = str(arq.get("nome_arquivo") or "arquivo")[:90]
+
+        linha = f"• **{nome}** — {tamanho / 1024:.1f} KB"
+        if url:
+            linha += f" — [abrir]({url})"
+        if arq.get("descricao"):
+            linha += f"\n  {str(arq.get('descricao'))[:120]}"
+        linhas.append(linha)
+
+    embed.add_field(
+        name="Arquivos registrados",
+        value="\n".join(linhas)[:1024],
+        inline=False,
+    )
+
+    # Anexa os cinco primeiros pequenos; materialização usa /tmp.
+    for arq in arquivos[:5]:
+        tamanho = int(arq.get("tamanho_bytes") or 0)
+        if tamanho > 8 * 1024 * 1024:
+            continue
+        caminho = await asyncio.to_thread(
+            _v78_materializar_sync,
+            arq.get("caminho"),
+            str(arq.get("nome_arquivo") or ""),
+        )
+        try:
+            if caminho and caminho.exists():
+                anexos.append(
+                    discord.File(
+                        str(caminho),
+                        filename=str(
+                            arq.get("nome_arquivo")
+                            or caminho.name
+                        ),
+                    )
+                )
+        except Exception:
+            pass
+
+    await interaction.followup.send(
+        embed=embed,
+        files=anexos,
+        ephemeral=True,
+    )
+
+
+# -----------------------------------------------------
+# CENTRAL: resolve mídia migrada
+# -----------------------------------------------------
+_V78_V21_MIDIA_URL_ANTES = _v21_midia_url
+
+
+def _v21_midia_url(item: Any) -> str:
+    texto = str(item or "").strip()
+
+    if texto.startswith("r2://"):
+        return _v78_presign_sync(texto)
+
+    # Se o caminho já foi migrado e removido, busca no índice.
+    if texto and not texto.startswith(("http://", "https://")):
+        try:
+            p = Path(texto)
+            if not p.exists():
+                reg = _v78_index_get_by_path(texto)
+                if reg:
+                    return _v78_presign_sync(
+                        _v78_pointer(reg["object_key"])
+                    )
+        except Exception:
+            pass
+
+    return _V78_V21_MIDIA_URL_ANTES(item)
+
+
+# -----------------------------------------------------
+# DOWNLOADS DE DOSSIES/BACKUPS MIGRADOS
+# -----------------------------------------------------
+_V78_BAIXAR_DOSSIE_ANTES = baixar_dossie_http
+_V78_BAIXAR_BACKUP_ANTES = baixar_backup_http
+
+
+async def _v78_redirect_r2_por_path(
+    local: Path,
+) -> Optional[web.StreamResponse]:
+    reg = await asyncio.to_thread(
+        _v78_index_get_by_path,
+        local,
+    )
+    if not reg:
+        return None
+
+    url = await asyncio.to_thread(
+        _v78_presign_sync,
+        _v78_pointer(reg["object_key"]),
+    )
+    if not url:
+        return None
+
+    raise web.HTTPFound(url)
+
+
+async def baixar_dossie_http(
+    request: web.Request,
+) -> web.StreamResponse:
+    rel = (
+        str(request.match_info.get("caminho", "") or "")
+        .strip()
+        .replace("\\", "/")
+    )
+    if rel and ".." not in rel.split("/"):
+        try:
+            local = (DOSSIES_DIR / rel).resolve()
+            if not local.exists():
+                resposta = await _v78_redirect_r2_por_path(local)
+                if resposta is not None:
+                    return resposta
+        except web.HTTPException:
+            raise
+        except Exception:
+            pass
+    return await _V78_BAIXAR_DOSSIE_ANTES(request)
+
+
+async def baixar_backup_http(
+    request: web.Request,
+) -> web.StreamResponse:
+    rel = (
+        str(request.match_info.get("caminho", "") or "")
+        .strip()
+        .replace("\\", "/")
+    )
+    if rel and ".." not in rel.split("/"):
+        try:
+            local = (PUBLIC_BACKUPS_DIR / rel).resolve()
+            if not local.exists():
+                resposta = await _v78_redirect_r2_por_path(local)
+                if resposta is not None:
+                    return resposta
+        except web.HTTPException:
+            raise
+        except Exception:
+            pass
+    return await _V78_BAIXAR_BACKUP_ANTES(request)
+
+
+# -----------------------------------------------------
+# COMANDOS ADMINISTRATIVOS
+# -----------------------------------------------------
+@bot.tree.command(
+    name="storager2",
+    description="Mostra o status do Railway Volume e do Cloudflare R2.",
+)
+async def storager2_v78(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar o armazenamento.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    volume = await asyncio.to_thread(
+        _v78_volume_percent_sync,
+    )
+
+    configurado = _v78_r2_configurado()
+    r2_status = "❌ Não configurado"
+
+    if configurado:
+        try:
+            cliente = _v78_r2_client()
+            await asyncio.to_thread(
+                cliente.head_bucket,
+                Bucket=V78_R2_BUCKET,
+            )
+            r2_status = f"✅ Online • bucket `{V78_R2_BUCKET}`"
+        except Exception as erro:
+            r2_status = (
+                f"⚠️ Configurado, mas indisponível: "
+                f"`{type(erro).__name__}`"
+            )
+    elif V78_R2_ENABLED and _v78_boto3 is None:
+        r2_status = "⚠️ `boto3` não está instalado."
+
+    _v78_index_init()
+    try:
+        with sqlite3.connect(str(V78_R2_INDEX_DB)) as db:
+            quantidade, total = db.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(tamanho_bytes),0)
+                FROM objetos
+                """
+            ).fetchone()
+    except Exception:
+        quantidade, total = 0, 0
+
+    await interaction.followup.send(
+        "💾 **STORAGE DICOR V78**\n"
+        f"**Railway:** `{volume['percent']:.1f}%` usado • "
+        f"`{volume['free_mb']:.1f} MB` livres\n"
+        f"**R2:** {r2_status}\n"
+        f"**Objetos indexados no R2:** `{quantidade}`\n"
+        f"**Dados externos:** `{total / 1024 / 1024:.1f} MB`\n"
+        f"**Cache local R2:** `/tmp` (não usa o Volume)",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="migrarr2",
+    description="Migra arquivos pesados do Railway para o R2 com verificação.",
+)
+@app_commands.describe(
+    limite_mb="Máximo aproximado a migrar nesta execução (32–500 MB)",
+)
+async def migrarr2_v78(
+    interaction: discord.Interaction,
+    limite_mb: app_commands.Range[int, 32, 500] = 220,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode executar migração.",
+            ephemeral=True,
+        )
+
+    if not _v78_r2_configurado():
+        return await interaction.response.send_message(
+            "❌ O R2 ainda não está configurado. "
+            "Defina as variáveis `R2_*` no Railway e instale `boto3`.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    async with _V78_R2_MIGRATION_LOCK:
+        antes = await asyncio.to_thread(
+            _v78_volume_percent_sync,
+        )
+        resultado = await asyncio.to_thread(
+            _v78_migrar_batch_sync,
+            int(limite_mb),
+            apagar_local=True,
+        )
+        depois = await asyncio.to_thread(
+            _v78_volume_percent_sync,
+        )
+
+    await interaction.followup.send(
+        "✅ **MIGRAÇÃO R2 CONCLUÍDA**\n"
+        f"**Enviados:** `{resultado['enviados']}` arquivo(s)\n"
+        f"**Falhas:** `{resultado['falhas']}`\n"
+        f"**Referências atualizadas:** `{resultado['referencias']}`\n"
+        f"**Espaço liberado:** "
+        f"`{resultado['liberados_bytes'] / 1024 / 1024:.1f} MB`\n"
+        f"**Volume:** `{antes['percent']:.1f}%` → `{depois['percent']:.1f}%`\n\n"
+        "O arquivo local só é excluído após o R2 confirmar o upload.",
+        ephemeral=True,
+    )
+
+
+# -----------------------------------------------------
+# AUTO-MIGRAÇÃO CONTROLADA
+# -----------------------------------------------------
+@tasks.loop(hours=6)
+async def _v78_auto_migracao_loop():
+    if not (
+        V78_R2_AUTO_MIGRATE
+        and _v78_r2_configurado()
+    ):
+        return
+
+    if _V78_R2_MIGRATION_LOCK.locked():
+        return
+
+    try:
+        volume = await asyncio.to_thread(
+            _v78_volume_percent_sync,
+        )
+        if volume["percent"] < V78_R2_AUTO_TRIGGER_PERCENT:
+            await asyncio.to_thread(
+                _v78_limpar_cache_tmp_sync,
+            )
+            return
+
+        async with _V78_R2_MIGRATION_LOCK:
+            ciclos = 0
+            total_liberado = 0
+
+            while (
+                volume["percent"] > V78_R2_AUTO_TARGET_PERCENT
+                and ciclos < 4
+            ):
+                resultado = await asyncio.to_thread(
+                    _v78_migrar_batch_sync,
+                    V78_R2_BATCH_MB,
+                    apagar_local=True,
+                )
+                total_liberado += int(
+                    resultado.get("liberados_bytes") or 0
+                )
+                ciclos += 1
+
+                if int(resultado.get("enviados") or 0) == 0:
+                    break
+
+                volume = await asyncio.to_thread(
+                    _v78_volume_percent_sync,
+                )
+                await asyncio.sleep(3)
+
+        if total_liberado:
+            print(
+                "✅ V78 auto-R2: "
+                f"{total_liberado / 1024 / 1024:.1f} MB liberados; "
+                f"volume={volume['percent']:.1f}%.",
+                flush=True,
+            )
+
+        await asyncio.to_thread(
+            _v78_limpar_cache_tmp_sync,
+        )
+    except Exception as erro:
+        print(
+            "⚠️ V78 auto-R2 falhou sem interromper o bot: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+@_v78_auto_migracao_loop.before_loop
+async def _v78_antes_auto_migracao():
+    await bot.wait_until_ready()
+    # Não disputa recursos com o startup escalonado.
+    await asyncio.sleep(240)
+
+
+@bot.listen("on_ready")
+async def _v78_on_ready():
+    global _V78_R2_AUTO_STARTED
+
+    if _V78_R2_AUTO_STARTED:
+        return
+    _V78_R2_AUTO_STARTED = True
+
+    _v78_index_init()
+
+    if _v78_r2_configurado():
+        try:
+            cliente = _v78_r2_client()
+            await asyncio.to_thread(
+                cliente.head_bucket,
+                Bucket=V78_R2_BUCKET,
+            )
+            print(
+                f"✅ V78 R2 conectado: bucket `{V78_R2_BUCKET}`. "
+                "Arquivos pesados podem sair do Railway Volume.",
+                flush=True,
+            )
+        except Exception as erro:
+            print(
+                "⚠️ V78 R2 configurado, mas conexão falhou: "
+                f"{type(erro).__name__}: {erro}. "
+                "Fallback local continua ativo.",
+                flush=True,
+            )
+    else:
+        motivo = (
+            "boto3 ausente"
+            if _v78_boto3 is None
+            else "variáveis R2 incompletas"
+        )
+        print(
+            f"ℹ️ V78 R2 em fallback local: {motivo}.",
+            flush=True,
+        )
+
+    if not _v78_auto_migracao_loop.is_running():
+        _v78_auto_migracao_loop.start()
+
+
+print(
+    "✅ V78 carregada — storage híbrido Railway + Cloudflare R2, "
+    "migração verificada, cache em /tmp e fallback local ativos.",
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
