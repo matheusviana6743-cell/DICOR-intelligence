@@ -13,6 +13,7 @@ import secrets
 import string
 import time
 import asyncio
+import inspect
 import datetime
 import unicodedata
 import zipfile
@@ -66559,13 +66560,15 @@ async def _v75_etapa(
     thread: bool = False,
 ) -> Any:
     inicio = time.monotonic()
+    resultado = None
     try:
         if thread:
             resultado = await asyncio.to_thread(func)
         else:
             resultado = func()
-            if inspect.isawaitable(resultado):
-                resultado = await resultado
+
+        if inspect.isawaitable(resultado):
+            resultado = await resultado
 
         print(
             f"✅ V75 startup: {nome} concluído em "
@@ -66573,9 +66576,19 @@ async def _v75_etapa(
             flush=True,
         )
         return resultado
+    except asyncio.CancelledError:
+        raise
     except Exception as erro:
+        # Se uma função devolveu uma coroutine e alguma falha ocorrer antes
+        # do await, fecha a coroutine para evitar RuntimeWarning.
+        try:
+            if inspect.iscoroutine(resultado):
+                resultado.close()
+        except Exception:
+            pass
+
         print(
-            f"⚠️ V75 startup: {nome} ignorou falha "
+            f"⚠️ V77 startup: {nome} ignorou falha "
             f"{type(erro).__name__}: {erro}",
             flush=True,
         )
@@ -66831,6 +66844,14 @@ print(
     "✅ V76 carregada — novas prisões somente no canal 1535671619069018223.",
     flush=True,
 )
+
+
+print(
+    "✅ V77 carregada — import inspect corrigido e coroutines do startup "
+    "agora são aguardadas corretamente.",
+    flush=True,
+)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
