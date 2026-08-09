@@ -70976,5 +70976,543 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V87 — B2 DIRETO ESTÁVEL / SEM LEITURAS DE CONFIRMAÇÃO
+# =====================================================
+# Corrige o problema da V86:
+# - NÃO faz LIST/HEAD/GET depois de cada upload direto;
+# - sucesso do upload_file() é a confirmação de escrita;
+# - key determinística evita criar nomes novos em retries;
+# - embeds usam a URL original do Discord e não são recopiados a cada sync;
+# - se o próprio PUT/upload for bloqueado, ativa fallback temporário;
+# - nenhuma rotina fica imprimindo o mesmo erro em loop;
+# - migração automática antiga fica desligada enquanto o modo direto está ativo.
+
+V87_B2_WRITE_PAUSE_SECONDS = max(
+    300,
+    env_int("B2_WRITE_PAUSE_SECONDS", 1800),
+)
+
+_V87_B2_PAUSE_UNTIL = 0.0
+_V87_B2_PAUSE_REASON = ""
+_V87_B2_LAST_LOG_AT = 0.0
+_V87_B2_LAST_LOG_TEXT = ""
+_V87_UPLOADS_OK = 0
+_V87_UPLOADS_FALLBACK = 0
+
+
+def _v87_erro_cap_ou_bloqueio(
+    erro: BaseException,
+) -> bool:
+    msg = (
+        f"{type(erro).__name__}: {erro}"
+        .lower()
+    )
+    sinais = (
+        "transaction cap exceeded",
+        "cap exceeded",
+        "too many requests",
+        "429",
+        "accessdenied",
+        "access denied",
+        "forbidden",
+        "invalidaccesskeyid",
+        "signaturedoesnotmatch",
+    )
+    return any(s in msg for s in sinais)
+
+
+def _v87_log_unico(
+    texto_msg: str,
+    intervalo: float = 300.0,
+) -> None:
+    global _V87_B2_LAST_LOG_AT
+    global _V87_B2_LAST_LOG_TEXT
+
+    agora = time.monotonic()
+    chave = str(texto_msg or "")[:600]
+
+    if (
+        chave == _V87_B2_LAST_LOG_TEXT
+        and agora - _V87_B2_LAST_LOG_AT < intervalo
+    ):
+        return
+
+    _V87_B2_LAST_LOG_AT = agora
+    _V87_B2_LAST_LOG_TEXT = chave
+
+    print(
+        chave,
+        flush=True,
+    )
+
+
+def _v87_pausar_b2(
+    erro: BaseException,
+) -> None:
+    global _V87_B2_PAUSE_UNTIL
+    global _V87_B2_PAUSE_REASON
+
+    _V87_B2_PAUSE_UNTIL = (
+        time.monotonic()
+        + V87_B2_WRITE_PAUSE_SECONDS
+    )
+    _V87_B2_PAUSE_REASON = (
+        f"{type(erro).__name__}: {erro}"
+    )[:500]
+
+    _v87_log_unico(
+        "⚠️ V87 B2: o próprio upload foi bloqueado. "
+        f"Fallback local ativado por "
+        f"{V87_B2_WRITE_PAUSE_SECONDS // 60} min. "
+        "O bot continuará online.",
+        intervalo=V87_B2_WRITE_PAUSE_SECONDS,
+    )
+
+
+def _v87_b2_pausado() -> bool:
+    return (
+        time.monotonic()
+        < _V87_B2_PAUSE_UNTIL
+    )
+
+
+def _v86_b2_direto_ativo() -> bool:
+    # Sobrescreve a função V86.
+    # Erro de LIST antigo não importa mais: a V87 não usa LIST.
+    return bool(
+        V86_B2_DIRECT_ENABLED
+        and _v78_r2_configurado()
+        and not _v87_b2_pausado()
+    )
+
+
+def _v87_upload_write_only_sync(
+    caminho: Path,
+    categoria: str,
+) -> Dict[str, Any]:
+    """
+    Upload direto de baixa operação.
+
+    Não consulta o objeto antes nem depois.
+    boto3.upload_file só retorna se o envio foi concluído sem exceção.
+    """
+    global _V87_UPLOADS_OK
+
+    caminho = Path(caminho)
+
+    if not caminho.exists() or not caminho.is_file():
+        raise FileNotFoundError(str(caminho))
+
+    cliente = _v78_r2_client()
+    if cliente is None:
+        raise RuntimeError(
+            "Backblaze B2 não está configurado."
+        )
+
+    tamanho = int(caminho.stat().st_size)
+    if tamanho <= 0:
+        raise RuntimeError("Arquivo vazio.")
+
+    sha256 = _v78_hash_file(caminho)
+    mime = (
+        _v78_mimetypes.guess_type(
+            caminho.name
+        )[0]
+        or "application/octet-stream"
+    )
+
+    # Mesma origem/conteúdo = mesma key.
+    # Se houver retry, substitui a mesma key em vez de criar duplicata.
+    key = _v84_key_deterministica(
+        categoria,
+        caminho,
+        sha256,
+    )
+
+    kwargs: Dict[str, Any] = {
+        "ExtraArgs": {
+            "ContentType": mime,
+            "Metadata": {
+                "sha256": sha256[:64],
+                "origem": "dicor-intelligence-v87",
+            },
+        }
+    }
+
+    if _V81_TRANSFER_CONFIG is not None:
+        kwargs["Config"] = _V81_TRANSFER_CONFIG
+
+    try:
+        cliente.upload_file(
+            str(caminho),
+            V78_R2_BUCKET,
+            key,
+            **kwargs,
+        )
+    except Exception as erro:
+        if _v87_erro_cap_ou_bloqueio(erro):
+            _v87_pausar_b2(erro)
+        raise
+
+    # Só grava o índice depois que upload_file retornar com sucesso.
+    _v78_index_save(
+        local_path=caminho,
+        key=key,
+        categoria=categoria,
+        mime_type=mime,
+        tamanho=tamanho,
+        sha256=sha256,
+    )
+
+    _V87_UPLOADS_OK += 1
+
+    return {
+        "key": key,
+        "pointer": _v78_pointer(key),
+        "size": tamanho,
+        "sha256": sha256,
+        "reutilizado": False,
+        "confirmado_por": "UPLOAD_OK",
+    }
+
+
+# -----------------------------------------------------
+# ANEXOS NOVOS -> /tmp -> B2, SEM LIST/HEAD/GET
+# -----------------------------------------------------
+async def _v86_attachment_para_b2(
+    attachment: discord.Attachment,
+    categoria: str,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_ENVIADOS
+    global _V87_UPLOADS_FALLBACK
+
+    if _v87_b2_pausado():
+        raise RuntimeError(
+            "B2 temporariamente pausado; usar fallback."
+        )
+
+    tmp: Optional[Path] = None
+
+    try:
+        tmp = await _v86_attachment_tmp(
+            attachment,
+            prefixo,
+        )
+
+        resultado = await asyncio.to_thread(
+            _v87_upload_write_only_sync,
+            tmp,
+            categoria,
+        )
+
+        pointer = str(
+            resultado.get("pointer") or ""
+        ).strip()
+
+        if not pointer.startswith("b2://"):
+            raise RuntimeError(
+                "Ponteiro B2 inválido."
+            )
+
+        _V86_DIRECT_ENVIADOS += 1
+        return pointer
+
+    except Exception:
+        _V87_UPLOADS_FALLBACK += 1
+        raise
+
+    finally:
+        if tmp is not None:
+            try:
+                await asyncio.to_thread(
+                    tmp.unlink,
+                    missing_ok=True,
+                )
+            except Exception:
+                pass
+
+
+def _v86_bytes_para_b2_sync(
+    dados: bytes,
+    nome: str,
+    categoria: str,
+    prefixo: str,
+) -> str:
+    global _V86_DIRECT_ENVIADOS
+    global _V87_UPLOADS_FALLBACK
+
+    if _v87_b2_pausado():
+        raise RuntimeError(
+            "B2 temporariamente pausado; usar fallback."
+        )
+
+    bruto = bytes(dados or b"")
+    if not bruto:
+        raise RuntimeError("Arquivo vazio.")
+
+    tmp = _v86_tmp_path(
+        nome,
+        prefixo,
+    )
+
+    try:
+        _v85_escrever_bytes_confirmado(
+            tmp,
+            bruto,
+        )
+
+        resultado = _v87_upload_write_only_sync(
+            tmp,
+            categoria,
+        )
+
+        pointer = str(
+            resultado.get("pointer") or ""
+        ).strip()
+
+        if not pointer.startswith("b2://"):
+            raise RuntimeError(
+                "Ponteiro B2 inválido."
+            )
+
+        _V86_DIRECT_ENVIADOS += 1
+        return pointer
+
+    except Exception:
+        _V87_UPLOADS_FALLBACK += 1
+        raise
+
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------
+# EMBEDS
+# A V86 estava baixando + subindo TODO embed a cada sincronização.
+# Isso causava centenas de PUT/LIST repetidos.
+#
+# Agora:
+# - se já é uma URL HTTP do Discord/CDN, usa a própria URL;
+# - anexos reais continuam indo para o B2 pelas rotinas específicas.
+# -----------------------------------------------------
+async def _v24_baixar_url_imagem(
+    url: str,
+    prefixo: str,
+) -> str:
+    url = str(url or "").strip()
+
+    if url.startswith(
+        ("https://", "http://")
+    ):
+        return url
+
+    return ""
+
+
+# -----------------------------------------------------
+# DOCUMENTOS GERADOS
+# Upload -> índice -> troca referências -> apaga local.
+# Sem leitura remota adicional.
+# -----------------------------------------------------
+def _v86_offload_gerados_sync(
+    max_arquivos: int = 20,
+) -> Dict[str, int]:
+    if not _v86_b2_direto_ativo():
+        return {
+            "enviados": 0,
+            "falhas": 0,
+        }
+
+    agora = time.time()
+    enviados = 0
+    falhas = 0
+
+    for pasta, categoria in (
+        _v86_documentos_gerados_dirs()
+    ):
+        if enviados >= max_arquivos:
+            break
+
+        if not pasta.exists():
+            continue
+
+        try:
+            for raiz, dirs, nomes in os.walk(
+                str(pasta)
+            ):
+                dirs[:] = [
+                    d for d in dirs
+                    if d.lower()
+                    not in {
+                        "assinaturas",
+                        "assets_dossie",
+                    }
+                ]
+
+                for nome in nomes:
+                    if enviados >= max_arquivos:
+                        break
+
+                    caminho = Path(raiz) / nome
+
+                    try:
+                        if (
+                            caminho.suffix.lower()
+                            not in _V78_EXTENSOES_PESADAS
+                        ):
+                            continue
+
+                        st = caminho.stat()
+
+                        if (
+                            agora - float(st.st_mtime)
+                            < V86_GENERATED_MIN_AGE_SECONDS
+                        ):
+                            continue
+
+                        if int(st.st_size) <= 0:
+                            continue
+
+                        resultado = (
+                            _v87_upload_write_only_sync(
+                                caminho,
+                                categoria,
+                            )
+                        )
+
+                        pointer = str(
+                            resultado.get(
+                                "pointer"
+                            )
+                            or ""
+                        )
+
+                        if not pointer.startswith(
+                            "b2://"
+                        ):
+                            raise RuntimeError(
+                                "Pointer inválido."
+                            )
+
+                        # Só após upload_file concluir.
+                        _v78_reescrever_referencias_sync(
+                            caminho,
+                            pointer,
+                        )
+
+                        caminho.unlink(
+                            missing_ok=True
+                        )
+                        enviados += 1
+
+                    except FileNotFoundError:
+                        continue
+
+                    except Exception as erro:
+                        falhas += 1
+
+                        # Se upload foi bloqueado, encerra este ciclo.
+                        if _v87_b2_pausado():
+                            return {
+                                "enviados": enviados,
+                                "falhas": falhas,
+                            }
+
+                        if falhas <= 1:
+                            _v87_log_unico(
+                                "⚠️ V87 offload: "
+                                f"{type(erro).__name__}: {erro}"
+                            )
+
+        except Exception:
+            continue
+
+    return {
+        "enviados": enviados,
+        "falhas": falhas,
+    }
+
+
+# -----------------------------------------------------
+# DESLIGA AS MIGRAÇÕES ANTIGAS DE LEITURA/LISTAGEM
+# NO MODO DIRETO.
+# Os comandos manuais continuam disponíveis, mas não rodam sozinhos.
+# -----------------------------------------------------
+if V86_B2_DIRECT_ENABLED:
+    V78_R2_AUTO_MIGRATE = False
+    V79_B2_AUTO_MIGRATE = False
+
+    # Evita que um /migrarb2 antigo marcado como MIGRANDO
+    # retome sozinho após um redeploy.
+    try:
+        bot.remove_listener(
+            _v81_retomar_ready,
+            "on_ready",
+        )
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------
+# STATUS SEM CONSULTAR O B2
+# -----------------------------------------------------
+@bot.tree.command(
+    name="b2statusv87",
+    description="Mostra o estado do B2 direto sem gastar transações de leitura.",
+)
+async def b2statusv87(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(
+        interaction.user
+    ):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar.",
+            ephemeral=True,
+        )
+
+    pausado = _v87_b2_pausado()
+
+    restante = max(
+        0,
+        int(
+            _V87_B2_PAUSE_UNTIL
+            - time.monotonic()
+        ),
+    )
+
+    await interaction.response.send_message(
+        "☁️ **B2 DIRETO — V87**\n"
+        f"**Configurado:** "
+        f"{'✅' if _v78_r2_configurado() else '❌'}\n"
+        f"**Modo direto:** "
+        f"{'⏸️ FALLBACK TEMPORÁRIO' if pausado else '✅ ATIVO'}\n"
+        f"**Uploads OK nesta sessão:** `{_V87_UPLOADS_OK}`\n"
+        f"**Fallbacks nesta sessão:** `{_V87_UPLOADS_FALLBACK}`\n"
+        f"**HEAD/LIST/GET automáticos:** `0`\n"
+        f"**Embeds duplicados:** `não são reenviados`\n"
+        + (
+            f"**Retoma em:** `~{max(1, restante // 60)} min`\n"
+            f"**Motivo:** `{_V87_B2_PAUSE_REASON[:250]}`"
+            if pausado
+            else
+            "**Armazenamento novo:** `B2 direto via upload`"
+        ),
+        ephemeral=True,
+    )
+
+
+print(
+    "✅ V87 carregada — B2 direto sem HEAD/LIST/GET pós-upload, "
+    "embeds sem reupload e fallback com circuit breaker.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
