@@ -16891,7 +16891,7 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
         return s or padrao
 
     def iniciar_pagina(titulo: str, continuacao: bool = False) -> float:
-        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=13.2)
+        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=18.0)
         c.saveState()
         _alpha_pdf(c, 0.82, 1)
         c.setFillColor(cores['painel'])
@@ -75476,8 +75476,8 @@ print(
 )
 
 print(
-    "✅ V94 carregada — somente o cabeçalho do dossiê foi ampliado: "
-    "POLÍCIA FEDERAL • DICOR = 23 pt; cidade = 13.2 pt; modelo preservado.",
+    "✅ V95 carregada — cabeçalho do dossiê preservado: "
+    "POLÍCIA FEDERAL • DICOR = 23 pt; CAPITAL MORADA DO VALLEY = 18 pt.",
     flush=True,
 )
 
