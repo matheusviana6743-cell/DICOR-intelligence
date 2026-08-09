@@ -75481,5 +75481,545 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V96 — DOSSIÊ: FOTOS RESTAURADAS / MODELO V95 PRESERVADO
+# =====================================================
+# NÃO altera:
+# - moldura;
+# - brasões;
+# - cores;
+# - seções;
+# - fontes internas;
+# - título V95 (23 pt / 18 pt).
+#
+# Corrige somente:
+# - download confiável das fotos da mesa;
+# - proteção das evidências durante a geração;
+# - vínculo de fotos com liderança, integrantes e informantes.
+
+_V96_COLETAR_DADOS_ANTES = coletar_dados_operacionais_mesa
+
+
+def _v96_arquivo_imagem_valido(caminho: Any) -> bool:
+    try:
+        p = Path(str(caminho or ""))
+        return (
+            bool(str(caminho or "").strip())
+            and p.exists()
+            and p.is_file()
+            and p.stat().st_size > 0
+        )
+    except Exception:
+        return False
+
+
+def _v96_escrever_bytes_sync(caminho: Path, dados: bytes) -> bool:
+    caminho = Path(caminho)
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_bytes(bytes(dados or b""))
+    return _v96_arquivo_imagem_valido(caminho)
+
+
+async def salvar_anexo_dossie(
+    anexo: discord.Attachment,
+    pasta_evidencias: Path,
+    indice: int,
+) -> Optional[Path]:
+    """
+    V96: restaura o comportamento local do dossiê e adiciona fallbacks.
+    A foto fica dentro da pasta de evidências até o PDF/DOCX terminar.
+    """
+    pasta_evidencias = Path(pasta_evidencias)
+    await asyncio.to_thread(
+        pasta_evidencias.mkdir,
+        parents=True,
+        exist_ok=True,
+    )
+
+    nome_base = (
+        nome_arquivo_seguro(
+            getattr(anexo, "filename", "arquivo")
+        )
+        or "arquivo"
+    )
+    caminho = pasta_evidencias / f"{int(indice):03d}-{nome_base}"
+
+    contador = 2
+    while caminho.exists():
+        caminho = pasta_evidencias / (
+            f"{int(indice):03d}-{contador}-{nome_base}"
+        )
+        contador += 1
+
+    erros: List[str] = []
+
+    # 1) Discord Attachment.save — preferindo cache.
+    for usar_cache in (True, False):
+        try:
+            try:
+                await anexo.save(
+                    str(caminho),
+                    use_cached=usar_cache,
+                )
+            except TypeError:
+                await anexo.save(str(caminho))
+
+            if await asyncio.to_thread(
+                _v96_arquivo_imagem_valido,
+                caminho,
+            ):
+                return caminho
+        except Exception as erro:
+            erros.append(
+                f"save({usar_cache}): "
+                f"{type(erro).__name__}: {erro}"
+            )
+
+    # 2) Attachment.read.
+    for usar_cache in (True, False):
+        try:
+            try:
+                dados = await anexo.read(
+                    use_cached=usar_cache
+                )
+            except TypeError:
+                dados = await anexo.read()
+
+            if dados and await asyncio.to_thread(
+                _v96_escrever_bytes_sync,
+                caminho,
+                bytes(dados),
+            ):
+                return caminho
+        except Exception as erro:
+            erros.append(
+                f"read({usar_cache}): "
+                f"{type(erro).__name__}: {erro}"
+            )
+
+    # 3) CDN/proxy do Discord.
+    urls: List[str] = []
+    for valor in (
+        getattr(anexo, "proxy_url", None),
+        getattr(anexo, "url", None),
+    ):
+        url = str(valor or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+
+    if urls:
+        try:
+            async with ClientSession(
+                timeout=ClientTimeout(total=60),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(compatible; DICOR-Intelligence/1.0)"
+                    ),
+                    "Accept": "*/*",
+                    "Referer": "https://discord.com/",
+                },
+            ) as sessao:
+                for url in urls:
+                    try:
+                        async with sessao.get(
+                            url,
+                            allow_redirects=True,
+                        ) as resp:
+                            if resp.status != 200:
+                                erros.append(
+                                    f"CDN HTTP {resp.status}"
+                                )
+                                continue
+
+                            dados = await resp.read()
+                            if dados and await asyncio.to_thread(
+                                _v96_escrever_bytes_sync,
+                                caminho,
+                                bytes(dados),
+                            ):
+                                return caminho
+                    except Exception as erro:
+                        erros.append(
+                            f"CDN: {type(erro).__name__}: {erro}"
+                        )
+        except Exception as erro:
+            erros.append(
+                f"sessão CDN: {type(erro).__name__}: {erro}"
+            )
+
+    try:
+        await asyncio.to_thread(
+            caminho.unlink,
+            missing_ok=True,
+        )
+    except Exception:
+        pass
+
+    try:
+        await enviar_log(
+            "⚠️ V96 não conseguiu salvar uma foto do dossiê "
+            f"`{getattr(anexo, 'filename', 'arquivo')}`. "
+            + " | ".join(erros[-3:])[:1200]
+        )
+    except Exception:
+        pass
+
+    return None
+
+
+async def _v96_recuperar_evidencia_local(
+    ev: Dict[str, Any],
+    pasta_dossie: Path,
+    indice: int,
+) -> str:
+    """
+    Se a evidência tinha URL mas o arquivo local sumiu/falhou,
+    baixa novamente antes de montar o PDF.
+    """
+    atual = str(ev.get("local") or "").strip()
+    if await asyncio.to_thread(
+        _v96_arquivo_imagem_valido,
+        atual,
+    ):
+        return atual
+
+    urls = []
+    for campo in ("url", "proxy_url"):
+        url = str(ev.get(campo) or "").strip()
+        if url.startswith(("https://", "http://")) and url not in urls:
+            urls.append(url)
+
+    if not urls:
+        return ""
+
+    pasta = Path(pasta_dossie) / "evidencias"
+    await asyncio.to_thread(
+        pasta.mkdir,
+        parents=True,
+        exist_ok=True,
+    )
+
+    nome_original = str(ev.get("arquivo") or f"foto-{indice}.png")
+    nome_seguro = (
+        nome_arquivo_seguro(nome_original)
+        or f"foto-{indice}.png"
+    )
+    destino = pasta / (
+        f"v96-recuperada-{int(indice):03d}-"
+        f"{secrets.token_hex(3)}-{nome_seguro}"
+    )
+
+    try:
+        async with ClientSession(
+            timeout=ClientTimeout(total=60),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; DICOR-Intelligence/1.0)"
+                ),
+                "Accept": "*/*",
+                "Referer": "https://discord.com/",
+            },
+        ) as sessao:
+            for url in urls:
+                try:
+                    async with sessao.get(
+                        url,
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+
+                        dados = await resp.read()
+                        if dados and await asyncio.to_thread(
+                            _v96_escrever_bytes_sync,
+                            destino,
+                            bytes(dados),
+                        ):
+                            ev["local"] = str(destino)
+                            return str(destino)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        await asyncio.to_thread(
+            destino.unlink,
+            missing_ok=True,
+        )
+    except Exception:
+        pass
+
+    return ""
+
+
+def _v96_evidencia_do_topico(
+    ev: Dict[str, Any],
+    topico_alvo: str,
+) -> bool:
+    if not isinstance(ev, dict):
+        return False
+    if str(ev.get("tipo") or "").lower() != "imagem":
+        return False
+
+    topico = normalizar_busca(
+        str(ev.get("topico") or "")
+    )
+    alvo = normalizar_busca(topico_alvo)
+
+    if topico == alvo:
+        return True
+
+    origem = str(ev.get("origem") or "")
+    try:
+        return (
+            normalizar_busca(
+                topico_dossie_por_nome(origem)
+            )
+            == alvo
+        )
+    except Exception:
+        return False
+
+
+async def _v96_restaurar_fotos_pessoas(
+    dados: Dict[str, Any],
+    pasta_dossie: Path,
+) -> None:
+    """
+    Mantém a ordem ORIGINAL da mesa:
+      1ª foto -> 1ª pessoa
+      2ª foto -> 2ª pessoa
+      ...
+    É exatamente o comportamento que o dossiê tinha antes.
+    """
+    evidencias = list(
+        dados.get("evidencias") or []
+    )
+
+    secoes = (
+        ("liderancas", "liderancas"),
+        ("integrantes", "integrantes"),
+        ("informantes", "informantes"),
+    )
+
+    contador = 1
+
+    for campo, topico in secoes:
+        pessoas = list(
+            dados.get(campo) or []
+        )
+
+        if not pessoas:
+            continue
+
+        imagens = [
+            ev
+            for ev in evidencias
+            if _v96_evidencia_do_topico(
+                ev,
+                topico,
+            )
+        ]
+
+        locais_validos: List[str] = []
+
+        for ev in imagens:
+            local = await _v96_recuperar_evidencia_local(
+                ev,
+                pasta_dossie,
+                contador,
+            )
+            contador += 1
+
+            if local:
+                locais_validos.append(local)
+
+        # Reaplica o vínculo clássico por ordem.
+        for idx, pessoa in enumerate(pessoas):
+            foto_atual = str(
+                pessoa.get("foto") or ""
+            ).strip()
+
+            if await asyncio.to_thread(
+                _v96_arquivo_imagem_valido,
+                foto_atual,
+            ):
+                continue
+
+            if idx < len(locais_validos):
+                pessoa["foto"] = locais_validos[idx]
+
+        dados[campo] = pessoas
+
+
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    V96 não muda a lógica V92/V95.
+    Apenas garante as fotos antes de entregar os dados ao gerador.
+    """
+    dados = await _V96_COLETAR_DADOS_ANTES(
+        canal,
+        mesa,
+        interaction,
+        pasta_dossie,
+        dados_confirmacao=dados_confirmacao,
+    )
+
+    await _v96_restaurar_fotos_pessoas(
+        dados,
+        Path(pasta_dossie),
+    )
+
+    return dados
+
+
+# -----------------------------------------------------
+# Proteção contra o offloader apagar fotos enquanto
+# o PDF/DOCX ainda está sendo montado.
+# -----------------------------------------------------
+def _v86_offload_gerados_sync(
+    max_arquivos: int = 20,
+) -> Dict[str, int]:
+    """
+    Mesma lógica V87/V89 para arquivos finais,
+    mas NUNCA entra nas pastas internas de evidências do dossiê.
+    """
+    if not _v86_b2_direto_ativo():
+        return {
+            "enviados": 0,
+            "falhas": 0,
+        }
+
+    agora = time.time()
+    enviados = 0
+    falhas = 0
+
+    dirs_protegidos = {
+        "assinaturas",
+        "assets_dossie",
+        "evidencias",
+        "_imagens_otimizadas",
+    }
+
+    for pasta, categoria in (
+        _v86_documentos_gerados_dirs()
+    ):
+        if enviados >= max_arquivos:
+            break
+
+        if not pasta.exists():
+            continue
+
+        try:
+            for raiz, dirs, nomes in os.walk(
+                str(pasta)
+            ):
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if d.lower()
+                    not in dirs_protegidos
+                ]
+
+                for nome in nomes:
+                    if enviados >= max_arquivos:
+                        break
+
+                    caminho = Path(raiz) / nome
+
+                    try:
+                        if (
+                            caminho.suffix.lower()
+                            not in _V78_EXTENSOES_PESADAS
+                        ):
+                            continue
+
+                        st = caminho.stat()
+
+                        if (
+                            agora - float(st.st_mtime)
+                            < V86_GENERATED_MIN_AGE_SECONDS
+                        ):
+                            continue
+
+                        if int(st.st_size) <= 0:
+                            continue
+
+                        resultado = (
+                            _v87_upload_write_only_sync(
+                                caminho,
+                                categoria,
+                            )
+                        )
+
+                        pointer = str(
+                            resultado.get("pointer")
+                            or ""
+                        )
+
+                        if not pointer.startswith(
+                            "b2://"
+                        ):
+                            raise RuntimeError(
+                                "Pointer inválido."
+                            )
+
+                        _v78_reescrever_referencias_sync(
+                            caminho,
+                            pointer,
+                        )
+
+                        caminho.unlink(
+                            missing_ok=True
+                        )
+                        enviados += 1
+
+                    except FileNotFoundError:
+                        continue
+
+                    except Exception as erro:
+                        falhas += 1
+
+                        if _v87_b2_pausado():
+                            return {
+                                "enviados": enviados,
+                                "falhas": falhas,
+                            }
+
+                        if falhas <= 1:
+                            try:
+                                _v87_log_unico(
+                                    "⚠️ V96 offload: "
+                                    f"{type(erro).__name__}: {erro}"
+                                )
+                            except Exception:
+                                pass
+
+        except Exception:
+            continue
+
+    return {
+        "enviados": enviados,
+        "falhas": falhas,
+    }
+
+
+print(
+    "✅ V96 carregada — modelo e títulos V95 preservados; "
+    "fotos de lideranças, integrantes e informantes restauradas e "
+    "pastas de evidências protegidas durante a geração.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
