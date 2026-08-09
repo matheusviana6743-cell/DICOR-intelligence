@@ -73803,5 +73803,635 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V91 — VÍNCULOS EXATOS DE FICHA / SEM FALSOS POSITIVOS
+# =====================================================
+# Corrige o problema em que RG curto (ex.: 123) aparecia em IDs, URLs,
+# números de perícia/BO etc. e acabava puxando registros de terceiros.
+#
+# Regras:
+# - Prisão: somente RG EXATO do registro prisional.
+# - BO/Perícia automática: somente RG/passaporte explicitamente rotulado.
+# - Veículo: mantém vínculo já confirmado ao indivíduo.
+# - Nunca usa mais "RG contido no JSON inteiro".
+# - Repara automaticamente individuo_id antigo das prisões pelo rg_texto.
+# - Não apaga dados; apenas corrige vínculo determinístico por RG.
+
+_V91_FICHA_CARREGAR_ANTES = _banco_ficha_geral_carregar
+
+
+def _v91_rg(valor: Any) -> str:
+    return _banco_normalizar_rg(valor)
+
+
+def _v91_texto_tem_rg_explicito(texto: Any, rg: str) -> bool:
+    """
+    Só aceita RG/documento quando há rótulo explícito.
+    Ex.: RG: 123 / Passaporte 123 / Documento: 123.
+    """
+    rg_n = _v91_rg(rg)
+    if not rg_n:
+        return False
+
+    bruto = str(texto or "")
+    if not bruto:
+        return False
+
+    # Para RG alfanumérico, tolera espaços/pontuação ao redor, mas exige rótulo.
+    alvo = re.escape(rg_n)
+
+    padroes = (
+        rf"(?i)(?:^|[\s|•;,])RG\s*(?:DO\s+(?:INDIV[IÍ]DUO|PROPRIET[AÁ]RIO))?\s*[:#=\-]?\s*`?\s*{alvo}(?![A-Za-z0-9])",
+        rf"(?i)(?:^|[\s|•;,])PASSAPORTE\s*[:#=\-]?\s*`?\s*{alvo}(?![A-Za-z0-9])",
+        rf"(?i)(?:^|[\s|•;,])DOCUMENTO\s*[:#=\-]?\s*`?\s*{alvo}(?![A-Za-z0-9])",
+        rf"(?i)(?:^|[\s|•;,])CPF\s*[:#=\-]?\s*`?\s*{alvo}(?![A-Za-z0-9])",
+    )
+
+    compacto = re.sub(r"[^\w\s:;,#=\-•|`]", " ", bruto)
+
+    return any(
+        re.search(p, compacto) is not None
+        for p in padroes
+    )
+
+
+def _v91_dict_tem_rg_explicito(item: Dict[str, Any], rg: str) -> bool:
+    """
+    Verifica somente campos de identidade ou textos reais.
+    NÃO serializa IDs/URLs/metadados inteiros.
+    """
+    if not isinstance(item, dict):
+        return False
+
+    rg_n = _v91_rg(rg)
+    if not rg_n:
+        return False
+
+    # Campos que representam RG/documento de forma explícita.
+    chaves_rg = {
+        "rg",
+        "rg_texto",
+        "rg_ocr",
+        "proprietario_rg",
+        "proprietario_documento",
+        "documento",
+        "passaporte",
+        "cpf",
+        "suspeito_rg",
+        "individuo_rg",
+        "rg_individuo",
+    }
+
+    for chave in chaves_rg:
+        if chave not in item:
+            continue
+        valor = _v91_rg(item.get(chave))
+        if valor and valor == rg_n:
+            return True
+
+    # Apenas campos textuais de conteúdo. IDs, URLs, datas e números
+    # administrativos ficam completamente de fora.
+    chaves_texto = {
+        "texto",
+        "texto_original",
+        "conteudo",
+        "content",
+        "descricao",
+        "description",
+        "relatorio",
+        "resultado",
+        "observacoes",
+        "observação",
+        "historico",
+        "histórico",
+        "conclusao",
+        "conclusão",
+        "detalhes",
+        "dados",
+    }
+
+    for chave in chaves_texto:
+        valor = item.get(chave)
+        if isinstance(valor, str) and _v91_texto_tem_rg_explicito(valor, rg_n):
+            return True
+        if isinstance(valor, list):
+            for sub in valor[:100]:
+                if isinstance(sub, str) and _v91_texto_tem_rg_explicito(sub, rg_n):
+                    return True
+                if isinstance(sub, dict) and _v91_dict_tem_rg_explicito(sub, rg_n):
+                    return True
+        if isinstance(valor, dict) and _v91_dict_tem_rg_explicito(valor, rg_n):
+            return True
+
+    return False
+
+
+def _v91_prisao_pertence_ao_rg(prisao: Dict[str, Any], rg: str) -> bool:
+    if not isinstance(prisao, dict):
+        return False
+    rg_alvo = _v91_rg(rg)
+    rg_registro = _v91_rg(prisao.get("rg_texto"))
+    if not rg_alvo or not rg_registro:
+        return False
+    return rg_registro == rg_alvo
+
+
+def _v91_reconciliar_prisoes_sync() -> Dict[str, int]:
+    """
+    Corrige vínculo antigo de prisões pelo RG exato armazenado no prisional.
+    Não cria pessoa, não apaga prisão e não faz fuzzy matching.
+    """
+    inicializar_banco_dicor()
+    stats = {
+        "verificadas": 0,
+        "corrigidas": 0,
+        "fontes_corrigidas": 0,
+        "sem_ficha": 0,
+    }
+
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT id, mensagem_id, individuo_id, rg_texto
+            FROM historico_prisoes
+            WHERE TRIM(COALESCE(rg_texto,'')) <> ''
+            """
+        ).fetchall()
+
+        for row in rows:
+            stats["verificadas"] += 1
+            rg = _v91_rg(row["rg_texto"])
+            if not rg:
+                continue
+
+            pessoa = db.execute(
+                "SELECT id FROM individuos WHERE rg=? LIMIT 1",
+                (rg,),
+            ).fetchone()
+
+            if not pessoa:
+                stats["sem_ficha"] += 1
+                continue
+
+            correto_id = int(pessoa["id"] or 0)
+            atual_id = int(row["individuo_id"] or 0)
+
+            if correto_id and correto_id != atual_id:
+                db.execute(
+                    """
+                    UPDATE historico_prisoes
+                    SET individuo_id=?, atualizado_em=?
+                    WHERE id=?
+                    """,
+                    (correto_id, _banco_agora_iso(), int(row["id"])),
+                )
+                stats["corrigidas"] += 1
+
+            # A fonte PRISAO segue sempre o mesmo RG exato.
+            cur = db.execute(
+                """
+                UPDATE fontes_ficha_individuo
+                SET individuo_id=?
+                WHERE tipo='PRISAO'
+                  AND mensagem_id=?
+                  AND individuo_id<>?
+                """,
+                (
+                    correto_id,
+                    int(row["mensagem_id"] or 0),
+                    correto_id,
+                ),
+            )
+            stats["fontes_corrigidas"] += max(0, int(cur.rowcount or 0))
+
+    return stats
+
+
+def _v91_prisoes_exatas(individuo: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rg = _v91_rg(individuo.get("rg"))
+    if not rg:
+        return []
+
+    with _banco_conexao() as db:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM historico_prisoes
+            WHERE rg_texto=?
+            ORDER BY criado_em DESC
+            LIMIT 30
+            """,
+            (rg,),
+        ).fetchall()
+
+    return [dict(x) for x in rows]
+
+
+def _v91_fonte_prisao_valida(
+    fonte: Dict[str, Any],
+    rg: str,
+) -> bool:
+    mid = int(fonte.get("mensagem_id") or 0)
+    if not mid:
+        return False
+
+    with _banco_conexao() as db:
+        row = db.execute(
+            """
+            SELECT rg_texto
+            FROM historico_prisoes
+            WHERE mensagem_id=?
+            LIMIT 1
+            """,
+            (mid,),
+        ).fetchone()
+
+    return bool(
+        row
+        and _v91_rg(row["rg_texto"]) == _v91_rg(rg)
+    )
+
+
+def _v91_tipo_origem_veiculo(veiculo: Dict[str, Any]) -> str:
+    origem = normalizar_busca(
+        str(
+            veiculo.get("origem_tipo")
+            or veiculo.get("origem")
+            or ""
+        )
+    )
+
+    if "pericia" in origem:
+        return "PERICIA"
+    if "boletim" in origem or origem == "bo":
+        return "BOLETIM"
+    return "REGISTRO"
+
+
+def _v91_numero_limpo(valor: Any) -> str:
+    texto_num = str(valor or "").strip()
+    if not texto_num:
+        return ""
+    texto_num = re.sub(r"https?://\S+", "", texto_num).strip()
+    return texto_num[:40]
+
+
+def _v91_fontes_exatas(perfil: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ind = dict(perfil.get("individuo") or {})
+    if not ind:
+        return []
+
+    individuo_id = int(ind.get("id") or 0)
+    rg = _v91_rg(ind.get("rg"))
+
+    if not individuo_id or not rg:
+        return []
+
+    fontes: List[Dict[str, Any]] = []
+
+    # 1) Fontes já vinculadas explicitamente à ficha.
+    try:
+        with _banco_conexao() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM fontes_ficha_individuo
+                WHERE individuo_id=?
+                ORDER BY criado_em DESC
+                LIMIT 80
+                """,
+                (individuo_id,),
+            ).fetchall()
+
+        for row in rows:
+            fonte = dict(row)
+            tipo = str(fonte.get("tipo") or "REGISTRO").upper()
+
+            # Prisões antigas só permanecem se o RG do registro for exato.
+            if tipo == "PRISAO" and not _v91_fonte_prisao_valida(fonte, rg):
+                continue
+
+            fontes.append(fonte)
+    except Exception:
+        traceback.print_exc()
+
+    # 2) Origem dos veículos REALMENTE vinculados à pessoa.
+    for veiculo in list(perfil.get("veiculos") or []):
+        if not isinstance(veiculo, dict):
+            continue
+
+        v_rg = _v91_rg(veiculo.get("proprietario_rg"))
+        v_ind = int(veiculo.get("proprietario_individuo_id") or 0)
+
+        if v_rg and v_rg != rg:
+            continue
+        if v_ind and v_ind != individuo_id:
+            continue
+
+        url = str(veiculo.get("mensagem_url") or "").strip()
+        if not url.startswith("http"):
+            continue
+
+        fontes.append(
+            {
+                "tipo": _v91_tipo_origem_veiculo(veiculo),
+                "mensagem_url": url,
+                "numero_referencia": str(veiculo.get("placa") or "")[:40],
+                "descricao": (
+                    f"Origem do veículo {veiculo.get('placa') or ''}"
+                ),
+            }
+        )
+
+    # 3) Origem da própria ficha (ex.: criação/importação confirmada).
+    ultima = str(ind.get("ultima_origem_url") or "").strip()
+    if ultima.startswith("http"):
+        fontes.append(
+            {
+                "tipo": "REGISTRO",
+                "mensagem_url": ultima,
+                "descricao": "Origem confirmada da ficha",
+            }
+        )
+
+    # 4) BOs: somente quando RG/documento aparece EXPLICITAMENTE no conteúdo.
+    try:
+        for bo in carregar_atendimentos_boletins():
+            if not isinstance(bo, dict):
+                continue
+            if not _v91_dict_tem_rg_explicito(bo, rg):
+                continue
+
+            url = str(
+                bo.get("mensagem_original_url")
+                or bo.get("mensagem_url")
+                or ""
+            ).strip()
+
+            if not url:
+                mid = int(bo.get("mensagem_original_id") or 0)
+                cid = int(
+                    bo.get("canal_origem_id")
+                    or bo.get("canal_id")
+                    or BOLETINS_CHANNEL_ID
+                    or 0
+                )
+                url = _prisao_url_discord(
+                    int(bo.get("guild_id") or GUILD_ID or 0),
+                    cid,
+                    mid,
+                )
+
+            if url.startswith("http"):
+                fontes.append(
+                    {
+                        "tipo": "BOLETIM",
+                        "mensagem_url": url,
+                        "numero_referencia": _v91_numero_limpo(
+                            numero_curto_boletim(bo.get("numero") or "")
+                        ),
+                        "descricao": "BO com RG explicitamente identificado",
+                    }
+                )
+    except Exception:
+        traceback.print_exc()
+
+    # 5) Perícias: usa o snapshot com TEXTO REAL, nunca IDs/URLs do registro.
+    try:
+        snapshots = carregar_json(
+            CENTRAL_PERICIAS_SNAPSHOT_JSON,
+            [],
+        )
+        if isinstance(snapshots, list):
+            for pericia in snapshots:
+                if not isinstance(pericia, dict):
+                    continue
+                if not _v91_dict_tem_rg_explicito(pericia, rg):
+                    continue
+
+                url = str(
+                    pericia.get("mensagem_url")
+                    or pericia.get("mensagem_original_url")
+                    or ""
+                ).strip()
+
+                if not url.startswith("http"):
+                    continue
+
+                fontes.append(
+                    {
+                        "tipo": "PERICIA",
+                        "mensagem_url": url,
+                        "numero_referencia": _v91_numero_limpo(
+                            pericia.get("numero")
+                        ),
+                        "descricao": "Perícia com RG explicitamente identificado",
+                    }
+                )
+    except Exception:
+        traceback.print_exc()
+
+    # Deduplica por URL.
+    saida: List[Dict[str, Any]] = []
+    vistos: set[str] = set()
+
+    for fonte in fontes:
+        url = str(fonte.get("mensagem_url") or "").strip()
+        if not url.startswith("http") or url in vistos:
+            continue
+
+        vistos.add(url)
+        saida.append(fonte)
+
+    return saida[:50]
+
+
+def _v91_recalcular_itens_prisao(
+    prisoes: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    acumulado: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    evidencias: List[Dict[str, Any]] = []
+
+    for prisao in prisoes:
+        foto = str(prisao.get("foto_mochila_url") or "").strip()
+        itens = _prisao_itens_json_seguro(
+            prisao.get("itens_ilegais_json")
+        )
+
+        if foto and itens:
+            evidencias.append(
+                {
+                    "foto": foto,
+                    "mensagem_url": str(
+                        prisao.get("mensagem_url") or ""
+                    ),
+                    "data": str(
+                        prisao.get("data_prisao")
+                        or prisao.get("criado_em")
+                        or "Data não informada"
+                    ),
+                }
+            )
+
+        for item in itens:
+            grupo = str(item.get("grupo") or "OUTROS")
+            nome_item = str(item.get("nome") or "Item")
+            chave = (grupo, nome_item)
+
+            alvo = acumulado.setdefault(
+                chave,
+                {
+                    "grupo": grupo,
+                    "nome": nome_item,
+                    "quantidade": 0,
+                    "fotos": [],
+                },
+            )
+
+            alvo["quantidade"] += max(
+                1,
+                int(item.get("quantidade") or 1),
+            )
+
+            if foto and foto not in alvo["fotos"]:
+                alvo["fotos"].append(foto)
+
+    return list(acumulado.values()), evidencias
+
+
+def _banco_ficha_geral_carregar(
+    tipo: str,
+    registro_id: int,
+) -> Dict[str, Any]:
+    """
+    V91: sanitiza o perfil depois de todas as camadas antigas.
+    """
+    perfil = dict(
+        _V91_FICHA_CARREGAR_ANTES(
+            tipo,
+            registro_id,
+        )
+        or {}
+    )
+
+    ind = dict(perfil.get("individuo") or {})
+    if not ind:
+        perfil["historico_prisoes"] = []
+        perfil["itens_ilegais_acumulados"] = []
+        perfil["evidencias_mochila"] = []
+        perfil["fontes_documentais"] = []
+        return perfil
+
+    # Prisões exclusivamente pelo RG EXATO, não pelo individuo_id antigo.
+    prisoes = _v91_prisoes_exatas(ind)
+
+    # Resolve pointers B2/R2 das fotos prisionais, preservando V78+.
+    resolvidas: List[Dict[str, Any]] = []
+    for original in prisoes:
+        p = dict(original)
+
+        for campo in (
+            "foto_individuo_path",
+            "foto_rg_path",
+        ):
+            valor = str(p.get(campo) or "")
+            if valor.startswith(("b2://", "r2://")):
+                try:
+                    p[campo + "_url"] = _v78_presign_sync(valor)
+                except Exception:
+                    pass
+
+        resolvidas.append(p)
+
+    perfil["historico_prisoes"] = resolvidas
+
+    itens, evidencias = _v91_recalcular_itens_prisao(
+        resolvidas
+    )
+    perfil["itens_ilegais_acumulados"] = itens
+    perfil["evidencias_mochila"] = evidencias
+
+    # Fontes recalculadas com associação exata.
+    perfil["fontes_documentais"] = _v91_fontes_exatas(
+        perfil
+    )
+
+    return perfil
+
+
+@bot.tree.command(
+    name="repararvinculosfichas",
+    description="Repara vínculos antigos de prisões usando somente RG exato.",
+)
+async def reparar_vinculos_fichas_v91(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode executar esta correção.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    stats = await asyncio.to_thread(
+        _v91_reconciliar_prisoes_sync
+    )
+
+    await interaction.followup.send(
+        "✅ **VÍNCULOS REVISADOS**\n"
+        f"• Prisões verificadas: `{stats['verificadas']}`\n"
+        f"• Prisões realocadas pelo RG exato: `{stats['corrigidas']}`\n"
+        f"• Fontes de prisão corrigidas: `{stats['fontes_corrigidas']}`\n"
+        f"• Prisões sem ficha correspondente: `{stats['sem_ficha']}`\n\n"
+        "Nenhum registro foi apagado.",
+        ephemeral=True,
+    )
+
+
+@bot.listen("on_ready")
+async def _v91_reparar_vinculos_ready() -> None:
+    await asyncio.sleep(35)
+
+    try:
+        stats = await asyncio.to_thread(
+            _v91_reconciliar_prisoes_sync
+        )
+
+        if (
+            stats["corrigidas"]
+            or stats["fontes_corrigidas"]
+        ):
+            print(
+                "✅ V91 vínculos antigos corrigidos por RG exato: "
+                f"prisões={stats['corrigidas']} | "
+                f"fontes={stats['fontes_corrigidas']}.",
+                flush=True,
+            )
+        else:
+            print(
+                "✅ V91 vínculos exatos verificados: "
+                "nenhuma prisão precisou ser realocada.",
+                flush=True,
+            )
+
+    except Exception as erro:
+        print(
+            "⚠️ V91 reparo de vínculos ignorou falha sem derrubar o bot: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+
+print(
+    "✅ V91 carregada — prisões por RG exato e BO/perícias somente "
+    "com documento explicitamente identificado; falsos vínculos removidos.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
