@@ -14526,8 +14526,11 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
     doc.add_page_break()
 
     docx_add_heading(doc, '11. INFORMANTES', 1)
-    docx_add_pessoas(doc, dados.get('informantes', []), 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.')
-    docx_add_paragraph(doc, dados.get('resumos', {}).get('informantes'))
+    docx_add_pessoas(
+        doc,
+        dados.get('informantes', []),
+        'Nenhum informante foi identificado automaticamente nos tópicos da mesa.',
+    )
     doc.add_page_break()
 
     docx_add_heading(doc, 'ASSINATURAS INSTITUCIONAIS', 1)
@@ -17223,7 +17226,7 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
             detalhes = [
                 f"RG: {seguro(pessoa.get('rg'))}",
                 f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}",
-                f"Observações: {seguro((pessoa.get('periculosidade') or '') + ' ' + (pessoa.get('observacoes') or ''))}",
+                f"Observações: {_v98_texto_observacoes_pessoa(pessoa)}",
             ]
             ly = y - 0.76 * cm
             for det in detalhes:
@@ -17234,74 +17237,113 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
         return y
 
     def assinaturas(y: float) -> float:
-        registros = obter_assinaturas_dossie(dados)
-        assinatura = registros[0] if registros else {
-            "titulo": "DIRETOR",
-            "nome": "Arthur Fleker",
-            "texto": "",
-            "imagem": None,
-        }
+        registros = list(obter_assinaturas_dossie(dados) or [])
 
-        y = quebra(y, 3.15 * cm)
-        caixa_w = min(largura_util - 1.60 * cm, 11.80 * cm)
-        caixa_h = 2.65 * cm
-        x = (largura - caixa_w) / 2
+        while len(registros) < 2:
+            if len(registros) == 0:
+                registros.append({
+                    "titulo": "DIRETOR GERAL",
+                    "nome": "Diretor Geral",
+                    "texto": "",
+                    "imagem": None,
+                })
+            else:
+                registros.append({
+                    "titulo": "DIRETOR DICOR",
+                    "nome": "Arthur Fleker",
+                    "texto": "Arthur Fleker",
+                    "imagem": None,
+                })
 
-        c.setFillColor(colors.HexColor("#F7F3E9"))
-        c.setStrokeColor(cores["linha"])
-        c.roundRect(
-            x,
-            y - caixa_h,
-            caixa_w,
-            caixa_h,
-            5,
-            fill=1,
-            stroke=1,
-        )
+        registros = registros[:2]
 
-        arquivo = (
-            limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
-            or assinatura.get("imagem")
-        )
-        if arquivo and Path(str(arquivo)).exists():
-            desenhar_imagem(
-                arquivo,
-                x + 0.35 * cm,
-                y - 1.34 * cm,
-                caixa_w - 0.70 * cm,
-                1.20 * cm,
+        y = quebra(y, 3.35 * cm)
+
+        gap = 0.38 * cm
+        total_w = min(largura_util - 0.45 * cm, 16.55 * cm)
+        caixa_w = (total_w - gap) / 2
+        caixa_h = 2.78 * cm
+        x0 = (largura - total_w) / 2
+
+        for idx_ass, assinatura in enumerate(registros):
+            x = x0 + idx_ass * (caixa_w + gap)
+
+            c.setFillColor(colors.HexColor("#F7F3E9"))
+            c.setStrokeColor(cores["linha"])
+            c.roundRect(
+                x,
+                y - caixa_h,
+                caixa_w,
+                caixa_h,
+                5,
+                fill=1,
+                stroke=1,
             )
-        else:
-            c.setFillColor(cores["texto_suave"])
-            c.setFont("Courier-Oblique", 10.2)
+
+            arquivo = (
+                limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
+                or assinatura.get("imagem")
+                or assinatura.get("arquivo")
+            )
+
+            if arquivo and Path(str(arquivo)).exists():
+                desenhar_imagem(
+                    arquivo,
+                    x + 0.24 * cm,
+                    y - 1.32 * cm,
+                    caixa_w - 0.48 * cm,
+                    1.15 * cm,
+                )
+            else:
+                nome_fallback = str(
+                    assinatura.get("texto")
+                    or assinatura.get("nome")
+                    or "Autoridade"
+                )
+                c.setFillColor(cores["texto_suave"])
+                c.setFont("Courier-Oblique", 8.6)
+                c.drawCentredString(
+                    x + caixa_w / 2,
+                    y - 0.88 * cm,
+                    nome_fallback[:36],
+                )
+
+            c.setStrokeColor(cores["texto_suave"])
+            c.line(
+                x + 0.34 * cm,
+                y - 1.50 * cm,
+                x + caixa_w - 0.34 * cm,
+                y - 1.50 * cm,
+            )
+
+            nome_ass = str(
+                assinatura.get("nome")
+                or assinatura.get("texto")
+                or "AUTORIDADE"
+            ).upper()
+
+            titulo_ass = str(
+                assinatura.get("titulo")
+                or assinatura.get("cargo")
+                or "AUTORIDADE"
+            ).upper()
+
+            c.setFillColor(cores["texto"])
+            c.setFont("Courier-Bold", 8.7)
             c.drawCentredString(
-                largura / 2,
-                y - 0.92 * cm,
-                "Arthur Fleker",
+                x + caixa_w / 2,
+                y - 1.91 * cm,
+                nome_ass[:36],
             )
 
-        c.setStrokeColor(cores["texto_suave"])
-        c.line(
-            x + 0.55 * cm,
-            y - 1.53 * cm,
-            x + caixa_w - 0.55 * cm,
-            y - 1.53 * cm,
-        )
+            c.setFont("Courier", 8.0)
+            c.drawCentredString(
+                x + caixa_w / 2,
+                y - 2.25 * cm,
+                titulo_ass[:34],
+            )
 
-        c.setFillColor(cores["texto"])
-        c.setFont("Courier-Bold", 10.2)
-        c.drawCentredString(
-            largura / 2,
-            y - 1.93 * cm,
-            "ARTHUR FLEKER",
-        )
-        c.setFont("Courier", 9.2)
-        c.drawCentredString(
-            largura / 2,
-            y - 2.28 * cm,
-            "DIRETOR",
-        )
-        return y - 2.95 * cm
+        return y - 3.08 * cm
 
     # Capa / identificação
     titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
@@ -17375,9 +17417,11 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
     y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['baus', 'bau', 'baú']), y)
 
     y = nova_secao('11. INFORMANTES')
-    y = pessoas(dados.get('informantes', []), y, 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.')
-    y = subtitulo('Observações', y)
-    y = texto(dados.get('resumos', {}).get('informantes') or 'Sem registros textuais adicionais.', y)
+    y = pessoas(
+        dados.get('informantes', []),
+        y,
+        'Nenhum informante foi identificado automaticamente nos tópicos da mesa.',
+    )
 
     # Sem partes 12 e 13: apenas encerramento institucional não numerado.
     y = nova_secao('ASSINATURAS INSTITUCIONAIS')
@@ -76227,6 +76271,803 @@ print(
     flush=True,
 )
 
+
+
+# =====================================================
+# V98 — DOSSIÊ COMPLETO
+# 2 ASSINATURAS + INTELIGÊNCIA DO BANCO NAS PESSOAS
+# =====================================================
+# Mantém integralmente o modelo V95/V96/V97.
+# Mudanças:
+# - Diretor Geral + Diretor DICOR no dossiê;
+# - informantes sem repetição do texto bruto;
+# - lideranças/integrantes enriquecidos POR RG EXATO com dados do Banco.
+
+_V98_COLETAR_DADOS_ANTES = coletar_dados_operacionais_mesa
+
+
+def _v98_valor_util(valor: Any) -> str:
+    s = str(valor or "").strip()
+
+    if normalizar_busca(s) in {
+        "",
+        "nao informado",
+        "nao informada",
+        "n/i",
+        "ni",
+        "nenhum",
+        "nenhuma",
+    }:
+        return ""
+
+    return s
+
+
+def _v98_texto_observacoes_pessoa(
+    pessoa: Dict[str, Any],
+) -> str:
+    """
+    Texto enxuto para caber no cartão do modelo aprovado.
+    Remove duplicações de 'Não informado'.
+    """
+    partes: List[str] = []
+
+    periculosidade = _v98_valor_util(
+        pessoa.get("periculosidade")
+    )
+    observacoes = _v98_valor_util(
+        pessoa.get("observacoes")
+    )
+    banco = _v98_valor_util(
+        pessoa.get("observacoes_banco")
+    )
+
+    for valor in (
+        periculosidade,
+        observacoes,
+        banco,
+    ):
+        if not valor:
+            continue
+
+        if valor not in partes:
+            partes.append(valor)
+
+    if not partes:
+        return "Não informado"
+
+    return " | ".join(partes)[:310]
+
+
+def _v98_assinatura_diretor_geral() -> Dict[str, Any]:
+    registros = carregar_assinaturas_dossie()
+    registro = dict(
+        registros.get("delegado_geral") or {}
+    )
+
+    imagem = caminho_assinatura_registrada(
+        registro
+    )
+
+    if not imagem:
+        imagem = caminho_arquivo_configurado(
+            str(
+                globals().get(
+                    "ASSINATURA_DELEGADO_GERAL_IMAGEM",
+                    "",
+                )
+                or ""
+            ),
+            [
+                "assinatura_delegado_geral.png",
+                "assinatura_delegado_geral.jpg",
+                "assinatura_delegado_geral.jpeg",
+            ],
+        )
+
+    nome_padrao = str(
+        globals().get(
+            "ASSINATURA_DELEGADO_GERAL_NOME",
+            "",
+        )
+        or ""
+    ).strip()
+
+    nome = (
+        str(registro.get("nome") or "").strip()
+        or nome_padrao
+        or "Diretor Geral"
+    )
+
+    return {
+        "slot": "delegado_geral",
+        "titulo": "DIRETOR GERAL",
+        "cargo": "Diretor Geral",
+        "nome": nome,
+        "texto": str(
+            registro.get("texto")
+            or nome
+        ),
+        "imagem": (
+            str(imagem)
+            if imagem
+            else ""
+        ),
+        "arquivo": (
+            str(imagem)
+            if imagem
+            else ""
+        ),
+        "usuario_id": int(
+            registro.get("usuario_id") or 0
+        ),
+    }
+
+
+def obter_assinaturas_dossie(
+    dados: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Dossiês:
+      1. Diretor Geral;
+      2. Arthur Fleker — Diretor DICOR.
+
+    Mandados continuam usando a função própria de comparecimento.
+    """
+    geral = _v98_assinatura_diretor_geral()
+
+    dicor = dict(
+        _v68_assinatura_arthur()
+    )
+    dicor["titulo"] = "DIRETOR DICOR"
+    dicor["cargo"] = "Diretor DICOR"
+
+    return [
+        geral,
+        dicor,
+    ]
+
+
+def _v98_rg_normalizado(
+    valor: Any,
+) -> str:
+    try:
+        return _banco_normalizar_rg(
+            valor
+        )
+    except Exception:
+        return re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            str(valor or ""),
+        ).upper()
+
+
+def _v98_data_curta(
+    valor: Any,
+) -> str:
+    s = str(valor or "").strip()
+
+    if not s:
+        return ""
+
+    try:
+        base = s.replace(
+            "Z",
+            "+00:00",
+        )
+        dt = datetime.datetime.fromisoformat(
+            base
+        )
+        return dt.strftime(
+            "%d/%m/%Y"
+        )
+    except Exception:
+        pass
+
+    m = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b",
+        s,
+    )
+
+    if m:
+        dia, mes, ano = m.groups()
+
+        if len(ano) == 2:
+            ano = "20" + ano
+
+        return (
+            f"{int(dia):02d}/"
+            f"{int(mes):02d}/"
+            f"{ano}"
+        )
+
+    return s[:18]
+
+
+def _v98_enriquecer_pessoas_banco_sync(
+    dados: Dict[str, Any],
+) -> Dict[str, int]:
+    """
+    Enriquecimento estrito por RG.
+    Nunca associa por nome, imagem ou semelhança.
+    """
+    stats = {
+        "pessoas": 0,
+        "enriquecidas": 0,
+        "veiculos": 0,
+        "prisoes": 0,
+    }
+
+    alvos: List[Dict[str, Any]] = []
+
+    # Somente lideranças e integrantes, como solicitado.
+    for chave in (
+        "liderancas",
+        "integrantes",
+    ):
+        for pessoa in list(
+            dados.get(chave) or []
+        ):
+            if not isinstance(
+                pessoa,
+                dict,
+            ):
+                continue
+
+            rg = _v98_rg_normalizado(
+                pessoa.get("rg")
+            )
+
+            if not rg:
+                continue
+
+            alvos.append(pessoa)
+
+    if not alvos:
+        return stats
+
+    stats["pessoas"] = len(alvos)
+
+    rgs_alvo = {
+        _v98_rg_normalizado(
+            pessoa.get("rg")
+        )
+        for pessoa in alvos
+        if _v98_rg_normalizado(
+            pessoa.get("rg")
+        )
+    }
+
+    individuos: Dict[
+        str,
+        Dict[str, Any],
+    ] = {}
+
+    veiculos: Dict[
+        str,
+        List[Dict[str, Any]],
+    ] = {}
+
+    prisoes: Dict[
+        str,
+        List[Dict[str, Any]],
+    ] = {}
+
+    try:
+        inicializar_banco_dicor()
+
+        with _banco_conexao() as db:
+            for row in db.execute(
+                """
+                SELECT rg, nome, telefone, status,
+                       faccao_atual, cargo_faccao
+                FROM individuos
+                """
+            ).fetchall():
+                item = dict(row)
+                rg_n = _v98_rg_normalizado(
+                    item.get("rg")
+                )
+
+                if rg_n in rgs_alvo:
+                    individuos[rg_n] = item
+
+            for row in db.execute(
+                """
+                SELECT placa, modelo, cor, proprietario_rg,
+                       local_ultimo_avistamento, atualizado_em
+                FROM veiculos
+                WHERE TRIM(COALESCE(proprietario_rg,'')) <> ''
+                ORDER BY atualizado_em DESC, id DESC
+                """
+            ).fetchall():
+                item = dict(row)
+                rg_n = _v98_rg_normalizado(
+                    item.get(
+                        "proprietario_rg"
+                    )
+                )
+
+                if rg_n not in rgs_alvo:
+                    continue
+
+                veiculos.setdefault(
+                    rg_n,
+                    [],
+                ).append(item)
+
+            for row in db.execute(
+                """
+                SELECT rg_texto, data_prisao, pena_total,
+                       multa_total, infracoes_quantidade,
+                       criado_em
+                FROM historico_prisoes
+                WHERE TRIM(COALESCE(rg_texto,'')) <> ''
+                ORDER BY criado_em DESC, id DESC
+                """
+            ).fetchall():
+                item = dict(row)
+                rg_n = _v98_rg_normalizado(
+                    item.get("rg_texto")
+                )
+
+                if rg_n not in rgs_alvo:
+                    continue
+
+                prisoes.setdefault(
+                    rg_n,
+                    [],
+                ).append(item)
+
+    except Exception as erro:
+        print(
+            "⚠️ V98 banco/dossiê: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+        return stats
+
+    for pessoa in alvos:
+        rg = _v98_rg_normalizado(
+            pessoa.get("rg")
+        )
+
+        if not rg:
+            continue
+
+        partes: List[str] = []
+
+        # ---------------- VEÍCULOS ----------------
+        carros = veiculos.get(
+            rg,
+            [],
+        )
+
+        if carros:
+            resumo_carros: List[str] = []
+
+            for carro in carros[:3]:
+                placa = _v98_valor_util(
+                    carro.get("placa")
+                )
+                modelo = _v98_valor_util(
+                    carro.get("modelo")
+                )
+
+                if placa and modelo:
+                    resumo_carros.append(
+                        f"{placa} ({modelo})"
+                    )
+                elif placa:
+                    resumo_carros.append(
+                        placa
+                    )
+                elif modelo:
+                    resumo_carros.append(
+                        modelo
+                    )
+
+            if resumo_carros:
+                extra = (
+                    f" +{len(carros) - 3}"
+                    if len(carros) > 3
+                    else ""
+                )
+
+                partes.append(
+                    "Veículos: "
+                    + ", ".join(
+                        resumo_carros
+                    )
+                    + extra
+                )
+
+                stats["veiculos"] += len(
+                    carros
+                )
+
+        # ---------------- ÚLTIMA PRISÃO ----------------
+        lista_prisoes = prisoes.get(
+            rg,
+            [],
+        )
+
+        if lista_prisoes:
+            ultima = lista_prisoes[0]
+
+            data = _v98_data_curta(
+                ultima.get("data_prisao")
+                or ultima.get("criado_em")
+            )
+            pena = _v98_valor_util(
+                ultima.get("pena_total")
+            )
+            infracoes = int(
+                ultima.get(
+                    "infracoes_quantidade"
+                )
+                or 0
+            )
+
+            info_ultima: List[str] = []
+
+            if data:
+                info_ultima.append(
+                    data
+                )
+
+            if pena:
+                info_ultima.append(
+                    f"pena {pena}"
+                )
+
+            if infracoes:
+                info_ultima.append(
+                    f"{infracoes} infração"
+                    + (
+                        "ões"
+                        if infracoes != 1
+                        else ""
+                    )
+                )
+
+            if info_ultima:
+                partes.append(
+                    "Última prisão: "
+                    + " • ".join(
+                        info_ultima
+                    )
+                )
+
+            if len(lista_prisoes) > 1:
+                partes.append(
+                    "Prisões registradas: "
+                    f"{len(lista_prisoes)}"
+                )
+
+            stats["prisoes"] += len(
+                lista_prisoes
+            )
+
+        # ---------------- TELEFONE ----------------
+        individuo = individuos.get(
+            rg
+        ) or {}
+
+        telefone = _v98_valor_util(
+            individuo.get("telefone")
+        )
+
+        if telefone:
+            partes.append(
+                f"Telefone: {telefone}"
+            )
+
+        if partes:
+            pessoa[
+                "observacoes_banco"
+            ] = " | ".join(
+                partes
+            )[:270]
+
+            stats["enriquecidas"] += 1
+
+    return stats
+
+
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[
+        Dict[str, Any]
+    ] = None,
+) -> Dict[str, Any]:
+    """
+    Preserva o coletor V96/V97.
+    Acrescenta dados do Banco depois que RGs/fotos já foram definidos.
+    """
+    dados = await _V98_COLETAR_DADOS_ANTES(
+        canal,
+        mesa,
+        interaction,
+        pasta_dossie,
+        dados_confirmacao=dados_confirmacao,
+    )
+
+    try:
+        stats = await asyncio.to_thread(
+            _v98_enriquecer_pessoas_banco_sync,
+            dados,
+        )
+
+        if stats.get(
+            "enriquecidas"
+        ):
+            print(
+                "✅ V98 dossiê/banco: "
+                f"{stats['enriquecidas']} "
+                "pessoa(s) enriquecida(s) por RG exato.",
+                flush=True,
+            )
+
+    except Exception as erro:
+        # O Banco nunca impede a geração do dossiê.
+        print(
+            "⚠️ V98 enriquecimento ignorado "
+            "sem interromper o dossiê: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+    return dados
+
+
+def docx_add_pessoas(
+    doc,
+    pessoas: List[Dict[str, str]],
+    vazio: str,
+):
+    """
+    DOCX alinhado ao PDF:
+    foto, nome, RG, função e observações enriquecidas.
+    """
+    if not pessoas:
+        docx_add_paragraph(
+            doc,
+            vazio,
+        )
+        return
+
+    table = doc.add_table(
+        rows=1,
+        cols=5,
+    )
+    table.style = "Table Grid"
+
+    headers = [
+        "Foto",
+        "Nome",
+        "RG",
+        "Função/Cargo",
+        "Observações",
+    ]
+
+    for idx, header in enumerate(
+        headers
+    ):
+        cell = table.cell(
+            0,
+            idx,
+        )
+        docx_set_cell_shading(
+            cell,
+            DICOR_AZUL,
+        )
+        docx_set_cell_text(
+            cell,
+            header,
+            bold=True,
+            color="FFFFFF",
+        )
+
+    for pessoa in pessoas[:40]:
+        row = table.add_row().cells
+
+        row[0].text = ""
+        par = row[0].paragraphs[0]
+
+        if not docx_add_picture_safe(
+            par,
+            pessoa.get("foto", ""),
+            0.9,
+        ):
+            docx_set_cell_text(
+                row[0],
+                "Sem foto",
+            )
+
+        docx_set_cell_text(
+            row[1],
+            pessoa.get(
+                "nome",
+                "Não informado",
+            ),
+        )
+        docx_set_cell_text(
+            row[2],
+            pessoa.get(
+                "rg",
+                "Não informado",
+            ),
+        )
+        docx_set_cell_text(
+            row[3],
+            pessoa.get("funcao")
+            or pessoa.get("cargo")
+            or "Não informado",
+        )
+        docx_set_cell_text(
+            row[4],
+            _v98_texto_observacoes_pessoa(
+                pessoa
+            ),
+        )
+
+    doc.add_paragraph()
+
+
+def docx_add_assinaturas_dossie(
+    doc,
+    dados: Dict[str, Any],
+) -> None:
+    """
+    Diretor Geral + Diretor DICOR lado a lado.
+    """
+    assinaturas = list(
+        obter_assinaturas_dossie(
+            dados
+        )
+        or []
+    )[:2]
+
+    while len(assinaturas) < 2:
+        assinaturas.append({
+            "titulo": "AUTORIDADE",
+            "nome": "Não cadastrada",
+            "imagem": "",
+        })
+
+    tabela = doc.add_table(
+        rows=4,
+        cols=2,
+    )
+
+    try:
+        tabela.alignment = (
+            WD_TABLE_ALIGNMENT.CENTER
+        )
+    except Exception:
+        pass
+
+    for col, assinatura in enumerate(
+        assinaturas
+    ):
+        p_img = tabela.cell(
+            0,
+            col,
+        ).paragraphs[0]
+
+        try:
+            p_img.alignment = (
+                WD_ALIGN_PARAGRAPH.CENTER
+            )
+        except Exception:
+            pass
+
+        imagem = (
+            limpar_imagem_assinatura_dossie(
+                assinatura.get(
+                    "imagem"
+                )
+            )
+            if assinatura.get("imagem")
+            else None
+        )
+
+        if imagem and Path(
+            str(imagem)
+        ).exists():
+            try:
+                p_img.add_run().add_picture(
+                    str(imagem),
+                    width=Inches(2.55),
+                )
+            except Exception:
+                p_img.add_run(
+                    str(
+                        assinatura.get(
+                            "nome"
+                        )
+                        or "Autoridade"
+                    )
+                )
+        else:
+            run = p_img.add_run(
+                str(
+                    assinatura.get("texto")
+                    or assinatura.get("nome")
+                    or "Autoridade"
+                )
+            )
+            try:
+                run.italic = True
+                run.font.size = Pt(13)
+                run.font.name = (
+                    "Segoe Script"
+                )
+            except Exception:
+                pass
+
+        linha = tabela.cell(
+            1,
+            col,
+        ).paragraphs[0]
+        linha.text = (
+            "____________________________"
+        )
+
+        nome_p = tabela.cell(
+            2,
+            col,
+        ).paragraphs[0]
+        nome_p.text = str(
+            assinatura.get("nome")
+            or "AUTORIDADE"
+        ).upper()
+
+        cargo_p = tabela.cell(
+            3,
+            col,
+        ).paragraphs[0]
+        cargo_p.text = str(
+            assinatura.get("titulo")
+            or assinatura.get("cargo")
+            or "AUTORIDADE"
+        ).upper()
+
+        for p in (
+            linha,
+            nome_p,
+            cargo_p,
+        ):
+            try:
+                p.alignment = (
+                    WD_ALIGN_PARAGRAPH.CENTER
+                )
+            except Exception:
+                pass
+
+        try:
+            for run in nome_p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+
+            for run in cargo_p.runs:
+                run.font.size = Pt(8.5)
+
+        except Exception:
+            pass
+
+
+print(
+    "✅ V98 carregada — dossiê com Diretor Geral + Diretor DICOR, "
+    "informantes sem texto duplicado e líderes/membros enriquecidos "
+    "pelo Banco via RG exato.",
+    flush=True,
+)
 
 if __name__ == '__main__':
     asyncio.run(main())
