@@ -9270,10 +9270,12 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
             if dicor and Path(dicor).exists():
                 c.drawImage(str(dicor), largura - 1.35 * cm - logo_w, logo_y, width=logo_w, height=logo_h, preserveAspectRatio=True, anchor="c", mask="auto")
             c.setFillColor(colors.HexColor("#111111"))
-            c.setFont("Helvetica-Bold", 10.2)
+            # V92: título institucional maior, mantendo exatamente o mesmo
+            # posicionamento e o mesmo modelo visual aprovado.
+            c.setFont("Helvetica-Bold", 15.8)
             c.drawCentredString(largura / 2, altura - 2.05 * cm, "POLÍCIA FEDERAL - DICOR")
-            c.setFont("Helvetica", 7.8)
-            c.drawCentredString(largura / 2, altura - 2.45 * cm, "CAPITAL MORADA DO VALLEY")
+            c.setFont("Helvetica-Bold", 9.4)
+            c.drawCentredString(largura / 2, altura - 2.48 * cm, "CAPITAL MORADA DO VALLEY")
         except Exception as erro_brasoes:
             print(f"⚠️ Falha ao desenhar brasões no PDF: {erro_brasoes}")
 
@@ -9719,7 +9721,8 @@ def configurar_docx(doc: Any, dados: Dict[str, Any]) -> None:
         )
         run.bold = True
         run.font.color.rgb = RGBColor.from_string(DICOR_AZUL)
-        run.font.size = Pt(8.5)
+        # V92: mesma identidade, apenas com presença institucional maior.
+        run.font.size = Pt(11.5)
     except Exception as erro_header:
         print(f"⚠️ Falha ao montar cabeçalho DOCX com brasões: {erro_header}")
         p_header = header.paragraphs[0]
@@ -14882,7 +14885,18 @@ async def _canal_topico_do_atendimento(
 
     canal_atual = getattr(interaction, 'channel', None)
     if canal_atual is not None and hasattr(canal_atual, 'send'):
-        return canal_atual
+        # V93: nunca usa o canal temporário de procurado como destino silencioso
+        # da autorização. Só aceita o canal atual se ele for exatamente o canal
+        # do BO já conhecido no contexto/atendimento.
+        atual_id = int(getattr(canal_atual, 'id', 0) or 0)
+        ids_bo = {
+            int(contexto.get('area_id') or 0),
+            int((atendimento or {}).get('area_id') or 0),
+            int((atendimento or {}).get('thread_id') or 0),
+        }
+        ids_bo.discard(0)
+        if atual_id in ids_bo:
+            return canal_atual
     return None
 
 
@@ -15753,14 +15767,57 @@ async def _canal_exato_autorizacao_boletim(
 async def _solicitacao_pendente_mesmo_boletim(
     tipo: str,
     atendimento_id: Any,
+    contexto_atual: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    """
+    V93: cada pedido do mesmo BO é independente.
+
+    Antes, qualquer PENDENTE do mesmo tipo+BO bloqueava todos os próximos.
+    Agora somente reutiliza uma autorização se for o MESMO pedido_id ou o
+    MESMO canal temporário. Fluxos legados sem identificador continuam
+    usando a regra antiga para não criar duplicata acidental.
+    """
+    contexto_atual = dict(contexto_atual or {})
+    pedido_atual = str(contexto_atual.get('pedido_id') or '').strip()
+    canal_atual = str(
+        contexto_atual.get('canal_provisorio_id')
+        or contexto_atual.get('canal_temporario_id')
+        or ''
+    ).strip()
+
     for item in carregar_autorizacoes().values():
         if str(item.get('tipo')) != str(tipo):
             continue
         if str((item.get('contexto') or {}).get('atendimento_id')) != str(atendimento_id):
             continue
-        if str(item.get('status') or '').upper() in {'PENDENTE', 'PROCESSANDO'}:
+        if str(item.get('status') or '').upper() not in {'PENDENTE', 'PROCESSANDO'}:
+            continue
+
+        ctx = dict(item.get('contexto') or {})
+        pedido_item = str(ctx.get('pedido_id') or '').strip()
+        canal_item = str(
+            ctx.get('canal_provisorio_id')
+            or ctx.get('canal_temporario_id')
+            or (item.get('dados') or {}).get('_canal_temporario_id')
+            or (item.get('dados') or {}).get('_canal_fluxo_id')
+            or ''
+        ).strip()
+
+        if pedido_atual:
+            if pedido_item == pedido_atual:
+                return item
+            continue
+
+        if canal_atual:
+            if canal_item == canal_atual:
+                return item
+            continue
+
+        # Compatibilidade com solicitações realmente antigas, que não tinham
+        # pedido_id nem canal temporário.
+        if not pedido_item and not canal_item:
             return item
+
     return None
 
 
@@ -15808,7 +15865,7 @@ async def criar_solicitacao_autorizacao(
     await _adicionar_administradores_ao_topico(canal, interaction.guild)
 
     existente = await _solicitacao_pendente_mesmo_boletim(
-        tipo, contexto.get('atendimento_id')
+        tipo, contexto.get('atendimento_id'), contexto
     )
     if existente:
         mensagem_existente = None
@@ -60113,7 +60170,12 @@ class FinalizarProcuradoView(View):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         dados = dict(dados)
+        pedido_id = str(
+            dados.get('_pedido_id')
+            or f'PRQ-TEMP-{int(canal.id)}'
+        )
         dados.update({
+            '_pedido_id': pedido_id,
             '_canal_temporario_id': int(canal.id),
             '_canal_fluxo_id': int(canal.id),
             '_solicitante_id': int(dados.get('autor_id') or interaction.user.id),
@@ -60136,6 +60198,21 @@ class FinalizarProcuradoView(View):
             'procurado_solicitado_em': atendimento.get('procurado_solicitado_em') or agora_br(),
             'procurado_canal_temporario_id': int(canal.id),
         })
+
+        # V93: preserva cada procurado do mesmo boletim separadamente.
+        pedido = {
+            'id': pedido_id,
+            'dados': dict(dados),
+            'status': 'fotos_confirmadas',
+            'solicitante_id': int(dados.get('autor_id') or interaction.user.id),
+            'solicitante_nome': str(dados.get('autor_nome') or interaction.user),
+            'solicitado_em': dados.get('solicitado_em') or agora_br(),
+            'canal_fluxo_id': int(canal.id),
+        }
+        _guardar_pedido_atendimento(
+            atendimento, 'procurado_pedidos', pedido_id, pedido
+        )
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
 
         try:
             if eh_inspetor_mais:
@@ -60166,9 +60243,16 @@ class FinalizarProcuradoView(View):
                     'atendimento_id': atendimento.get('id'),
                     'area_id': area_id,
                     'canal_provisorio_id': int(canal.id),
+                    'pedido_id': pedido_id,
                 },
             )
             atendimento['procurado_autorizacao_id'] = solicitacao['id']
+            pedido['status'] = 'aguardando_autorizacao'
+            pedido['autorizacao_id'] = solicitacao['id']
+            pedido['dados'] = dict(dados)
+            _guardar_pedido_atendimento(
+                atendimento, 'procurado_pedidos', pedido_id, pedido
+            )
             atendimento['procurado_status'] = 'aguardando_autorizacao'
             atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
             dados['solicitacao_id'] = solicitacao['id']
@@ -74430,6 +74514,964 @@ async def _v91_reparar_vinculos_ready() -> None:
 print(
     "✅ V91 carregada — prisões por RG exato e BO/perícias somente "
     "com documento explicitamente identificado; falsos vínculos removidos.",
+    flush=True,
+)
+
+
+# =====================================================
+# V92 — DOSSIÊ DE MESAS: NOME EXATO + RG + INFORMANTES
+# =====================================================
+# O modelo visual NÃO é alterado.
+# Corrige somente a origem/extração dos dados exibidos no PDF/DOCX.
+
+_V92_COLETAR_DADOS_MESA_ANTES = coletar_dados_operacionais_mesa
+
+
+def _v92_limpar_markdown(valor: Any, limite: int = 160) -> str:
+    s = str(valor or "").replace("\u200b", " ").strip()
+    s = re.sub(r"[*_`>#]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" \t\r\n-–—:|")
+    if not s:
+        return ""
+    return s[:limite]
+
+
+def _v92_valor_nao_informado(valor: Any) -> bool:
+    n = normalizar_busca(str(valor or "")).strip()
+    return n in {
+        "",
+        "nao informado",
+        "nao informada",
+        "n/i",
+        "ni",
+        "nenhum",
+        "nenhuma",
+    }
+
+
+def _v92_extrair_rg_linha(linha: str) -> str:
+    """
+    Aceita:
+      RG: 40521
+      RG - 40521
+      RG 40521
+      Passaporte: 40521
+      Documento Nº 40521
+    Sem confundir números soltos de datas/URLs.
+    """
+    s = _v92_limpar_markdown(linha, 260)
+    padroes = (
+        r"(?i)\bRG\b\s*(?:N[º°o.]*)?\s*[:#=\-–—]?\s*([A-Z0-9][A-Z0-9.\-]{1,24})",
+        r"(?i)\bPASSAPORTE\b\s*(?:N[º°o.]*)?\s*[:#=\-–—]?\s*([A-Z0-9][A-Z0-9.\-]{1,24})",
+        r"(?i)\bDOCUMENTO\b\s*(?:N[º°o.]*)?\s*[:#=\-–—]?\s*([A-Z0-9][A-Z0-9.\-]{1,24})",
+    )
+    for padrao in padroes:
+        m = re.search(padrao, s)
+        if not m:
+            continue
+        rg = m.group(1).strip(" .,-–—")
+        # Rejeita palavras que o OCR às vezes cola após RG.
+        if normalizar_busca(rg) in {"nao", "informado", "informada", "n"}:
+            continue
+        if len(rg) >= 2:
+            return rg[:30]
+    return ""
+
+
+def _v92_extrair_nome_rotulado(linha: str) -> str:
+    s = _v92_limpar_markdown(linha, 260)
+    m = re.search(
+        r"(?i)^(?:NOME|INDIV[IÍ]DUO|PESSOA|MEMBRO|INTEGRANTE|"
+        r"L[IÍ]DER|LIDERAN[CÇ]A|INFORMANTE)\s*[:\-–—]\s*(.+)$",
+        s,
+    )
+    if not m:
+        return ""
+    return _v92_limpar_markdown(m.group(1), 120)
+
+
+def _v92_linha_parece_nome_solto(linha: str) -> bool:
+    s = _v92_limpar_markdown(linha, 140)
+    if len(s) < 3 or len(s) > 90:
+        return False
+    if not re.search(r"[A-Za-zÀ-ÿ]", s):
+        return False
+
+    n = normalizar_busca(s)
+    proibidos = (
+        "rg",
+        "passaporte",
+        "documento",
+        "funcao",
+        "cargo",
+        "posicao",
+        "observacao",
+        "periculosidade",
+        "telefone",
+        "placa",
+        "data",
+        "status",
+        "mensagem",
+        "enviado por",
+        "informacoes",
+    )
+    if any(n == p or n.startswith(p + " ") or n.startswith(p + ":") for p in proibidos):
+        return False
+
+    # Evita inferir frases inteiras como nome.
+    if len(s.split()) > 6:
+        return False
+    return True
+
+
+def _v92_extrair_campo_janela(
+    linhas: List[str],
+    inicio: int,
+    fim: int,
+    rotulos: List[str],
+    limite: int = 150,
+) -> str:
+    for linha in linhas[max(0, inicio):min(len(linhas), fim)]:
+        s = _v92_limpar_markdown(linha, 400)
+        for rotulo in rotulos:
+            m = re.search(
+                rf"(?i)\b{re.escape(rotulo)}\b\s*[:\-–—]\s*(.+)$",
+                s,
+            )
+            if m:
+                valor = _v92_limpar_markdown(m.group(1), limite)
+                if valor:
+                    return valor
+    return ""
+
+
+def extrair_blocos_pessoas(
+    textos: List[str],
+    funcao_padrao: str = "Integrante",
+) -> List[Dict[str, str]]:
+    """
+    V92:
+    - mantém o formato Nome: / RG:;
+    - reconhece NOME em uma linha e RG - 00000 na linha seguinte;
+    - funde entradas duplicadas sem perder RG;
+    - não exige que a palavra 'Nome:' exista.
+    """
+    pessoas: List[Dict[str, str]] = []
+    indice_por_nome: Dict[str, int] = {}
+
+    def adicionar(
+        nome: str,
+        rg: str = "",
+        cargo: str = "",
+        periculosidade: str = "",
+        observacoes: str = "",
+    ) -> None:
+        nome = _v92_limpar_markdown(nome, 120)
+        rg = _v92_limpar_markdown(rg, 40)
+        cargo = _v92_limpar_markdown(cargo, 120)
+        periculosidade = _v92_limpar_markdown(periculosidade, 100)
+        observacoes = _v92_limpar_markdown(observacoes, 260)
+
+        if not nome or not _v92_linha_parece_nome_solto(nome):
+            return
+
+        chave_nome = normalizar_busca(nome)
+        pos = indice_por_nome.get(chave_nome)
+
+        if pos is not None:
+            atual = pessoas[pos]
+            if rg and _v92_valor_nao_informado(atual.get("rg")):
+                atual["rg"] = rg
+            if cargo and (
+                _v92_valor_nao_informado(atual.get("cargo"))
+                or atual.get("cargo") == funcao_padrao
+            ):
+                atual["cargo"] = cargo
+                atual["funcao"] = cargo
+            if periculosidade:
+                atual["periculosidade"] = periculosidade
+            if observacoes:
+                atual["observacoes"] = observacoes
+            return
+
+        pessoas.append({
+            "nome": nome,
+            "rg": rg or "Não informado",
+            "cargo": cargo or funcao_padrao,
+            "funcao": cargo or funcao_padrao,
+            "periculosidade": periculosidade or "Não informado",
+            # deixa vazio quando realmente não há observação, evitando
+            # "Não informado Não informado" no cartão.
+            "observacoes": observacoes or "",
+            "foto": "",
+        })
+        indice_por_nome[chave_nome] = len(pessoas) - 1
+
+    for texto in textos:
+        linhas = [
+            _v92_limpar_markdown(x, 500)
+            for x in str(texto or "").splitlines()
+            if _v92_limpar_markdown(x, 500)
+        ]
+        if not linhas:
+            continue
+
+        nomes_rotulados: List[tuple[int, str]] = []
+        rgs: List[tuple[int, str]] = []
+
+        for i, linha in enumerate(linhas):
+            nome = _v92_extrair_nome_rotulado(linha)
+            if nome:
+                nomes_rotulados.append((i, nome))
+
+            rg = _v92_extrair_rg_linha(linha)
+            if rg:
+                rgs.append((i, rg))
+
+        # A) blocos com nome explicitamente rotulado.
+        for pos_nome, nome in nomes_rotulados:
+            rg = ""
+            for pos_rg, valor_rg in rgs:
+                if pos_nome <= pos_rg <= pos_nome + 10:
+                    rg = valor_rg
+                    break
+
+            cargo = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Função", "Funcao", "Cargo", "Posição", "Posicao"],
+                120,
+            )
+            periculosidade = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Grau de periculosidade", "Periculosidade"],
+                100,
+            )
+            obs = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Observações", "Observacoes", "Obs"],
+                260,
+            )
+            adicionar(nome, rg, cargo, periculosidade, obs)
+
+        # B) formato simples usado nas mesas:
+        #    COLA PINTO
+        #    RG - 40521
+        for pos_rg, rg in rgs:
+            # Se já existe um nome rotulado muito perto, ele já foi tratado.
+            if any(0 <= pos_rg - p <= 10 for p, _ in nomes_rotulados):
+                continue
+
+            nome_inferido = ""
+            for j in range(pos_rg - 1, max(-1, pos_rg - 4), -1):
+                if j < 0:
+                    break
+                candidato = linhas[j]
+                if _v92_linha_parece_nome_solto(candidato):
+                    nome_inferido = candidato
+                    break
+
+            if not nome_inferido:
+                continue
+
+            cargo = _v92_extrair_campo_janela(
+                linhas,
+                max(0, pos_rg - 3),
+                pos_rg + 7,
+                ["Função", "Funcao", "Cargo", "Posição", "Posicao"],
+                120,
+            )
+            obs = _v92_extrair_campo_janela(
+                linhas,
+                max(0, pos_rg - 3),
+                pos_rg + 7,
+                ["Observações", "Observacoes", "Obs"],
+                260,
+            )
+            adicionar(nome_inferido, rg, cargo, "", obs)
+
+        # C) Se houver nomes rotulados e RGs na mesma ordem, preenche
+        #    os RGs restantes sem usar números soltos.
+        nomes_sem_rg = [
+            p for p in pessoas
+            if _v92_valor_nao_informado(p.get("rg"))
+            and normalizar_busca(p.get("nome")) in {
+                normalizar_busca(n) for _, n in nomes_rotulados
+            }
+        ]
+        rgs_usados = {
+            str(p.get("rg"))
+            for p in pessoas
+            if not _v92_valor_nao_informado(p.get("rg"))
+        }
+        rgs_livres = [rg for _, rg in rgs if rg not in rgs_usados]
+
+        if len(nomes_sem_rg) == len(rgs_livres) and rgs_livres:
+            for p, rg in zip(nomes_sem_rg, rgs_livres):
+                p["rg"] = rg
+
+    return pessoas[:80]
+
+
+def _v92_ocr_rg_sync(caminho: str) -> str:
+    """
+    OCR é usado SOMENTE para completar RG ausente de foto já vinculada.
+    Nunca inventa número solto: exige rótulo RG/Passaporte/Documento.
+    """
+    try:
+        p = Path(str(caminho or ""))
+        if not p.exists() or not p.is_file():
+            return ""
+        if "_banco_ocr_ler_imagem_sync" not in globals():
+            return ""
+
+        linhas_ocr = _banco_ocr_ler_imagem_sync(str(p))
+        for texto_linha, _confianca in linhas_ocr:
+            rg = _v92_extrair_rg_linha(str(texto_linha))
+            if rg:
+                return rg
+
+        # Alguns OCRs quebram "RG" e o número em linhas seguidas.
+        textos = [str(x[0]).strip() for x in linhas_ocr if str(x[0]).strip()]
+        for i, linha in enumerate(textos[:-1]):
+            if normalizar_busca(linha) in {"rg", "passaporte", "documento"}:
+                candidato = _v92_limpar_markdown(textos[i + 1], 40)
+                if re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{1,24}", candidato, re.I):
+                    return candidato
+    except Exception:
+        return ""
+    return ""
+
+
+async def _v92_nome_original_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Fonte principal: mensagem original criada pelo próprio fluxo da mesa.
+    Assim uma linha "Local: ..." nunca substitui o nome da organização.
+    """
+    try:
+        async for msg in canal.history(limit=60, oldest_first=True):
+            texto_msg = coletar_texto_embed(msg)
+            if not texto_msg:
+                continue
+
+            # Mensagem oficial da criação da mesa.
+            padroes = (
+                r"(?im)Organiza[çc][ãa]o\s*/\s*Fam[ií]lia\s*[:\-–—]\s*(.+)$",
+                r"(?im)Fam[ií]lia\s*[:\-–—]\s*(.+)$",
+            )
+            for padrao in padroes:
+                m = re.search(padrao, texto_msg)
+                if not m:
+                    continue
+                valor = _v92_limpar_markdown(m.group(1), 120)
+                if valor and not _v92_valor_nao_informado(valor):
+                    return valor
+    except Exception:
+        pass
+
+    if isinstance(mesa, dict):
+        valor = _v92_limpar_markdown(mesa.get("familia"), 120)
+        if valor and not _v92_valor_nao_informado(valor):
+            return valor
+
+    return ""
+
+
+async def _v92_enriquecer_pessoas_com_fotos_ocr(
+    dados: Dict[str, Any],
+) -> None:
+    evidencias = list(dados.get("evidencias") or [])
+
+    mapa = (
+        ("liderancas", "liderancas"),
+        ("integrantes", "integrantes"),
+        ("informantes", "informantes"),
+    )
+
+    for campo, topico in mapa:
+        pessoas = list(dados.get(campo) or [])
+        imagens = [
+            ev
+            for ev in evidencias
+            if ev.get("tipo") == "imagem"
+            and normalizar_busca(ev.get("topico")) == normalizar_busca(topico)
+            and str(ev.get("local") or "").strip()
+        ]
+
+        # Reforça o vínculo visual por ordem do próprio tópico.
+        for idx, pessoa in enumerate(pessoas):
+            if idx < len(imagens) and not str(pessoa.get("foto") or "").strip():
+                pessoa["foto"] = str(imagens[idx].get("local") or "")
+
+        # OCR somente quando o RG textual não foi encontrado.
+        for pessoa in pessoas:
+            if not _v92_valor_nao_informado(pessoa.get("rg")):
+                continue
+            foto = str(pessoa.get("foto") or "").strip()
+            if not foto:
+                continue
+            rg_ocr = await asyncio.to_thread(
+                _v92_ocr_rg_sync,
+                foto,
+            )
+            if rg_ocr:
+                pessoa["rg"] = rg_ocr
+
+        dados[campo] = pessoas
+
+
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    V92 envolve o coletor aprovado.
+    O layout do documento continua sendo o mesmo.
+    """
+    dados = await _V92_COLETAR_DADOS_MESA_ANTES(
+        canal,
+        mesa,
+        interaction,
+        pasta_dossie,
+        dados_confirmacao=dados_confirmacao,
+    )
+
+    # -------------------------------------------------
+    # NOME DA MESA / ORGANIZAÇÃO
+    # -------------------------------------------------
+    nome_original = await _v92_nome_original_mesa(
+        canal,
+        mesa,
+    )
+
+    if nome_original:
+        comunidade_anterior = str(dados.get("comunidade") or "")
+
+        # "Comunidade Investigada" representa a organização informada na
+        # criação da mesa. Não aceita mais "Local:" como substituto.
+        dados["comunidade"] = nome_original
+
+        faccao_atual = str(dados.get("faccao") or "")
+        if (
+            _v92_valor_nao_informado(faccao_atual)
+            or normalizar_busca(faccao_atual) == normalizar_busca(comunidade_anterior)
+            or normalizar_busca(faccao_atual) == normalizar_busca(canal.name)
+        ):
+            dados["faccao"] = nome_original
+
+        # Nome automático da operação também acompanha a mesa correta,
+        # exceto se o usuário informou um nome de operação manualmente.
+        nome_manual = str(
+            (dados_confirmacao or {}).get("nome")
+            or ""
+        ).strip()
+        if not nome_manual:
+            dados["nome_operacao"] = texto_limpo_dossie(
+                f"OPERAÇÃO {nome_original.upper()}",
+                150,
+            )
+            dados["nome"] = dados["nome_operacao"]
+
+    # -------------------------------------------------
+    # PESSOAS / RG / FOTOS
+    # -------------------------------------------------
+    # Refaz a extração com o parser V92 para garantir que os dados retornados
+    # por versões antigas do coletor também recebam a correção.
+    textos_por_topico = dict(
+        dados.get("textos_por_topico")
+        or {}
+    )
+
+    dados["liderancas"] = extrair_blocos_pessoas(
+        list(textos_por_topico.get("liderancas") or [])
+        + list(textos_por_topico.get("painel") or []),
+        "Liderança",
+    )
+    dados["integrantes"] = extrair_blocos_pessoas(
+        list(textos_por_topico.get("integrantes") or [])
+        + list(textos_por_topico.get("chat") or []),
+        "Integrante",
+    )
+    dados["informantes"] = extrair_blocos_pessoas(
+        list(textos_por_topico.get("informantes") or []),
+        "Informante",
+    )
+
+    await _v92_enriquecer_pessoas_com_fotos_ocr(
+        dados
+    )
+
+    return dados
+
+
+print(
+    "✅ V92 carregada — dossiê mantém o modelo aprovado; "
+    "nome original da mesa, RGs e fotos de informantes corrigidos, "
+    "cabeçalho institucional ampliado.",
+    flush=True,
+)
+
+
+# =====================================================
+# V93 — PROCURADOS MÚLTIPLOS + RECUPERAÇÃO DE AUTORIZAÇÕES
+# =====================================================
+# - Cada canal temporário/procurado possui pedido_id próprio.
+# - Um pedido pendente no mesmo BO não bloqueia os demais.
+# - Autorização SEMPRE vai para o tópico correto do BO; nunca cai no canal
+#   temporário como fallback silencioso.
+# - No startup, recupera cadastros persistidos que já têm as duas fotos e
+#   estavam esperando autorização, sem refazer o cadastro.
+# - Confirmação pós-publicação é independente por procurado.
+
+_V93_RECUPERACAO_EXECUTADA = False
+_V93_RECUPERACAO_LOCK = asyncio.Lock()
+
+
+def _v93_pedido_id_dados(canal_id: int, dados: Dict[str, Any]) -> str:
+    return str(
+        dados.get('_pedido_id')
+        or dados.get('pedido_id')
+        or f'PRQ-TEMP-{int(canal_id)}'
+    ).strip()
+
+
+def _v93_autorizacao_corresponde_canal(
+    item: Dict[str, Any],
+    atendimento_id: Any,
+    canal_id: int,
+    pedido_id: str,
+) -> bool:
+    if str(item.get('tipo') or '') != 'procurado_boletim':
+        return False
+    if str(item.get('status') or '').upper() not in {'PENDENTE', 'PROCESSANDO'}:
+        return False
+    ctx = dict(item.get('contexto') or {})
+    if str(ctx.get('atendimento_id')) != str(atendimento_id):
+        return False
+
+    pid = str(ctx.get('pedido_id') or '').strip()
+    cid = int(
+        ctx.get('canal_provisorio_id')
+        or ctx.get('canal_temporario_id')
+        or (item.get('dados') or {}).get('_canal_temporario_id')
+        or (item.get('dados') or {}).get('_canal_fluxo_id')
+        or 0
+    )
+    return bool(
+        (pedido_id and pid == pedido_id)
+        or (canal_id and cid == int(canal_id))
+    )
+
+
+async def _v93_mensagem_autorizacao_existe(item: Dict[str, Any]) -> bool:
+    try:
+        canal_id = int(item.get('canal_autorizacao_id') or 0)
+        msg_id = int(item.get('mensagem_id') or 0)
+        if not canal_id or not msg_id:
+            return False
+        canal = await obter_canal_bot(canal_id)
+        if canal is None or not hasattr(canal, 'fetch_message'):
+            return False
+        await canal.fetch_message(msg_id)
+        return True
+    except Exception:
+        return False
+
+
+async def _v93_criar_autorizacao_recuperada(
+    guild: discord.Guild,
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    canal_temp_id: int,
+    pedido_id: str,
+) -> Dict[str, Any]:
+    # Localiza SOMENTE o tópico real do BO.
+    canal_bo = await _v59_canal_bo(atendimento, dados)
+    if canal_bo is None or not hasattr(canal_bo, 'send'):
+        raise RuntimeError('TOPICO_BO_NAO_LOCALIZADO')
+
+    await _adicionar_administradores_ao_topico(canal_bo, guild)
+
+    codigo = (
+        f"AUT-REC-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-"
+        f"{secrets.token_hex(3).upper()}"
+    )
+    solicitante_id = int(
+        dados.get('autor_id')
+        or dados.get('_solicitante_id')
+        or 0
+    )
+    solicitante = guild.get_member(solicitante_id) if solicitante_id else None
+    solicitante_nome = str(
+        dados.get('autor_nome')
+        or dados.get('_solicitante_nome')
+        or solicitante
+        or 'Agente não identificado'
+    )
+
+    dados_auth = dict(dados)
+    dados_auth.update({
+        '_pedido_id': pedido_id,
+        '_canal_temporario_id': int(canal_temp_id),
+        '_canal_fluxo_id': int(canal_temp_id),
+        '_solicitante_id': solicitante_id,
+        '_solicitante_nome': solicitante_nome,
+        '_solicitacao_id': codigo,
+    })
+    contexto = {
+        'atendimento_id': atendimento.get('id'),
+        'area_id': int(getattr(canal_bo, 'id', 0) or atendimento.get('area_id') or 0),
+        'canal_provisorio_id': int(canal_temp_id),
+        'pedido_id': pedido_id,
+        'recuperado_v93': True,
+    }
+    solicitacao = {
+        'id': codigo,
+        'tipo': 'procurado_boletim',
+        'status': 'PENDENTE',
+        'dados': dados_auth,
+        'contexto': contexto,
+        'solicitante_id': solicitante_id,
+        'solicitante_nome': solicitante_nome,
+        'solicitado_em': agora_br(),
+        'canal_solicitante_id': int(getattr(canal_bo, 'id', 0) or 0),
+        'canal_autorizacao_id': int(getattr(canal_bo, 'id', 0) or 0),
+        'mensagem_id': None,
+        'autorizacao_na_origem': True,
+        'versao_fluxo': 'V93_RECUPERADO',
+    }
+
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+
+    embed = discord.Embed(
+        title='🚨 Autorizar procurado do boletim',
+        description=resumo_dados_autorizacao('procurado_boletim', dados_auth),
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(name='Solicitação', value=f'`{codigo}`', inline=True)
+    embed.add_field(name='Pedido', value=f'`{pedido_id}`', inline=True)
+    embed.add_field(
+        name='Solicitado por',
+        value=(
+            f'{solicitante.mention if solicitante else solicitante_nome}\n'
+            f'`{solicitante_id or "N/I"}`'
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name='Boletim',
+        value=f'`{atendimento.get("numero") or "N/I"}`',
+        inline=True,
+    )
+    embed.set_footer(
+        text='Decisão no próprio tópico • cada procurado possui autorização independente'
+    )
+
+    msg = await canal_bo.send(
+        content=(
+            f'{mencoes_inspetor_mais(guild)}\n'
+            '🔐 **Solicitação de procurado recuperada e aguardando decisão.**'
+        ),
+        embed=embed,
+        view=AutorizacaoBoletimViewV3(),
+        allowed_mentions=discord.AllowedMentions(
+            roles=True, users=True, everyone=False,
+        ),
+    )
+    solicitacao['mensagem_id'] = int(msg.id)
+    todos = carregar_autorizacoes()
+    todos[codigo] = solicitacao
+    salvar_autorizacoes(todos)
+    return solicitacao
+
+
+async def _v93_recuperar_procurados_pendentes() -> Dict[str, int]:
+    async with _V93_RECUPERACAO_LOCK:
+        stats = {
+            'analisados': 0,
+            'ja_corretos': 0,
+            'recuperados': 0,
+            'ignorados_sem_fotos': 0,
+            'ja_publicados': 0,
+            'falhas': 0,
+        }
+
+        guild = bot.get_guild(int(GUILD_ID or 0)) if int(GUILD_ID or 0) else None
+        if guild is None:
+            guild = next(iter(getattr(bot, 'guilds', []) or []), None)
+        if guild is None:
+            return stats
+
+        # Garante que a memória reflita o /data após deploy.
+        await asyncio.to_thread(carregar_cadastros_pendentes_memoria)
+        todos_auth = carregar_autorizacoes()
+
+        for canal_id, original in list(cadastros_pendentes.items()):
+            if not isinstance(original, dict) or not original.get('_fluxo_fotos_v58'):
+                continue
+            dados = dict(original)
+            stats['analisados'] += 1
+
+            rg = _banco_normalizar_rg(str(dados.get('rg') or ''))
+            if rg and procurar_por_rg(rg):
+                stats['ja_publicados'] += 1
+                continue
+
+            # Recupera apenas fluxos que já chegaram à fase final/fotos.
+            status = normalizar_busca(str(dados.get('status') or ''))
+            if not _fotos_procurado_validas(dados):
+                stats['ignorados_sem_fotos'] += 1
+                continue
+            if status and not any(
+                alvo in status
+                for alvo in ('aguardando autoriz', 'fotos confirm', 'finaliz', 'pendente')
+            ):
+                # Mesmo que o status antigo esteja vazio, fotos válidas + atendimento
+                # são suficientes para preservar o cadastro; status incompatível não é.
+                continue
+
+            atendimento = _v56_atendimento_por_id(dados.get('_atendimento_id'))
+            if not atendimento:
+                stats['falhas'] += 1
+                await enviar_log(
+                    f'⚠️ V93 não recuperou canal `{canal_id}`: atendimento ausente.'
+                )
+                continue
+
+            pedido_id = _v93_pedido_id_dados(int(canal_id), dados)
+            dados.update({
+                '_pedido_id': pedido_id,
+                '_canal_temporario_id': int(canal_id),
+                '_canal_fluxo_id': int(canal_id),
+                '_canal_bo_origem_id': int(
+                    dados.get('_canal_bo_origem_id')
+                    or atendimento.get('area_id')
+                    or atendimento.get('thread_id')
+                    or 0
+                ),
+                'numero_boletim': atendimento.get('numero'),
+                'boletim': atendimento.get('numero'),
+            })
+
+            existente = None
+            for item in todos_auth.values():
+                if _v93_autorizacao_corresponde_canal(
+                    item, atendimento.get('id'), int(canal_id), pedido_id
+                ):
+                    existente = item
+                    break
+
+            if existente and await _v93_mensagem_autorizacao_existe(existente):
+                stats['ja_corretos'] += 1
+                dados['solicitacao_id'] = existente.get('id')
+                dados['status'] = 'AGUARDANDO AUTORIZAÇÃO'
+                cadastros_pendentes[int(canal_id)] = dados
+                continue
+
+            # Se havia registro quebrado para este canal, arquiva como órfão.
+            if existente:
+                todos = carregar_autorizacoes()
+                existente['status'] = 'CANCELADO_ORFAO_V93'
+                existente['cancelado_em'] = agora_br()
+                existente['motivo_cancelamento'] = (
+                    'Autorização do canal temporário não estava visível no tópico do BO.'
+                )
+                todos[str(existente.get('id'))] = existente
+                salvar_autorizacoes(todos)
+
+            try:
+                nova = await _v93_criar_autorizacao_recuperada(
+                    guild, atendimento, dados, int(canal_id), pedido_id
+                )
+                dados['solicitacao_id'] = nova['id']
+                dados['status'] = 'AGUARDANDO AUTORIZAÇÃO'
+                cadastros_pendentes[int(canal_id)] = dados
+
+                pedido = {
+                    'id': pedido_id,
+                    'dados': dict(nova.get('dados') or dados),
+                    'status': 'aguardando_autorizacao',
+                    'autorizacao_id': nova['id'],
+                    'solicitante_id': int(dados.get('autor_id') or 0),
+                    'solicitante_nome': str(dados.get('autor_nome') or ''),
+                    'solicitado_em': dados.get('solicitado_em') or agora_br(),
+                    'canal_fluxo_id': int(canal_id),
+                }
+                _guardar_pedido_atendimento(
+                    atendimento, 'procurado_pedidos', pedido_id, pedido
+                )
+                atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+                stats['recuperados'] += 1
+                todos_auth = carregar_autorizacoes()
+            except Exception as erro:
+                stats['falhas'] += 1
+                await enviar_log(
+                    f'❌ V93 recuperação procurado | canal `{canal_id}` | '
+                    f'RG `{dados.get("rg")}` | {type(erro).__name__}: {erro}'
+                )
+
+        await asyncio.to_thread(salvar_cadastros_pendentes)
+        return stats
+
+
+# Confirmação independente por pedido/RG no tópico do BO.
+async def _v59_notificar_publicacao_no_bo(
+    atendimento: Dict[str, Any],
+    dados: Dict[str, Any],
+    autorizador: discord.Member,
+    url: str,
+) -> Optional[discord.Message]:
+    canal = await _v59_canal_bo(atendimento, dados)
+    if canal is None:
+        await enviar_log(
+            f'⚠️ V93 publicou procurado, mas não localizou o tópico do BO | '
+            f'BO `{atendimento.get("numero")}` | RG `{dados.get("rg")}` | {url}'
+        )
+        return None
+
+    chave = str(
+        dados.get('_pedido_id')
+        or dados.get('_canal_temporario_id')
+        or _banco_normalizar_rg(str(dados.get('rg') or ''))
+        or secrets.token_hex(4)
+    )
+    confirmacoes = atendimento.get('procurado_confirmacoes_bo') or {}
+    if not isinstance(confirmacoes, dict):
+        confirmacoes = {}
+
+    existente_id = int(
+        (confirmacoes.get(chave) or {}).get('mensagem_id')
+        if isinstance(confirmacoes.get(chave), dict)
+        else 0
+        or 0
+    )
+    if existente_id and hasattr(canal, 'fetch_message'):
+        try:
+            return await canal.fetch_message(existente_id)
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title='✅ PROCURADO CADASTRADO',
+        description='O cadastro foi autorizado e publicado no canal oficial.',
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.add_field(
+        name='👤 Indivíduo',
+        value=(
+            f'**{dados.get("nome", "Não informado")}**\n'
+            f'RG: `{dados.get("rg", "Não informado")}`'
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name='📋 Boletim',
+        value=f'`{atendimento.get("numero") or dados.get("numero_boletim") or "N/I"}`',
+        inline=True,
+    )
+    embed.add_field(
+        name='🔐 Autorização',
+        value=f'**{cargo_autorizador(autorizador)}**\n{autorizador.mention}',
+        inline=True,
+    )
+    embed.add_field(
+        name='🔗 Publicação oficial',
+        value=f'[Abrir mensagem do procurado]({url})',
+        inline=False,
+    )
+    embed.set_footer(text='Polícia Federal • DICOR • Cadastro vinculado ao boletim')
+    mensagem = await canal.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=False, everyone=False
+        ),
+    )
+
+    confirmacoes[chave] = {
+        'mensagem_id': int(mensagem.id),
+        'mensagem_url': mensagem.jump_url,
+        'rg': dados.get('rg'),
+        'nome': dados.get('nome'),
+        'publicado_em': agora_br(),
+    }
+    atendimento['procurado_confirmacoes_bo'] = confirmacoes
+    # Campos antigos continuam apontando para a confirmação mais recente.
+    atendimento['procurado_confirmacao_bo_mensagem_id'] = mensagem.id
+    atendimento['procurado_confirmacao_bo_mensagem_url'] = mensagem.jump_url
+    atendimento['procurado_confirmacao_bo_em'] = agora_br()
+    atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    return mensagem
+
+
+@bot.tree.command(
+    name='recuperarprocuradospendentes',
+    description='Recupera procurados já prontos que ficaram sem autorização no BO.',
+)
+async def recuperar_procurados_pendentes_v93(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            '❌ Apenas Inspetor+ pode executar esta recuperação.', ephemeral=True
+        )
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    stats = await _v93_recuperar_procurados_pendentes()
+    await interaction.followup.send(
+        '✅ **RECUPERAÇÃO DE PROCURADOS CONCLUÍDA**\n'
+        f'• Cadastros analisados: `{stats["analisados"]}`\n'
+        f'• Autorizações já corretas: `{stats["ja_corretos"]}`\n'
+        f'• Autorizações recriadas no BO: `{stats["recuperados"]}`\n'
+        f'• Já publicados: `{stats["ja_publicados"]}`\n'
+        f'• Ainda sem as duas fotos: `{stats["ignorados_sem_fotos"]}`\n'
+        f'• Falhas: `{stats["falhas"]}`\n\n'
+        'Nenhum procurado existente foi apagado.',
+        ephemeral=True,
+    )
+
+
+@bot.listen('on_ready')
+async def _v93_recuperacao_automatica_ready() -> None:
+    global _V93_RECUPERACAO_EXECUTADA
+    if _V93_RECUPERACAO_EXECUTADA:
+        return
+    _V93_RECUPERACAO_EXECUTADA = True
+    await asyncio.sleep(25)
+    try:
+        stats = await _v93_recuperar_procurados_pendentes()
+        print(
+            '✅ V93 recuperação de procurados: '
+            f'analisados={stats["analisados"]} | '
+            f'já corretos={stats["ja_corretos"]} | '
+            f'recuperados={stats["recuperados"]} | '
+            f'falhas={stats["falhas"]}.',
+            flush=True,
+        )
+    except Exception as erro:
+        print(
+            f'⚠️ V93 recuperação automática ignorou falha: '
+            f'{type(erro).__name__}: {erro}',
+            flush=True,
+        )
+
+
+print(
+    '✅ V93 carregada — vários procurados por BO possuem autorizações independentes; '
+    'pendências antigas são recuperadas automaticamente.',
     flush=True,
 )
 
