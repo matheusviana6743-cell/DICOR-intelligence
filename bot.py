@@ -16651,7 +16651,7 @@ def _linhas_pdf_seguras(c, texto: Any, fonte: str, tam: float, largura_max: floa
     return saida or ['Não informado']
 
 
-def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float) -> None:
+def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float, titulo_tam: float = 17.0, subtitulo_tam: float = 11.2) -> None:
     """Aplica a moldura anexada, fundo mais claro e marca d'água visível."""
     cores = _cores_documento_dicor()
     c.setFillColor(colors.HexColor('#6F716D'))
@@ -16679,11 +16679,11 @@ def _desenhar_fundo_moldura_dicor(c, largura: float, altura: float) -> None:
         traceback.print_exc()
 
     c.setFillColor(cores['dourado_claro'])
-    c.setFont('Courier-Bold', 17.0)
+    c.setFont('Courier-Bold', float(titulo_tam))
     c.drawCentredString(largura / 2, altura - 1.50 * cm, 'POLÍCIA FEDERAL  •  DICOR')
     c.setFillColor(cores['branco'])
-    c.setFont('Courier-Bold', 11.2)
-    c.drawCentredString(largura / 2, altura - 2.02 * cm, 'CAPITAL MORADA DO VALLEY')
+    c.setFont('Courier-Bold', float(subtitulo_tam))
+    c.drawCentredString(largura / 2, altura - 2.08 * cm, 'CAPITAL MORADA DO VALLEY')
 
 
 def gerar_pdf_comparecimento(registro: Dict[str, Any], caminho_pdf: Path) -> None:
@@ -16891,7 +16891,7 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
         return s or padrao
 
     def iniciar_pagina(titulo: str, continuacao: bool = False) -> float:
-        _desenhar_fundo_moldura_dicor(c, largura, altura)
+        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=13.2)
         c.saveState()
         _alpha_pdf(c, 0.82, 1)
         c.setFillColor(cores['painel'])
@@ -75472,6 +75472,12 @@ async def _v93_recuperacao_automatica_ready() -> None:
 print(
     '✅ V93 carregada — vários procurados por BO possuem autorizações independentes; '
     'pendências antigas são recuperadas automaticamente.',
+    flush=True,
+)
+
+print(
+    "✅ V94 carregada — somente o cabeçalho do dossiê foi ampliado: "
+    "POLÍCIA FEDERAL • DICOR = 23 pt; cidade = 13.2 pt; modelo preservado.",
     flush=True,
 )
 
