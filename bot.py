@@ -72464,5 +72464,1344 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V90 — ESTABILIDADE GERAL + CRIAÇÃO PROFISSIONAL DE FICHAS
+# =====================================================
+# Revisão estrutural aplicada sobre o arquivo completo:
+# - criação não usa mais wait_for no canal principal;
+# - clique em Criar ficha recebe ACK imediatamente;
+# - coleta em sala temporária privada, com múltiplas mensagens/anexos;
+# - OCR e I/O pesado sempre fora do event loop;
+# - imagens grandes são comprimidas antes do armazenamento permanente;
+# - B2 respeita o circuit breaker persistente V89; fallback local é automático;
+# - sincronização textual de BO passa a ser streaming;
+# - pressão de RAM desacelera rotinas de snapshot antes de causar OOM;
+# - tarefas V90 têm done-callback e log de exceções não recuperadas;
+# - nenhuma função operacional anterior é removida.
+
+import threading as _v90_threading
+
+V90_FICHA_STATE_JSON = DATA_DIR / "v90_fichas_temporarias.json"
+V90_FICHA_TMP_DIR = Path("/tmp/dicor-v90-fichas")
+V90_FICHA_TMP_DIR.mkdir(parents=True, exist_ok=True)
+V90_FICHA_EXPIRA_MINUTOS = max(
+    10,
+    env_int("DICOR_FICHA_TEMP_MINUTOS", 30),
+)
+V90_FICHA_MAX_ANEXOS = max(
+    5,
+    min(30, env_int("DICOR_FICHA_MAX_ANEXOS", 20)),
+)
+V90_FICHA_MAX_MB = max(
+    8,
+    min(30, env_int("DICOR_FICHA_MAX_MB", 20)),
+)
+V90_RAM_SOFT_MB = max(
+    320.0,
+    float(os.getenv("DICOR_RAM_SOFT_LIMIT_MB", "410") or 410),
+)
+V90_RAM_HARD_MB = max(
+    V90_RAM_SOFT_MB + 20.0,
+    float(os.getenv("DICOR_RAM_HARD_LIMIT_MB", "455") or 455),
+)
+
+_V90_FICHA_STATE_LOCK = _v90_threading.RLock()
+_V90_FICHA_PROCESS_LOCKS: Dict[int, asyncio.Lock] = {}
+_V90_OCR_SEMAFORO = asyncio.Semaphore(1)
+_V90_TASKS: set[asyncio.Task] = set()
+_V90_MEMORY_PRESSURE = False
+_V90_READY_ONCE = False
+
+
+def _v90_ram_mb_sync() -> float:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                if linha.startswith("VmRSS:"):
+                    return float(linha.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _v90_task(coro: Any, nome: str) -> asyncio.Task:
+    tarefa = asyncio.create_task(coro, name=nome)
+    _V90_TASKS.add(tarefa)
+
+    def _fim(t: asyncio.Task) -> None:
+        _V90_TASKS.discard(t)
+        if t.cancelled():
+            return
+        try:
+            erro = t.exception()
+        except Exception:
+            return
+        if erro is not None:
+            print(
+                f"⚠️ V90 tarefa `{t.get_name()}` terminou com erro: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    tarefa.add_done_callback(_fim)
+    return tarefa
+
+
+def _v90_ficha_state_load() -> Dict[str, Dict[str, Any]]:
+    with _V90_FICHA_STATE_LOCK:
+        try:
+            if not V90_FICHA_STATE_JSON.exists():
+                return {}
+            bruto = json.loads(V90_FICHA_STATE_JSON.read_text(encoding="utf-8"))
+            return bruto if isinstance(bruto, dict) else {}
+        except Exception:
+            return {}
+
+
+def _v90_ficha_state_save(dados: Dict[str, Dict[str, Any]]) -> None:
+    with _V90_FICHA_STATE_LOCK:
+        V90_FICHA_STATE_JSON.parent.mkdir(parents=True, exist_ok=True)
+        tmp = V90_FICHA_STATE_JSON.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(dados, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        tmp.replace(V90_FICHA_STATE_JSON)
+
+
+def _v90_ficha_get(canal_id: int) -> Optional[Dict[str, Any]]:
+    dados = _v90_ficha_state_load()
+    item = dados.get(str(int(canal_id or 0)))
+    return dict(item) if isinstance(item, dict) else None
+
+
+def _v90_ficha_set(canal_id: int, item: Dict[str, Any]) -> None:
+    dados = _v90_ficha_state_load()
+    dados[str(int(canal_id))] = dict(item)
+    _v90_ficha_state_save(dados)
+
+
+def _v90_ficha_del(canal_id: int) -> None:
+    dados = _v90_ficha_state_load()
+    dados.pop(str(int(canal_id or 0)), None)
+    _v90_ficha_state_save(dados)
+    _V90_FICHA_PROCESS_LOCKS.pop(int(canal_id or 0), None)
+
+
+def _v90_lock_canal(canal_id: int) -> asyncio.Lock:
+    cid = int(canal_id or 0)
+    lock = _V90_FICHA_PROCESS_LOCKS.get(cid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _V90_FICHA_PROCESS_LOCKS[cid] = lock
+    return lock
+
+
+def _v90_sessao_vazia() -> Dict[str, Any]:
+    return {
+        "nome": "",
+        "rg": "",
+        "documento_tipo": "RG",
+        "telefone": "",
+        "faccao": "",
+        "cargo": "",
+        "placa": "",
+        "modelo": "",
+        "cor": "",
+        "local": "",
+        "ano": "",
+        "chassi": "",
+        "observacoes": "",
+        "texto_bruto": "",
+        "confianca": 0.0,
+        "arquivos": [],
+    }
+
+
+def _v90_eh_imagem(nome: str, mime: str) -> bool:
+    return str(mime or "").lower().startswith("image/") or Path(str(nome or "")).suffix.lower() in {
+        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"
+    }
+
+
+def _v90_comprimir_imagem_sync(origem: Path) -> Path:
+    """Comprime apenas imagens grandes; preserva screenshots menores para o OCR."""
+    if PILImage is None:
+        return origem
+    try:
+        tamanho = origem.stat().st_size
+        if tamanho < 1_500_000:
+            return origem
+        with PILImage.open(origem) as im:
+            imagem = im.convert("RGB")
+            maior = max(imagem.size)
+            if maior > 1900:
+                escala = 1900.0 / float(maior)
+                novo = (
+                    max(1, int(imagem.width * escala)),
+                    max(1, int(imagem.height * escala)),
+                )
+                imagem = imagem.resize(novo, PILImage.Resampling.LANCZOS)
+            destino = origem.with_suffix(".jpg")
+            imagem.save(destino, format="JPEG", quality=84, optimize=True)
+        if destino != origem:
+            try:
+                origem.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return destino
+    except Exception:
+        return origem
+
+
+def _v90_copiar_fallback_sync(origem: Path, usuario_id: int, nome: str) -> Path:
+    pasta = _BANCO_V3_UPLOAD_DIR / "v90" / str(int(usuario_id or 0))
+    pasta.mkdir(parents=True, exist_ok=True)
+    seguro = re.sub(r"[^0-9A-Za-z._-]+", "_", Path(nome).name)[:130] or "arquivo"
+    digest = _v78_hash_file(origem)[:16]
+    destino = pasta / f"{digest}-{seguro}"
+    if origem.suffix.lower() == ".jpg" and destino.suffix.lower() != ".jpg":
+        destino = destino.with_suffix(".jpg")
+    if not destino.exists() or destino.stat().st_size != origem.stat().st_size:
+        shutil.copy2(origem, destino)
+    return destino
+
+
+async def _v90_processar_anexo_ficha(
+    anexo: discord.Attachment,
+    usuario_id: int,
+    indice: int,
+) -> Dict[str, Any]:
+    nome_original = Path(str(getattr(anexo, "filename", "arquivo") or "arquivo")).name
+    mime = str(getattr(anexo, "content_type", "") or "")
+    tamanho_declarado = int(getattr(anexo, "size", 0) or 0)
+    limite = V90_FICHA_MAX_MB * 1024 * 1024
+    if tamanho_declarado > limite:
+        raise ValueError(
+            f"`{nome_original}` excede o limite de {V90_FICHA_MAX_MB} MB."
+        )
+
+    pasta = V90_FICHA_TMP_DIR / str(int(usuario_id or 0))
+    await asyncio.to_thread(pasta.mkdir, parents=True, exist_ok=True)
+    seguro = re.sub(r"[^0-9A-Za-z._-]+", "_", nome_original)[:130] or "arquivo"
+    tmp = pasta / f"{int(time.time()*1000)}-{indice}-{secrets.token_hex(3)}-{seguro}"
+
+    linhas_ocr: List[Tuple[str, float]] = []
+    dados_detectados: Dict[str, Any] = {}
+    imagem = _v90_eh_imagem(nome_original, mime)
+
+    try:
+        try:
+            await asyncio.wait_for(
+                anexo.save(str(tmp), use_cached=True),
+                timeout=45,
+            )
+        except Exception:
+            bruto = await asyncio.wait_for(
+                anexo.read(use_cached=False),
+                timeout=45,
+            )
+            await asyncio.to_thread(
+                _v85_escrever_bytes_confirmado,
+                tmp,
+                bytes(bruto),
+            )
+
+        if imagem and BANCO_OCR_ATIVO and RapidOCR is not None:
+            async with _V90_OCR_SEMAFORO:
+                try:
+                    linhas_ocr = await asyncio.wait_for(
+                        asyncio.to_thread(_banco_ocr_ler_imagem_sync, str(tmp)),
+                        timeout=45,
+                    )
+                    dados_detectados = await asyncio.to_thread(
+                        _banco_v3_extrair_dados,
+                        linhas_ocr,
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"⚠️ V90 OCR excedeu 45s em {nome_original}; ficha continua sem bloquear.",
+                        flush=True,
+                    )
+                except Exception as erro:
+                    print(
+                        f"⚠️ V90 OCR ignorou {nome_original}: {type(erro).__name__}: {erro}",
+                        flush=True,
+                    )
+
+        arquivo_para_salvar = tmp
+        if imagem:
+            arquivo_para_salvar = await asyncio.to_thread(
+                _v90_comprimir_imagem_sync,
+                tmp,
+            )
+
+        path_final = ""
+        armazenamento = "LOCAL"
+
+        if _v86_b2_direto_ativo():
+            try:
+                resultado_b2 = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _v87_upload_write_only_sync,
+                        arquivo_para_salvar,
+                        "fichas/criacao-v90",
+                    ),
+                    timeout=90,
+                )
+                path_final = str(resultado_b2.get("pointer") or "")
+                if not path_final.startswith("b2://"):
+                    raise RuntimeError("B2 não retornou ponteiro válido.")
+                armazenamento = "B2"
+            except Exception as erro:
+                # A V89 persiste o bloqueio quando for cap/credencial.
+                try:
+                    if _v87_erro_cap_ou_bloqueio(erro):
+                        _v89_b2_block(erro)
+                except Exception:
+                    pass
+                print(
+                    f"⚠️ V90 ficha usou fallback local para {nome_original}: "
+                    f"{type(erro).__name__}: {erro}",
+                    flush=True,
+                )
+
+        if not path_final:
+            destino = await asyncio.to_thread(
+                _v90_copiar_fallback_sync,
+                arquivo_para_salvar,
+                usuario_id,
+                nome_original,
+            )
+            path_final = str(destino)
+            armazenamento = "LOCAL"
+
+        tipo_hint = "individuo"
+        if dados_detectados.get("placa"):
+            tipo_hint = "veiculo"
+        elif dados_detectados.get("rg"):
+            tipo_hint = "documento"
+
+        tamanho_final = 0
+        if path_final.startswith("b2://"):
+            try:
+                tamanho_final = int(arquivo_para_salvar.stat().st_size)
+            except Exception:
+                tamanho_final = tamanho_declarado
+        else:
+            try:
+                tamanho_final = Path(path_final).stat().st_size
+            except Exception:
+                tamanho_final = tamanho_declarado
+
+        return {
+            "nome": nome_original,
+            "path": path_final,
+            "url": str(getattr(anexo, "url", "") or ""),
+            "mime": ("image/jpeg" if Path(path_final).suffix.lower() == ".jpg" else mime),
+            "tamanho": int(tamanho_final or 0),
+            "imagem": bool(imagem),
+            "dados_detectados": dict(dados_detectados),
+            "tipo_hint": tipo_hint,
+            "armazenamento": armazenamento,
+        }
+    finally:
+        for candidato in {tmp, tmp.with_suffix(".jpg")}:
+            try:
+                await asyncio.to_thread(candidato.unlink, missing_ok=True)
+            except Exception:
+                pass
+
+
+def _v90_preview_embed(sessao: Dict[str, Any]) -> discord.Embed:
+    embed = _banco_v3_preview_embed(sessao)
+    embed.title = "📋 PRÉVIA FINAL • NOVA FICHA"
+    embed.description = (
+        "Confira os dados reconhecidos. Você pode corrigir qualquer campo antes de salvar. "
+        "A ficha só entra no banco depois de **Confirmar e salvar**."
+    )
+
+    extras = []
+    if sessao.get("cargo"):
+        extras.append(f"**Cargo:** {sessao.get('cargo')}")
+    if sessao.get("local"):
+        extras.append(f"**Local:** {sessao.get('local')}")
+    if sessao.get("ano"):
+        extras.append(f"**Ano:** {sessao.get('ano')}")
+    if sessao.get("chassi"):
+        extras.append(f"**Chassi:** {sessao.get('chassi')}")
+    if sessao.get("observacoes"):
+        extras.append(f"**Observações:** {str(sessao.get('observacoes'))[:500]}")
+    if extras:
+        embed.add_field(
+            name="📝 INFORMAÇÕES ADICIONAIS",
+            value="\n".join(extras)[:1024],
+            inline=False,
+        )
+
+    arquivos = list(sessao.get("arquivos") or [])
+    b2 = sum(1 for x in arquivos if str(x.get("path") or "").startswith("b2://"))
+    local = len(arquivos) - b2
+    embed.add_field(
+        name="💾 ARMAZENAMENTO",
+        value=f"B2: **{b2}** • fallback local: **{local}**",
+        inline=False,
+    )
+    embed.set_footer(text="DICOR • revisão obrigatória antes da gravação")
+    return embed
+
+
+def _v90_salvar_ficha_melhorada(sessao: Dict[str, Any], usuario_id: int) -> Dict[str, Any]:
+    """Usa o motor oficial e corrige a classificação visual indivíduo/RG depois do upsert."""
+    perfil = _banco_v3_salvar_ficha(sessao, usuario_id)
+    arquivos = list(sessao.get("arquivos") or [])
+    foto_pessoa = next(
+        (x for x in arquivos if x.get("imagem") and x.get("tipo_hint") == "individuo"),
+        None,
+    )
+    foto_doc = next(
+        (x for x in arquivos if x.get("imagem") and x.get("tipo_hint") == "documento"),
+        None,
+    )
+    foto_veiculo = next(
+        (x for x in arquivos if x.get("imagem") and x.get("tipo_hint") == "veiculo"),
+        None,
+    )
+
+    individuo = dict(perfil.get("individuo") or {}) if isinstance(perfil, dict) else {}
+    veiculo = dict(perfil.get("veiculo") or {}) if isinstance(perfil, dict) else {}
+
+    with _banco_conexao() as db:
+        iid = int(individuo.get("id") or 0)
+        if iid:
+            campos = []
+            valores = []
+            if foto_pessoa:
+                campos += ["foto_ficha_path=?", "foto_ficha_url=?"]
+                valores += [str(foto_pessoa.get("path") or ""), str(foto_pessoa.get("url") or "")]
+            if foto_doc:
+                campos += ["foto_rg_path=?", "foto_rg_url=?"]
+                valores += [str(foto_doc.get("path") or ""), str(foto_doc.get("url") or "")]
+            if campos:
+                valores.append(iid)
+                db.execute(
+                    f"UPDATE individuos SET {', '.join(campos)} WHERE id=?",
+                    valores,
+                )
+
+        vid = int(veiculo.get("id") or 0)
+        if vid and foto_veiculo:
+            db.execute(
+                "UPDATE veiculos SET foto_path=?, foto_url=?, atualizado_em=? WHERE id=?",
+                (
+                    str(foto_veiculo.get("path") or ""),
+                    str(foto_veiculo.get("url") or ""),
+                    _banco_agora_iso(),
+                    vid,
+                ),
+            )
+
+    tipo = str(perfil.get("tipo") or "") if isinstance(perfil, dict) else ""
+    rid = int(perfil.get("registro_id") or 0) if isinstance(perfil, dict) else 0
+    if tipo and rid:
+        atualizado = _banco_ficha_geral_carregar(tipo, rid)
+        if atualizado:
+            perfil = atualizado
+    return perfil
+
+
+class V90FichaPrincipalModal(Modal, title="Dados principais da ficha"):
+    def __init__(self, canal_id: int):
+        super().__init__(timeout=300)
+        self.canal_id = int(canal_id)
+        estado = _v90_ficha_get(self.canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        self.nome = TextInput(label="Nome", default=str(manual.get("nome") or "")[:120], required=False, max_length=120)
+        self.rg = TextInput(label="RG / Passaporte", default=str(manual.get("rg") or "")[:40], required=False, max_length=40)
+        self.telefone = TextInput(label="Telefone", default=str(manual.get("telefone") or "")[:80], required=False, max_length=80)
+        self.placa = TextInput(label="Placa", default=str(manual.get("placa") or "")[:16], required=False, max_length=16)
+        self.modelo_cor = TextInput(label="Modelo | Cor", default=f"{manual.get('modelo') or ''} | {manual.get('cor') or ''}"[:180], required=False, max_length=180)
+        for item in (self.nome, self.rg, self.telefone, self.placa, self.modelo_cor):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        partes = str(self.modelo_cor.value or "").split("|", 1)
+        estado = await asyncio.to_thread(_v90_ficha_get, self.canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        manual.update({
+            "nome": _banco_limpar_texto(self.nome.value, 120),
+            "rg": _banco_normalizar_rg(self.rg.value),
+            "telefone": _banco_limpar_texto(self.telefone.value, 80),
+            "placa": _banco_normalizar_placa(self.placa.value),
+            "modelo": _banco_limpar_texto(partes[0] if partes else "", 120),
+            "cor": _banco_limpar_texto(partes[1] if len(partes) > 1 else "", 80),
+        })
+        estado["manual"] = manual
+        await asyncio.to_thread(_v90_ficha_set, self.canal_id, estado)
+        await interaction.response.send_message(
+            "✅ Dados principais salvos nesta criação. Agora envie as imagens/textos e clique em **Processar e revisar**.",
+            ephemeral=True,
+        )
+
+
+class V90FichaExtrasModal(Modal, title="Informações adicionais"):
+    def __init__(self, canal_id: int, sessao: Optional[Dict[str, Any]] = None):
+        super().__init__(timeout=300)
+        self.canal_id = int(canal_id)
+        base = dict(sessao or {})
+        self.faccao = TextInput(label="Organização / facção", default=str(base.get("faccao") or "")[:120], required=False, max_length=120)
+        self.cargo = TextInput(label="Cargo / função", default=str(base.get("cargo") or "")[:120], required=False, max_length=120)
+        self.local = TextInput(label="Local / último local relacionado", default=str(base.get("local") or "")[:120], required=False, max_length=120)
+        self.ano_chassi = TextInput(label="Ano | Chassi", default=f"{base.get('ano') or ''} | {base.get('chassi') or ''}"[:180], required=False, max_length=180)
+        self.obs = TextInput(label="Observações", default=str(base.get("observacoes") or "")[:1000], required=False, max_length=1000, style=discord.TextStyle.paragraph)
+        for item in (self.faccao, self.cargo, self.local, self.ano_chassi, self.obs):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        partes = str(self.ano_chassi.value or "").split("|", 1)
+        estado = await asyncio.to_thread(_v90_ficha_get, self.canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        manual.update({
+            "faccao": _banco_limpar_texto(self.faccao.value, 120),
+            "cargo": _banco_limpar_texto(self.cargo.value, 120),
+            "local": _banco_limpar_texto(self.local.value, 120),
+            "ano": _banco_limpar_texto(partes[0] if partes else "", 40),
+            "chassi": _banco_limpar_texto(partes[1] if len(partes) > 1 else "", 120),
+            "observacoes": _banco_limpar_texto(self.obs.value, 1000),
+        })
+        estado["manual"] = manual
+        await asyncio.to_thread(_v90_ficha_set, self.canal_id, estado)
+        await interaction.response.send_message(
+            "✅ Informações adicionais salvas.",
+            ephemeral=True,
+        )
+
+
+async def _v90_apagar_sala(canal: Any, atraso: int = 5) -> None:
+    await asyncio.sleep(max(0, int(atraso)))
+    try:
+        cid = int(getattr(canal, "id", 0) or 0)
+        if cid:
+            await asyncio.to_thread(_v90_ficha_del, cid)
+        await canal.delete(reason="Fluxo de criação de ficha concluído")
+    except Exception:
+        pass
+
+
+class V90FichaPreviewPrincipalModal(Modal, title="Corrigir dados da prévia"):
+    def __init__(self, view_ref: "V90FichaPreviewView"):
+        super().__init__(timeout=300)
+        self.view_ref = view_ref
+        sessao = view_ref.sessao
+        self.nome = TextInput(label="Nome", default=str(sessao.get("nome") or "")[:120], required=False, max_length=120)
+        self.rg = TextInput(label="RG / Passaporte", default=str(sessao.get("rg") or "")[:40], required=False, max_length=40)
+        self.telefone = TextInput(label="Telefone", default=str(sessao.get("telefone") or "")[:80], required=False, max_length=80)
+        self.placa = TextInput(label="Placa", default=str(sessao.get("placa") or "")[:16], required=False, max_length=16)
+        self.modelo_cor = TextInput(label="Modelo | Cor", default=f"{sessao.get('modelo') or ''} | {sessao.get('cor') or ''}"[:180], required=False, max_length=180)
+        for item in (self.nome, self.rg, self.telefone, self.placa, self.modelo_cor):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        partes = str(self.modelo_cor.value or "").split("|", 1)
+        self.view_ref.sessao.update({
+            "nome": _banco_limpar_texto(self.nome.value, 120),
+            "rg": _banco_normalizar_rg(self.rg.value),
+            "telefone": _banco_limpar_texto(self.telefone.value, 80),
+            "placa": _banco_normalizar_placa(self.placa.value),
+            "modelo": _banco_limpar_texto(partes[0] if partes else "", 120),
+            "cor": _banco_limpar_texto(partes[1] if len(partes) > 1 else "", 80),
+        })
+        estado = await asyncio.to_thread(_v90_ficha_get, self.view_ref.canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        manual.update({
+            k: self.view_ref.sessao.get(k, "")
+            for k in ("nome", "rg", "telefone", "placa", "modelo", "cor")
+        })
+        estado["manual"] = manual
+        await asyncio.to_thread(_v90_ficha_set, self.view_ref.canal_id, estado)
+        await interaction.response.edit_message(
+            content="✅ Dados corrigidos. Revise novamente antes de salvar.",
+            embed=_v90_preview_embed(self.view_ref.sessao),
+            view=self.view_ref,
+        )
+
+
+class V90FichaPreviewExtrasModal(Modal, title="Corrigir informações adicionais"):
+    def __init__(self, view_ref: "V90FichaPreviewView"):
+        super().__init__(timeout=300)
+        self.view_ref = view_ref
+        sessao = view_ref.sessao
+        self.faccao = TextInput(label="Organização / facção", default=str(sessao.get("faccao") or "")[:120], required=False, max_length=120)
+        self.cargo = TextInput(label="Cargo / função", default=str(sessao.get("cargo") or "")[:120], required=False, max_length=120)
+        self.local = TextInput(label="Local", default=str(sessao.get("local") or "")[:120], required=False, max_length=120)
+        self.ano_chassi = TextInput(label="Ano | Chassi", default=f"{sessao.get('ano') or ''} | {sessao.get('chassi') or ''}"[:180], required=False, max_length=180)
+        self.obs = TextInput(label="Observações", default=str(sessao.get("observacoes") or "")[:1000], required=False, max_length=1000, style=discord.TextStyle.paragraph)
+        for item in (self.faccao, self.cargo, self.local, self.ano_chassi, self.obs):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        partes = str(self.ano_chassi.value or "").split("|", 1)
+        self.view_ref.sessao.update({
+            "faccao": _banco_limpar_texto(self.faccao.value, 120),
+            "cargo": _banco_limpar_texto(self.cargo.value, 120),
+            "local": _banco_limpar_texto(self.local.value, 120),
+            "ano": _banco_limpar_texto(partes[0] if partes else "", 40),
+            "chassi": _banco_limpar_texto(partes[1] if len(partes) > 1 else "", 120),
+            "observacoes": _banco_limpar_texto(self.obs.value, 1000),
+        })
+        estado = await asyncio.to_thread(_v90_ficha_get, self.view_ref.canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        manual.update({
+            k: self.view_ref.sessao.get(k, "")
+            for k in ("faccao", "cargo", "local", "ano", "chassi", "observacoes")
+        })
+        estado["manual"] = manual
+        await asyncio.to_thread(_v90_ficha_set, self.view_ref.canal_id, estado)
+        await interaction.response.edit_message(
+            content="✅ Informações adicionais corrigidas.",
+            embed=_v90_preview_embed(self.view_ref.sessao),
+            view=self.view_ref,
+        )
+
+
+class V90FichaPreviewView(View):
+    def __init__(self, autor_id: int, canal_id: int, sessao: Dict[str, Any]):
+        super().__init__(timeout=900)
+        self.autor_id = int(autor_id)
+        self.canal_id = int(canal_id)
+        self.sessao = sessao
+        self.processando = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.autor_id:
+            return True
+        await interaction.response.send_message("❌ Esta ficha pertence a outro agente.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Confirmar e salvar", emoji="✅", style=discord.ButtonStyle.success, row=0)
+    async def salvar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ACK literalmente antes de SQLite/backup/embed.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.processando:
+            return await interaction.followup.send("⏳ A ficha já está sendo salva.", ephemeral=True)
+        self.processando = True
+        try:
+            perfil = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _v90_salvar_ficha_melhorada,
+                    self.sessao,
+                    int(interaction.user.id),
+                ),
+                timeout=60,
+            )
+            await interaction.edit_original_response(
+                content="✅ **Ficha criada/atualizada com sucesso.**",
+                embed=_v63_embed_seguro(perfil),
+                view=V65FichaGeralView(int(interaction.user.id), perfil),
+            )
+            _v90_task(
+                _v90_atualizar_paineis_banco(),
+                f"v90-painel-pos-ficha-{interaction.id}",
+            )
+            _v90_task(
+                _v90_apagar_sala(interaction.channel, 45),
+                f"v90-apagar-sala-{self.canal_id}",
+            )
+        except asyncio.TimeoutError:
+            self.processando = False
+            await interaction.edit_original_response(
+                content="❌ A gravação demorou além do limite. Nada será duplicado automaticamente; tente novamente em alguns segundos.",
+                embed=None,
+                view=None,
+            )
+        except Exception as erro:
+            self.processando = False
+            traceback.print_exc()
+            try:
+                await enviar_log(
+                    f"❌ V90 salvar ficha | canal `{self.canal_id}` | "
+                    f"{type(erro).__name__}: {erro}\n```py\n{traceback.format_exc()[-2500:]}\n```"
+                )
+            except Exception:
+                pass
+            await interaction.edit_original_response(
+                content="❌ Não foi possível salvar a ficha. O diagnóstico completo foi enviado aos logs; a sala foi mantida para você tentar novamente.",
+                embed=None,
+                view=self,
+            )
+
+    @discord.ui.button(label="Corrigir dados", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
+    async def corrigir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(V90FichaPreviewPrincipalModal(self))
+
+    @discord.ui.button(label="Dados adicionais", emoji="📝", style=discord.ButtonStyle.secondary, row=0)
+    async def extras(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(V90FichaPreviewExtrasModal(self))
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.danger, row=0)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🗑️ Criação cancelada. A sala será removida.", ephemeral=True)
+        _v90_task(_v90_apagar_sala(interaction.channel, 2), f"v90-cancelar-{self.canal_id}")
+
+
+async def _v90_coletar_processar(interaction: discord.Interaction, canal_id: int, autor_id: int) -> None:
+    lock = _v90_lock_canal(canal_id)
+    if lock.locked():
+        return await interaction.edit_original_response(content="⏳ Esta ficha já está sendo processada.")
+
+    async with lock:
+        canal = interaction.channel
+        if canal is None or not hasattr(canal, "history"):
+            return await interaction.edit_original_response(content="❌ A sala temporária não está disponível.")
+
+        estado = await asyncio.to_thread(_v90_ficha_get, canal_id) or {}
+        manual = dict(estado.get("manual") or {})
+        textos: List[str] = []
+        anexos: List[discord.Attachment] = []
+
+        try:
+            async for msg in canal.history(limit=180, oldest_first=True):
+                if int(getattr(msg.author, "id", 0) or 0) != int(autor_id):
+                    continue
+                conteudo = str(msg.content or "").strip()
+                if conteudo:
+                    textos.append(conteudo)
+                for anexo in list(msg.attachments or []):
+                    if len(anexos) < V90_FICHA_MAX_ANEXOS:
+                        anexos.append(anexo)
+        except Exception as erro:
+            return await interaction.edit_original_response(
+                content=f"❌ Não consegui ler a sala: `{type(erro).__name__}`"
+            )
+
+        if not textos and not anexos and not any(str(v or "").strip() for v in manual.values()):
+            return await interaction.edit_original_response(
+                content="⚠️ Envie pelo menos uma foto/texto ou use **Preencher dados** antes de processar."
+            )
+
+        sessao = _v90_sessao_vazia()
+        texto_total = "\n\n".join(textos)[:100000]
+        if texto_total:
+            try:
+                dados_texto = await asyncio.wait_for(
+                    asyncio.to_thread(_banco_v3_extrair_dados, [], texto_total),
+                    timeout=15,
+                )
+                _banco_v3_mesclar_dados(sessao, dados_texto)
+            except Exception as erro:
+                print(f"⚠️ V90 leitura textual: {type(erro).__name__}: {erro}", flush=True)
+
+        falhas: List[str] = []
+        for indice, anexo in enumerate(anexos, 1):
+            try:
+                arquivo = await _v90_processar_anexo_ficha(anexo, autor_id, indice)
+                sessao["arquivos"].append(arquivo)
+                _banco_v3_mesclar_dados(sessao, dict(arquivo.get("dados_detectados") or {}))
+            except Exception as erro:
+                falhas.append(f"{getattr(anexo, 'filename', 'arquivo')}: {str(erro)[:120]}")
+            # Cede o loop após cada arquivo.
+            await asyncio.sleep(0)
+
+        # Dado manual sempre vence OCR.
+        for chave, valor in manual.items():
+            if str(valor or "").strip():
+                sessao[chave] = valor
+
+        sessao["texto_bruto"] = texto_total or str(sessao.get("texto_bruto") or "")
+        estado["ultima_previa"] = {
+            k: v for k, v in sessao.items() if k != "arquivos"
+        }
+        estado["processado_em"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        await asyncio.to_thread(_v90_ficha_set, canal_id, estado)
+
+        aviso = ""
+        if falhas:
+            aviso = "\n\n⚠️ Alguns anexos não puderam ser lidos: " + " | ".join(falhas[:4])
+
+        await interaction.edit_original_response(
+            content=(
+                "✅ **Leitura concluída. Revise antes de salvar.**"
+                + aviso
+            ),
+            embed=_v90_preview_embed(sessao),
+            view=V90FichaPreviewView(autor_id, canal_id, sessao),
+        )
+
+
+class V90FichaColetaView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Não toca em disco antes do ACK da interação. O autor fica gravado
+        # no topic da sala e já está em memória no objeto do canal.
+        topico = str(getattr(interaction.channel, "topic", "") or "")
+        match = re.search(r"DICOR_V90_FICHA\s+autor=(\d+)", topico)
+        if match and int(match.group(1)) != int(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ Esta sala pertence a outro agente.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Processar e revisar", emoji="🔎", style=discord.ButtonStyle.success, custom_id="v90:ficha:processar", row=0)
+    async def processar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        estado = await asyncio.to_thread(_v90_ficha_get, int(interaction.channel_id or 0)) or {}
+        await _v90_coletar_processar(
+            interaction,
+            int(interaction.channel_id or 0),
+            int(estado.get("autor_id") or interaction.user.id),
+        )
+
+    @discord.ui.button(label="Preencher dados", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="v90:ficha:manual", row=0)
+    async def manual(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(V90FichaPrincipalModal(int(interaction.channel_id or 0)))
+
+    @discord.ui.button(label="Dados adicionais", emoji="📝", style=discord.ButtonStyle.secondary, custom_id="v90:ficha:extras", row=0)
+    async def extras(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(V90FichaExtrasModal(int(interaction.channel_id or 0)))
+
+    @discord.ui.button(label="Cancelar", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="v90:ficha:cancelar", row=0)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🗑️ Criação cancelada. A sala será apagada.", ephemeral=True)
+        _v90_task(_v90_apagar_sala(interaction.channel, 2), f"v90-cancelar-coleta-{interaction.channel_id}")
+
+
+async def _v90_abrir_sala_ficha(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    usuario = interaction.user
+    if guild is None or not isinstance(usuario, discord.Member):
+        return await interaction.edit_original_response(content="❌ Use esta função dentro do servidor.")
+
+    if not _membro_inspetor_mais(usuario):
+        return await interaction.edit_original_response(content="❌ Apenas **Inspetor+** pode criar fichas.")
+
+    # Se já existir sala válida para o mesmo agente, reutiliza.
+    estados = await asyncio.to_thread(_v90_ficha_state_load)
+    for cid_txt, item in list(estados.items()):
+        if not isinstance(item, dict) or int(item.get("autor_id") or 0) != int(usuario.id):
+            continue
+        canal_existente = guild.get_channel(int(cid_txt))
+        if canal_existente is not None:
+            return await interaction.edit_original_response(
+                content=f"📋 Você já possui uma criação em andamento: {canal_existente.mention}"
+            )
+
+    categoria = getattr(interaction.channel, "category", None)
+    overwrites: Dict[Any, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        usuario: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+    }
+    if guild.me is not None:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+            attach_files=True,
+            embed_links=True,
+        )
+    for cargo_id in CARGOS_ADMIN_IDS:
+        cargo = guild.get_role(int(cargo_id))
+        if cargo:
+            overwrites[cargo] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+            )
+
+    nome = normalizar_busca(getattr(usuario, "display_name", str(usuario))).replace(" ", "-")[:28] or str(usuario.id)
+    try:
+        canal = await asyncio.wait_for(
+            guild.create_text_channel(
+                name=f"📋-ficha-{nome}",
+                category=categoria,
+                overwrites=overwrites,
+                topic=f"DICOR_V90_FICHA autor={usuario.id}",
+                reason=f"Criação de ficha por {usuario}",
+            ),
+            timeout=20,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f"❌ V90 criar sala de ficha | {type(erro).__name__}: {erro}")
+        except Exception:
+            pass
+        return await interaction.edit_original_response(
+            content="❌ Não consegui abrir a sala temporária. O erro foi enviado aos logs."
+        )
+
+    estado = {
+        "autor_id": int(usuario.id),
+        "guild_id": int(guild.id),
+        "canal_id": int(canal.id),
+        "criado_em_epoch": int(time.time()),
+        "manual": {},
+    }
+    await asyncio.to_thread(_v90_ficha_set, canal.id, estado)
+
+    embed = discord.Embed(
+        title="📋 CRIAÇÃO DE FICHA • DICOR",
+        description=(
+            "Envie aqui **uma ou várias mensagens** com tudo que você tiver: foto do indivíduo, RG, "
+            "COPOM, placa, mochila, documento ou texto. Quando terminar, clique em **Processar e revisar**.\n\n"
+            "Se alguma informação estiver difícil de ler, use **Preencher dados**. Nada é salvo no banco sem sua confirmação final."
+        ),
+        color=discord.Color.from_rgb(30, 88, 140),
+    )
+    embed.add_field(
+        name="📷 Imagens",
+        value=f"Até **{V90_FICHA_MAX_ANEXOS} anexos**, máximo **{V90_FICHA_MAX_MB} MB** por arquivo.",
+        inline=True,
+    )
+    embed.add_field(
+        name="🧠 Leitura",
+        value="OCR roda em segundo plano e não bloqueia os outros comandos do bot.",
+        inline=True,
+    )
+    embed.add_field(
+        name="💾 Segurança",
+        value="B2 quando disponível; fallback local automático quando o armazenamento externo estiver bloqueado.",
+        inline=False,
+    )
+    embed.set_footer(text=f"A sala expira após {V90_FICHA_EXPIRA_MINUTOS} minutos sem conclusão")
+
+    await canal.send(
+        content=usuario.mention,
+        embed=embed,
+        view=V90FichaColetaView(),
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+    )
+    await interaction.edit_original_response(
+        content=f"✅ Sala privada criada: {canal.mention}\nEnvie os dados lá e use **Processar e revisar**."
+    )
+
+
+class BancoDadosViewV90(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member):
+            return True
+        await interaction.response.send_message("❌ Use o painel dentro do servidor.", ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        if _v14_erro_interacao_duplicada(error):
+            return
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await enviar_log(
+                f"❌ V90 painel Banco | item `{getattr(item, 'custom_id', '?')}` | "
+                f"{type(error).__name__}: {error}\n```py\n{traceback.format_exc()[-2200:]}\n```"
+            )
+        except Exception:
+            pass
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ O painel apresentou uma falha. O diagnóstico foi enviado aos logs.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ O painel apresentou uma falha. O diagnóstico foi enviado aos logs.", ephemeral=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Criar ficha", emoji="📋", style=discord.ButtonStyle.primary, custom_id="pf_banco_criar_ficha_v90", row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Primeira operação de rede: ACK. Todo o resto acontece depois.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _v90_abrir_sala_ficha(interaction)
+
+    @discord.ui.button(label="Pesquisar fichas", emoji="🔎", style=discord.ButtonStyle.secondary, custom_id="pf_banco_pesquisar_v90", row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Modal precisa ser a primeira resposta; nenhuma consulta roda antes.
+        await interaction.response.send_modal(BancoConsultaIntegradaModalV61())
+
+    @discord.ui.button(label="Painel", emoji="🏴", style=discord.ButtonStyle.secondary, custom_id="pf_banco_painel_v90", row=0)
+    async def painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message("❌ Apenas **Inspetor+** pode importar/atualizar painéis.", ephemeral=True)
+        await _v12_banco_importar(interaction)
+
+
+class BancoDadosCompatV90(View):
+    """Assume imediatamente os custom_ids do painel V61 já publicado."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Criar ficha legado", style=discord.ButtonStyle.secondary, custom_id="pf_banco_criar_ficha_v61", row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _v90_abrir_sala_ficha(interaction)
+
+    @discord.ui.button(label="Pesquisar legado", style=discord.ButtonStyle.secondary, custom_id="pf_banco_pesquisar_v61", row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaIntegradaModalV61())
+
+    @discord.ui.button(label="Painel legado", style=discord.ButtonStyle.secondary, custom_id="pf_banco_painel_v61", row=0)
+    async def painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message("❌ Apenas **Inspetor+** pode importar/atualizar painéis.", ephemeral=True)
+        await _v12_banco_importar(interaction)
+
+
+BancoDadosView = BancoDadosViewV90
+
+
+_V90_EMBED_BANCO_ANTERIOR = banco_embed_painel
+
+
+def banco_embed_painel() -> discord.Embed:
+    embed = _V90_EMBED_BANCO_ANTERIOR()
+    embed.title = "🏛️ CENTRAL DE DADOS — POLÍCIA FEDERAL"
+    embed.description = (
+        "Banco operacional da DICOR para indivíduos, veículos, organizações e vínculos investigativos.\n"
+        "A criação de ficha agora usa uma **sala privada temporária**, permitindo enviar várias fotos e textos, revisar o OCR e confirmar tudo antes de gravar."
+    )
+    for indice, campo in enumerate(list(embed.fields)):
+        if "AÇÕES" in str(campo.name or "").upper():
+            embed.set_field_at(
+                indice,
+                name="🧭 AÇÕES",
+                value=(
+                    "**Criar ficha — Inspetor+:** abre sala privada, coleta várias imagens/textos, revisa e salva.\n"
+                    "**Pesquisar fichas — todos:** nome, RG, telefone, placa, organização, evidências e anexos.\n"
+                    "**Painel — Inspetor+:** importar ou atualizar a formação de uma organização.\n"
+                    "**Sincronização:** automática e protegida contra execuções simultâneas."
+                ),
+                inline=False,
+            )
+            break
+    embed.set_footer(text="Polícia Federal • DICOR • fluxo V90 estável e revisão antes da gravação")
+    return embed
+
+
+async def _v90_atualizar_paineis_banco() -> int:
+    if bot.user is None:
+        return 0
+    atualizados = 0
+    vistos: set[int] = set()
+    canal_env = int(os.getenv("BANCO_DADOS_CHANNEL_ID", "0") or 0)
+    for guild in bot.guilds:
+        candidatos = []
+        if canal_env:
+            c = guild.get_channel(canal_env)
+            if c is not None:
+                candidatos.append(c)
+        for c in getattr(guild, "text_channels", []):
+            nome = normalizar_busca(getattr(c, "name", ""))
+            if ("banco-de-dados" in nome or "central-de-dados" in nome) and c not in candidatos:
+                candidatos.append(c)
+        for canal in candidatos[:4]:
+            if int(canal.id) in vistos or not hasattr(canal, "history"):
+                continue
+            vistos.add(int(canal.id))
+            try:
+                achou = False
+                async for msg in canal.history(limit=100, oldest_first=False):
+                    if int(getattr(msg.author, "id", 0) or 0) != int(bot.user.id):
+                        continue
+                    titulos = " ".join(str(e.title or "") for e in msg.embeds).upper()
+                    if not any(x in titulos for x in ("CENTRAL DE DADOS", "CENTRAL DE FICHAS", "BANCO DE DADOS")):
+                        continue
+                    await msg.edit(embed=banco_embed_painel(), view=BancoDadosViewV90())
+                    atualizados += 1
+                    achou = True
+                    break
+                if not achou:
+                    await canal.send(embed=banco_embed_painel(), view=BancoDadosViewV90())
+                    atualizados += 1
+            except Exception as erro:
+                print(f"⚠️ V90 painel Banco {getattr(canal,'id',0)}: {type(erro).__name__}: {erro}", flush=True)
+    return atualizados
+
+
+# V75 chama esse nome no startup. Agora ele usa a atualização final V90.
+_v61_atualizar_paineis_banco = _v90_atualizar_paineis_banco
+
+
+# -----------------------------------------------------
+# V19 EM STREAMING — elimina lista de até 3.000 mensagens na RAM.
+# -----------------------------------------------------
+async def _v90_processar_grupo_bo_textual(grupo: List[discord.Message]) -> int:
+    if not grupo:
+        return 0
+    numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(grupo[0]))
+    if not numero:
+        return 0
+    atendimento = _v18_buscar_atendimento_bo(numero)
+    if not atendimento:
+        return 0
+    textos: List[str] = []
+    for msg in grupo:
+        texto_msg = _pericia_texto_mensagem(msg).strip()
+        if texto_msg and texto_msg not in textos:
+            textos.append(texto_msg)
+    atendimento["texto_original"] = "\n\n".join(textos)[:30000]
+    atendimento["ultima_sincronizacao_central"] = agora_br()
+    atendimento["fotos_copiadas_topico"] = 0
+    atendimento["anexos_salvos"] = []
+    atendimento["fotos_salvas"] = []
+    await asyncio.to_thread(
+        atualizar_atendimento_boletim,
+        "id",
+        atendimento.get("id"),
+        atendimento,
+    )
+    return 1
+
+
+async def _v19_sincronizar_boletins_completos() -> Dict[str, int]:
+    if _V90_MEMORY_PRESSURE:
+        return {"boletins": 0, "fotos": 0}
+    canal = await _v18_resolver_canal_id(BOLETINS_CHANNEL_ID)
+    if canal is None or not hasattr(canal, "history"):
+        return {"boletins": 0, "fotos": 0}
+    total = 0
+    atual: List[discord.Message] = []
+    grupos = 0
+    async for msg in canal.history(limit=3000, oldest_first=True):
+        if eh_boletim_valido_para_atendimento(msg):
+            if atual:
+                total += await _v90_processar_grupo_bo_textual(atual)
+                atual.clear()
+                grupos += 1
+                if grupos % 10 == 0:
+                    await asyncio.sleep(0)
+            atual.append(msg)
+        elif atual and str(msg.content or "").strip():
+            atual.append(msg)
+    if atual:
+        total += await _v90_processar_grupo_bo_textual(atual)
+        atual.clear()
+    return {"boletins": total, "fotos": 0}
+
+
+# -----------------------------------------------------
+# PROTEÇÃO DE MEMÓRIA: GC + pausa temporária de snapshots pesados.
+# -----------------------------------------------------
+_V90_V21_ORIGINAL = _v21_snapshot_boletins_do_canal
+_V90_V23_ORIGINAL = _v23_sincronizar_pericias
+
+
+async def _v21_snapshot_boletins_do_canal() -> Dict[str, int]:
+    if _V90_MEMORY_PRESSURE:
+        return {"boletins": 0, "arquivos": 0}
+    return await _V90_V21_ORIGINAL()
+
+
+async def _v23_sincronizar_pericias() -> Dict[str, int]:
+    if _V90_MEMORY_PRESSURE:
+        return {"pericias": 0, "fotos": 0}
+    return await _V90_V23_ORIGINAL()
+
+
+@tasks.loop(minutes=1)
+async def _v90_guard_memoria() -> None:
+    global _V90_MEMORY_PRESSURE
+    try:
+        ram = await asyncio.to_thread(_v90_ram_mb_sync)
+        anterior = _V90_MEMORY_PRESSURE
+        if ram >= V90_RAM_SOFT_MB:
+            await asyncio.to_thread(_v75_gc.collect)
+            # Caches recriáveis não precisam permanecer na RAM.
+            try:
+                globals()["_V17_CATALOGO_CACHE_HTML"] = ""
+                globals()["_V17_CATALOGO_CACHE_KEY"] = tuple()
+            except Exception:
+                pass
+            ram = await asyncio.to_thread(_v90_ram_mb_sync)
+        _V90_MEMORY_PRESSURE = bool(ram >= V90_RAM_HARD_MB)
+        if _V90_MEMORY_PRESSURE and not anterior:
+            print(
+                f"⚠️ V90 memória alta: {ram:.1f} MB. Snapshots pesados foram adiados temporariamente; interações continuam prioritárias.",
+                flush=True,
+            )
+        elif anterior and not _V90_MEMORY_PRESSURE:
+            print(f"✅ V90 memória normalizada: {ram:.1f} MB. Snapshots liberados novamente.", flush=True)
+    except Exception as erro:
+        print(f"⚠️ V90 guard memória: {type(erro).__name__}: {erro}", flush=True)
+
+
+@_v90_guard_memoria.before_loop
+async def _v90_guard_memoria_before() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(45)
+
+
+# -----------------------------------------------------
+# SETUP + RECUPERAÇÃO DE SESSÕES TEMPORÁRIAS
+# -----------------------------------------------------
+_V90_SETUP_ANTERIOR = bot.setup_hook
+
+
+async def _v90_setup_hook(self) -> None:
+    await _V90_SETUP_ANTERIOR()
+    for view in (BancoDadosViewV90(), BancoDadosCompatV90(), V90FichaColetaView()):
+        try:
+            bot.add_view(view)
+        except Exception as erro:
+            print(f"⚠️ V90 registro view {type(view).__name__}: {type(erro).__name__}: {erro}", flush=True)
+
+
+bot.setup_hook = _v13_types.MethodType(_v90_setup_hook, bot)
+
+
+async def _v90_limpar_sessoes_expiradas() -> int:
+    dados = await asyncio.to_thread(_v90_ficha_state_load)
+    agora = int(time.time())
+    removidos = 0
+    limite = V90_FICHA_EXPIRA_MINUTOS * 60
+    for cid_txt, item in list(dados.items()):
+        if not isinstance(item, dict):
+            continue
+        criado = int(item.get("criado_em_epoch") or 0)
+        if criado and agora - criado < limite:
+            continue
+        cid = int(cid_txt or 0)
+        canal = bot.get_channel(cid)
+        if canal is not None:
+            try:
+                await canal.delete(reason="Sala de ficha V90 expirada")
+            except Exception:
+                pass
+        await asyncio.to_thread(_v90_ficha_del, cid)
+        removidos += 1
+    return removidos
+
+
+@bot.tree.command(
+    name="diagnosticov90",
+    description="Verifica os módulos críticos da DICOR sem alterar registros.",
+)
+async def diagnostico_v90(interaction: discord.Interaction) -> None:
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas Inspetor+ pode executar o diagnóstico.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    resultados: List[str] = []
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(inicializar_banco_dicor), timeout=20)
+        def _contar():
+            with _banco_conexao() as db:
+                return int(db.execute("SELECT COUNT(*) FROM individuos").fetchone()[0])
+        qtd = await asyncio.wait_for(asyncio.to_thread(_contar), timeout=10)
+        resultados.append(f"✅ Banco SQLite: `{qtd}` ficha(s)")
+    except Exception as erro:
+        resultados.append(f"❌ Banco SQLite: `{type(erro).__name__}`")
+
+    try:
+        BancoDadosViewV90()
+        BancoDadosCompatV90()
+        V90FichaColetaView()
+        resultados.append("✅ Views do Banco: carregadas")
+    except Exception as erro:
+        resultados.append(f"❌ Views do Banco: `{type(erro).__name__}`")
+
+    guild = interaction.guild
+    canais = {
+        "Prisões": int(globals().get("HISTORICO_PRISAO_CHANNEL_ID", 0) or 0),
+        "BO": int(globals().get("BOLETINS_CHANNEL_ID", 0) or 0),
+        "Perícias": int(globals().get("PERICIAS_CHANNEL_ID", 0) or 0),
+        "Auditoria": int(globals().get("AUDITORIA_INCONSISTENCIAS_CHANNEL_ID", 0) or 0),
+    }
+    if guild:
+        for nome, cid in canais.items():
+            resultados.append(
+                f"{'✅' if cid and guild.get_channel(cid) else '⚠️'} {nome}: `{cid or 'N/I'}`"
+            )
+
+    ram = await asyncio.to_thread(_v90_ram_mb_sync)
+    resultados.append(f"📊 RAM atual: `{ram:.1f} MB`")
+    resultados.append(f"🧵 Tarefas asyncio: `{len(asyncio.all_tasks())}`")
+
+    try:
+        estado_b2 = await asyncio.to_thread(_v89_b2_state_load)
+        if _v89_b2_blocked():
+            resultados.append(
+                f"⏸️ B2: fallback ativo (`{estado_b2.get('reason') or 'bloqueado'}`)"
+            )
+        else:
+            resultados.append("✅ B2: liberado para novos uploads")
+    except Exception:
+        resultados.append("⚠️ B2: estado local não pôde ser lido")
+
+    resultados.append(
+        f"{'⏸️' if _V90_MEMORY_PRESSURE else '✅'} Guard de memória: "
+        f"{'pressão alta' if _V90_MEMORY_PRESSURE else 'normal'}"
+    )
+
+    await interaction.edit_original_response(
+        content=(
+            "🧪 **DIAGNÓSTICO DICOR V90**\n"
+            + "\n".join(resultados)
+            + "\n\nO diagnóstico é somente leitura e não altera fichas."
+        )[:1900]
+    )
+
+
+@bot.listen("on_ready")
+async def _v90_ready() -> None:
+    global _V90_READY_ONCE
+    if _V90_READY_ONCE:
+        return
+    _V90_READY_ONCE = True
+
+    if not _v90_guard_memoria.is_running():
+        _v90_guard_memoria.start()
+
+    # Handler para exceções de tarefas: loga e mantém o loop vivo.
+    try:
+        loop = asyncio.get_running_loop()
+        anterior = loop.get_exception_handler()
+
+        def _handler(loop_obj, contexto):
+            erro = contexto.get("exception")
+            msg = str(contexto.get("message") or "erro assíncrono")
+            if erro is not None:
+                print(f"⚠️ V90 asyncio: {msg} | {type(erro).__name__}: {erro}", flush=True)
+            else:
+                print(f"⚠️ V90 asyncio: {msg}", flush=True)
+            if anterior:
+                try:
+                    anterior(loop_obj, contexto)
+                    return
+                except Exception:
+                    pass
+            # Não relança: exceção de tarefa desacoplada não derruba o gateway.
+        loop.set_exception_handler(_handler)
+    except Exception:
+        pass
+
+    _v90_task(_v90_limpar_sessoes_expiradas(), "v90-limpar-sessoes")
+    _v90_task(_v90_atualizar_paineis_banco(), "v90-atualizar-painel-banco")
+
+    print(
+        "✅ V90 pronta — criação de ficha em sala privada, ACK imediato, "
+        "BO streaming, guard de RAM e tarefas supervisionadas.",
+        flush=True,
+    )
+
+
+print(
+    "✅ V90 carregada — revisão estrutural final de estabilidade e criação profissional de fichas.",
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
