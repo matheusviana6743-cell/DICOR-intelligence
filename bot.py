@@ -68205,18 +68205,23 @@ async def storageb2_v79(
     configurado = _v78_r2_configurado()
     r2_status = "❌ Não configurado"
 
+    # V88: não faz HeadBucket/LIST/GET para consultar status.
+    # O modo direto considera o B2 pronto quando as variáveis e o cliente
+    # estão configurados. Falhas reais de PUT são tratadas pelo circuit breaker V87.
     if configurado:
-        try:
-            cliente = _v78_r2_client()
-            await asyncio.to_thread(
-                cliente.head_bucket,
-                Bucket=V78_R2_BUCKET,
+        if _v87_b2_pausado():
+            restante = max(
+                0,
+                int(_V87_B2_PAUSE_UNTIL - time.monotonic()),
             )
-            r2_status = f"✅ Online • bucket `{V78_R2_BUCKET}`"
-        except Exception as erro:
             r2_status = (
-                f"⚠️ Configurado, mas indisponível: "
-                f"`{type(erro).__name__}`"
+                f"⏸️ Fallback temporário • bucket `{V78_R2_BUCKET}` "
+                f"• retoma em ~{max(1, restante // 60)} min"
+            )
+        else:
+            r2_status = (
+                f"✅ Configurado • bucket `{V78_R2_BUCKET}` "
+                "• modo direto ativo"
             )
     elif V78_R2_ENABLED and _v78_boto3 is None:
         r2_status = "⚠️ `boto3` não está instalado."
@@ -68234,7 +68239,7 @@ async def storageb2_v79(
         quantidade, total = 0, 0
 
     await interaction.followup.send(
-        "💾 **STORAGE DICOR V86**\n"
+        "💾 **STORAGE DICOR V88**\n"
         f"**Railway:** `{volume['percent']:.1f}%` usado • "
         f"`{volume['free_mb']:.1f} MB` livres\n"
         f"**B2:** {r2_status}\n"
@@ -69241,32 +69246,21 @@ async def _v78_on_ready():
     _v78_index_init()
 
     if _v78_r2_configurado():
-        try:
-            cliente = _v78_r2_client()
-            await asyncio.to_thread(
-                cliente.head_bucket,
-                Bucket=V78_R2_BUCKET,
-            )
-            print(
-                f"✅ V79 B2 conectado: bucket `{V78_R2_BUCKET}`. "
-                "Arquivos pesados podem sair do Railway Volume.",
-                flush=True,
-            )
-        except Exception as erro:
-            print(
-                "⚠️ V79 B2 configurado, mas conexão falhou: "
-                f"{type(erro).__name__}: {erro}. "
-                "Fallback local continua ativo.",
-                flush=True,
-            )
+        # V88: nenhuma chamada de leitura ao B2 no startup.
+        # O primeiro PUT real valida a escrita; se falhar, V87 ativa fallback.
+        print(
+            f"✅ V88 B2 configurado: bucket `{V78_R2_BUCKET}` • "
+            "modo direto sem HEAD/LIST/GET no startup.",
+            flush=True,
+        )
     else:
         motivo = (
             "boto3 ausente"
             if _v78_boto3 is None
-            else "variáveis R2 incompletas"
+            else "variáveis B2 incompletas"
         )
         print(
-            f"ℹ️ V79 B2 em fallback local: {motivo}.",
+            f"ℹ️ V88 B2 em fallback local: {motivo}.",
             flush=True,
         )
 
@@ -71511,6 +71505,962 @@ async def b2statusv87(
 print(
     "✅ V87 carregada — B2 direto sem HEAD/LIST/GET pós-upload, "
     "embeds sem reupload e fallback com circuit breaker.",
+    flush=True,
+)
+
+
+print(
+    "✅ V88 carregada — B2 direto sem HeadBucket no startup/status, "
+    "sem leituras automáticas e com fallback V87 preservado.",
+    flush=True,
+)
+
+
+
+# =====================================================
+# V89 — CRASH FIX: B2 CAP + PERÍCIA + RAM
+# =====================================================
+# 1) B2: circuit breaker PERSISTENTE em /data.
+#    "storage cap exceeded" não é crash do bot; vira fallback local estável.
+# 2) Perícia: UserSelect reconhece a interação IMEDIATAMENTE.
+# 3) BO/perícia: histórico processado em streaming para reduzir pico de RAM.
+
+V89_B2_STATE_JSON = DATA_DIR / "b2_direct_circuit.json"
+V89_B2_TRANSIENT_BLOCK_SECONDS = max(
+    1800,
+    env_int("B2_TRANSIENT_BLOCK_SECONDS", 21600),
+)
+_V89_B2_STATE_LOCK = threading.RLock()
+
+
+def _v89_b2_state_default() -> Dict[str, Any]:
+    return {
+        "blocked": False,
+        "permanent": False,
+        "until_epoch": 0,
+        "reason": "",
+        "detail": "",
+        "updated_at": "",
+    }
+
+
+def _v89_b2_state_load() -> Dict[str, Any]:
+    with _V89_B2_STATE_LOCK:
+        try:
+            if not V89_B2_STATE_JSON.exists():
+                return _v89_b2_state_default()
+            bruto = json.loads(
+                V89_B2_STATE_JSON.read_text(encoding="utf-8")
+            )
+            estado = _v89_b2_state_default()
+            if isinstance(bruto, dict):
+                estado.update(bruto)
+            return estado
+        except Exception:
+            return _v89_b2_state_default()
+
+
+def _v89_b2_state_save(estado: Dict[str, Any]) -> None:
+    with _V89_B2_STATE_LOCK:
+        V89_B2_STATE_JSON.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        dados = dict(estado)
+        dados["updated_at"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+
+        tmp = V89_B2_STATE_JSON.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                dados,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(V89_B2_STATE_JSON)
+
+
+def _v89_classificar_b2_erro(
+    erro: BaseException,
+) -> Tuple[str, bool]:
+    msg = (
+        f"{type(erro).__name__}: {erro}"
+        .lower()
+    )
+
+    if "storage cap exceeded" in msg:
+        return "STORAGE_CAP", True
+
+    if (
+        "invalidaccesskeyid" in msg
+        or "signaturedoesnotmatch" in msg
+    ):
+        return "CREDENCIAL", True
+
+    if (
+        "transaction cap exceeded" in msg
+        or "too many requests" in msg
+        or "429" in msg
+    ):
+        return "TRANSACOES", False
+
+    if (
+        "accessdenied" in msg
+        or "access denied" in msg
+        or "forbidden" in msg
+    ):
+        return "ACESSO", False
+
+    return "ERRO_TEMPORARIO", False
+
+
+def _v89_b2_block(
+    erro: BaseException,
+) -> None:
+    motivo, permanente = _v89_classificar_b2_erro(erro)
+    agora = int(time.time())
+
+    estado = {
+        "blocked": True,
+        "permanent": bool(permanente),
+        "until_epoch": (
+            0
+            if permanente
+            else agora + V89_B2_TRANSIENT_BLOCK_SECONDS
+        ),
+        "reason": motivo,
+        "detail": f"{type(erro).__name__}: {erro}"[:1000],
+    }
+    _v89_b2_state_save(estado)
+
+    if permanente:
+        mensagem = (
+            f"⚠️ V89 B2 bloqueado ({motivo}). "
+            "Fallback local ativado e salvo após restart. "
+            "Use /b2retomar depois de corrigir o limite/credencial."
+        )
+    else:
+        mensagem = (
+            f"⚠️ V89 B2 pausado ({motivo}) por "
+            f"~{V89_B2_TRANSIENT_BLOCK_SECONDS // 3600}h. "
+            "Fallback local ativo; o bot continua online."
+        )
+
+    try:
+        _v87_log_unico(
+            mensagem,
+            intervalo=V89_B2_TRANSIENT_BLOCK_SECONDS,
+        )
+    except Exception:
+        print(mensagem, flush=True)
+
+
+def _v89_b2_blocked() -> bool:
+    estado = _v89_b2_state_load()
+
+    if not estado.get("blocked"):
+        return False
+
+    if estado.get("permanent"):
+        return True
+
+    until_epoch = int(estado.get("until_epoch") or 0)
+    if until_epoch > int(time.time()):
+        return True
+
+    # Expirou: libera automaticamente.
+    _v89_b2_state_save(
+        _v89_b2_state_default()
+    )
+    return False
+
+
+# Sobrescreve o circuit breaker em memória da V87 por um persistente.
+def _v87_pausar_b2(
+    erro: BaseException,
+) -> None:
+    _v89_b2_block(erro)
+
+
+def _v87_b2_pausado() -> bool:
+    return _v89_b2_blocked()
+
+
+def _v86_b2_direto_ativo() -> bool:
+    return bool(
+        V86_B2_DIRECT_ENABLED
+        and _v78_r2_configurado()
+        and not _v89_b2_blocked()
+    )
+
+
+# O próprio PUT é o único teste de escrita.
+# Se o Backblaze disser storage cap exceeded, o bloqueio fica persistente.
+_V89_UPLOAD_ANTERIOR = _v87_upload_write_only_sync
+
+
+def _v87_upload_write_only_sync(
+    caminho: Path,
+    categoria: str,
+) -> Dict[str, Any]:
+    if _v89_b2_blocked():
+        raise RuntimeError(
+            "B2 bloqueado pelo circuit breaker V89; usar fallback local."
+        )
+
+    try:
+        return _V89_UPLOAD_ANTERIOR(
+            caminho,
+            categoria,
+        )
+    except Exception as erro:
+        if _v87_erro_cap_ou_bloqueio(erro):
+            _v89_b2_block(erro)
+        raise
+
+
+@bot.tree.command(
+    name="b2retomar",
+    description="Libera novamente o B2 após corrigir limite ou credencial.",
+)
+async def b2retomar_v89(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode liberar o B2.",
+            ephemeral=True,
+        )
+
+    await asyncio.to_thread(
+        _v89_b2_state_save,
+        _v89_b2_state_default(),
+    )
+
+    await interaction.response.send_message(
+        "✅ **B2 LIBERADO NOVAMENTE**\n"
+        "O próximo arquivo novo fará uma tentativa real de upload.\n"
+        "Se o limite ainda estiver bloqueado, o fallback será reativado automaticamente.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="b2status",
+    description="Mostra o estado do B2 sem fazer nenhuma consulta externa.",
+)
+async def b2status_v89(
+    interaction: discord.Interaction,
+):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message(
+            "❌ Apenas a Diretoria pode consultar.",
+            ephemeral=True,
+        )
+
+    estado = await asyncio.to_thread(
+        _v89_b2_state_load
+    )
+    bloqueado = _v89_b2_blocked()
+
+    if bloqueado:
+        motivo = str(
+            estado.get("reason") or "BLOQUEADO"
+        )
+        permanente = bool(
+            estado.get("permanent")
+        )
+
+        if permanente:
+            tempo = "até `/b2retomar`"
+        else:
+            restante = max(
+                0,
+                int(estado.get("until_epoch") or 0)
+                - int(time.time()),
+            )
+            tempo = f"~{max(1, restante // 60)} min"
+
+        texto_status = (
+            "⏸️ **B2 EM FALLBACK LOCAL**\n"
+            f"**Motivo:** `{motivo}`\n"
+            f"**Bloqueio:** `{tempo}`\n"
+            "O bot continua funcionando normalmente pelo Railway."
+        )
+    else:
+        texto_status = (
+            "✅ **B2 DIRETO LIBERADO**\n"
+            f"**Bucket:** `{V78_R2_BUCKET}`\n"
+            "Nenhuma leitura é feita para testar o serviço; "
+            "o próximo PUT real valida a escrita."
+        )
+
+    await interaction.response.send_message(
+        texto_status,
+        ephemeral=True,
+    )
+
+
+# -----------------------------------------------------
+# PERÍCIA — ACK IMEDIATO NO USER SELECT
+# -----------------------------------------------------
+async def _v89_pericia_select_callback(
+    self: PericiaSelecionarAgente,
+    interaction: discord.Interaction,
+) -> None:
+    # PRIMEIRA operação: confirma ao Discord.
+    # Evita "O aplicativo não respondeu a tempo".
+    try:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+    except discord.InteractionResponded:
+        pass
+
+    async def responder(msg: str) -> None:
+        try:
+            await interaction.followup.send(
+                msg,
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not _membro_inspetor_mais(interaction.user)
+    ):
+        return await responder(
+            "❌ Apenas Inspetor+ pode escolher o responsável pela perícia."
+        )
+
+    registro = await asyncio.to_thread(
+        _pericia_por_topico,
+        interaction.channel_id,
+    )
+
+    if not registro:
+        return await responder(
+            "❌ Atendimento da perícia não encontrado."
+        )
+
+    if (
+        str(registro.get("status") or "").upper()
+        in _PERICIA_STATUS_FINAIS
+    ):
+        return await responder(
+            "⚠️ Esta perícia já foi concluída."
+        )
+
+    escolhido = (
+        self.values[0]
+        if self.values
+        else None
+    )
+
+    if (
+        interaction.guild
+        and not isinstance(escolhido, discord.Member)
+        and escolhido is not None
+    ):
+        try:
+            escolhido = interaction.guild.get_member(
+                int(escolhido.id)
+            )
+            if escolhido is None:
+                escolhido = await interaction.guild.fetch_member(
+                    int(self.values[0].id)
+                )
+        except Exception:
+            escolhido = None
+
+    if (
+        not isinstance(escolhido, discord.Member)
+        or escolhido.bot
+    ):
+        return await responder(
+            "❌ Selecione um agente válido."
+        )
+
+    if (
+        not usuario_tem_equipe(escolhido)
+        and not _membro_inspetor_mais(escolhido)
+    ):
+        return await responder(
+            "❌ O membro selecionado não possui cargo da equipe DICOR."
+        )
+
+    registro.update({
+        "agente_id": escolhido.id,
+        "agente_nome": str(escolhido),
+        "agente_escolhido_por_id": interaction.user.id,
+        "agente_escolhido_por_nome": str(interaction.user),
+        "agente_escolhido_em": agora_br(),
+        "status": (
+            "AGUARDANDO_BO"
+            if str(registro.get("status") or "").upper()
+            == "AGUARDANDO_BO"
+            else "PENDENTE"
+        ),
+    })
+
+    await asyncio.to_thread(
+        _pericia_atualizar,
+        registro,
+    )
+
+    topico = await _pericia_obter_topico(
+        registro
+    )
+
+    if topico:
+        try:
+            await topico.add_user(
+                escolhido
+            )
+        except Exception as erro:
+            print(
+                "⚠️ V89 perícia add_user ignorado: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+        try:
+            await topico.send(
+                f"{escolhido.mention}\n"
+                f"📌 **TAREFA PENDENTE — PERÍCIA Nº {registro.get('numero')}**\n"
+                "Você foi definido como responsável. "
+                "Analise a perícia e responda pelo painel abaixo.",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                    everyone=False,
+                ),
+            )
+        except Exception as erro:
+            print(
+                "⚠️ V89 perícia aviso no tópico ignorado: "
+                f"{type(erro).__name__}: {erro}",
+                flush=True,
+            )
+
+    try:
+        canal_pai_id = int(
+            registro.get("canal_pai_id") or 0
+        )
+        canal_pai = (
+            interaction.guild.get_channel(canal_pai_id)
+            if interaction.guild
+            else None
+        )
+
+        if canal_pai is None and canal_pai_id:
+            canal_pai = await bot.fetch_channel(
+                canal_pai_id
+            )
+
+        mensagem_tarefa = None
+        mid = int(
+            registro.get("mensagem_tarefa_id") or 0
+        )
+
+        if (
+            mid
+            and canal_pai is not None
+            and hasattr(canal_pai, "fetch_message")
+        ):
+            try:
+                mensagem_tarefa = await canal_pai.fetch_message(
+                    mid
+                )
+            except Exception:
+                mensagem_tarefa = None
+
+        if (
+            mensagem_tarefa is None
+            and canal_pai is not None
+            and hasattr(canal_pai, "send")
+        ):
+            mensagem_tarefa = await canal_pai.send(
+                f"📌 **TAREFA PENDENTE — PERÍCIA Nº {registro.get('numero')}**\n"
+                f"Responsável: {escolhido.mention}\n"
+                f"Atendimento: <#{int(registro.get('topico_id') or 0)}>",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                    everyone=False,
+                ),
+            )
+
+            registro["mensagem_tarefa_id"] = (
+                mensagem_tarefa.id
+            )
+
+            await asyncio.to_thread(
+                _pericia_atualizar,
+                registro,
+            )
+
+    except Exception as erro:
+        print(
+            "⚠️ V89 perícia tarefa externa ignorada: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+    try:
+        await _pericia_atualizar_painel(
+            registro
+        )
+    except Exception as erro:
+        print(
+            "⚠️ V89 perícia painel ignorou falha: "
+            f"{type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+    await responder(
+        f"✅ {escolhido.mention} foi definido como responsável "
+        f"pela Perícia Nº **{registro.get('numero')}**."
+    )
+
+    try:
+        await enviar_log(
+            f"👤 Responsável da Perícia `{registro.get('numero')}` definido: "
+            f"{escolhido.mention} (`{escolhido.id}`) "
+            f"por {interaction.user.mention}."
+        )
+    except Exception:
+        pass
+
+
+PericiaSelecionarAgente.callback = (
+    _v89_pericia_select_callback
+)
+
+
+# -----------------------------------------------------
+# SNAPSHOT BO EM STREAMING — NÃO CARREGA TODO HISTÓRICO
+# -----------------------------------------------------
+async def _v89_processar_grupo_bo(
+    grupo: List[discord.Message],
+    canal: Any,
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    if not grupo:
+        return None, 0
+
+    texto_inicio = (
+        _pericia_texto_mensagem(grupo[0])
+        if "_pericia_texto_mensagem" in globals()
+        else str(grupo[0].content or "")
+    )
+
+    numero = _v21_numero_bo_texto(
+        texto_inicio
+    )
+    if not numero:
+        return None, 0
+
+    textos: List[str] = []
+    midias: List[str] = []
+    arquivos = 0
+
+    for msg in grupo:
+        txt = (
+            _pericia_texto_mensagem(msg)
+            if "_pericia_texto_mensagem" in globals()
+            else str(msg.content or "")
+        ).strip()
+
+        if txt and txt not in textos:
+            textos.append(txt)
+
+        for anexo in list(
+            getattr(msg, "attachments", [])
+            or []
+        ):
+            try:
+                salvo = await _v21_salvar_anexo_bo(
+                    anexo,
+                    numero,
+                )
+                if salvo and salvo not in midias:
+                    midias.append(salvo)
+                    arquivos += 1
+            except Exception as erro:
+                print(
+                    "⚠️ V89 BO anexo ignorado: "
+                    f"{type(erro).__name__}: {erro}",
+                    flush=True,
+                )
+
+        for emb in list(
+            getattr(msg, "embeds", [])
+            or []
+        ):
+            url = str(
+                getattr(
+                    getattr(emb, "image", None),
+                    "url",
+                    "",
+                )
+                or getattr(
+                    getattr(emb, "thumbnail", None),
+                    "url",
+                    "",
+                )
+                or ""
+            )
+            if url and url not in midias:
+                midias.append(url)
+
+    status = await asyncio.to_thread(
+        _v21_status_numero,
+        numero,
+    )
+
+    registro = {
+        "numero": numero,
+        "status": status,
+        "texto": "\n\n".join(textos)[:60000],
+        "midias": midias,
+        "mensagem_id": int(grupo[0].id),
+        "canal_id": int(
+            getattr(
+                canal,
+                "id",
+                BOLETINS_CHANNEL_ID,
+            )
+        ),
+        "criado_em": getattr(
+            grupo[0],
+            "created_at",
+            datetime.datetime.now(
+                datetime.timezone.utc
+            ),
+        ).isoformat(),
+        "autor": str(
+            getattr(
+                grupo[0],
+                "author",
+                "Não informado",
+            )
+        ),
+    }
+
+    return registro, arquivos
+
+
+async def _v21_snapshot_boletins_do_canal() -> Dict[str, int]:
+    async with _V85_MAINTENANCE_LOCK:
+        if "_v18_resolver_canal_id" in globals():
+            canal = await _v18_resolver_canal_id(
+                BOLETINS_CHANNEL_ID
+            )
+        else:
+            canal = bot.get_channel(
+                BOLETINS_CHANNEL_ID
+            )
+            if canal is None:
+                canal = await bot.fetch_channel(
+                    BOLETINS_CHANNEL_ID
+                )
+
+        if (
+            canal is None
+            or not hasattr(canal, "history")
+        ):
+            return {
+                "boletins": 0,
+                "arquivos": 0,
+            }
+
+        registros: List[Dict[str, Any]] = []
+        arquivos_total = 0
+        atual: List[discord.Message] = []
+        grupos_processados = 0
+
+        async for msg in canal.history(
+            limit=None,
+            oldest_first=True,
+        ):
+            texto_msg = (
+                _pericia_texto_mensagem(msg)
+                if "_pericia_texto_mensagem" in globals()
+                else str(msg.content or "")
+            )
+
+            numero = _v21_numero_bo_texto(
+                texto_msg
+            )
+
+            inicio = bool(numero) and (
+                eh_boletim_valido_para_atendimento(msg)
+                if "eh_boletim_valido_para_atendimento" in globals()
+                else True
+            )
+
+            if inicio and atual:
+                item, qtd = await _v89_processar_grupo_bo(
+                    atual,
+                    canal,
+                )
+                if item:
+                    registros.append(item)
+                    arquivos_total += qtd
+
+                atual.clear()
+                grupos_processados += 1
+
+                if grupos_processados % 8 == 0:
+                    await asyncio.to_thread(
+                        _v75_gc.collect
+                    )
+                    await asyncio.sleep(0)
+
+            atual.append(msg)
+
+        if atual:
+            item, qtd = await _v89_processar_grupo_bo(
+                atual,
+                canal,
+            )
+            if item:
+                registros.append(item)
+                arquivos_total += qtd
+            atual.clear()
+
+        payload = {
+            "origem_canal_id": int(
+                BOLETINS_CHANNEL_ID
+            ),
+            "atualizado_em": agora_br(),
+            "boletins": registros,
+        }
+
+        await asyncio.to_thread(
+            salvar_json,
+            CENTRAL_BO_CANAL_SNAPSHOT_JSON,
+            payload,
+        )
+
+        return {
+            "boletins": len(registros),
+            "arquivos": arquivos_total,
+        }
+
+
+# -----------------------------------------------------
+# SNAPSHOT PERÍCIA EM STREAMING
+# -----------------------------------------------------
+async def _v89_processar_grupo_pericia(
+    grupo: List[discord.Message],
+    indice: int,
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    if not grupo:
+        return None, 0
+
+    textos: List[str] = []
+    midias: List[str] = []
+    fotos = 0
+
+    for m in grupo:
+        tx = (
+            _pericia_texto_mensagem(m)
+            if "_pericia_texto_mensagem" in globals()
+            else str(m.content or "")
+        ).strip()
+
+        if tx and tx not in textos:
+            textos.append(tx)
+
+        for anexo in list(
+            getattr(m, "attachments", [])
+            or []
+        ):
+            try:
+                url = await _v23_baixar_attachment(
+                    anexo,
+                    f"p{indice}",
+                )
+                if url and url not in midias:
+                    midias.append(url)
+                    fotos += 1
+            except Exception as erro:
+                print(
+                    "⚠️ V89 perícia anexo ignorado: "
+                    f"{type(erro).__name__}: {erro}",
+                    flush=True,
+                )
+
+        for embed_item in list(
+            getattr(m, "embeds", [])
+            or []
+        ):
+            for obj in (
+                getattr(embed_item, "image", None),
+                getattr(embed_item, "thumbnail", None),
+            ):
+                url = str(
+                    getattr(
+                        obj,
+                        "url",
+                        "",
+                    )
+                    or ""
+                )
+                if not url:
+                    continue
+
+                try:
+                    local = await _v24_baixar_url_imagem(
+                        url,
+                        f"pe{indice}",
+                    )
+                except Exception:
+                    local = url
+
+                if local and local not in midias:
+                    midias.append(local)
+                    fotos += 1
+
+    texto_pericia = "\n\n".join(
+        textos
+    )
+
+    numero_match = re.search(
+        r"(?:PER[IÍ]CIA|LAUDO)"
+        r"[^0-9]{0,15}(\d{1,8})",
+        texto_pericia,
+        re.I,
+    )
+
+    item = {
+        "numero": (
+            numero_match.group(1)
+            if numero_match
+            else str(indice)
+        ),
+        "texto": texto_pericia,
+        "midias": midias,
+        "mensagem_url": str(
+            getattr(
+                grupo[0],
+                "jump_url",
+                "",
+            )
+            or ""
+        ),
+        "data": str(
+            getattr(
+                grupo[0],
+                "created_at",
+                "",
+            )
+            or ""
+        ),
+    }
+
+    return item, fotos
+
+
+async def _v23_sincronizar_pericias() -> Dict[str, int]:
+    async with _V85_MAINTENANCE_LOCK:
+        canal = bot.get_channel(
+            PERICIAS_CHANNEL_ID
+        )
+
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(
+                    PERICIAS_CHANNEL_ID
+                )
+            except Exception:
+                canal = None
+
+        if (
+            canal is None
+            or not hasattr(canal, "history")
+        ):
+            return {
+                "pericias": 0,
+                "fotos": 0,
+            }
+
+        saida: List[Dict[str, Any]] = []
+        fotos_total = 0
+        atual: List[discord.Message] = []
+        indice = 0
+
+        async for m in canal.history(
+            limit=5000,
+            oldest_first=True,
+        ):
+            texto_msg = (
+                _pericia_texto_mensagem(m)
+                if "_pericia_texto_mensagem" in globals()
+                else str(m.content or "")
+            )
+
+            if _v23_pericia_inicio(
+                texto_msg
+            ):
+                if atual:
+                    indice += 1
+                    item, qtd = await _v89_processar_grupo_pericia(
+                        atual,
+                        indice,
+                    )
+                    if item:
+                        saida.append(item)
+                        fotos_total += qtd
+                    atual.clear()
+
+                    if indice % 8 == 0:
+                        await asyncio.to_thread(
+                            _v75_gc.collect
+                        )
+                        await asyncio.sleep(0)
+
+                atual.append(m)
+
+            elif atual and (
+                getattr(m, "attachments", None)
+                or str(texto_msg).strip()
+                or getattr(m, "embeds", None)
+            ):
+                atual.append(m)
+
+        if atual:
+            indice += 1
+            item, qtd = await _v89_processar_grupo_pericia(
+                atual,
+                indice,
+            )
+            if item:
+                saida.append(item)
+                fotos_total += qtd
+            atual.clear()
+
+        await asyncio.to_thread(
+            salvar_json,
+            CENTRAL_PERICIAS_SNAPSHOT_JSON,
+            saida,
+        )
+
+        return {
+            "pericias": len(saida),
+            "fotos": fotos_total,
+        }
+
+
+print(
+    "✅ V89 carregada — B2 cap persistente em fallback, "
+    "perícia responde imediatamente e snapshots usam streaming.",
     flush=True,
 )
 
