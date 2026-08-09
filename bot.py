@@ -3966,6 +3966,168 @@ async def atualizar_status_mesa_fechada(canal_id: int, dados_dossie: Dict[str, A
         await enviar_log(f"⚠️ Erro ao atualizar status da mesa {canal_id}: {erro}")
 
 
+
+# =====================================================
+# V97 — DOSSIÊ SEM ESTOURAR O VOLUME DO RAILWAY
+# =====================================================
+# Regra:
+# - imagens/evidências/cache do dossiê = /tmp
+# - PDF/DOCX são enviados ao Discord a partir do /tmp
+# - somente o arquivo final pode ser persistido no Volume, se houver espaço
+# - caches antigos de evidências podem ser apagados com segurança
+# - NUNCA apaga fichas, banco, PDFs/DOCXs finais ou demais dados persistentes
+
+V97_DOSSIE_TMP_ROOT = Path("/tmp/dicor_dossies")
+V97_DOSSIE_RESERVA_VOLUME_BYTES = 12 * 1024 * 1024
+
+
+def _v97_limpar_cache_dossie_volume_sync() -> Dict[str, int]:
+    removidos = 0
+    bytes_liberados = 0
+
+    raiz = Path(DOSSIES_DIR)
+    if not raiz.exists():
+        return {"pastas": 0, "bytes": 0}
+
+    nomes_cache = {"evidencias", "_imagens_otimizadas"}
+
+    try:
+        for atual, dirs, _arquivos in os.walk(str(raiz), topdown=True):
+            atual_p = Path(atual)
+
+            # copia para poder alterar dirs durante o walk
+            for nome_dir in list(dirs):
+                if nome_dir not in nomes_cache:
+                    continue
+
+                alvo_cache = atual_p / nome_dir
+
+                try:
+                    tamanho = 0
+                    for arq in alvo_cache.rglob("*"):
+                        try:
+                            if arq.is_file():
+                                tamanho += arq.stat().st_size
+                        except Exception:
+                            pass
+
+                    shutil.rmtree(alvo_cache, ignore_errors=True)
+
+                    if not alvo_cache.exists():
+                        removidos += 1
+                        bytes_liberados += tamanho
+
+                    # não entra na pasta que acabou de ser removida
+                    try:
+                        dirs.remove(nome_dir)
+                    except ValueError:
+                        pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "pastas": removidos,
+        "bytes": bytes_liberados,
+    }
+
+
+def _v97_pasta_temporaria_dossie(processo_limpo: str) -> Path:
+    V97_DOSSIE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # evita reaproveitar pasta de uma execução anterior
+    nome = (
+        f"{slugify(str(processo_limpo)) or 'dossie'}-"
+        f"{int(time.time())}-{secrets.token_hex(4)}"
+    )
+    pasta = V97_DOSSIE_TMP_ROOT / nome
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def _v97_persistir_finais_sync(
+    arquivos_temp: Dict[str, str],
+    pasta_persistente: Path,
+) -> Dict[str, str]:
+    """
+    Persiste APENAS PDF/DOCX finais e somente se houver espaço.
+    O dossiê já terá sido enviado ao Discord antes desta etapa.
+    """
+    saida: Dict[str, str] = {}
+    pasta_persistente = Path(pasta_persistente)
+
+    try:
+        pasta_persistente.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return saida
+
+    for chave in ("pdf", "docx"):
+        origem_s = str(arquivos_temp.get(chave) or "").strip()
+        if not origem_s:
+            continue
+
+        origem = Path(origem_s)
+        try:
+            if not origem.exists() or not origem.is_file():
+                continue
+
+            tamanho = int(origem.stat().st_size)
+            uso = shutil.disk_usage(str(pasta_persistente))
+            necessario = tamanho + V97_DOSSIE_RESERVA_VOLUME_BYTES
+
+            if int(uso.free) < necessario:
+                # Sem espaço: não falha e não enche o Volume.
+                continue
+
+            destino = pasta_persistente / origem.name
+
+            # Evita acumular múltiplas cópias idênticas do mesmo arquivo final.
+            try:
+                if destino.exists():
+                    destino.unlink()
+            except Exception:
+                pass
+
+            shutil.copy2(origem, destino)
+
+            if destino.exists() and destino.stat().st_size == tamanho:
+                saida[chave] = str(destino)
+        except Exception:
+            continue
+
+    return saida
+
+
+def _v97_limpar_temp_dossie_sync(pasta: Any) -> None:
+    try:
+        p = Path(str(pasta or ""))
+        if not p:
+            return
+        # proteção: só permite apagar dentro do root temporário V97
+        root = V97_DOSSIE_TMP_ROOT.resolve()
+        alvo = p.resolve()
+        if root == alvo or root in alvo.parents:
+            shutil.rmtree(alvo, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# Limpeza no deploy: SOMENTE caches transitórios antigos.
+try:
+    _v97_limpeza_inicial = _v97_limpar_cache_dossie_volume_sync()
+    if _v97_limpeza_inicial.get("pastas", 0):
+        print(
+            "✅ V97 limpeza segura do Volume: "
+            f"{_v97_limpeza_inicial['pastas']} pasta(s) temporária(s) removida(s), "
+            f"{_v97_limpeza_inicial['bytes'] / 1024 / 1024:.1f} MB liberados. "
+            "PDFs/DOCXs e banco preservados.",
+            flush=True,
+        )
+except Exception:
+    pass
+
+
 async def fechar_mesa_core(
     interaction: discord.Interaction,
     motivo: str = "Fechada",
@@ -4022,8 +4184,10 @@ async def fechar_mesa_core(
 
     processo_base = str((dados_confirmacao or {}).get("processo") or f"PF-DICOR-{canal.id}").replace(" ", "-")
     processo_limpo = slugify(processo_base).upper().replace("-", "_") or str(canal.id)
-    pasta_dossie = DOSSIES_DIR / processo_limpo
-    pasta_dossie.mkdir(parents=True, exist_ok=True)
+    # V97: o Volume não é mais usado como área de trabalho.
+    # Fotos, evidências, QR e cache ficam no /tmp até o envio terminar.
+    pasta_persistente = DOSSIES_DIR / processo_limpo
+    pasta_dossie = _v97_pasta_temporaria_dossie(processo_limpo)
 
     await editar_progresso_dossie(
         msg_aviso,
@@ -4141,7 +4305,23 @@ async def fechar_mesa_core(
             erros_envio.append(f"Envio na mesa: {erro}")
             await enviar_log(f"⚠️ Dossiê gerado, mas não consegui enviar cópia na mesa {canal.id}: {erro}")
 
-    await atualizar_status_mesa_fechada(canal.id, dados_dossie, arquivos)
+    # V97: depois que os anexos já foram enviados ao Discord,
+    # tenta guardar apenas PDF/DOCX final no Volume. Se não houver espaço,
+    # isso NÃO interrompe o fechamento da mesa.
+    try:
+        arquivos_registro = await asyncio.to_thread(
+            _v97_persistir_finais_sync,
+            arquivos,
+            pasta_persistente,
+        )
+    except Exception:
+        arquivos_registro = {}
+
+    await atualizar_status_mesa_fechada(
+        canal.id,
+        dados_dossie,
+        arquivos_registro,
+    )
 
     registrar_dossie_operacional({
         "processo": dados_dossie.get("processo"),
@@ -4153,8 +4333,8 @@ async def fechar_mesa_core(
         "gerado_em": agora_br(),
         "encerrado_por": str(interaction.user),
         "encerrado_por_id": interaction.user.id,
-        "pdf": arquivos.get("pdf"),
-        "docx": arquivos.get("docx"),
+        "pdf": arquivos_registro.get("pdf"),
+        "docx": arquivos_registro.get("docx"),
         "mensagem_dossie_url": mensagem_dossie_url,
         "estatisticas": dados_dossie.get("estatisticas", {}),
         "tempos_segundos": {
@@ -4164,6 +4344,16 @@ async def fechar_mesa_core(
             "total": round(time.monotonic() - inicio_total, 2),
         },
     })
+
+    # As fotos/evidências não precisam permanecer no disco depois
+    # que PDF/DOCX já foram gerados e enviados.
+    try:
+        await asyncio.to_thread(
+            _v97_limpar_temp_dossie_sync,
+            pasta_dossie,
+        )
+    except Exception:
+        pass
 
     await editar_progresso_dossie(
         msg_aviso,
@@ -4190,8 +4380,8 @@ async def fechar_mesa_core(
         description=(
             "✅ **Mesa encerrada com sucesso.**\n\n"
             "📄 **Dossiê Operacional gerado.**\n"
-            "📁 **Arquivos salvos com sucesso.**\n"
-            "📎 **PDF e DOCX anexados diretamente na mesa e/ou no canal oficial.**\n"
+            "📎 **PDF e DOCX enviados diretamente na mesa e/ou no canal oficial.**\n"
+            "🧹 **Cache temporário de evidências limpo após a geração.**\n"
             "📚 **Investigação arquivada.**\n"
             "🏛️ **Polícia Federal - DICOR.**"
         ),
@@ -4217,6 +4407,14 @@ async def fechar_mesa_core(
     if mensagem_dossie_url:
         embed_sucesso.add_field(name="Arquivos do dossiê", value=f"[Abrir mensagem com os anexos]({mensagem_dossie_url})", inline=False)
     avisos = erros_geracao + erros_envio
+
+    if arquivos and not arquivos_registro:
+        avisos.append(
+            "Os arquivos foram enviados ao Discord, mas não foram mantidos "
+            "no Volume do Railway por falta de espaço. As evidências temporárias "
+            "foram limpas para evitar crash."
+        )
+
     if avisos:
         embed_sucesso.add_field(name="Avisos", value="\n".join(avisos)[:900], inline=False)
 
@@ -76020,6 +76218,15 @@ print(
     "pastas de evidências protegidas durante a geração.",
     flush=True,
 )
+
+
+print(
+    "✅ V97 carregada — dossiês usam /tmp para fotos/evidências/cache; "
+    "somente PDF/DOCX final tenta usar o Volume; cache é removido após envio. "
+    "Modelo V95/V96 e fotos preservados.",
+    flush=True,
+)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
