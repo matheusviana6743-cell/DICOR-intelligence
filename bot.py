@@ -77666,5 +77666,1162 @@ print(
     flush=True,
 )
 
+
+
+# ===== V100 MODELOS FINAIS FIXOS =====
+
+def _v100_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    """Dossiê com a mesma moldura, fundo mais claro, marca d'água e fluxo sem sobreposição."""
+    if canvas is None or A4 is None:
+        raise RuntimeError('Dependência ausente: instale reportlab.')
+
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(caminho_pdf), pagesize=A4)
+    largura, altura = A4
+    cores = _cores_documento_dicor()
+    margem_x = 1.35 * cm
+    largura_util = largura - 2 * margem_x
+    topo = altura - 4.35 * cm
+    base = 1.45 * cm
+
+    def seguro(v: Any, padrao: str = 'Não informado') -> str:
+        s = str(v if v is not None else '').replace('\r', '').strip()
+        return s or padrao
+
+    def iniciar_pagina(titulo: str, continuacao: bool = False) -> float:
+        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=18.0)
+        c.saveState()
+        _alpha_pdf(c, 0.82, 1)
+        c.setFillColor(cores['painel'])
+        c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.30 * cm, 6, fill=1, stroke=0)
+        c.restoreState()
+        _desenhar_marca_dagua_visivel(c, largura, altura)
+        c.setStrokeColor(cores['linha'])
+        c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.30 * cm, 6, fill=0, stroke=1)
+        faixa_y = topo - 0.63 * cm
+        c.setFillColor(cores['azul'])
+        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=1, stroke=0)
+        c.setStrokeColor(cores['dourado_claro'])
+        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
+        c.setFillColor(cores['branco'])
+        c.setFont('Courier-Bold', 13.2)
+        tt = titulo + (' - CONTINUAÇÃO' if continuacao else '')
+        c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, tt[:88])
+        return faixa_y - 0.35 * cm
+
+    titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
+
+    def quebra(y: float, espaco: float) -> float:
+        nonlocal titulo_atual
+        if y - espaco < base + 0.35 * cm:
+            c.showPage()
+            return iniciar_pagina(titulo_atual, True)
+        return y
+
+    def nova_secao(titulo: str) -> float:
+        nonlocal titulo_atual
+        titulo_atual = titulo
+        if c.getPageNumber() > 0:
+            c.showPage()
+        return iniciar_pagina(titulo)
+
+    def subtitulo(txt: str, y: float) -> float:
+        y = quebra(y, 0.70 * cm)
+        c.setFillColor(cores['painel_sec'])
+        c.setStrokeColor(cores['dourado'])
+        c.roundRect(margem_x + 0.10 * cm, y - 0.50 * cm, largura_util - 0.20 * cm, 0.50 * cm, 4, fill=1, stroke=1)
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 9.7)
+        c.drawString(margem_x + 0.25 * cm, y - 0.33 * cm, txt.upper()[:96])
+        return y - 0.84 * cm
+
+    def texto(txt: Any, y: float, tam: float = 9.15, leading: float = 0.38 * cm) -> float:
+        for linha in _linhas_pdf_seguras(c, txt, 'Courier', tam, largura_util - 0.48 * cm):
+            y = quebra(y, leading)
+            if not linha:
+                y -= leading * 0.58
+                continue
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', tam)
+            c.drawString(margem_x + 0.24 * cm, y, linha[:166])
+            y -= leading
+        return y
+
+    def campo(label: str, valor: Any, y: float, label_w: float = 4.9 * cm) -> float:
+        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_util - label_w - 0.45 * cm)
+        h = max(0.45 * cm, len(linhas) * 0.34 * cm + 0.08 * cm)
+        y = quebra(y, h)
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 9.05)
+        c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
+        c.setFillColor(cores['texto'])
+        c.setFont('Courier', 9.0)
+        xx = margem_x + label_w
+        for i, ln in enumerate(linhas[:5]):
+            c.drawString(xx, y - i * 0.33 * cm, ln[:148])
+        return y - h
+
+    def campos(itens: List[List[Any]], y: float) -> float:
+        for rotulo, valor in itens:
+            y = campo(str(rotulo), valor, y)
+        return y - 0.10 * cm
+
+    def desenhar_imagem(path: Any, x: float, y: float, w: float, h: float) -> bool:
+        try:
+            p = Path(str(path))
+            if not p.exists():
+                return False
+            c.drawImage(str(p), x, y, width=w, height=h, preserveAspectRatio=True, anchor='c', mask='auto')
+            return True
+        except Exception:
+            return False
+
+    def imagens(lista: List[Dict[str, Any]], y: float) -> float:
+        imgs = [ev for ev in lista if ev.get('tipo') == 'imagem' and ev.get('local')][:200]
+        if not imgs:
+            return texto('Nenhuma imagem anexada nesta seção.', y, tam=8.9)
+        col_w = (largura_util - 0.42 * cm) / 2
+        card_h = 6.65 * cm
+        img_h = 4.95 * cm
+        xs = [margem_x + 0.10 * cm, margem_x + 0.10 * cm + col_w + 0.22 * cm]
+        for i in range(0, len(imgs), 2):
+            y = quebra(y, card_h + 0.22 * cm)
+            for j, x in enumerate(xs):
+                if i + j >= len(imgs):
+                    continue
+                ev = imgs[i + j]
+                c.setFillColor(colors.HexColor('#F7F3E9'))
+                c.setStrokeColor(cores['linha'])
+                c.roundRect(x, y - card_h, col_w, card_h, 4, fill=1, stroke=1)
+                desenhar_imagem(ev.get('local'), x + 0.12 * cm, y - img_h - 0.15 * cm, col_w - 0.24 * cm, img_h)
+                legenda = f"Tópico: {seguro(ev.get('origem'), 'N/I')} | Autor: {seguro(ev.get('autor'), 'N/I')} | Data: {seguro(ev.get('data'), 'N/I')}"
+                c.setFillColor(cores['texto_suave'])
+                c.setFont('Courier', 7.0)
+                ly = y - img_h - 0.38 * cm
+                for ln in _linhas_pdf_seguras(c, legenda, 'Courier', 7.0, col_w - 0.22 * cm)[:3]:
+                    c.drawString(x + 0.12 * cm, ly, ln[:110])
+                    ly -= 0.23 * cm
+            y -= card_h + 0.22 * cm
+        return y
+
+    def pessoas(lista: List[Dict[str, Any]], y: float, vazio: str) -> float:
+        if not lista:
+            return texto(vazio, y, tam=8.95)
+        for idx, pessoa in enumerate(lista[:60], 1):
+            h = 2.50 * cm
+            y = quebra(y, h + 0.16 * cm)
+            c.setFillColor(colors.HexColor('#F7F3E9'))
+            c.setStrokeColor(cores['linha'])
+            c.roundRect(margem_x + 0.12 * cm, y - h, largura_util - 0.24 * cm, h, 4, fill=1, stroke=1)
+            desenhar_imagem(pessoa.get('foto'), margem_x + 0.20 * cm, y - 2.18 * cm, 1.90 * cm, 1.90 * cm)
+            tx = margem_x + 2.42 * cm
+            c.setFillColor(cores['dourado'])
+            c.setFont('Courier-Bold', 9.3)
+            c.drawString(tx, y - 0.34 * cm, f"{idx}. {seguro(pessoa.get('nome'))[:68]}")
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', 8.55)
+            detalhes = [
+                f"RG: {seguro(pessoa.get('rg'))}",
+                f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}",
+                f"Observações: {_v98_texto_observacoes_pessoa(pessoa)}",
+            ]
+            ly = y - 0.76 * cm
+            for det in detalhes:
+                for ln in _linhas_pdf_seguras(c, det, 'Courier', 8.55, largura_util - 2.85 * cm)[:2]:
+                    c.drawString(tx, ly, ln[:140])
+                    ly -= 0.27 * cm
+            y -= h + 0.18 * cm
+        return y
+
+    def assinaturas(y: float) -> float:
+        registros = list(obter_assinaturas_dossie(dados) or [])
+
+        while len(registros) < 2:
+            if len(registros) == 0:
+                registros.append({
+                    "titulo": "DIRETOR GERAL",
+                    "nome": "Diretor Geral",
+                    "texto": "",
+                    "imagem": None,
+                })
+            else:
+                registros.append({
+                    "titulo": "DIRETOR DICOR",
+                    "nome": "Arthur Fleker",
+                    "texto": "Arthur Fleker",
+                    "imagem": None,
+                })
+
+        registros = registros[:2]
+
+        y = quebra(y, 3.35 * cm)
+
+        gap = 0.38 * cm
+        total_w = min(largura_util - 0.45 * cm, 16.55 * cm)
+        caixa_w = (total_w - gap) / 2
+        caixa_h = 2.78 * cm
+        x0 = (largura - total_w) / 2
+
+        for idx_ass, assinatura in enumerate(registros):
+            x = x0 + idx_ass * (caixa_w + gap)
+
+            c.setFillColor(colors.HexColor("#F7F3E9"))
+            c.setStrokeColor(cores["linha"])
+            c.roundRect(
+                x,
+                y - caixa_h,
+                caixa_w,
+                caixa_h,
+                5,
+                fill=1,
+                stroke=1,
+            )
+
+            arquivo = (
+                limpar_imagem_assinatura_dossie(assinatura.get("imagem"))
+                or assinatura.get("imagem")
+                or assinatura.get("arquivo")
+            )
+
+            if arquivo and Path(str(arquivo)).exists():
+                desenhar_imagem(
+                    arquivo,
+                    x + 0.24 * cm,
+                    y - 1.32 * cm,
+                    caixa_w - 0.48 * cm,
+                    1.15 * cm,
+                )
+            else:
+                nome_fallback = str(
+                    assinatura.get("texto")
+                    or assinatura.get("nome")
+                    or "Autoridade"
+                )
+                c.setFillColor(cores["texto_suave"])
+                c.setFont("Courier-Oblique", 8.6)
+                c.drawCentredString(
+                    x + caixa_w / 2,
+                    y - 0.88 * cm,
+                    nome_fallback[:36],
+                )
+
+            c.setStrokeColor(cores["texto_suave"])
+            c.line(
+                x + 0.34 * cm,
+                y - 1.50 * cm,
+                x + caixa_w - 0.34 * cm,
+                y - 1.50 * cm,
+            )
+
+            nome_ass = str(
+                assinatura.get("nome")
+                or assinatura.get("texto")
+                or "AUTORIDADE"
+            ).upper()
+
+            titulo_ass = str(
+                assinatura.get("titulo")
+                or assinatura.get("cargo")
+                or "AUTORIDADE"
+            ).upper()
+
+            c.setFillColor(cores["texto"])
+            c.setFont("Courier-Bold", 8.7)
+            c.drawCentredString(
+                x + caixa_w / 2,
+                y - 1.91 * cm,
+                nome_ass[:36],
+            )
+
+            c.setFont("Courier", 8.0)
+            c.drawCentredString(
+                x + caixa_w / 2,
+                y - 2.25 * cm,
+                titulo_ass[:34],
+            )
+
+        return y - 3.08 * cm
+
+    # Capa / identificação
+    titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
+    y = iniciar_pagina(titulo_atual)
+    y = subtitulo('Identificação do Procedimento', y)
+    y = campos([
+        ['Processo Nº', dados.get('processo')],
+        ['Investigação Nº', dados.get('numero_investigacao')],
+        ['Nome da Operação', dados.get('nome_operacao')],
+        ['Comunidade Investigada', dados.get('comunidade')],
+        ['Cidade Operacional', dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)],
+        ['Data de Abertura', dados.get('data_abertura')],
+        ['Data de Encerramento', dados.get('data_encerramento')],
+        ['Diretor Responsável', dados.get('delegado_responsavel')],
+        ['Agente do Encerramento', dados.get('agente_encerramento')],
+        ['Integrantes', ', '.join(dados.get('integrantes_investigacao', [])) or 'Não informado'],
+    ], y)
+    est = dados.get('estatisticas', {}) or {}
+    y = subtitulo('Indicadores', y)
+    y = campos([
+        ['Mensagens analisadas', est.get('mensagens_analisadas', est.get('mensagens', 0))],
+        ['Evidências coletadas', est.get('evidencias', 0)],
+        ['Imagens anexadas', est.get('imagens', 0)],
+        ['Vídeos anexados', est.get('videos', 0)],
+        ['Links registrados', est.get('links', 0)],
+    ], y)
+
+    y = nova_secao('2. RESUMO EXECUTIVO')
+    y = subtitulo('Objetivo da Investigação', y)
+    y = texto(dados.get('objetivo') or 'Objetivo não informado.', y)
+    y = subtitulo('Contexto Operacional', y)
+    y = texto(resumo_contexto_operacional(dados), y)
+
+    y = nova_secao('3. LIDERANÇAS IDENTIFICADAS')
+    y = pessoas(dados.get('liderancas', []), y, 'Nenhuma liderança foi identificada automaticamente nos tópicos da mesa.')
+
+    y = nova_secao('4. INTEGRANTES IDENTIFICADOS')
+    y = pessoas(dados.get('integrantes', []), y, 'Nenhum integrante foi identificado automaticamente nos tópicos da mesa.')
+
+    y = nova_secao('5. PAINEL DA ORGANIZAÇÃO')
+    y = texto(dados.get('resumos', {}).get('painel') or dados.get('resumos', {}).get('informacoes_gerais') or 'Sem registros textuais adicionais.', y)
+    y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['painel', 'informações gerais', 'informacoes gerais']), y)
+
+    y = nova_secao('6. LOCALIZAÇÃO')
+    y = texto(dados.get('resumos', {}).get('localizacao') or 'Sem registros textuais adicionais.', y)
+    y = campos([
+        ['Comunidade/Base', dados.get('comunidade')],
+        ['Canal de reabertura', dados.get('reabrir_url') or 'Não informado'],
+        ['Cidade operacional', dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)],
+    ], y)
+    y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['localizacao', 'localização']), y)
+
+    # Parte 7 continua removida conforme aprovação anterior.
+    y = nova_secao('8. CRIMES DA COMUNIDADE')
+    y = texto(
+        dados.get('resumos', {}).get('crimes')
+        or dados.get('resumos', {}).get('crimes_da_comunidade')
+        or 'Sem registros textuais adicionais.',
+        y,
+        tam=11.0,
+        leading=0.45 * cm,
+    )
+    y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['crimes', 'crime', 'comunidade', 'ocorrencia', 'ocorrência']), y)
+
+    y = nova_secao('9. PRODUÇÃO E FABRICAÇÃO')
+    y = texto(dados.get('resumos', {}).get('producao') or 'Sem registros textuais adicionais.', y)
+    y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['producao', 'produção', 'farm', 'ingredientes', 'rota', 'fabricação']), y)
+
+    y = nova_secao('10. BAÚS E ARMAZENAMENTO')
+    y = texto(dados.get('resumos', {}).get('baus') or 'Sem registros textuais adicionais.', y)
+    y = imagens(filtrar_evidencias_por_topico(dados.get('evidencias', []), ['baus', 'bau', 'baú']), y)
+
+    y = nova_secao('11. INFORMANTES')
+    y = pessoas(
+        dados.get('informantes', []),
+        y,
+        'Nenhum informante foi identificado automaticamente nos tópicos da mesa.',
+    )
+
+    # Sem partes 12 e 13: apenas encerramento institucional não numerado.
+    y = nova_secao('ASSINATURAS INSTITUCIONAIS')
+    y = subtitulo('Síntese de Encerramento', y)
+    y = texto(montar_conclusao_dossie(dados), y)
+    y = subtitulo('Assinaturas Digitais', y)
+    y = assinaturas(y)
+    c.save()
+
+
+def _v100_gerar_docx_modelo_final(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """DOCX alinhado ao mesmo fluxo final do PDF, sem partes 7, 12 e 13."""
+    if Document is None:
+        return
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+    try:
+        sec = doc.sections[0]
+        sec.top_margin = Inches(0.6)
+        sec.bottom_margin = Inches(0.6)
+        sec.left_margin = Inches(0.65)
+        sec.right_margin = Inches(0.65)
+    except Exception:
+        pass
+
+    docx_add_heading(doc, 'DOSSIÊ OPERACIONAL DICOR', 0)
+    docx_add_paragraph(doc, f"POLÍCIA FEDERAL - DICOR\n{dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)}")
+    docx_add_info_table(doc, [
+        ['Campo', 'Informação'],
+        ['Processo Nº', dados.get('processo', 'Não informado')],
+        ['Investigação Nº', dados.get('numero_investigacao', 'Não informado')],
+        ['Nome da Operação', dados.get('nome_operacao', 'Não informado')],
+        ['Comunidade Investigada', dados.get('comunidade', 'Não informado')],
+        ['Cidade Operacional', dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)],
+        ['Data de Abertura', dados.get('data_abertura', 'Não informado')],
+        ['Data de Encerramento', dados.get('data_encerramento', 'Não informado')],
+        ['Delegado Responsável', dados.get('delegado_responsavel', 'Não informado')],
+        ['Agente do Encerramento', dados.get('agente_encerramento', 'Não informado')],
+    ])
+    doc.add_page_break()
+
+    docx_add_heading(doc, '2. RESUMO EXECUTIVO', 1)
+    docx_add_paragraph(doc, dados.get('objetivo') or 'Objetivo não informado.')
+    docx_add_paragraph(doc, resumo_contexto_operacional(dados))
+    docx_add_paragraph(doc, montar_conclusao_dossie(dados))
+    doc.add_page_break()
+
+    docx_add_heading(doc, '3. LIDERANÇAS IDENTIFICADAS', 1)
+    docx_add_pessoas(doc, dados.get('liderancas', []), 'Nenhuma liderança foi identificada automaticamente nos tópicos da mesa.')
+    doc.add_page_break()
+
+    docx_add_heading(doc, '4. INTEGRANTES IDENTIFICADOS', 1)
+    docx_add_pessoas(doc, dados.get('integrantes', []), 'Nenhum integrante foi identificado automaticamente nos tópicos da mesa.')
+    doc.add_page_break()
+
+    docx_add_heading(doc, '5. PAINEL DA ORGANIZAÇÃO', 1)
+    docx_add_paragraph(doc, dados.get('resumos', {}).get('painel'))
+    docx_add_imagens_evidencias(doc, filtrar_evidencias_por_topico(dados.get('evidencias', []), ['painel']), 8)
+    doc.add_page_break()
+
+    docx_add_heading(doc, '6. LOCALIZAÇÃO', 1)
+    docx_add_paragraph(doc, dados.get('resumos', {}).get('localizacao'))
+    docx_add_paragraph(doc, f"Comunidade/Base: {dados.get('comunidade', 'Não informado')}\nCanal de reabertura: {dados.get('reabrir_url', 'Não informado')}\nCidade operacional: {dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)}")
+    docx_add_imagens_evidencias(doc, filtrar_evidencias_por_topico(dados.get('evidencias', []), ['localizacao', 'localização']), 8)
+    doc.add_page_break()
+
+    docx_add_heading(doc, '8. CRIMES DA COMUNIDADE', 1)
+    docx_add_paragraph(doc, dados.get('resumos', {}).get('crimes'))
+    docx_add_imagens_evidencias(doc, filtrar_evidencias_por_topico(dados.get('evidencias', []), ['crimes', 'crime', 'comunidade', 'ocorrencia', 'ocorrência']), 8)
+    doc.add_page_break()
+
+    docx_add_heading(doc, '9. PRODUÇÃO E FABRICAÇÃO', 1)
+    docx_add_paragraph(doc, dados.get('resumos', {}).get('producao'))
+    docx_add_imagens_evidencias(doc, filtrar_evidencias_por_topico(dados.get('evidencias', []), ['producao', 'produção', 'farm', 'ingredientes', 'rota', 'fabricação']), 8)
+    doc.add_page_break()
+
+    docx_add_heading(doc, '10. BAÚS E ARMAZENAMENTO', 1)
+    docx_add_paragraph(doc, dados.get('resumos', {}).get('baus'))
+    docx_add_imagens_evidencias(doc, filtrar_evidencias_por_topico(dados.get('evidencias', []), ['baus', 'bau', 'baú']), 8)
+    doc.add_page_break()
+
+    docx_add_heading(doc, '11. INFORMANTES', 1)
+    docx_add_pessoas(
+        doc,
+        dados.get('informantes', []),
+        'Nenhum informante foi identificado automaticamente nos tópicos da mesa.',
+    )
+    doc.add_page_break()
+
+    docx_add_heading(doc, 'ASSINATURAS INSTITUCIONAIS', 1)
+    docx_add_paragraph(doc, montar_conclusao_dossie(dados))
+    doc.add_paragraph('')
+    docx_add_assinaturas_dossie(doc, dados)
+    doc.save(str(caminho_docx))
+
+
+
+
+# =====================================================
+# V100 — DOSSIÊ: IDENTIDADE 100% DA MESA
+# =====================================================
+# Regra absoluta:
+#   NOME / RG / CARGO / FOTO = SOMENTE A MESA
+#   BANCO = SOMENTE INFORMAÇÕES ADICIONAIS EM OBSERVAÇÕES
+#
+# Corrige também:
+# - palavras de cargo nunca viram pessoas;
+# - RG solto após bloco de cargo é anexado à pessoa anterior;
+# - informantes sem bloco textual repetido;
+# - gerador PDF final explícito com 2 assinaturas.
+
+_V100_COLETAR_ANTES = coletar_dados_operacionais_mesa
+
+
+_V100_CARGOS_NAO_SAO_NOMES = {
+    "lider",
+    "lideranca",
+    "membro",
+    "integrante",
+    "gerente",
+    "subgerente",
+    "sub lider",
+    "sublider",
+    "chefe",
+    "subchefe",
+    "informante",
+    "fundador",
+    "dono",
+    "responsavel",
+    "braço direito",
+    "braco direito",
+    "recrutador",
+    "vendedor",
+    "traficante",
+    "soldado",
+    "associado",
+    "operador",
+}
+
+
+def _v100_nome_valido_mesa(valor: Any) -> bool:
+    s = _v92_limpar_markdown(valor, 120)
+    if not s:
+        return False
+
+    n = normalizar_busca(s).strip()
+    if not n:
+        return False
+
+    if n in _V100_CARGOS_NAO_SAO_NOMES:
+        return False
+
+    # Também bloqueia variantes como "LÍDER DA ORG", "MEMBRO 1", etc.
+    for cargo in _V100_CARGOS_NAO_SAO_NOMES:
+        if n == cargo:
+            return False
+        if n.startswith(cargo + " ") and len(n.split()) <= 4:
+            return False
+
+    proibidos = (
+        "rg",
+        "passaporte",
+        "documento",
+        "funcao",
+        "cargo",
+        "posicao",
+        "observacao",
+        "periculosidade",
+        "telefone",
+        "placa",
+        "data",
+        "status",
+        "mensagem",
+        "enviado por",
+        "informacoes",
+        "nome",
+    )
+    if any(
+        n == p
+        or n.startswith(p + ":")
+        or n.startswith(p + " -")
+        for p in proibidos
+    ):
+        return False
+
+    # Nome de pessoa precisa conter letra e não pode ser frase longa.
+    if not re.search(r"[A-Za-zÀ-ÿ]", s):
+        return False
+    if len(s.split()) > 6:
+        return False
+
+    return True
+
+
+def _v100_cargo_de_linha(linha: Any) -> str:
+    s = _v92_limpar_markdown(linha, 120)
+    n = normalizar_busca(s)
+
+    # Cargo puro em uma linha.
+    if n in _V100_CARGOS_NAO_SAO_NOMES:
+        return s
+
+    # Cargo rotulado.
+    m = re.search(
+        r"(?i)^(?:FUNÇÃO|FUNCAO|CARGO|POSIÇÃO|POSICAO)\s*[:\-–—]\s*(.+)$",
+        s,
+    )
+    if m:
+        valor = _v92_limpar_markdown(m.group(1), 100)
+        return valor
+
+    return ""
+
+
+def extrair_blocos_pessoas(
+    textos: List[str],
+    funcao_padrao: str = "Integrante",
+) -> List[Dict[str, str]]:
+    """
+    V100 — parser estrito da própria mesa.
+
+    Não consulta banco.
+    Não usa nome aproximado.
+    Não transforma cargos em pessoas.
+    RG sem nome válido pode completar a pessoa anterior.
+    """
+    pessoas: List[Dict[str, str]] = []
+    por_nome: Dict[str, int] = {}
+    por_rg: Dict[str, int] = {}
+
+    def rg_util(valor: Any) -> str:
+        rg = _v92_limpar_markdown(valor, 40)
+        if _v92_valor_nao_informado(rg):
+            return ""
+        return rg
+
+    def cargo_util(valor: Any) -> str:
+        cargo = _v92_limpar_markdown(valor, 100)
+        if _v92_valor_nao_informado(cargo):
+            return ""
+        return cargo
+
+    def adicionar_ou_mesclar(
+        nome: Any,
+        rg: Any = "",
+        cargo: Any = "",
+        periculosidade: Any = "",
+        observacoes: Any = "",
+    ) -> Optional[int]:
+        nome_s = _v92_limpar_markdown(nome, 120)
+        if not _v100_nome_valido_mesa(nome_s):
+            return None
+
+        rg_s = rg_util(rg)
+        cargo_s = cargo_util(cargo)
+        per_s = _v92_limpar_markdown(periculosidade, 100)
+        obs_s = _v92_limpar_markdown(observacoes, 260)
+
+        nome_key = normalizar_busca(nome_s)
+        rg_key = _v98_rg_normalizado(rg_s) if rg_s else ""
+
+        # Mesmo RG = mesma pessoa. Mantém o nome real da mesa.
+        pos = por_rg.get(rg_key) if rg_key else None
+        if pos is None:
+            pos = por_nome.get(nome_key)
+
+        if pos is not None:
+            atual = pessoas[pos]
+
+            if rg_s and _v92_valor_nao_informado(atual.get("rg")):
+                atual["rg"] = rg_s
+                por_rg[rg_key] = pos
+
+            if cargo_s and (
+                _v92_valor_nao_informado(atual.get("cargo"))
+                or normalizar_busca(atual.get("cargo")) == normalizar_busca(funcao_padrao)
+            ):
+                atual["cargo"] = cargo_s
+                atual["funcao"] = cargo_s
+
+            if per_s and not _v92_valor_nao_informado(per_s):
+                atual["periculosidade"] = per_s
+
+            if obs_s and not _v92_valor_nao_informado(obs_s):
+                atual["observacoes"] = obs_s
+
+            return pos
+
+        pessoa = {
+            "nome": nome_s,
+            "rg": rg_s or "Não informado",
+            "cargo": cargo_s or funcao_padrao,
+            "funcao": cargo_s or funcao_padrao,
+            "periculosidade": (
+                per_s
+                if per_s and not _v92_valor_nao_informado(per_s)
+                else "Não informado"
+            ),
+            "observacoes": (
+                obs_s
+                if obs_s and not _v92_valor_nao_informado(obs_s)
+                else ""
+            ),
+            "foto": "",
+        }
+
+        pessoas.append(pessoa)
+        pos = len(pessoas) - 1
+        por_nome[nome_key] = pos
+        if rg_key:
+            por_rg[rg_key] = pos
+        return pos
+
+    ultimo_pos: Optional[int] = None
+
+    for texto_original in textos:
+        linhas = [
+            _v92_limpar_markdown(linha, 500)
+            for linha in str(texto_original or "").splitlines()
+            if _v92_limpar_markdown(linha, 500)
+        ]
+        if not linhas:
+            continue
+
+        nomes_exp: List[Tuple[int, str]] = []
+        rgs: List[Tuple[int, str]] = []
+
+        for i, linha in enumerate(linhas):
+            nome = _v92_extrair_nome_rotulado(linha)
+            if nome and _v100_nome_valido_mesa(nome):
+                nomes_exp.append((i, nome))
+
+            rg = _v92_extrair_rg_linha(linha)
+            if rg:
+                rgs.append((i, rg))
+
+        rgs_consumidos: set[int] = set()
+
+        # 1) Nome rotulado -> dados da própria janela na mesa.
+        for pos_nome, nome in nomes_exp:
+            rg = ""
+            rg_pos = None
+            for pos_rg, valor_rg in rgs:
+                if pos_nome <= pos_rg <= pos_nome + 10:
+                    rg = valor_rg
+                    rg_pos = pos_rg
+                    break
+
+            cargo = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Função", "Funcao", "Cargo", "Posição", "Posicao"],
+                120,
+            )
+
+            # Se o cargo estiver sozinho em linha próxima, aceita.
+            if not cargo:
+                for j in range(pos_nome + 1, min(len(linhas), pos_nome + 6)):
+                    c = _v100_cargo_de_linha(linhas[j])
+                    if c:
+                        cargo = c
+                        break
+
+            periculosidade = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Grau de periculosidade", "Periculosidade"],
+                100,
+            )
+            obs = _v92_extrair_campo_janela(
+                linhas,
+                pos_nome,
+                pos_nome + 10,
+                ["Observações", "Observacoes", "Obs"],
+                260,
+            )
+
+            ultimo_pos = adicionar_ou_mesclar(
+                nome,
+                rg,
+                cargo,
+                periculosidade,
+                obs,
+            )
+            if rg_pos is not None:
+                rgs_consumidos.add(rg_pos)
+
+        # 2) RGs ainda não usados.
+        for pos_rg, rg in rgs:
+            if pos_rg in rgs_consumidos:
+                continue
+
+            nome_inferido = ""
+            cargo_proximo = ""
+
+            # Procura até 4 linhas acima, ignorando cargo puro.
+            for j in range(pos_rg - 1, max(-1, pos_rg - 5), -1):
+                if j < 0:
+                    break
+                candidato = linhas[j]
+
+                cargo_candidato = _v100_cargo_de_linha(candidato)
+                if cargo_candidato and not cargo_proximo:
+                    cargo_proximo = cargo_candidato
+                    continue
+
+                if _v100_nome_valido_mesa(candidato):
+                    nome_inferido = candidato
+                    break
+
+            # Caso clássico do erro:
+            #   LÍDER
+            #   RG: 22414
+            # Não cria "LÍDER" como pessoa. Completa a pessoa anterior.
+            if not nome_inferido:
+                if (
+                    ultimo_pos is not None
+                    and 0 <= ultimo_pos < len(pessoas)
+                    and _v92_valor_nao_informado(pessoas[ultimo_pos].get("rg"))
+                ):
+                    pessoas[ultimo_pos]["rg"] = rg
+                    rg_key = _v98_rg_normalizado(rg)
+                    if rg_key:
+                        por_rg[rg_key] = ultimo_pos
+
+                    if cargo_proximo and (
+                        _v92_valor_nao_informado(pessoas[ultimo_pos].get("cargo"))
+                        or normalizar_busca(pessoas[ultimo_pos].get("cargo"))
+                        == normalizar_busca(funcao_padrao)
+                    ):
+                        pessoas[ultimo_pos]["cargo"] = cargo_proximo
+                        pessoas[ultimo_pos]["funcao"] = cargo_proximo
+                continue
+
+            ultimo_pos = adicionar_ou_mesclar(
+                nome_inferido,
+                rg,
+                cargo_proximo,
+                "",
+                "",
+            )
+
+        # 3) Mensagem com nome simples sem RG ainda.
+        # Só cria quando o texto parece claramente ser um cadastro de pessoa.
+        if not nomes_exp and not rgs:
+            candidatos = [
+                linha
+                for linha in linhas
+                if _v100_nome_valido_mesa(linha)
+            ]
+            if len(candidatos) == 1:
+                # Exige pista de função/cargo na mesma mensagem para não
+                # transformar conversa normal em pessoa.
+                cargo = ""
+                for linha in linhas:
+                    cargo = _v100_cargo_de_linha(linha)
+                    if cargo:
+                        break
+                if cargo:
+                    ultimo_pos = adicionar_ou_mesclar(
+                        candidatos[0],
+                        "",
+                        cargo,
+                        "",
+                        "",
+                    )
+
+    # Limpeza final defensiva.
+    saida: List[Dict[str, str]] = []
+    nomes_vistos: Dict[str, int] = {}
+    rgs_vistos: Dict[str, int] = {}
+
+    for pessoa in pessoas:
+        nome = _v92_limpar_markdown(pessoa.get("nome"), 120)
+        if not _v100_nome_valido_mesa(nome):
+            continue
+
+        rg = rg_util(pessoa.get("rg"))
+        nk = normalizar_busca(nome)
+        rk = _v98_rg_normalizado(rg) if rg else ""
+
+        pos = rgs_vistos.get(rk) if rk else None
+        if pos is None:
+            pos = nomes_vistos.get(nk)
+
+        if pos is not None:
+            alvo = saida[pos]
+            if rg and _v92_valor_nao_informado(alvo.get("rg")):
+                alvo["rg"] = rg
+                if rk:
+                    rgs_vistos[rk] = pos
+            continue
+
+        pessoa["nome"] = nome
+        pessoa["rg"] = rg or "Não informado"
+        saida.append(pessoa)
+        pos = len(saida) - 1
+        nomes_vistos[nk] = pos
+        if rk:
+            rgs_vistos[rk] = pos
+
+    return saida[:80]
+
+
+async def _v100_vincular_fotos_somente_mesa(
+    dados: Dict[str, Any],
+    pasta_dossie: Path,
+) -> None:
+    """
+    Foto também vem exclusivamente da mesa.
+    Primeiro tenta casar pela mensagem que contém nome/RG.
+    Depois usa a ordem original do tópico.
+    """
+    evidencias = list(dados.get("evidencias") or [])
+    mensagens = list(dados.get("mensagens") or [])
+
+    texto_por_url: Dict[str, str] = {}
+    for msg in mensagens:
+        url = str(msg.get("url") or "").strip()
+        if url:
+            texto_por_url[url] = str(msg.get("conteudo") or "")
+
+    secoes = (
+        ("liderancas", "liderancas"),
+        ("integrantes", "integrantes"),
+        ("informantes", "informantes"),
+    )
+
+    for campo, topico in secoes:
+        pessoas = list(dados.get(campo) or [])
+        imgs = [
+            ev
+            for ev in evidencias
+            if _v96_evidencia_do_topico(ev, topico)
+        ]
+
+        usados: set[int] = set()
+
+        # 1) vínculo por mensagem.
+        for pessoa in pessoas:
+            nome_n = normalizar_busca(pessoa.get("nome"))
+            rg_n = _v98_rg_normalizado(pessoa.get("rg"))
+
+            for idx, ev in enumerate(imgs):
+                if idx in usados:
+                    continue
+
+                msg_url = str(ev.get("mensagem_url") or "").strip()
+                conteudo = texto_por_url.get(msg_url, "")
+                conteudo_n = normalizar_busca(conteudo)
+
+                bate_nome = bool(nome_n and nome_n in conteudo_n)
+                bate_rg = bool(
+                    rg_n
+                    and rg_n in _v98_rg_normalizado(conteudo)
+                )
+
+                if not (bate_nome or bate_rg):
+                    continue
+
+                local = str(ev.get("local") or "").strip()
+                if local:
+                    pessoa["foto"] = local
+                    usados.add(idx)
+                    break
+
+        # 2) fallback pela ordem da mesa.
+        fila = [
+            (idx, ev)
+            for idx, ev in enumerate(imgs)
+            if idx not in usados
+        ]
+
+        cursor = 0
+        for pessoa in pessoas:
+            if str(pessoa.get("foto") or "").strip():
+                continue
+
+            while cursor < len(fila):
+                idx, ev = fila[cursor]
+                cursor += 1
+                local = str(ev.get("local") or "").strip()
+                if not local:
+                    continue
+                pessoa["foto"] = local
+                usados.add(idx)
+                break
+
+        dados[campo] = pessoas
+
+    # Recupera somente arquivos locais faltantes, ainda a partir das URLs
+    # das evidências da própria mesa.
+    await _v96_restaurar_fotos_pessoas(
+        dados,
+        Path(pasta_dossie),
+    )
+
+
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    V100 final:
+    1. deixa todo o pipeline anterior coletar/download;
+    2. RECONSTRÓI identidade exclusivamente dos textos da mesa;
+    3. vincula fotos exclusivamente das evidências da mesa;
+    4. Banco entra por último e só acrescenta observacoes_banco.
+    """
+    dados = await _V100_COLETAR_ANTES(
+        canal,
+        mesa,
+        interaction,
+        pasta_dossie,
+        dados_confirmacao=dados_confirmacao,
+    )
+
+    textos = dict(dados.get("textos_por_topico") or {})
+
+    # Identidade zerada e refeita da mesa.
+    dados["liderancas"] = extrair_blocos_pessoas(
+        list(textos.get("liderancas") or [])
+        + list(textos.get("painel") or []),
+        "Liderança",
+    )
+    dados["integrantes"] = extrair_blocos_pessoas(
+        list(textos.get("integrantes") or [])
+        + list(textos.get("chat") or []),
+        "Integrante",
+    )
+    dados["informantes"] = extrair_blocos_pessoas(
+        list(textos.get("informantes") or []),
+        "Informante",
+    )
+
+    await _v100_vincular_fotos_somente_mesa(
+        dados,
+        Path(pasta_dossie),
+    )
+
+    # Remove qualquer informação adicional anterior para impedir herança
+    # de versões velhas antes de consultar o Banco novamente.
+    for chave in ("liderancas", "integrantes"):
+        for pessoa in dados.get(chave, []):
+            pessoa.pop("observacoes_banco", None)
+
+    # BANCO = SOMENTE ADICIONAL.
+    # Essa função V98 só escreve observacoes_banco e usa RG exato.
+    try:
+        await asyncio.to_thread(
+            _v98_enriquecer_pessoas_banco_sync,
+            dados,
+        )
+    except Exception as erro:
+        print(
+            "⚠️ V100: informações adicionais do Banco indisponíveis; "
+            f"dossiê seguirá apenas com a mesa: {type(erro).__name__}: {erro}",
+            flush=True,
+        )
+
+    return dados
+
+
+# -----------------------------------------------------
+# ASSINATURAS FINAIS DO DOSSIÊ
+# -----------------------------------------------------
+def obter_assinaturas_dossie(
+    dados: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    registros = carregar_assinaturas_dossie()
+
+    geral_reg = dict(
+        registros.get("delegado_geral")
+        or {}
+    )
+
+    geral_img = caminho_assinatura_registrada(
+        geral_reg
+    )
+    if not geral_img:
+        geral_img = caminho_arquivo_configurado(
+            ASSINATURA_DELEGADO_GERAL_IMAGEM,
+            [
+                "assinatura_delegado_geral.png",
+                "assinatura_delegado_geral.jpg",
+                "assinatura_delegado_geral.jpeg",
+            ],
+        )
+
+    geral_nome = (
+        str(geral_reg.get("nome") or "").strip()
+        or str(ASSINATURA_DELEGADO_GERAL_NOME or "").strip()
+        or "Diretor Geral"
+    )
+
+    diretor_geral = {
+        "slot": "delegado_geral",
+        "titulo": "DIRETOR GERAL",
+        "cargo": "DIRETOR GERAL",
+        "nome": geral_nome,
+        "texto": (
+            str(geral_reg.get("texto") or "").strip()
+            or geral_nome
+        ),
+        "imagem": str(geral_img) if geral_img else "",
+        "arquivo": str(geral_img) if geral_img else "",
+    }
+
+    diretor_dicor = dict(
+        _v68_assinatura_arthur()
+    )
+    diretor_dicor.update({
+        "titulo": "DIRETOR DICOR",
+        "cargo": "DIRETOR DICOR",
+        "nome": (
+            str(diretor_dicor.get("nome") or "").strip()
+            or "Arthur Fleker"
+        ),
+    })
+
+    # Sempre exatamente duas posições.
+    return [
+        diretor_geral,
+        diretor_dicor,
+    ]
+
+
+# -----------------------------------------------------
+# OBSERVAÇÕES: identidade da mesa + extras do Banco
+# -----------------------------------------------------
+def _v98_texto_observacoes_pessoa(
+    pessoa: Dict[str, Any],
+) -> str:
+    partes: List[str] = []
+
+    observacao_mesa = _v98_valor_util(
+        pessoa.get("observacoes")
+    )
+    banco = _v98_valor_util(
+        pessoa.get("observacoes_banco")
+    )
+
+    if observacao_mesa:
+        partes.append(observacao_mesa)
+
+    if banco and banco not in partes:
+        partes.append(banco)
+
+    return (
+        " | ".join(partes)[:310]
+        if partes
+        else "Não informado"
+    )
+
+
+print(
+    "✅ V100 carregada — identidade do dossiê vem exclusivamente da mesa; "
+    "Banco somente em informações adicionais; cargos não viram pessoas; "
+    "informantes sem repetição; PDF/DOCX finais fixados e 2 assinaturas obrigatórias.",
+    flush=True,
+)
+
+
+# =====================================================
+# V100 — ÚNICO CAMINHO FINAL DE GERAÇÃO
+# =====================================================
+def gerar_pdf_dossie(
+    dados: Dict[str, Any],
+    caminho_pdf: Path,
+) -> None:
+    caminho_pdf = Path(caminho_pdf)
+    dados_leves = _dados_dossie_otimizados(
+        dados,
+        caminho_pdf.parent,
+    )
+    _v100_gerar_pdf_modelo_final(
+        dados_leves,
+        caminho_pdf,
+    )
+
+
+def gerar_docx_dossie(
+    dados: Dict[str, Any],
+    caminho_docx: Path,
+) -> None:
+    caminho_docx = Path(caminho_docx)
+    dados_leves = _dados_dossie_otimizados(
+        dados,
+        caminho_docx.parent,
+    )
+    _v100_gerar_docx_modelo_final(
+        dados_leves,
+        caminho_docx,
+    )
+
+
 if __name__ == '__main__':
     asyncio.run(main())
