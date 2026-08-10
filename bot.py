@@ -3746,7 +3746,29 @@ async def coletar_dados_operacionais_mesa(
     pasta_evidencias.mkdir(parents=True, exist_ok=True)
 
     limite = DOSSIE_HISTORY_LIMIT if DOSSIE_HISTORY_LIMIT > 0 else None
-    threads = await listar_threads_da_mesa(canal, mesa)
+    try:
+        threads = await asyncio.wait_for(
+            listar_threads_da_mesa(canal, mesa),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        threads = []
+        try:
+            await enviar_log(
+                f"⚠️ V99 dossiê {canal.id}: listagem de tópicos excedeu 15s; "
+                "continuando com o canal principal."
+            )
+        except Exception:
+            pass
+    except Exception as erro:
+        threads = []
+        try:
+            await enviar_log(
+                f"⚠️ V99 dossiê {canal.id}: falha ao listar tópicos "
+                f"({type(erro).__name__}); continuando com o canal principal."
+            )
+        except Exception:
+            pass
 
     mensagens: List[Dict[str, Any]] = []
     textos_por_topico: Dict[str, List[str]] = defaultdict(list)
@@ -3754,66 +3776,303 @@ async def coletar_dados_operacionais_mesa(
     links: List[Dict[str, str]] = []
     autores: Dict[int, str] = {}
     contador_anexo = 1
+    pendencias_anexos: List[
+        Tuple[discord.Attachment, Dict[str, Any], int]
+    ] = []
 
-    async def processar_historico(entidade, origem: str):
+    V99_HISTORY_TIMEOUT = 45.0
+    V99_DOWNLOAD_TIMEOUT = 10.0
+    V99_HISTORY_CONCURRENCY = 4
+    V99_DOWNLOAD_CONCURRENCY = 6
+
+    async def processar_historico(
+        entidade,
+        origem: str,
+    ) -> None:
         nonlocal contador_anexo
+
         topico = topico_dossie_por_nome(origem)
-        try:
-            async for msg in entidade.history(limit=limite, oldest_first=True):
-                if msg.author and not getattr(msg.author, "bot", False):
-                    autores[msg.author.id] = str(msg.author)
 
-                texto_msg = coletar_texto_embed(msg)
-                eh_bot = bool(getattr(msg.author, "bot", False))
-                texto_util = texto_dossie_tem_conteudo_util(texto_msg)
-                links_msg = [link.rstrip(".,)];") for link in URL_REGEX.findall(texto_msg)] if texto_msg else []
+        async def _coletar() -> None:
+            nonlocal contador_anexo
 
-                # Mensagens automáticas do próprio bot não entram no relatório,
-                # mas mensagens de usuários, links e anexos continuam sendo coletados.
-                if texto_msg and (texto_util or (not eh_bot and not texto_dossie_eh_boilerplate_bot(texto_msg))):
-                    textos_por_topico[topico].append(texto_msg)
+            async for msg in entidade.history(
+                limit=limite,
+                oldest_first=True,
+            ):
+                if (
+                    msg.author
+                    and not getattr(
+                        msg.author,
+                        "bot",
+                        False,
+                    )
+                ):
+                    autores[
+                        msg.author.id
+                    ] = str(msg.author)
+
+                texto_msg = coletar_texto_embed(
+                    msg
+                )
+                eh_bot = bool(
+                    getattr(
+                        msg.author,
+                        "bot",
+                        False,
+                    )
+                )
+                texto_util = (
+                    texto_dossie_tem_conteudo_util(
+                        texto_msg
+                    )
+                )
+                links_msg = (
+                    [
+                        link.rstrip(
+                            ".,)];"
+                        )
+                        for link in URL_REGEX.findall(
+                            texto_msg
+                        )
+                    ]
+                    if texto_msg
+                    else []
+                )
+
+                if texto_msg and (
+                    texto_util
+                    or (
+                        not eh_bot
+                        and not texto_dossie_eh_boilerplate_bot(
+                            texto_msg
+                        )
+                    )
+                ):
+                    textos_por_topico[
+                        topico
+                    ].append(texto_msg)
+
                     mensagens.append({
                         "id": msg.id,
                         "autor": str(msg.author),
-                        "autor_id": getattr(msg.author, "id", None),
-                        "data": formatar_data_discord(msg.created_at),
+                        "autor_id": getattr(
+                            msg.author,
+                            "id",
+                            None,
+                        ),
+                        "data": formatar_data_discord(
+                            msg.created_at
+                        ),
                         "origem": origem,
                         "topico": topico,
                         "conteudo": texto_msg,
-                        "url": getattr(msg, "jump_url", ""),
+                        "url": getattr(
+                            msg,
+                            "jump_url",
+                            "",
+                        ),
                     })
 
                 for link in links_msg:
                     if texto_util or not eh_bot:
                         links.append({
                             "url": link,
-                            "data": formatar_data_discord(msg.created_at),
-                            "autor": str(msg.author),
+                            "data": formatar_data_discord(
+                                msg.created_at
+                            ),
+                            "autor": str(
+                                msg.author
+                            ),
                             "origem": origem,
                         })
 
-                for anexo in msg.attachments:
-                    tipo = tipo_anexo_dossie(anexo)
-                    caminho_local = await salvar_anexo_dossie(anexo, pasta_evidencias, contador_anexo)
+                # V99: NÃO baixa dentro do loop de mensagens.
+                # Apenas cria o registro e agenda o download.
+                for anexo in list(
+                    getattr(
+                        msg,
+                        "attachments",
+                        [],
+                    )
+                    or []
+                ):
+                    indice = contador_anexo
                     contador_anexo += 1
-                    evidencias.append({
+
+                    tipo = tipo_anexo_dossie(
+                        anexo
+                    )
+
+                    evidencia = {
                         "tipo": tipo,
-                        "arquivo": anexo.filename,
-                        "content_type": anexo.content_type or "",
-                        "url": anexo.url,
-                        "local": str(caminho_local) if caminho_local else "",
-                        "data": formatar_data_discord(msg.created_at),
-                        "autor": str(msg.author),
+                        "arquivo": getattr(
+                            anexo,
+                            "filename",
+                            "arquivo",
+                        ),
+                        "content_type": (
+                            getattr(
+                                anexo,
+                                "content_type",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "url": str(
+                            getattr(
+                                anexo,
+                                "url",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "proxy_url": str(
+                            getattr(
+                                anexo,
+                                "proxy_url",
+                                "",
+                            )
+                            or ""
+                        ),
+                        "local": "",
+                        "data": formatar_data_discord(
+                            msg.created_at
+                        ),
+                        "autor": str(
+                            msg.author
+                        ),
                         "origem": origem,
                         "topico": topico,
-                        "mensagem_url": getattr(msg, "jump_url", ""),
-                    })
-        except Exception as erro:
-            await enviar_log(f"⚠️ Erro ao coletar histórico de `{origem}` na mesa {canal.id}: {erro}")
+                        "mensagem_url": getattr(
+                            msg,
+                            "jump_url",
+                            "",
+                        ),
+                    }
 
-    await processar_historico(canal, "Canal principal")
-    for thread in threads:
-        await processar_historico(thread, thread.name)
+                    evidencias.append(
+                        evidencia
+                    )
+                    pendencias_anexos.append(
+                        (
+                            anexo,
+                            evidencia,
+                            indice,
+                        )
+                    )
+
+        try:
+            await asyncio.wait_for(
+                _coletar(),
+                timeout=V99_HISTORY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            try:
+                await enviar_log(
+                    f"⚠️ V99 dossiê {canal.id}: tópico `{origem}` "
+                    f"passou de {int(V99_HISTORY_TIMEOUT)}s; "
+                    "o conteúdo já coletado foi preservado e o relatório continuou."
+                )
+            except Exception:
+                pass
+        except Exception as erro:
+            try:
+                await enviar_log(
+                    f"⚠️ Erro ao coletar histórico de `{origem}` "
+                    f"na mesa {canal.id}: {type(erro).__name__}: {erro}"
+                )
+            except Exception:
+                pass
+
+    # Canal principal primeiro.
+    await processar_historico(
+        canal,
+        "Canal principal",
+    )
+
+    # Tópicos em paralelo, mas com limite para não bater rate limit.
+    sem_historico = asyncio.Semaphore(
+        V99_HISTORY_CONCURRENCY
+    )
+
+    async def _processar_thread(
+        thread,
+    ) -> None:
+        async with sem_historico:
+            await processar_historico(
+                thread,
+                thread.name,
+            )
+
+    if threads:
+        await asyncio.gather(
+            *[
+                _processar_thread(
+                    thread
+                )
+                for thread in threads
+            ],
+            return_exceptions=True,
+        )
+
+    # Agora baixa os anexos em paralelo.
+    sem_download = asyncio.Semaphore(
+        V99_DOWNLOAD_CONCURRENCY
+    )
+
+    async def _baixar_pendencia(
+        anexo: discord.Attachment,
+        evidencia: Dict[str, Any],
+        indice: int,
+    ) -> None:
+        async with sem_download:
+            try:
+                caminho_local = (
+                    await asyncio.wait_for(
+                        salvar_anexo_dossie(
+                            anexo,
+                            pasta_evidencias,
+                            indice,
+                        ),
+                        timeout=V99_DOWNLOAD_TIMEOUT,
+                    )
+                )
+
+                if caminho_local:
+                    evidencia[
+                        "local"
+                    ] = str(caminho_local)
+
+            except asyncio.TimeoutError:
+                # URL continua registrada no dossiê.
+                evidencia[
+                    "download_status"
+                ] = "TIMEOUT"
+
+            except Exception as erro:
+                evidencia[
+                    "download_status"
+                ] = (
+                    f"{type(erro).__name__}"
+                )
+
+    if pendencias_anexos:
+        await asyncio.gather(
+            *[
+                _baixar_pendencia(
+                    anexo,
+                    evidencia,
+                    indice,
+                )
+                for (
+                    anexo,
+                    evidencia,
+                    indice,
+                ) in pendencias_anexos
+            ],
+            return_exceptions=True,
+        )
 
     todos_textos = [m["conteudo"] for m in mensagens]
     dados_base = dados_confirmacao or {}
@@ -4196,13 +4455,24 @@ async def fechar_mesa_core(
     )
 
     t_coleta = time.monotonic()
-    dados_dossie = await coletar_dados_operacionais_mesa(
-        canal,
-        mesa,
-        interaction,
-        pasta_dossie,
-        dados_confirmacao=dados_confirmacao,
-    )
+
+    global _V99_DOSSIE_ATIVO
+    _V99_DOSSIE_ATIVO += 1
+
+    try:
+        dados_dossie = await coletar_dados_operacionais_mesa(
+            canal,
+            mesa,
+            interaction,
+            pasta_dossie,
+            dados_confirmacao=dados_confirmacao,
+        )
+    finally:
+        _V99_DOSSIE_ATIVO = max(
+            0,
+            _V99_DOSSIE_ATIVO - 1,
+        )
+
     tempo_coleta = time.monotonic() - t_coleta
 
     try:
@@ -77066,6 +77336,333 @@ print(
     "✅ V98 carregada — dossiê com Diretor Geral + Diretor DICOR, "
     "informantes sem texto duplicado e líderes/membros enriquecidos "
     "pelo Banco via RG exato.",
+    flush=True,
+)
+
+
+# =====================================================
+# V99 — ETAPA 2 RÁPIDA / PRIORIDADE AO DOSSIÊ
+# =====================================================
+
+_V99_DOSSIE_ATIVO = 0
+
+
+# -----------------------------------------------------
+# OCR: não roda PaddleOCR em retrato comum.
+# Só tenta OCR quando a própria evidência parece documento.
+# -----------------------------------------------------
+async def _v92_enriquecer_pessoas_com_fotos_ocr(
+    dados: Dict[str, Any],
+) -> None:
+    evidencias = list(
+        dados.get("evidencias")
+        or []
+    )
+
+    secoes = (
+        ("liderancas", "liderancas"),
+        ("integrantes", "integrantes"),
+        ("informantes", "informantes"),
+    )
+
+    for campo, topico in secoes:
+        pessoas = list(
+            dados.get(campo)
+            or []
+        )
+
+        imagens = [
+            ev
+            for ev in evidencias
+            if (
+                str(
+                    ev.get("tipo")
+                    or ""
+                ).lower()
+                == "imagem"
+                and normalizar_busca(
+                    ev.get("topico")
+                )
+                == normalizar_busca(
+                    topico
+                )
+            )
+        ]
+
+        # Mesma vinculação por ordem que já estava aprovada.
+        for idx, pessoa in enumerate(
+            pessoas
+        ):
+            if idx >= len(imagens):
+                break
+
+            local = str(
+                imagens[idx].get("local")
+                or ""
+            ).strip()
+
+            if (
+                local
+                and not str(
+                    pessoa.get("foto")
+                    or ""
+                ).strip()
+            ):
+                pessoa["foto"] = local
+
+        # V99: OCR só se a imagem tiver cara de documento.
+        # Retratos de personagens não carregam mais o modelo pesado.
+        candidatos: List[
+            Tuple[Dict[str, Any], str]
+        ] = []
+
+        for idx, pessoa in enumerate(
+            pessoas
+        ):
+            if not _v92_valor_nao_informado(
+                pessoa.get("rg")
+            ):
+                continue
+
+            if idx >= len(imagens):
+                continue
+
+            ev = imagens[idx]
+            local = str(
+                ev.get("local")
+                or ""
+            ).strip()
+
+            if not local:
+                continue
+
+            pista = normalizar_busca(
+                " ".join([
+                    str(
+                        ev.get("arquivo")
+                        or ""
+                    ),
+                    str(
+                        ev.get("origem")
+                        or ""
+                    ),
+                    str(
+                        ev.get("content_type")
+                        or ""
+                    ),
+                ])
+            )
+
+            if not any(
+                chave in pista
+                for chave in (
+                    "rg",
+                    "passaporte",
+                    "documento",
+                    "identidade",
+                    "carteira",
+                )
+            ):
+                continue
+
+            candidatos.append(
+                (
+                    pessoa,
+                    local,
+                )
+            )
+
+        # Máximo 2 OCRs documentais por dossiê.
+        for pessoa, local in candidatos[:2]:
+            try:
+                rg_ocr = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _v92_ocr_rg_sync,
+                        local,
+                    ),
+                    timeout=8.0,
+                )
+
+                if rg_ocr:
+                    pessoa["rg"] = rg_ocr
+
+            except Exception:
+                continue
+
+        dados[campo] = pessoas
+
+
+# -----------------------------------------------------
+# Recuperação de fotos faltantes em paralelo.
+# Uma URL ruim não segura todas as outras.
+# -----------------------------------------------------
+async def _v96_restaurar_fotos_pessoas(
+    dados: Dict[str, Any],
+    pasta_dossie: Path,
+) -> None:
+    evidencias = list(
+        dados.get("evidencias")
+        or []
+    )
+
+    secoes = (
+        ("liderancas", "liderancas"),
+        ("integrantes", "integrantes"),
+        ("informantes", "informantes"),
+    )
+
+    sem = asyncio.Semaphore(6)
+    contador = 0
+
+    async def recuperar(
+        ev: Dict[str, Any],
+        indice: int,
+    ) -> str:
+        atual = str(
+            ev.get("local")
+            or ""
+        ).strip()
+
+        if await asyncio.to_thread(
+            _v96_arquivo_imagem_valido,
+            atual,
+        ):
+            return atual
+
+        async with sem:
+            try:
+                return await asyncio.wait_for(
+                    _v96_recuperar_evidencia_local(
+                        ev,
+                        pasta_dossie,
+                        indice,
+                    ),
+                    timeout=8.0,
+                )
+            except Exception:
+                return ""
+
+    for campo, topico in secoes:
+        pessoas = list(
+            dados.get(campo)
+            or []
+        )
+
+        if not pessoas:
+            continue
+
+        imagens = [
+            ev
+            for ev in evidencias
+            if _v96_evidencia_do_topico(
+                ev,
+                topico,
+            )
+        ]
+
+        if not imagens:
+            dados[campo] = pessoas
+            continue
+
+        tarefas = []
+
+        for ev in imagens:
+            contador += 1
+            tarefas.append(
+                recuperar(
+                    ev,
+                    contador,
+                )
+            )
+
+        locais = await asyncio.gather(
+            *tarefas,
+            return_exceptions=False,
+        )
+
+        locais_validos = [
+            str(local)
+            for local in locais
+            if str(local or "").strip()
+        ]
+
+        for idx, pessoa in enumerate(
+            pessoas
+        ):
+            foto_atual = str(
+                pessoa.get("foto")
+                or ""
+            ).strip()
+
+            if await asyncio.to_thread(
+                _v96_arquivo_imagem_valido,
+                foto_atual,
+            ):
+                continue
+
+            if idx < len(locais_validos):
+                pessoa[
+                    "foto"
+                ] = locais_validos[idx]
+
+        dados[campo] = pessoas
+
+
+# -----------------------------------------------------
+# Enquanto fecha dossiê, snapshots pesados esperam.
+# -----------------------------------------------------
+_V99_BO_SNAPSHOT_ANTES = (
+    _v21_snapshot_boletins_do_canal
+)
+_V99_PERICIAS_SYNC_ANTES = (
+    _v23_sincronizar_pericias
+)
+_V99_PRISAO_PAYLOADS_ANTES = (
+    _v53_prisao_payloads
+)
+
+
+async def _v21_snapshot_boletins_do_canal(
+) -> Dict[str, int]:
+    if _V99_DOSSIE_ATIVO > 0:
+        return {
+            "boletins": 0,
+            "arquivos": 0,
+            "adiado_dossie": 1,
+        }
+
+    return await _V99_BO_SNAPSHOT_ANTES()
+
+
+async def _v23_sincronizar_pericias(
+) -> Dict[str, int]:
+    if _V99_DOSSIE_ATIVO > 0:
+        return {
+            "pericias": 0,
+            "fotos": 0,
+            "adiado_dossie": 1,
+        }
+
+    return await _V99_PERICIAS_SYNC_ANTES()
+
+
+async def _v53_prisao_payloads(
+    message: discord.Message,
+) -> List[Any]:
+    if _V99_DOSSIE_ATIVO > 0:
+        # Durante a Etapa 2 evita fetch/snapshot extra.
+        # A mensagem original já contém o texto principal.
+        return [message]
+
+    return await _V99_PRISAO_PAYLOADS_ANTES(
+        message
+    )
+
+
+print(
+    "✅ V99 carregada — Etapa 2 com históricos e downloads concorrentes, "
+    "10s por mídia, OCR somente documental e snapshots pesados pausados "
+    "durante a coleta do dossiê.",
     flush=True,
 )
 
