@@ -47320,5 +47320,104 @@ async def on_ready():
 print('✅ V104 carregada — dossiê limpo/automático, SET corrigido e boletins alinhados ao número/data da mensagem oficial.', flush=True)
 
 
+
+
+# =====================================================
+# V105 — TÓPICO AUTOMÁTICO DE RESIDÊNCIA DO LÍDER
+# - Novas mesas já recebem o tópico 🏠・Residência do Líder.
+# - Mesas antigas recebem o tópico automaticamente ao serem reanalisadas/fechadas,
+#   caso ele ainda não exista.
+# - O dossiê lê fotos, mapas e texto desse tópico sem exigir cadastro duplicado.
+# =====================================================
+
+_V105_RESIDENCIA_TOPICO = '🏠・Residência do Líder'
+if _V105_RESIDENCIA_TOPICO not in TOPICOS_MESA:
+    # Mantém a organização dos tópicos: localização -> residência -> crimes.
+    try:
+        _v105_i = TOPICOS_MESA.index('📍 Localização') + 1
+    except ValueError:
+        _v105_i = len(TOPICOS_MESA)
+    TOPICOS_MESA.insert(_v105_i, _V105_RESIDENCIA_TOPICO)
+
+
+def _v105_nome_eh_residencia(nome: str) -> bool:
+    n = normalizar_busca(str(nome or ''))
+    return any(t in n for t in ('residencia do lider', 'residencia lider', 'moradia do lider', 'casa do lider'))
+
+
+async def _v105_topicos_mesa_todos(canal: discord.TextChannel) -> List[discord.Thread]:
+    encontrados: Dict[int, discord.Thread] = {}
+    for t in list(getattr(canal, 'threads', []) or []):
+        encontrados[int(t.id)] = t
+    # Inclui arquivados para não criar duplicata caso o tópico tenha sido arquivado.
+    try:
+        async for t in canal.archived_threads(limit=100):
+            encontrados[int(t.id)] = t
+    except Exception:
+        pass
+    return list(encontrados.values())
+
+
+async def _v105_garantir_topico_residencia(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]]=None) -> Optional[discord.Thread]:
+    if not isinstance(canal, discord.TextChannel):
+        return None
+    try:
+        topicos = await _v105_topicos_mesa_todos(canal)
+        existente = next((t for t in topicos if _v105_nome_eh_residencia(getattr(t, 'name', ''))), None)
+        if existente is not None:
+            # Reabre se estiver arquivado, quando possível.
+            try:
+                if bool(getattr(existente, 'archived', False)):
+                    await existente.edit(archived=False, reason='Reabertura automática do tópico de residência do líder')
+            except Exception:
+                pass
+            return existente
+
+        mensagem = await canal.send(f'🧵 **{_V105_RESIDENCIA_TOPICO}**')
+        try:
+            thread = await mensagem.create_thread(
+                name=_V105_RESIDENCIA_TOPICO[:100],
+                auto_archive_duration=10080,
+                reason='Tópico automático da mesa — residência do líder',
+            )
+        except discord.HTTPException:
+            thread = await mensagem.create_thread(
+                name=_V105_RESIDENCIA_TOPICO[:100],
+                auto_archive_duration=1440,
+                reason='Tópico automático da mesa — residência do líder',
+            )
+        await thread.send(
+            '## 🏠 Residência do Líder\n'
+            '> Envie aqui **foto da residência**, **print/mapa da localização** e, se necessário, uma descrição curta do local.\n'
+            '> O dossiê usa este tópico automaticamente; não é necessário repetir informações em outro formulário.'
+        )
+        if isinstance(mesa, dict):
+            ids = [int(x) for x in list(mesa.get('topicos_ids') or []) if str(x).isdigit()]
+            if int(thread.id) not in ids:
+                ids.append(int(thread.id))
+                mesa['topicos_ids'] = ids
+                try:
+                    registrar_mesa(mesa)
+                except Exception:
+                    pass
+        return thread
+    except Exception as erro:
+        try:
+            await enviar_log(f'⚠️ V105 não conseguiu criar o tópico de residência na mesa {getattr(canal, "id", 0)}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+        return None
+
+
+# Garante o tópico também nas mesas antigas quando o usuário usa Reanalisar/Fechar Mesa.
+_V105_DIAGNOSTICO_BASE = _v103_diagnostico_mesa
+async def _v103_diagnostico_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: Any, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    await _v105_garantir_topico_residencia(canal, mesa)
+    return await _V105_DIAGNOSTICO_BASE(canal, mesa, interaction, dados_confirmacao)
+
+
+print('✅ V105 carregada — tópico 🏠 Residência do Líder criado automaticamente em novas mesas e recuperado/criado nas mesas antigas durante a revisão do dossiê.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
