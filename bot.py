@@ -46012,16 +46012,10 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     y = subtitulo('Objetivo da Investigação', y); y = texto(dados.get('objetivo') or 'Objetivo não informado.', y)
     y = subtitulo('Contexto Operacional', y); y = texto(resumo_contexto_operacional(dados), y)
 
-    # 3. MANDADO
+    # 3. MANDADO — V104: uma única redação consolidada, preenchida da mesa ou por 1 campo manual.
     y = nova_secao('3. DISPOSIÇÕES DO MANDADO / BUSCA E PACIFICAÇÃO')
-    y = campos([
-        ['Abrangência da busca', _v102_valor_ou_pendencia(req.get('mandado_busca'), 'Definir autorização para busca em qualquer andar, sala, instalação e veículos relacionados aos investigados.')],
-        ['Bens de terceiros', _v102_valor_ou_pendencia(req.get('mandado_terceiros'), 'Definir regra de não apreensão de documentos ou objetos pertencentes a terceiros, familiares ou residentes.')],
-        ['OAB/Advogado', _v102_valor_ou_pendencia(req.get('mandado_oab'), 'Definir solicitação de presença de representante da OAB/advogado, caso aplicável ao padrão adotado.')],
-        ['Extensão da busca', _v102_valor_ou_pendencia(req.get('mandado_extensao'), 'Definir procedimento para extensão da busca caso sejam encontrados elementos probatórios adicionais.')],
-        ['Cofres/baús/porta-malas', _v102_valor_ou_pendencia(req.get('mandado_arrombamento'), 'Definir autorização/procedimento para abertura ou arrombamento de cofres, baús, porta-malas e compartimentos.')],
-        ['Detidos', _v102_valor_ou_pendencia(req.get('mandado_detidos'), 'Definir procedimento para apresentação dos investigados detidos à autoridade competente.')],
-    ], y)
+    y = subtitulo('Diretrizes consolidadas', y)
+    y = texto(_v102_valor_ou_pendencia(req.get('mandado_resumo'), 'Registrar as disposições específicas do mandado/busca que não constam na mesa.'), y, tam=10.0, leading=0.42 * cm)
 
     # 4-5. PESSOAS
     y = nova_secao('4. LIDERANÇAS IDENTIFICADAS'); y = pessoas(dados.get('liderancas', []), y, 'Nenhuma liderança foi identificada automaticamente nos tópicos da mesa.')
@@ -46074,14 +46068,14 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     if not prod_imgs: y = texto(_v102_pendencia('Fotos/vídeos comprobatórios — conferir/anexar.'), y)
     y = imagens(prod_imgs, y)
 
-    # 10. BAÚS
+    # 10. BAÚS — V104: líder/gerente e membros permanecem separados como na mesa.
     y = nova_secao('10. BAÚS E ARMAZENAMENTO')
-    y = texto(_v102_valor_util((dados.get('resumos') or {}).get('baus')) or 'Nenhum registro textual específico foi encontrado neste tópico.', y)
-    y = campos([
-        ['Conteúdo específico dos baús', _v102_valor_ou_pendencia(req.get('baus_conteudo'), 'Conteúdo específico dos baús — preencher após conferência das imagens.')],
-        ['Localização dos baús', _v102_valor_ou_pendencia(req.get('baus_local'), 'Localização dos baús — preencher, se disponível.')],
-    ], y)
-    y = imagens(_v102_evidencias(dados, ['baus', 'bau', 'baú']), y)
+    y = subtitulo('Baú do líder / gerente', y)
+    y = texto(req.get('baus_lider_conteudo') or 'Nenhum texto adicional; evidências abaixo preservam o conteúdo original do tópico.', y)
+    y = imagens(_v102_evidencias(dados, ['baú de líder', 'bau de lider', 'baú do líder', 'bau do lider', 'gerente']), y)
+    y = subtitulo('Baú dos membros', y)
+    y = texto(req.get('baus_membros_conteudo') or 'Nenhum texto adicional; evidências abaixo preservam o conteúdo original do tópico.', y)
+    y = imagens(_v102_evidencias(dados, ['baú de membros', 'bau de membros', 'baú dos membros', 'bau dos membros']), y)
 
     # 11. INFORMANTES
     y = nova_secao('11. INFORMANTES')
@@ -46100,19 +46094,10 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     if not resid_imgs: y = texto(_v102_pendencia('Fotos e vídeos da residência — anexar/conferir.'), y)
     y = imagens(resid_imgs, y)
 
-    # 13. PLANEJAMENTO
+    # 13. PLANEJAMENTO — V104: redação consolidada; evita nove campos manuais.
     y = nova_secao('13. PLANEJAMENTO OPERACIONAL')
-    y = campos([
-        ['Efetivo envolvido', _v102_valor_ou_pendencia(req.get('planejamento_efetivo'), 'Efetivo envolvido — preencher.')],
-        ['Equipes especializadas/reforço', _v102_valor_ou_pendencia(req.get('planejamento_equipes'), 'Equipes especializadas/reforço policial — preencher.')],
-        ['Recursos utilizados', _v102_valor_ou_pendencia(req.get('planejamento_recursos'), 'Recursos utilizados (viaturas, drones, apoio aéreo etc.) — preencher conforme operação efetivamente planejada.')],
-        ['Estratégia/Setores', _v102_valor_ou_pendencia(req.get('planejamento_estrategia'), 'Estratégia de abordagem e divisão de setores — preencher.')],
-        ['Barreiras/Acessos', _v102_valor_ou_pendencia(req.get('planejamento_barreiras'), 'Barreiras e controle dos acessos — preencher.')],
-        ['Negociação', _v102_valor_ou_pendencia(req.get('planejamento_negociacao'), 'Procedimento de negociação, se houver — preencher.')],
-        ['Proteção da população', _v102_valor_ou_pendencia(req.get('planejamento_protecao'), 'Medidas de proteção à população — preencher.')],
-        ['Equipe médica', _v102_valor_ou_pendencia(req.get('planejamento_medica'), 'Disponibilização de equipe médica, se aplicável — preencher.')],
-        ['Acompanhamento institucional', _v102_valor_ou_pendencia(req.get('planejamento_institucional'), 'Participação/acompanhamento institucional — preencher.')],
-    ], y)
+    y = subtitulo('Planejamento consolidado', y)
+    y = texto(_v102_valor_ou_pendencia(req.get('planejamento_resumo'), 'Registrar o planejamento operacional que não consta na mesa.'), y, tam=10.0, leading=0.42 * cm)
 
     # 14. MOTIVAÇÃO
     y = nova_secao('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO')
@@ -46132,10 +46117,10 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
         ['Cargo do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_cargo'), 'Cargo do delegado responsável — preencher.')],
         ['Matrícula/RG responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_registro'), 'Matrícula/RG do delegado responsável — preencher.')],
         ['Data do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_data'), 'Data da formalização pelo delegado responsável — preencher.')],
-        ['Delegado adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')],
-        ['Cargo do adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do delegado adjunto/delegado DIC — preencher.')],
-        ['Matrícula/RG adjunto', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do delegado adjunto/delegado DIC — preencher.')],
-        ['Data do adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo delegado adjunto/delegado DIC — preencher.')],
+        ['Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')],
+        ['Cargo do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do Diretor DICOR — preencher.')],
+        ['Matrícula/RG Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do Diretor DICOR — preencher.')],
+        ['Data do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo Diretor DICOR — preencher.')],
     ], y)
     y = subtitulo('Assinaturas Digitais', y); y = assinaturas(y)
 
@@ -46172,21 +46157,19 @@ def _v102_gerar_docx_modelo_final(dados: Dict[str, Any], caminho_docx: Path) -> 
         ['Nº do Pedido de Pacificação', _v102_valor_ou_pendencia(req.get('pedido_numero'), 'Nº do Pedido de Pacificação — não consta na mesa.')], ['Data de Expedição', _v102_valor_ou_pendencia(req.get('data_expedicao'), 'Data de Expedição — não consta como data de expedição.')], ['Requerente formal', _v102_valor_ou_pendencia(req.get('requerente'), 'Requerente formal do pedido de pacificação — não identificado.')], ['Local da pacificação', _v102_valor_ou_pendencia(req.get('local_pacificacao'), 'Localização/endereço específico da pacificação — preencher.')]
     ])
     doc.add_page_break(); h('2. RESUMO EXECUTIVO E OBJETIVO'); p('OBJETIVO DA INVESTIGAÇÃO'); p(dados.get('objetivo') or 'Objetivo não informado.'); p('CONTEXTO OPERACIONAL'); p(resumo_contexto_operacional(dados))
-    doc.add_page_break(); h('3. DISPOSIÇÕES DO MANDADO / BUSCA E PACIFICAÇÃO'); info([
-        ['Abrangência da busca', _v102_valor_ou_pendencia(req.get('mandado_busca'), 'Definir autorização para busca em qualquer andar, sala, instalação e veículos relacionados aos investigados.')], ['Bens de terceiros', _v102_valor_ou_pendencia(req.get('mandado_terceiros'), 'Definir regra de não apreensão de documentos ou objetos pertencentes a terceiros, familiares ou residentes.')], ['OAB/Advogado', _v102_valor_ou_pendencia(req.get('mandado_oab'), 'Definir solicitação de presença de representante da OAB/advogado, caso aplicável ao padrão adotado.')], ['Extensão da busca', _v102_valor_ou_pendencia(req.get('mandado_extensao'), 'Definir procedimento para extensão da busca caso sejam encontrados elementos probatórios adicionais.')], ['Cofres/baús/porta-malas', _v102_valor_ou_pendencia(req.get('mandado_arrombamento'), 'Definir autorização/procedimento para abertura ou arrombamento de cofres, baús, porta-malas e compartimentos.')], ['Detidos', _v102_valor_ou_pendencia(req.get('mandado_detidos'), 'Definir procedimento para apresentação dos investigados detidos à autoridade competente.')]
-    ])
+    doc.add_page_break(); h('3. DISPOSIÇÕES DO MANDADO / BUSCA E PACIFICAÇÃO'); p('DIRETRIZES CONSOLIDADAS'); p(_v102_valor_ou_pendencia(req.get('mandado_resumo'), 'Registrar as disposições específicas do mandado/busca que não constam na mesa.'))
     doc.add_page_break(); h('4. LIDERANÇAS IDENTIFICADAS'); docx_add_pessoas(doc, dados.get('liderancas', []), 'Nenhuma liderança foi identificada automaticamente nos tópicos da mesa.')
     doc.add_page_break(); h('5. INTEGRANTES IDENTIFICADOS'); docx_add_pessoas(doc, dados.get('integrantes', []), 'Nenhum integrante foi identificado automaticamente nos tópicos da mesa.')
     doc.add_page_break(); h('6. PAINEL DA ORGANIZAÇÃO'); p(_v102_primeiro(_v102_valor_util((dados.get('resumos') or {}).get('painel')), req.get('painel_descricao')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); p('Relação dos integrantes: ' + (', '.join([str(x.get('nome') or '') for x in dados.get('integrantes', []) if x.get('nome')]) or _v102_pendencia('registrar os integrantes na própria mesa.'))); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['painel']), 40)
     doc.add_page_break(); h('7. LOCALIZAÇÃO'); p(_v102_valor_util((dados.get('resumos') or {}).get('localizacao')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Comunidade/Base', dados.get('comunidade')], ['Canal de reabertura', dados.get('reabrir_url') or 'Não informado'], ['Cidade operacional', dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)], ['Endereço/Localização exata', _v102_valor_ou_pendencia(req.get('endereco_exato'), 'Endereço/localização exata — preencher.')], ['Coordenadas geográficas', _v102_valor_ou_pendencia(req.get('coordenadas'), 'Coordenadas geográficas — preencher.')], ['Visão aérea/estratégica', _v102_valor_ou_pendencia(req.get('visao_aerea'), 'Visão aérea/estratégica — descrever a referência visual registrada na mesa.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['localizacao','localização','mapa']), 40)
     doc.add_page_break(); h('8. CRIMES DA COMUNIDADE'); p(_v102_valor_util((dados.get('resumos') or {}).get('crimes')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Fundamentação da pacificação', _v102_valor_ou_pendencia(req.get('fundamentacao_crimes'), 'Fundamentação específica para pedido de pacificação — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['crimes','crime','comunidade','ocorrencia','ocorrência']), 40)
     doc.add_page_break(); h('9. PRODUÇÃO E FABRICAÇÃO'); p(_v102_valor_util((dados.get('resumos') or {}).get('producao')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Material/Produto', _v102_valor_ou_pendencia(req.get('produto_material'), 'Identificação objetiva do material comercializado e evidência correspondente — complementar.')], ['Local exato de fabricação', _v102_valor_ou_pendencia(req.get('producao_local'), 'Local exato de fabricação — preencher.')], ['Descrição do local', _v102_valor_ou_pendencia(req.get('producao_descricao'), 'Descrição do local de fabricação — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['producao','produção','farm','ingredientes','rota','fabricacao','fabricação']), 50)
-    doc.add_page_break(); h('10. BAÚS E ARMAZENAMENTO'); p(_v102_valor_util((dados.get('resumos') or {}).get('baus')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Conteúdo específico dos baús', _v102_valor_ou_pendencia(req.get('baus_conteudo'), 'Conteúdo específico dos baús — preencher após conferência das imagens.')], ['Localização dos baús', _v102_valor_ou_pendencia(req.get('baus_local'), 'Localização dos baús — preencher, se disponível.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baus','bau','baú']), 50)
+    doc.add_page_break(); h('10. BAÚS E ARMAZENAMENTO'); p('BAÚ DO LÍDER / GERENTE'); p(req.get('baus_lider_conteudo') or 'Evidências preservadas no tópico correspondente.'); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de líder','bau de lider','baú do líder','bau do lider','gerente']), 30); p('BAÚ DOS MEMBROS'); p(req.get('baus_membros_conteudo') or 'Evidências preservadas no tópico correspondente.'); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de membros','bau de membros','baú dos membros','bau dos membros']), 30)
     doc.add_page_break(); h('11. INFORMANTES'); docx_add_pessoas(doc, dados.get('informantes', []), 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.'); p('INFORMAÇÕES FORNECIDAS'); p(_v102_valor_ou_pendencia(req.get('informantes_info'), 'Informações fornecidas pelos informantes não constam no texto extraído. Preencher somente se houver registro comprovável.'))
     doc.add_page_break(); h('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA'); lider_nome = req.get('residencia_lider_nome') or 'líder identificado'; info([[f'Residência de {lider_nome}', _v102_valor_ou_pendencia(req.get('residencia'), f'Residência do líder {lider_nome} — não consta na mesa.')], ['Endereço/Localização', _v102_valor_ou_pendencia(req.get('residencia_endereco'), 'Endereço/localização da residência — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['residencia','residência','moradia','casa']), 30)
-    doc.add_page_break(); h('13. PLANEJAMENTO OPERACIONAL'); info([['Efetivo envolvido', _v102_valor_ou_pendencia(req.get('planejamento_efetivo'), 'Efetivo envolvido — preencher.')], ['Equipes especializadas/reforço', _v102_valor_ou_pendencia(req.get('planejamento_equipes'), 'Equipes especializadas/reforço policial — preencher.')], ['Recursos utilizados', _v102_valor_ou_pendencia(req.get('planejamento_recursos'), 'Recursos utilizados — preencher.')], ['Estratégia/Setores', _v102_valor_ou_pendencia(req.get('planejamento_estrategia'), 'Estratégia de abordagem e divisão de setores — preencher.')], ['Barreiras/Acessos', _v102_valor_ou_pendencia(req.get('planejamento_barreiras'), 'Barreiras e controle dos acessos — preencher.')], ['Negociação', _v102_valor_ou_pendencia(req.get('planejamento_negociacao'), 'Procedimento de negociação, se houver — preencher.')], ['Proteção da população', _v102_valor_ou_pendencia(req.get('planejamento_protecao'), 'Medidas de proteção à população — preencher.')], ['Equipe médica', _v102_valor_ou_pendencia(req.get('planejamento_medica'), 'Disponibilização de equipe médica, se aplicável — preencher.')], ['Acompanhamento institucional', _v102_valor_ou_pendencia(req.get('planejamento_institucional'), 'Participação/acompanhamento institucional — preencher.')]])
+    doc.add_page_break(); h('13. PLANEJAMENTO OPERACIONAL'); p('PLANEJAMENTO CONSOLIDADO'); p(_v102_valor_ou_pendencia(req.get('planejamento_resumo'), 'Registrar o planejamento operacional que não consta na mesa.'))
     doc.add_page_break(); h('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO'); info([['Justificativa específica', _v102_valor_ou_pendencia(req.get('motivacao'), 'Justificativa específica para necessidade da pacificação — preencher.')], ['Prisão preventiva', _v102_valor_ou_pendencia(req.get('prisao_preventiva'), 'Prisão preventiva decretada — preencher somente se houver decisão/registro.')], ['Artigo/Dispositivo jurídico', _v102_valor_ou_pendencia(req.get('artigo_juridico'), 'Artigo/dispositivo jurídico utilizado — preencher conforme documento que fundamenta a medida.')], ['Ameaças/violência', _v102_valor_ou_pendencia(req.get('ameacas'), 'Ameaças ou violência contra moradores — não consta.')], ['Histórico de confrontos', _v102_valor_ou_pendencia(req.get('confrontos'), 'Histórico de confrontos entre criminosos e forças de segurança — não consta.')], ['Acesso policial/controle territorial', _v102_valor_ou_pendencia(req.get('dificuldade_acesso'), 'Dificuldade de acesso da Polícia à região por controle territorial — não consta.')]])
-    doc.add_page_break(); h('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS'); info([['Delegado responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel'), 'Delegado responsável — preencher.')], ['Cargo do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_cargo'), 'Cargo do delegado responsável — preencher.')], ['Matrícula/RG responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_registro'), 'Matrícula/RG do delegado responsável — preencher.')], ['Data do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_data'), 'Data da formalização pelo delegado responsável — preencher.')], ['Delegado adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')], ['Cargo do adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do delegado adjunto/delegado DIC — preencher.')], ['Matrícula/RG adjunto', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do delegado adjunto/delegado DIC — preencher.')], ['Data do adjunto/DIC', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo delegado adjunto/delegado DIC — preencher.')]]); docx_add_assinaturas_dossie(doc, dados)
+    doc.add_page_break(); h('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS'); info([['Delegado responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel'), 'Delegado responsável — preencher.')], ['Cargo do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_cargo'), 'Cargo do delegado responsável — preencher.')], ['Matrícula/RG responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_registro'), 'Matrícula/RG do delegado responsável — preencher.')], ['Data do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_data'), 'Data da formalização pelo delegado responsável — preencher.')], ['Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')], ['Cargo do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do Diretor DICOR — preencher.')], ['Matrícula/RG Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do Diretor DICOR — preencher.')], ['Data do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo Diretor DICOR — preencher.')]]); docx_add_assinaturas_dossie(doc, dados)
     doc.add_page_break(); h('16. INDICADORES E SÍNTESE DE ENCERRAMENTO'); est = dados.get('estatisticas', {}) or {}; info([['Mensagens analisadas', est.get('mensagens_analisadas', est.get('mensagens', 0))], ['Evidências coletadas', est.get('evidencias', 0)], ['Imagens anexadas', est.get('imagens', 0)], ['Vídeos anexados', est.get('videos', 0)], ['Links registrados', est.get('links', 0)]]); p(montar_conclusao_dossie(dados))
     doc.add_page_break(); h('17. CHECKLIST FINAL DE CONFORMIDADE COM O PADRÃO DRAGONS'); info([[item, status] for item, status in _v102_checklist(dados, req)]); p('Importante: os campos marcados como PENDENTE não foram preenchidos com suposições. Eles exigem informação ou documento comprobatório que não aparece na mesa de investigação.')
     doc.save(str(caminho_docx))
@@ -46323,12 +46306,12 @@ _V103_SECOES = {
         ],
     },
     'adjunto': {
-        'titulo': 'Delegado adjunto / DIC',
+        'titulo': 'Diretor DICOR',
         'campos': [
-            ('delegado_adjunto', 'Nome do adjunto/DIC', 'Nome da autoridade', 200, False),
-            ('delegado_adjunto_cargo', 'Cargo do adjunto/DIC', 'Cargo/função', 180, False),
-            ('delegado_adjunto_registro', 'Matrícula/RG adjunto', 'Matrícula ou RG', 150, False),
-            ('delegado_adjunto_data', 'Data do adjunto/DIC', 'Ex.: 11/08/2026', 100, False),
+            ('delegado_adjunto', 'Nome do Diretor DICOR', 'Nome da autoridade', 200, False),
+            ('delegado_adjunto_cargo', 'Cargo do Diretor DICOR', 'Cargo/função', 180, False),
+            ('delegado_adjunto_registro', 'Matrícula/RG Diretor DICOR', 'Matrícula ou RG', 150, False),
+            ('delegado_adjunto_data', 'Data do Diretor DICOR', 'Ex.: 11/08/2026', 100, False),
         ],
     },
 }
@@ -46759,6 +46742,582 @@ async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Opti
 
 
 print('✅ V103 carregada — fechamento só prossegue após cumprir todas as pendências do padrão; complementação salva em /data, mídias verificadas, localização/visão estratégica e responsáveis formalizados; modelo visual preservado.', flush=True)
+
+
+# =====================================================
+# V104 — DOSSIÊ AUTO-FIRST + SET + BO OFICIAL
+# - Pede o mínimo possível no fechamento da mesa.
+# - Tudo que pode ser obtido/derivado da própria mesa é preenchido automaticamente.
+# - Buiu Gomes = Delegado Responsável; Arthur Fleker = Diretor DICOR.
+# - Baús de líder/gerente e membros são tratados separadamente.
+# - Solicitações de SET vão exclusivamente para 1536832915001053335.
+# - Boletins usam SEMPRE o número escrito na mensagem oficial e preservam a data.
+# =====================================================
+
+# --- SET: canal oficial solicitado pelo usuário ---
+SET_APROVACAO_CHANNEL_ID = 1536832915001053335
+
+# --- Dossiê: tópicos de baú precisam ser separados ANTES de detectar líder/membro ---
+_V104_TOPICO_ANTES = topico_dossie_por_nome
+
+def topico_dossie_por_nome(nome: str) -> str:
+    n = normalizar_busca(nome)
+    if 'bau' in n or 'baú' in str(nome or '').lower():
+        if any(x in n for x in ('lider', 'gerente', 'chefe')):
+            return 'baus_lider'
+        if any(x in n for x in ('membro', 'integrante')):
+            return 'baus_membros'
+        return 'baus'
+    return _V104_TOPICO_ANTES(nome)
+
+# Só existem formulários para informações que realmente não podem ser inventadas.
+_V103_SECOES = {
+    'mandado': {
+        'titulo': 'Mandado / busca',
+        'campos': [
+            ('mandado_resumo', 'Disposições da busca', 'Somente o que não consta na mesa: abrangência, terceiros, acesso a compartimentos e encaminhamento.', 3000, True),
+        ],
+    },
+    'localizacao': {
+        'titulo': 'Localização',
+        'campos': [
+            ('endereco_exato', 'Localização específica', 'Preencha somente se a mesa não tiver endereço/localização suficiente.', 1000, True),
+        ],
+    },
+    'residencia': {
+        'titulo': 'Residência do líder',
+        'campos': [
+            ('residencia', 'Residência do líder', 'Identificação/descrição que não consta na mesa.', 1200, True),
+            ('residencia_endereco', 'Local da residência', 'Localização da residência, somente se não estiver registrada.', 1000, True),
+        ],
+    },
+    'planejamento': {
+        'titulo': 'Planejamento operacional',
+        'campos': [
+            ('planejamento_resumo', 'Planejamento', 'Efetivo, recursos, estratégia, acessos e medidas de segurança em um único texto.', 3500, True),
+        ],
+    },
+    'motivacao': {
+        'titulo': 'Motivação',
+        'campos': [
+            ('motivacao', 'Justificativa', 'Preencha somente se os crimes/evidências da mesa não permitirem identificar a motivação.', 2500, True),
+        ],
+    },
+}
+_V103_LABELS = {campo[0]: campo[1] for sec in _V103_SECOES.values() for campo in sec['campos']}
+_V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo in sec['campos']]
+
+_V104_REQ_ANTES = _v102_montar_requisitos
+
+def _v104_data_documento() -> str:
+    try:
+        return str(data_atual_br()).split()[0]
+    except Exception:
+        return datetime.datetime.now().strftime('%d/%m/%Y')
+
+def _v104_resumo_topicos(dados: Dict[str, Any], chaves: List[str], limite: int=1800) -> str:
+    blocos: List[str] = []
+    mapa = dict(dados.get('textos_por_topico') or {})
+    for chave in chaves:
+        blocos.extend([str(x) for x in list(mapa.get(chave) or []) if str(x or '').strip()])
+    if not blocos:
+        return ''
+    try:
+        resumo = resumir_textos_topico(blocos)
+    except Exception:
+        resumo = '\n'.join(blocos)
+    return texto_limpo_dossie(resumo, limite)
+
+def _v104_tem_evidencia(dados: Dict[str, Any], termos: List[str]) -> bool:
+    return bool(_v102_evidencias(dados, termos))
+
+def _v104_rg_membro(nome: str, dados: Dict[str, Any]) -> str:
+    alvo = normalizar_busca(nome)
+    if not alvo:
+        return ''
+    try:
+        guild = bot.get_guild(int(dados.get('guild_id') or GUILD_ID or 0))
+    except Exception:
+        guild = None
+    if guild is None:
+        return ''
+    for membro in list(getattr(guild, 'members', []) or []):
+        exibicao = str(getattr(membro, 'display_name', '') or getattr(membro, 'name', '') or '')
+        if alvo not in normalizar_busca(exibicao):
+            continue
+        # Só usa dígitos realmente escritos no apelido/nome; nunca usa o ID do Discord como RG.
+        achados = re.findall(r'(?<!\d)(\d{2,7})(?!\d)', exibicao)
+        if achados:
+            return achados[-1]
+    return ''
+
+def _v104_numero_pacificacao(dados: Dict[str, Any]) -> str:
+    for chave in ('numero_investigacao', 'processo'):
+        valor = str(dados.get(chave) or '').strip()
+        if valor:
+            sufixo = re.sub(r'[^A-Za-z0-9-]+', '-', valor).strip('-')
+            return f'PP-{sufixo}'[:70]
+    canal_id = str(dados.get('canal_id') or '')
+    return f'PP-DICOR-{canal_id[-6:] or datetime.datetime.now().strftime("%d%m%y")}'
+
+def _v102_montar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    """V104: preenche automaticamente tudo que a mesa/sistema consegue comprovar."""
+    req = dict(_V104_REQ_ANTES(dados) or {})
+    complementos = dict(dados.get('complementos_pacificacao') or {})
+    if not complementos and dados.get('canal_id'):
+        complementos = _v103_complementos_canal(dados.get('canal_id'))
+    for chave in _V103_CAMPOS_OBRIGATORIOS:
+        manual = _v102_valor_util(complementos.get(chave))
+        if manual and not _v102_valor_util(req.get(chave)):
+            req[chave] = manual
+
+    hoje = _v104_data_documento()
+    local_resumo = _v104_resumo_topicos(dados, ['localizacao'], 1200)
+    crimes_resumo = _v104_resumo_topicos(dados, ['crimes'], 1800)
+    producao_resumo = _v104_resumo_topicos(dados, ['producao'], 1600)
+    painel_resumo = _v104_resumo_topicos(dados, ['painel'], 1400)
+    informantes_resumo = _v104_resumo_topicos(dados, ['informantes'], 1500)
+    mandado_resumo = _v102_primeiro(req.get('mandado_resumo'), _v104_resumo_topicos(dados, ['mandado'], 3000))
+    planejamento_resumo = _v102_primeiro(req.get('planejamento_resumo'), _v104_resumo_topicos(dados, ['planejamento'], 3500))
+    residencia_resumo = _v104_resumo_topicos(dados, ['residencia'], 1400)
+    baus_lider = _v104_resumo_topicos(dados, ['baus_lider'], 1400)
+    baus_membros = _v104_resumo_topicos(dados, ['baus_membros'], 1400)
+
+    # Identificação formal: automática; não vira formulário.
+    req['pedido_numero'] = _v102_primeiro(req.get('pedido_numero'), _v104_numero_pacificacao(dados))
+    req['data_expedicao'] = _v102_primeiro(req.get('data_expedicao'), hoje)
+    req['requerente'] = _v102_primeiro(req.get('requerente'), 'Buiu Gomes — Delegado Responsável')
+    req['local_pacificacao'] = _v102_primeiro(req.get('local_pacificacao'), req.get('endereco_exato'), local_resumo, dados.get('comunidade'))
+
+    # Autoridades conhecidas: nunca perguntar novamente.
+    req['delegado_responsavel'] = 'Buiu Gomes'
+    req['delegado_responsavel_cargo'] = 'Delegado Responsável'
+    req['delegado_responsavel_registro'] = _v102_primeiro(req.get('delegado_responsavel_registro'), _v104_rg_membro('Buiu Gomes', dados), 'Não informado na mesa')
+    req['delegado_responsavel_data'] = hoje
+    req['delegado_adjunto'] = 'Arthur Fleker'
+    req['delegado_adjunto_cargo'] = 'Diretor DICOR'
+    req['delegado_adjunto_registro'] = _v102_primeiro(req.get('delegado_adjunto_registro'), _v104_rg_membro('Arthur Fleker', dados), 'Não informado na mesa')
+    req['delegado_adjunto_data'] = hoje
+
+    # Painel e localização: usa texto/imagem da mesa; coordenada não bloqueia o dossiê.
+    if not _v102_valor_util(req.get('painel_descricao')):
+        if painel_resumo:
+            req['painel_descricao'] = painel_resumo
+        elif _v104_tem_evidencia(dados, ['painel']):
+            req['painel_descricao'] = 'Painel da organização documentado pelas evidências visuais anexadas na própria mesa.'
+    if not _v102_valor_util(req.get('endereco_exato')):
+        req['endereco_exato'] = _v102_primeiro(local_resumo, dados.get('comunidade'))
+    if not _v102_valor_util(req.get('coordenadas')):
+        req['coordenadas'] = 'Não informadas na mesa; localização preservada pelas referências e evidências da seção.'
+    if not _v102_valor_util(req.get('visao_aerea')):
+        req['visao_aerea'] = 'Evidência visual estratégica registrada no tópico Localização.' if _v104_tem_evidencia(dados, ['localizacao','localização','mapa']) else 'Não consta visão aérea específica na mesa.'
+
+    # Mandado: apenas UMA pendência manual, se a mesa realmente não contiver disposição alguma.
+    if mandado_resumo:
+        req['mandado_resumo'] = mandado_resumo
+        for chave in ('mandado_busca','mandado_terceiros','mandado_oab','mandado_extensao','mandado_arrombamento','mandado_detidos'):
+            req[chave] = _v102_primeiro(req.get(chave), mandado_resumo)
+
+    # Crimes/motivação: utiliza os próprios crimes da mesa. Ausências específicas são registradas como ausência de registro, não como fato inventado.
+    if crimes_resumo:
+        req['fundamentacao_crimes'] = _v102_primeiro(req.get('fundamentacao_crimes'), crimes_resumo)
+        req['motivacao'] = _v102_primeiro(req.get('motivacao'), f'A necessidade da medida decorre dos crimes e evidências consolidados nesta investigação: {crimes_resumo}')
+    req['prisao_preventiva'] = _v102_primeiro(req.get('prisao_preventiva'), 'Não consta decisão específica de prisão preventiva na mesa.')
+    req['artigo_juridico'] = _v102_primeiro(req.get('artigo_juridico'), 'Não consta dispositivo jurídico específico adicional na mesa.')
+    req['ameacas'] = _v102_primeiro(req.get('ameacas'), 'Não consta registro específico de ameaças/violência contra moradores na mesa.')
+    req['confrontos'] = _v102_primeiro(req.get('confrontos'), 'Não consta registro específico de confrontos com forças de segurança na mesa.')
+    req['dificuldade_acesso'] = _v102_primeiro(req.get('dificuldade_acesso'), 'Não consta registro específico de dificuldade de acesso/controle territorial na mesa.')
+
+    # Produção: texto e mídia já existentes são suficientes; não pede transcrição manual de imagem.
+    if producao_resumo:
+        req['produto_material'] = _v102_primeiro(req.get('produto_material'), producao_resumo)
+        req['producao_local'] = _v102_primeiro(req.get('producao_local'), 'Conforme registros do tópico de produção/fabricação da mesa.')
+        req['producao_descricao'] = _v102_primeiro(req.get('producao_descricao'), producao_resumo)
+    elif _v104_tem_evidencia(dados, ['producao','produção','farm','ingredientes','rota','fabricacao','fabricação']):
+        req['produto_material'] = _v102_primeiro(req.get('produto_material'), 'Materiais/produtos documentados nas evidências visuais da seção.')
+        req['producao_local'] = _v102_primeiro(req.get('producao_local'), 'Local documentado pelas evidências do tópico correspondente.')
+        req['producao_descricao'] = _v102_primeiro(req.get('producao_descricao'), 'Produção/fabricação documentada pelas evidências preservadas na mesa.')
+
+    # Baús: cada tópico é independente. Não pedir ao agente para redigitar o que já está nas fotos.
+    req['baus_lider_conteudo'] = _v102_primeiro(baus_lider, 'Conteúdo preservado nas imagens do tópico Baú de líder/gerente.' if _v104_tem_evidencia(dados, ['baú de líder','bau de lider','gerente']) else '')
+    req['baus_membros_conteudo'] = _v102_primeiro(baus_membros, 'Conteúdo preservado nas imagens do tópico Baú de membros.' if _v104_tem_evidencia(dados, ['baú de membros','bau de membros']) else '')
+    req['baus_conteudo'] = _v102_primeiro(req.get('baus_conteudo'), '\n'.join(x for x in [req.get('baus_lider_conteudo'), req.get('baus_membros_conteudo')] if x))
+    if req.get('baus_lider_conteudo') or req.get('baus_membros_conteudo'):
+        req['baus_local'] = _v102_primeiro(req.get('baus_local'), 'Registros separados nos tópicos Baú de líder/gerente e Baú de membros.')
+
+    # Informantes: os cartões e mensagens da mesa são a fonte; não repetir nome/RG em campo extra.
+    if informantes_resumo:
+        req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), _v102_resumo_informantes_extra(dados), informantes_resumo)
+    elif dados.get('informantes'):
+        req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), 'Informações individualizadas nos registros dos informantes exibidos acima.')
+    else:
+        req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), 'Nenhum informante foi identificado na mesa.')
+
+    # Residência: só pede manualmente quando NÃO existe texto nem mídia correspondente.
+    if not _v102_valor_util(req.get('residencia')):
+        if residencia_resumo:
+            req['residencia'] = residencia_resumo
+        elif _v104_tem_evidencia(dados, ['residencia','residência','moradia','casa']):
+            req['residencia'] = 'Residência do líder documentada pelas evidências visuais da própria mesa.'
+    if _v102_valor_util(req.get('residencia')) and not _v102_valor_util(req.get('residencia_endereco')):
+        req['residencia_endereco'] = _v102_primeiro(_v102_extrair_rotulo(dados, ['Endereço da Residência','Endereco da Residencia','Localização da Residência','Localizacao da Residencia'], ['residencia','localizacao']), 'Localização conforme registros/evidências da mesa.')
+
+    # Planejamento: uma única redação, em vez de nove campos.
+    if planejamento_resumo:
+        req['planejamento_resumo'] = planejamento_resumo
+        for chave in ('planejamento_efetivo','planejamento_equipes','planejamento_recursos','planejamento_estrategia','planejamento_barreiras','planejamento_negociacao','planejamento_protecao','planejamento_medica','planejamento_institucional'):
+            req[chave] = _v102_primeiro(req.get(chave), planejamento_resumo)
+
+    return req
+
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    faltas: List[str] = []
+    if not _v102_valor_util(req.get('mandado_resumo')):
+        faltas.append('mandado_resumo')
+    if not _v102_valor_util(req.get('endereco_exato')):
+        faltas.append('endereco_exato')
+    if not _v102_valor_util(req.get('residencia')):
+        faltas.append('residencia')
+    if not _v102_valor_util(req.get('planejamento_resumo')):
+        faltas.append('planejamento_resumo')
+    if not _v102_valor_util(req.get('motivacao')):
+        faltas.append('motivacao')
+    return faltas
+
+
+def _v103_pendencias_midia(dados: Dict[str, Any]) -> List[str]:
+    faltas: List[str] = []
+    painel = _v102_evidencias(dados, ['painel'])
+    local = _v102_evidencias(dados, ['localizacao','localização','mapa'])
+    crimes = _v102_evidencias(dados, ['crimes','crime','ocorrencia','ocorrência'])
+    producao = _v102_evidencias(dados, ['producao','produção','farm','ingredientes','rota','fabricacao','fabricação'])
+    bau_lider = _v102_evidencias(dados, ['baú de líder','bau de lider','baú do líder','bau do lider','gerente'])
+    bau_membros = _v102_evidencias(dados, ['baú de membros','bau de membros','baú dos membros','bau dos membros'])
+    residencia = _v102_evidencias(dados, ['residencia','residência','moradia','casa'])
+    if (dados.get('resumos') or {}).get('painel') and not painel:
+        faltas.append('Painel: o texto existe, mas falta a evidência visual do painel.')
+    if not local:
+        faltas.append('Localização: anexar pelo menos uma imagem/mapa no tópico correspondente.')
+    if (dados.get('resumos') or {}).get('crimes') and not crimes:
+        faltas.append('Crimes: anexar evidência visual correspondente, se houver.')
+    if _v104_resumo_topicos(dados, ['producao']) and not producao:
+        faltas.append('Produção/fabricação: anexar a evidência visual correspondente.')
+    if not bau_lider:
+        faltas.append('Baú do líder/gerente: falta a imagem no tópico próprio.')
+    if not bau_membros:
+        faltas.append('Baú dos membros: falta a imagem no tópico próprio.')
+    if _v102_valor_util((_v102_montar_requisitos(dados) or {}).get('residencia')) and not residencia:
+        faltas.append('Residência do líder: anexar foto/mapa da residência.')
+    # Fotos de pessoas: considera primeiro a foto já associada ao cartão, evitando falso positivo.
+    for titulo, pessoas, termos in (
+        ('Lideranças', list(dados.get('liderancas') or []), ['liderancas','liderança','lideranca']),
+        ('Integrantes', list(dados.get('integrantes') or []), ['integrantes','integrante','membros','membro']),
+        ('Informantes', list(dados.get('informantes') or []), ['informante','informantes']),
+    ):
+        sem_foto = [p for p in pessoas if not str(p.get('foto') or '').strip()]
+        if sem_foto and len(_v102_evidencias(dados, termos)) < len(sem_foto):
+            faltas.append(f'{titulo}: faltam {len(sem_foto)} identificação(ões) visual(is) que não podem ser inventadas.')
+    return faltas
+
+
+def _v103_pendencias_estrutura(dados: Dict[str, Any]) -> List[str]:
+    faltas: List[str] = []
+    liderancas = list(dados.get('liderancas') or [])
+    integrantes = list(dados.get('integrantes') or [])
+    if not liderancas:
+        faltas.append('Lideranças: nenhuma liderança foi registrada na própria mesa.')
+    else:
+        sem_rg = [p for p in liderancas if not _v98_rg_normalizado(p.get('rg'))]
+        if sem_rg:
+            faltas.append(f'Lideranças: {len(sem_rg)} pessoa(s) sem RG na mesa.')
+    if not integrantes:
+        faltas.append('Integrantes: nenhum integrante foi registrado na própria mesa.')
+    else:
+        sem_rg = [p for p in integrantes if not _v98_rg_normalizado(p.get('rg'))]
+        if sem_rg:
+            faltas.append(f'Integrantes: {len(sem_rg)} pessoa(s) sem RG na mesa.')
+    if len(obter_assinaturas_dossie(dados) or []) < 2:
+        faltas.append('Assinaturas: faltam as 2 assinaturas institucionais configuradas (Diretor Geral + Diretor DICOR).')
+    return faltas
+
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    req, faltas_texto, faltas_midia, faltas_estrutura = _v103_status_requisitos(dados)
+    total = len(faltas_texto) + len(faltas_midia) + len(faltas_estrutura)
+    if total == 0:
+        return '✅ **DOSSIÊ PRONTO PARA GERAÇÃO**\nO bot preencheu automaticamente tudo que conseguiu obter da mesa. Não restou nenhuma pendência real.\n\nClique em **Gerar Dossiê**.'
+    linhas = ['📋 **REVISÃO FINAL DO DOSSIÊ**', 'Tudo que o bot conseguiu obter da mesa já foi preenchido automaticamente. Abaixo aparecem **somente pendências reais** que exigem ação humana.']
+    if faltas_texto:
+        linhas += ['', f'📝 **Informações que realmente faltam ({len(faltas_texto)}):**']
+        linhas.extend([f'• {_V103_LABELS.get(k, k)}' for k in faltas_texto])
+    if faltas_midia:
+        linhas += ['', f'🖼️ **Evidências que precisam ser anexadas ({len(faltas_midia)}):**']
+        linhas.extend([f'• {x}' for x in faltas_midia[:10]])
+    if faltas_estrutura:
+        linhas += ['', f'📌 **Dados da própria mesa que faltam ({len(faltas_estrutura)}):**']
+        linhas.extend([f'• {x}' for x in faltas_estrutura[:10]])
+    linhas += ['', 'Use o menu apenas se houver uma informação textual acima. Para imagens/RGs, corrija diretamente no tópico da mesa e clique em **Reanalisar Mesa**.']
+    return cortar_discord('\n'.join(linhas), 1950)
+
+
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    painel = bool(_v102_evidencias(dados, ['painel']))
+    local = bool(_v102_evidencias(dados, ['localizacao','localização','mapa']))
+    crimes_img = bool(_v102_evidencias(dados, ['crimes','crime','ocorrencia','ocorrência']))
+    prod = bool(_v102_evidencias(dados, ['producao','produção','farm','ingredientes','rota','fabricacao','fabricação']))
+    bau_lider = bool(_v102_evidencias(dados, ['baú de líder','bau de lider','baú do líder','bau do lider','gerente']))
+    bau_membros = bool(_v102_evidencias(dados, ['baú de membros','bau de membros','baú dos membros','bau dos membros']))
+    resid = bool(_v102_evidencias(dados, ['residencia','residência','moradia','casa']))
+    crimes_txt = bool(_v102_valor_util((dados.get('resumos') or {}).get('crimes')))
+    assin = len(obter_assinaturas_dossie(dados) or []) >= 2
+    return [
+        ('Identificação do procedimento', 'OK — gerada/vinculada automaticamente'),
+        ('Requerente formal', 'OK — Buiu Gomes'),
+        ('Disposições do mandado', 'OK' if req.get('mandado_resumo') else 'PENDENTE'),
+        ('Planejamento operacional', 'OK' if req.get('planejamento_resumo') else 'PENDENTE'),
+        ('Proteção da população', 'INCLUÍDA NO PLANEJAMENTO CONSOLIDADO' if req.get('planejamento_resumo') else 'PENDENTE'),
+        ('Painel da organização', 'OK' if painel or req.get('painel_descricao') else 'PENDENTE'),
+        ('Lideranças', 'OK' if dados.get('liderancas') else 'PENDENTE'),
+        ('Integrantes', 'OK' if dados.get('integrantes') else 'PENDENTE'),
+        ('Localização', 'OK' if req.get('endereco_exato') and local else 'PENDENTE'),
+        ('Visão aérea/estratégica', 'OK' if local else 'PENDENTE'),
+        ('Materiais/produtos', 'OK' if req.get('produto_material') or prod else 'PENDENTE'),
+        ('Informante', 'OK — registros da própria mesa'),
+        ('Baú de membros', 'OK' if bau_membros else 'PENDENTE'),
+        ('Baú de líder/gerente', 'OK' if bau_lider else 'PENDENTE'),
+        ('Fabricação/produção', 'OK' if req.get('producao_descricao') or prod else 'PENDENTE'),
+        ('Residência do líder', 'OK' if req.get('residencia') and resid else 'PENDENTE'),
+        ('Motivação da pacificação', 'OK' if req.get('motivacao') else 'PENDENTE'),
+        ('Crimes', 'OK' if crimes_txt or crimes_img else 'PENDENTE'),
+        ('Prisão preventiva', 'VERIFICADO — conforme registros da mesa'),
+        ('Ameaças/violência', 'VERIFICADO — conforme registros da mesa'),
+        ('Confrontos com forças de segurança', 'VERIFICADO — conforme registros da mesa'),
+        ('Dificuldade de acesso policial', 'VERIFICADO — conforme registros da mesa'),
+        ('Responsáveis/assinaturas', 'OK — Buiu Gomes + Arthur Fleker' if assin else 'PENDENTE — configurar 2 assinaturas'),
+    ]
+
+# Ajusta o diagnóstico leve da V103 para reconhecer os novos tópicos separados de baú.
+_V104_DIAGNOSTICO_ANTES = _v103_diagnostico_mesa
+async def _v103_diagnostico_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: Any, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V104_DIAGNOSTICO_ANTES(canal, mesa, interaction, dados_confirmacao)
+    resumos = dict(dados.get('resumos') or {})
+    for chave in ('baus_lider','baus_membros'):
+        resumos[chave] = _v104_resumo_topicos(dados, [chave], 1500)
+    dados['resumos'] = resumos
+    dados['requisitos_pacificacao'] = _v102_montar_requisitos(dados)
+    return dados
+
+# --- BO: número e data SEMPRE vêm da mensagem oficial ---
+import contextvars as _v104_contextvars
+_V104_BO_META = _v104_contextvars.ContextVar('dicor_bo_meta_v104', default={})
+
+def _v104_bo_meta_texto(texto: str) -> Dict[str, str]:
+    texto = str(texto or '')
+    numero = ''
+    padroes = [
+        r'BOLETIM\s+DE\s+OCORR[ÊE]NCIA\s*[—–-]?\s*(?:N[º°O]\.?|Nº|N)?\s*(\d{1,8})',
+        r'\bN[º°O]\.?\s*(\d{1,8})\b',
+        r'\bBO[-\s]?DICOR[-\s]?(\d{1,8})\b',
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, texto, flags=re.I)
+        if m:
+            numero = m.group(1)
+            break
+    data = ''
+    mdata = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', texto)
+    if mdata:
+        data = mdata.group(1)
+    return {'numero_raw': numero, 'data': data}
+
+def _v104_bo_meta_mensagem(message: discord.Message) -> Dict[str, str]:
+    partes = [str(getattr(message, 'content', '') or '')]
+    for embed in list(getattr(message, 'embeds', []) or []):
+        partes += [str(getattr(embed, 'title', '') or ''), str(getattr(embed, 'description', '') or '')]
+        for campo in list(getattr(embed, 'fields', []) or []):
+            partes += [str(getattr(campo, 'name', '') or ''), str(getattr(campo, 'value', '') or '')]
+    return _v104_bo_meta_texto('\n'.join(partes))
+
+def extrair_numero_boletim_seguro(texto: str) -> str:
+    meta = _v104_bo_meta_texto(texto)
+    raw = str(meta.get('numero_raw') or '')
+    if not raw:
+        return ''
+    largura = max(4, len(raw))
+    return f'BO-DICOR-{int(raw):0{largura}d}'
+
+def numero_curto_boletim(numero: str) -> str:
+    texto = str(numero or '')
+    m = re.search(r'(\d+)(?!.*\d)', texto)
+    if not m:
+        return texto
+    raw = m.group(1)
+    return str(int(raw)).zfill(max(4, len(raw)))
+
+def _bo_numero_formatado(valor: int) -> str:
+    return f'BO-DICOR-{int(valor):04d}'
+
+_V104_PROXIMO_ANTES = _proximo_numero_topico_boletim
+async def _proximo_numero_topico_boletim(canal_pai) -> str:
+    # Quando o BO oficial traz número, ele é soberano. Não renumera para contador interno.
+    preferido = _bo_numero_contexto_inteiro()
+    if preferido > 0:
+        _BO_NUMEROS_RESERVADOS.add(preferido)
+        salvar_json(BOLETINS_CONTADOR_JSON, {'ultimo': preferido, 'modelo': 'numero_oficial_da_mensagem_v104', 'atualizado_em': agora_br()})
+        return _bo_numero_formatado(preferido)
+    return await _V104_PROXIMO_ANTES(canal_pai)
+
+_V104_EMBED_BO_ANTES = _embed_boletim_limpo
+def _embed_boletim_limpo(numero: str, agente: Optional[discord.Member], autor: Optional[discord.abc.User], texto_original: str, mensagem_url: str, quantidade_anexos: int) -> discord.Embed:
+    embed = _V104_EMBED_BO_ANTES(numero, agente, autor, texto_original, mensagem_url, quantidade_anexos)
+    meta = _V104_BO_META.get() or {}
+    data = str(meta.get('data') or '').strip()
+    curto = numero_curto_boletim(numero)
+    embed.title = f'📋 BOLETIM DE OCORRÊNCIA — Nº {curto}' + (f' — {data}' if data else '')
+    if data:
+        embed.add_field(name='📅 Data oficial do BO', value=data, inline=True)
+    embed.set_footer(text='Numeração e data preservadas da mensagem oficial da Polícia Federal')
+    return embed
+
+_V104_TEXTO_PAINEL_ANTES = texto_painel_boletim
+def texto_painel_boletim(atendimento: Dict[str, Any]) -> str:
+    base = _V104_TEXTO_PAINEL_ANTES(atendimento)
+    data = str(atendimento.get('data_bo_original') or '').strip()
+    if data and 'Data oficial do BO' not in base:
+        base = base.replace('\n**Agente responsável', f'\n**Data oficial do BO:** `{data}`\n**Agente responsável', 1)
+    return base
+
+_V104_BO_CRIAR_ANTES = criar_area_atendimento_boletim
+async def criar_area_atendimento_boletim(message: discord.Message) -> Optional[Dict[str, Any]]:
+    meta = _v104_bo_meta_mensagem(message)
+    raw = str(meta.get('numero_raw') or '')
+    numero_oficial = f'BO-DICOR-{int(raw):0{max(4, len(raw))}d}' if raw else ''
+    # Não cria cópia com outro número: se o oficial já existe, mantém o atendimento existente.
+    if numero_oficial:
+        existente = buscar_atendimento_por_numero(numero_oficial)
+        if existente and int(existente.get('mensagem_original_id') or 0) != int(getattr(message, 'id', 0) or 0):
+            await enviar_log(f'⚠️ BO oficial duplicado ignorado: `{numero_oficial}` já possui atendimento `{existente.get("thread_id") or existente.get("area_id")}`. Origem nova `{message.id}`.')
+            return None
+    token = _V104_BO_META.set(meta)
+    try:
+        atendimento = await _V104_BO_CRIAR_ANTES(message)
+    finally:
+        _V104_BO_META.reset(token)
+    if not atendimento:
+        return atendimento
+    try:
+        if numero_oficial:
+            atendimento['numero'] = numero_oficial
+            atendimento['numero_original_texto'] = numero_oficial
+            atendimento['numero_origem_oficial'] = numero_oficial
+            atendimento['numero_origem_confirmado'] = True
+        atendimento['numero_exibicao'] = numero_curto_boletim(atendimento.get('numero'))
+        atendimento['data_bo_original'] = str(meta.get('data') or '')
+        atendimento['data_bo_origem_confirmada'] = bool(meta.get('data'))
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+        tid = int(atendimento.get('thread_id') or atendimento.get('area_id') or 0)
+        topico = bot.get_channel(tid)
+        if topico is None and tid:
+            try:
+                topico = await bot.fetch_channel(tid)
+            except Exception:
+                topico = None
+        if isinstance(topico, discord.Thread):
+            curto = numero_curto_boletim(atendimento.get('numero'))
+            data = str(meta.get('data') or '')
+            nome = f'📋 BOLETIM DE OCORRÊNCIA — Nº {curto}' + (f' — {data.replace("/", "-")}' if data else '')
+            if str(getattr(topico, 'name', '')) != nome[:100]:
+                await topico.edit(name=nome[:100], reason='V104: alinhar número e data ao BO oficial')
+            # Atualiza o painel textual para mostrar a data oficial.
+            painel_id = int(atendimento.get('painel_msg_id') or 0)
+            if painel_id:
+                try:
+                    painel = await topico.fetch_message(painel_id)
+                    await painel.edit(content=texto_painel_boletim(atendimento), view=BoletimAtendimentoView())
+                except Exception:
+                    pass
+        # Abertura no canal pai também fica limpa e alinhada.
+        abertura_id = int(atendimento.get('mensagem_abertura_id') or 0)
+        canal_pai_id = int(atendimento.get('canal_atendimento_id') or 0)
+        if abertura_id and canal_pai_id:
+            try:
+                canal_pai = bot.get_channel(canal_pai_id) or await bot.fetch_channel(canal_pai_id)
+                abertura = await canal_pai.fetch_message(abertura_id)
+                curto = numero_curto_boletim(atendimento.get('numero'))
+                data = str(meta.get('data') or '')
+                data_txt = f' • **{data}**' if data else ''
+                topico_txt = f'<#{int(atendimento.get("thread_id") or atendimento.get("area_id") or 0)}>'
+                await abertura.edit(content=f'📋 **BO Nº {curto}**{data_txt} • atendimento privado: {topico_txt}', allowed_mentions=discord.AllowedMentions.none())
+            except Exception:
+                pass
+    except Exception as erro:
+        print(f'⚠️ V104: BO criado, mas falhou algum ajuste visual de número/data: {type(erro).__name__}: {erro}', flush=True)
+    return atendimento
+
+def _bo_titulo_arquivo(numero: Any) -> str:
+    return f'📁 BOLETIM ARQUIVADO — Nº {numero_curto_boletim(numero)}'
+
+async def _v104_realinhar_boletins_existentes() -> Dict[str, int]:
+    resumo = {'analisados': 0, 'ajustados': 0, 'datas_recuperadas': 0}
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return resumo
+    for atendimento in carregar_atendimentos_boletins():
+        if str(atendimento.get('status') or '').upper() == 'FINALIZADO':
+            continue
+        resumo['analisados'] += 1
+        meta = {'numero_raw': '', 'data': str(atendimento.get('data_bo_original') or '')}
+        try:
+            canal_origem = guild.get_channel(int(atendimento.get('canal_origem_id') or 0))
+            if canal_origem is None and atendimento.get('canal_origem_id'):
+                canal_origem = await bot.fetch_channel(int(atendimento.get('canal_origem_id')))
+            if canal_origem is not None and atendimento.get('mensagem_original_id'):
+                msg = await canal_origem.fetch_message(int(atendimento.get('mensagem_original_id')))
+                meta = _v104_bo_meta_mensagem(msg)
+        except Exception:
+            pass
+        raw = str(meta.get('numero_raw') or '')
+        if raw:
+            oficial = f'BO-DICOR-{int(raw):0{max(4, len(raw))}d}'
+            atendimento['numero'] = oficial
+            atendimento['numero_original_texto'] = oficial
+            atendimento['numero_origem_oficial'] = oficial
+        data = str(meta.get('data') or atendimento.get('data_bo_original') or '')
+        if data and not atendimento.get('data_bo_original'):
+            resumo['datas_recuperadas'] += 1
+        atendimento['data_bo_original'] = data
+        atendimento['numero_exibicao'] = numero_curto_boletim(atendimento.get('numero'))
+        tid = int(atendimento.get('thread_id') or atendimento.get('area_id') or 0)
+        if tid:
+            try:
+                topico = bot.get_channel(tid) or await bot.fetch_channel(tid)
+                if isinstance(topico, discord.Thread):
+                    curto = numero_curto_boletim(atendimento.get('numero'))
+                    nome = f'📋 BOLETIM DE OCORRÊNCIA — Nº {curto}' + (f' — {data.replace("/", "-")}' if data else '')
+                    if str(getattr(topico, 'name', '')) != nome[:100]:
+                        await topico.edit(name=nome[:100], reason='V104: realinhar BO com número/data da origem')
+                        resumo['ajustados'] += 1
+            except Exception:
+                pass
+        atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
+    return resumo
+
+# Reaplica o canal de SET no on_ready, corrige BOs existentes e deixa diagnóstico explícito sem crash.
+_V104_ON_READY_ANTES = on_ready
+@bot.event
+async def on_ready():
+    await _V104_ON_READY_ANTES()
+    try:
+        resumo_bo = await _v104_realinhar_boletins_existentes()
+        print(f"✅ V104 BO realinhado: {resumo_bo['analisados']} analisado(s), {resumo_bo['ajustados']} tópico(s) ajustado(s), {resumo_bo['datas_recuperadas']} data(s) recuperada(s).", flush=True)
+    except Exception as erro:
+        print(f'⚠️ V104 BO: falha não crítica ao realinhar registros existentes: {type(erro).__name__}: {erro}', flush=True)
+    print(f'✅ V104 SET: solicitações de set -> canal {SET_APROVACAO_CHANNEL_ID}.', flush=True)
+    print('✅ V104 BO: número oficial da mensagem preservado (4+ dígitos) e data adicionada ao tópico/painel.', flush=True)
+    print('✅ V104 Dossiê: auto-first ativo; Buiu Gomes + Arthur Fleker automáticos; baús separados; somente pendências reais são solicitadas.', flush=True)
+
+print('✅ V104 carregada — dossiê limpo/automático, SET corrigido e boletins alinhados ao número/data da mensagem oficial.', flush=True)
 
 
 if __name__ == '__main__':
