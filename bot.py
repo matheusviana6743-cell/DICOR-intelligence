@@ -48529,5 +48529,1291 @@ def _v103_pendencias_midia(dados: Dict[str, Any]) -> List[str]:
 
 print('✅ V109 carregada — fechamento de mesa profissional: segunda varredura de mídia, residência reconhecida por anexos/embeds, crimes sem repetição, campos sem sobreposição, cartões limpos e assinaturas oficiais preservadas.',flush=True)
 
+# =====================================================
+# V110 — DOSSIÊ / FECHAMENTO DE MESA VALIDADO
+# Revisão estrutural baseada no checklist de pacificação entregue pela chefia.
+# Mantém o visual institucional aprovado e corrige exclusivamente coleta,
+# validação, paginação, conteúdo e associação de evidências.
+# =====================================================
+
+_V110_COLETAR_BASE = coletar_dados_operacionais_mesa
+_V110_DIAG_BASE = _v103_diagnostico_mesa
+
+
+def _v110_topico_canonico(nome: Any) -> str:
+    """Classificador único usado por coleta, diagnóstico, PDF, DOCX e checklist.
+
+    A causa dos falsos 'baú sem imagem' era a existência de duas convenções:
+    a coleta salvava ``baus_lider``/``baus_membros`` enquanto o PDF procurava
+    ``baú de líder``/``baú de membros``. Tudo passa por esta função agora.
+    """
+    bruto = str(nome or '').strip()
+    n = normalizar_busca(bruto).replace('_', ' ')
+    n = re.sub(r'\s+', ' ', n).strip()
+    if not n:
+        return ''
+    # Chaves canônicas já existentes.
+    if n in {'baus lider', 'bau lider', 'baus do lider', 'bau do lider', 'bau de lider'}:
+        return 'baus_lider'
+    if n in {'baus membros', 'bau membros', 'baus dos membros', 'bau dos membros', 'bau de membros'}:
+        return 'baus_membros'
+    if n in {'localizacao', 'painel', 'crimes', 'producao', 'residencia', 'informantes', 'liderancas', 'integrantes', 'mandado', 'planejamento', 'motivacao'}:
+        return n
+
+    # Primeiro as categorias mais específicas.
+    if 'bau' in n:
+        if any(x in n for x in ('lider', 'gerente', 'chefe')):
+            return 'baus_lider'
+        if any(x in n for x in ('membro', 'integrante')):
+            return 'baus_membros'
+        return 'baus'
+    if any(x in n for x in ('residencia', 'moradia', 'domicilio', 'casa do lider', 'casa lider')):
+        return 'residencia'
+    if any(x in n for x in ('mandado', 'busca e pacificacao', 'disposicoes da busca', 'disposicoes do mandado')):
+        return 'mandado'
+    if any(x in n for x in ('planejamento', 'estrategia operacional', 'operacao planejada')):
+        return 'planejamento'
+    if any(x in n for x in ('motivacao', 'fundamentacao da pacificacao', 'pedido de pacificacao')):
+        return 'motivacao'
+    if 'painel' in n or 'quadro de membros' in n:
+        return 'painel'
+    if any(x in n for x in ('localizacao', 'mapa', 'visao aerea', 'visao estrategica', 'coordenada', 'gps')):
+        return 'localizacao'
+    if any(x in n for x in ('crime', 'ocorrencia', 'delito')):
+        return 'crimes'
+    if any(x in n for x in ('producao', 'fabricacao', 'farm', 'ingrediente', 'produto', 'rota de producao', 'rota de farm')):
+        return 'producao'
+    if 'informante' in n:
+        return 'informantes'
+    if any(x in n for x in ('lideranca', 'lideres', 'gerentes')):
+        return 'liderancas'
+    if any(x in n for x in ('integrantes', 'membros')):
+        return 'integrantes'
+    try:
+        antigo = topico_dossie_por_nome(bruto)
+        if antigo and antigo != bruto:
+            return _v110_topico_canonico(antigo)
+    except Exception:
+        pass
+    return n
+
+
+# A varredura V109 passa a usar exatamente a mesma classificação.
+def _v109_topico_canonico(nome: Any) -> str:
+    return _v110_topico_canonico(nome)
+
+
+def filtrar_evidencias_por_topico(evidencias: List[Dict[str, Any]], topicos: List[str], limite: int=12) -> List[Dict[str, Any]]:
+    """Associação estrita por seção canônica, sem vazamento de mídia entre tópicos."""
+    procurados = {_v110_topico_canonico(t) for t in list(topicos or []) if _v110_topico_canonico(t)}
+    saida: List[Dict[str, Any]] = []
+    vistos = set()
+    for ev in list(evidencias or []):
+        if not isinstance(ev, dict):
+            continue
+        secao = _v110_topico_canonico(ev.get('topico') or ev.get('origem') or '')
+        if secao not in procurados:
+            continue
+        ref = str(ev.get('url') or ev.get('proxy_url') or ev.get('local') or ev.get('arquivo') or '')
+        ident = (str(ev.get('mensagem_id') or ''), ref, secao)
+        if ident in vistos:
+            continue
+        vistos.add(ident)
+        ev['topico'] = secao
+        saida.append(ev)
+    return saida[:max(1, int(limite or 12))]
+
+
+def _v102_evidencias(dados: Dict[str, Any], termos: List[str], limite: int=80) -> List[Dict[str, Any]]:
+    return filtrar_evidencias_por_topico(list(dados.get('evidencias') or []), termos, limite)
+
+
+def _v110_evidencias(dados: Dict[str, Any], secao: str, limite: int=200, *, somente_imagem: bool=False) -> List[Dict[str, Any]]:
+    lista = filtrar_evidencias_por_topico(list(dados.get('evidencias') or []), [secao], limite)
+    if somente_imagem:
+        lista = [e for e in lista if str(e.get('tipo') or '').lower() == 'imagem']
+    return lista
+
+
+def _v110_tem_midia(dados: Dict[str, Any], secao: str) -> bool:
+    return bool(_v110_evidencias(dados, secao, 1, somente_imagem=True))
+
+
+def _v110_int(valor: Any, padrao: int=0) -> int:
+    try:
+        if valor is None:
+            return int(padrao)
+        if isinstance(valor, bool):
+            return int(valor)
+        m = re.search(r'-?\d+', str(valor).replace('.', ''))
+        return int(m.group(0)) if m else int(padrao)
+    except Exception:
+        return int(padrao)
+
+
+def _v110_texto_real(valor: Any) -> str:
+    s = str(valor or '').replace('\r', '').strip()
+    if not s:
+        return ''
+    n = normalizar_busca(s)
+    rejeitar = (
+        'nao informado', 'nao informada', 'nao consta', 'nenhum registro textual especifico',
+        'envie aqui', 'foto da residencia', 'print mapa', 'localizacao registrada nas evidencias',
+        'residencia do lider documentada por evidencias', 'evidencia visual estrategica registrada',
+        'conforme registros evidencias da mesa', 'conforme registros do topico',
+        # Frases técnicas/genéricas de versões antigas não contam como dado real.
+        'materiais produtos documentados nas evidencias visuais',
+        'producao fabricacao documentada pelas evidencias',
+        'local documentado pelas evidencias',
+        'conteudo preservado nas imagens',
+        'registros visuais do bau',
+        'evidencias abaixo registram a residencia',
+    )
+    if any(x in n for x in rejeitar):
+        return ''
+    return s
+
+
+def _v110_limpar_resumo(valor: Any, limite: int=2500) -> str:
+    s = str(valor or '').replace('\r', '').strip()
+    if not s:
+        return ''
+    linhas: List[str] = []
+    vistos = set()
+    for linha in s.splitlines():
+        l = linha.strip().strip('•*-_#> ')
+        if not l:
+            continue
+        n = normalizar_busca(l)
+        if not n or len(n) < 2:
+            continue
+        if any(x in n for x in (
+            'envie aqui', 'clique para ver anexo', 'para encerrar esta mesa', 'utilize este espaco',
+            'residencia do lider documentada por evidencias', 'localizacao registrada nas evidencias visuais',
+            'nenhum registro textual especifico', 'conteudo preservado nas imagens',
+        )):
+            continue
+        if n in vistos:
+            continue
+        vistos.add(n)
+        linhas.append(l)
+    return '\n'.join(linhas)[:limite]
+
+
+def _v110_recalcular_estatisticas(dados: Dict[str, Any]) -> None:
+    # Deduplica antes de contar: a varredura principal + a varredura de segurança
+    # podem encontrar o mesmo anexo. O dossiê deve mostrar quantidade real, não
+    # quantidade de vezes em que o coletor encontrou a evidência.
+    evid_brutas = [e for e in list(dados.get('evidencias') or []) if isinstance(e, dict)]
+    evid: List[Dict[str, Any]] = []
+    vistos = set()
+    for e in evid_brutas:
+        secao = _v110_topico_canonico(e.get('topico') or e.get('origem') or '')
+        ref = str(e.get('url') or e.get('proxy_url') or e.get('local') or e.get('arquivo') or '').strip()
+        mid = str(e.get('mensagem_id') or '').strip()
+        chave = (secao, mid, ref)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        e['topico'] = secao
+        evid.append(e)
+    dados['evidencias'] = evid
+    est = dict(dados.get('estatisticas') or {})
+    est['mensagens_analisadas'] = _v110_int(est.get('mensagens_analisadas', est.get('mensagens', len(dados.get('mensagens') or []))))
+    est['evidencias'] = len(evid)
+    est['imagens'] = len([e for e in evid if str(e.get('tipo') or '').lower() == 'imagem'])
+    est['videos'] = len([e for e in evid if str(e.get('tipo') or '').lower() == 'video'])
+    est['links'] = _v110_int(est.get('links', 0))
+    dados['estatisticas'] = est
+
+
+async def _v110_baixar_url_imagem(sessao: aiohttp.ClientSession, ev: Dict[str, Any], pasta: Path, indice: int) -> str:
+    urls = []
+    for chave in ('url', 'proxy_url'):
+        u = str(ev.get(chave) or '').strip()
+        if u.startswith(('http://', 'https://')) and u not in urls:
+            urls.append(u)
+    for url in urls:
+        try:
+            async with sessao.get(url, allow_redirects=True) as resp:
+                if resp.status >= 400:
+                    continue
+                tamanho = _v110_int(resp.headers.get('Content-Length'), 0)
+                if tamanho and tamanho > 25 * 1024 * 1024:
+                    continue
+                tipo = str(resp.headers.get('Content-Type') or '').lower()
+                ext = Path(url.split('?', 1)[0]).suffix.lower()
+                if ext not in {'.png', '.jpg', '.jpeg', '.webp', '.gif'}:
+                    ext = '.png' if 'png' in tipo else '.jpg'
+                destino = pasta / f'v110_{indice:05d}{ext}'
+                total = 0
+                with destino.open('wb') as fp:
+                    async for bloco in resp.content.iter_chunked(256 * 1024):
+                        total += len(bloco)
+                        if total > 25 * 1024 * 1024:
+                            raise RuntimeError('imagem acima do limite de segurança')
+                        fp.write(bloco)
+                if destino.exists() and destino.stat().st_size > 0:
+                    return str(destino)
+        except Exception:
+            continue
+    return ''
+
+
+async def _v110_materializar_imagens(dados: Dict[str, Any], pasta: Path) -> None:
+    """Garante cópia local das imagens antes do gerador PDF/DOCX."""
+    pasta = Path(pasta) / 'evidencias_v110'
+    pasta.mkdir(parents=True, exist_ok=True)
+    candidatos = [e for e in list(dados.get('evidencias') or []) if isinstance(e, dict) and str(e.get('tipo') or '').lower() == 'imagem' and not (str(e.get('local') or '').strip() and Path(str(e.get('local'))).exists())]
+    if not candidatos:
+        return
+    timeout = aiohttp.ClientTimeout(total=40, connect=12, sock_read=30)
+    sem = asyncio.Semaphore(6)
+    async with aiohttp.ClientSession(timeout=timeout) as sessao:
+        async def um(idx: int, ev: Dict[str, Any]):
+            async with sem:
+                local = await _v110_baixar_url_imagem(sessao, ev, pasta, idx)
+                if local:
+                    ev['local'] = local
+        await asyncio.gather(*(um(i, ev) for i, ev in enumerate(candidatos[:240], 1)), return_exceptions=True)
+
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    try:
+        req = dict(_v107_preparar_requisitos(dados) or {})
+    except Exception:
+        req = dict(_v102_montar_requisitos(dados) or {})
+
+    # Identificação que o próprio sistema pode gerar sem ação humana.
+    req['pedido_numero'] = _v102_primeiro(req.get('pedido_numero'), _v104_numero_pacificacao(dados))
+    req['data_expedicao'] = _v102_primeiro(req.get('data_expedicao'), _v104_data_documento())
+    req['requerente'] = 'Buiu Gomes - Delegado Responsável'
+    req['delegado_responsavel'] = 'Buiu Gomes'
+    req['delegado_responsavel_cargo'] = 'Delegado Responsável'
+    req['delegado_responsavel_data'] = _v102_primeiro(req.get('delegado_responsavel_data'), _v104_data_documento())
+    req['delegado_adjunto'] = 'Arthur Fleker'
+    req['delegado_adjunto_cargo'] = 'Diretor DICOR'
+    req['delegado_adjunto_data'] = _v102_primeiro(req.get('delegado_adjunto_data'), _v104_data_documento())
+
+    # Registros das autoridades: tenta extrair automaticamente do apelido/cadastro Discord
+    # antes de pedir intervenção humana. Nunca usa ID de usuário como RG.
+    if not _v110_texto_real(req.get('delegado_responsavel_registro')):
+        try:
+            rg_auto = _v104_rg_membro('Buiu Gomes', dados)
+            if rg_auto:
+                req['delegado_responsavel_registro'] = rg_auto
+        except Exception:
+            pass
+    if not _v110_texto_real(req.get('delegado_adjunto_registro')):
+        try:
+            rg_auto = _v104_rg_membro('Arthur Fleker', dados)
+            if rg_auto:
+                req['delegado_adjunto_registro'] = rg_auto
+        except Exception:
+            pass
+
+    # Nunca colocar no documento frases técnicas criadas apenas para satisfazer o código.
+    for chave in ('residencia', 'residencia_endereco', 'visao_aerea', 'coordenadas', 'producao_local', 'producao_descricao', 'produto_material'):
+        valor = str(req.get(chave) or '').strip()
+        if valor and not _v110_texto_real(valor):
+            req[chave] = ''
+
+    # Painel: uma descrição institucional pode ser inferida das próprias imagens sem inventar fato.
+    if _v110_tem_midia(dados, 'painel') and not _v110_texto_real(req.get('painel_descricao')):
+        req['painel_descricao'] = (
+            'Os registros visuais desta seção documentam o painel interno da organização investigada. '
+            'A identificação nominal permanece consolidada nas seções de lideranças e integrantes.'
+        )
+
+    # Localização: usa texto real quando existir. A imagem/mapa é preservada como evidência.
+    local_txt = _v110_limpar_resumo((dados.get('resumos') or {}).get('localizacao'), 1200)
+    if not _v110_texto_real(req.get('endereco_exato')) and local_txt:
+        req['endereco_exato'] = local_txt
+    # Nome da comunidade/cidade sozinho não satisfaz a exigência de localização específica.
+    # Se não houver referência textual real (rua, região, ponto, coordenada etc.), o fluxo
+    # pede uma única complementação humana em vez de fingir que o requisito foi atendido.
+    end_atual = _v110_texto_real(req.get('endereco_exato'))
+    n_end = normalizar_busca(end_atual)
+    n_com = normalizar_busca(dados.get('comunidade'))
+    n_cid = normalizar_busca(dados.get('cidade_operacional') or DOSSIE_CIDADE_OPERACIONAL)
+    if end_atual and (n_end in {n_com, n_cid} or len(n_end) < 8):
+        req['endereco_exato'] = ''
+    req['local_pacificacao'] = _v102_primeiro(_v110_texto_real(req.get('local_pacificacao')), _v110_texto_real(req.get('endereco_exato')), dados.get('comunidade'))
+
+    # Crimes: não copiar a própria lista para um segundo campo de fundamentação.
+    crimes = _v110_limpar_resumo((dados.get('resumos') or {}).get('crimes'), 2200)
+    fund = _v110_texto_real(req.get('fundamentacao_crimes'))
+    if crimes and fund:
+        try:
+            if _v109_contem_mesmos_delitos(crimes, fund) or _v107_textos_muito_parecidos(crimes, fund):
+                req['fundamentacao_crimes'] = ''
+        except Exception:
+            pass
+    if crimes and not _v110_texto_real(req.get('motivacao')):
+        req['motivacao'] = 'A pacificação é requerida em razão do conjunto de delitos e evidências documentados na investigação.'
+
+    # Baús e residência são comprovados pelas mídias: não exigir transcrição redundante.
+    if _v110_tem_midia(dados, 'baus_lider'):
+        req['baus_lider_ok'] = '1'
+    if _v110_tem_midia(dados, 'baus_membros'):
+        req['baus_membros_ok'] = '1'
+    if _v110_tem_midia(dados, 'residencia'):
+        req['residencia_midia_ok'] = '1'
+
+    # Informação de informantes só aparece se trouxer algo além de nome/RG/cargo.
+    try:
+        req['informantes_info'] = _v106_informante_extra_sem_repeticao(req.get('informantes_info'), dados.get('informantes', []))
+    except Exception:
+        pass
+    return {str(k): str(v or '').strip() for k, v in req.items()}
+
+
+async def _v110_enriquecer_midias(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], dados: Dict[str, Any], pasta: Optional[Path]) -> None:
+    # Faz uma única varredura de segurança de todas as seções visuais exigidas.
+    alvos = {'painel', 'localizacao', 'crimes', 'producao', 'baus_lider', 'baus_membros', 'residencia', 'liderancas', 'integrantes', 'informantes'}
+    try:
+        extras = await _v109_varrer_evidencias_mesa(canal, mesa, baixar_em=(Path(pasta) / 'evidencias') if pasta is not None else None, alvos=alvos)
+        _v109_mesclar_evidencias(dados, extras)
+    except Exception as erro:
+        print(f'⚠️ V110 varredura complementar: {type(erro).__name__}: {erro}', flush=True)
+    # Canoniza qualquer evidência antiga.
+    for ev in list(dados.get('evidencias') or []):
+        if isinstance(ev, dict):
+            ev['topico'] = _v110_topico_canonico(ev.get('topico') or ev.get('origem') or '')
+    if pasta is not None:
+        try:
+            await _v110_materializar_imagens(dados, Path(pasta))
+        except Exception as erro:
+            print(f'⚠️ V110 materialização de imagens: {type(erro).__name__}: {erro}', flush=True)
+    _v110_recalcular_estatisticas(dados)
+    dados['requisitos_pacificacao'] = _v110_preparar_requisitos(dados)
+
+
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V110_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    await _v110_enriquecer_midias(canal, mesa, dados, Path(pasta_dossie))
+    return dados
+
+
+async def _v103_diagnostico_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: Any, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V110_DIAG_BASE(canal, mesa, interaction, dados_confirmacao)
+    await _v110_enriquecer_midias(canal, mesa, dados, None)
+    return dados
+
+
+def _v110_assinaturas() -> List[Dict[str, Any]]:
+    try:
+        return list(obter_assinaturas_dossie({}) or [])[:2]
+    except Exception:
+        return []
+
+
+def _v110_assinaturas_ok(dados: Dict[str, Any]) -> bool:
+    try:
+        regs = list(obter_assinaturas_dossie(dados) or [])[:2]
+    except Exception:
+        return False
+    if len(regs) < 2:
+        return False
+    ok = 0
+    for reg in regs:
+        arquivo = limpar_imagem_assinatura_dossie(reg.get('imagem')) or reg.get('imagem') or reg.get('arquivo')
+        try:
+            if arquivo and Path(str(arquivo)).exists() and Path(str(arquivo)).stat().st_size > 0:
+                ok += 1
+        except Exception:
+            pass
+    return ok >= 2
+
+
+def _v110_status_textual(req: Dict[str, str]) -> List[Tuple[str, str]]:
+    faltas: List[Tuple[str, str]] = []
+    if not _v110_texto_real(req.get('mandado_resumo')):
+        faltas.append(('mandado_resumo', 'Disposições da busca/pacificação'))
+    if not _v110_texto_real(req.get('endereco_exato')):
+        faltas.append(('endereco_exato', 'Localização específica da operação'))
+    if not _v110_texto_real(req.get('planejamento_resumo')):
+        faltas.append(('planejamento_resumo', 'Planejamento operacional consolidado'))
+    for chave, nome in (
+        ('prisao_preventiva', 'Prisão preventiva'),
+        ('artigo_juridico', 'Dispositivo jurídico'),
+        ('ameacas', 'Ameaças/violência'),
+        ('confrontos', 'Histórico de confrontos'),
+        ('dificuldade_acesso', 'Acesso policial/controle territorial'),
+    ):
+        if not _v102_valor_util(req.get(chave)):
+            faltas.append((chave, nome))
+    return faltas
+
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    return [chave for chave, _ in _v110_status_textual(dict(req or {}))]
+
+
+def _v103_pendencias_midia(dados: Dict[str, Any]) -> List[str]:
+    faltas: List[str] = []
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    # Itens visualmente exigidos pelos documentos de referência.
+    checks = (
+        ('painel', 'Painel da organização: anexar pelo menos uma imagem no tópico Painel.'),
+        ('localizacao', 'Localização: anexar pelo menos uma imagem/mapa no tópico Localização.'),
+        ('producao', 'Produção/fabricação: anexar evidência visual da rota, local, ingredientes ou produto.'),
+        ('baus_lider', 'Baú do líder/gerente: anexar imagem no tópico próprio.'),
+        ('baus_membros', 'Baú dos membros: anexar imagem no tópico próprio.'),
+        ('residencia', 'Residência do líder: anexar foto e/ou mapa no tópico Residência do Líder.'),
+    )
+    for sec, msg in checks:
+        if not _v110_tem_midia(dados, sec):
+            faltas.append(msg)
+    # Crimes só exigem mídia quando a mesa registrou crimes.
+    if _v110_limpar_resumo((dados.get('resumos') or {}).get('crimes')) and not _v110_tem_midia(dados, 'crimes'):
+        faltas.append('Crimes: anexar a evidência visual correspondente no tópico Crimes da comunidade.')
+    # Fotos de pessoas: cobra apenas pessoas que realmente existem no cadastro da própria mesa.
+    for titulo, chave, secao in (
+        ('Lideranças', 'liderancas', 'liderancas'),
+        ('Integrantes', 'integrantes', 'integrantes'),
+        ('Informantes', 'informantes', 'informantes'),
+    ):
+        pessoas = list(dados.get(chave) or [])
+        sem = [p for p in pessoas if not (str(p.get('foto') or '').strip() and Path(str(p.get('foto'))).exists())]
+        if sem:
+            disponiveis = len(_v110_evidencias(dados, secao, 100, somente_imagem=True))
+            if disponiveis < len(sem):
+                faltas.append(f'{titulo}: faltam {len(sem) - disponiveis} identificação(ões) visual(is).')
+    # Deduplica.
+    out, vistos = [], set()
+    for x in faltas:
+        k = normalizar_busca(x)
+        if k not in vistos:
+            vistos.add(k); out.append(x)
+    return out
+
+
+def _v103_pendencias_estrutura(dados: Dict[str, Any]) -> List[str]:
+    faltas: List[str] = []
+    for titulo, chave in (('Lideranças', 'liderancas'), ('Integrantes', 'integrantes')):
+        pessoas = list(dados.get(chave) or [])
+        if not pessoas:
+            faltas.append(f'{titulo}: nenhum registro encontrado na própria mesa.')
+            continue
+        sem_rg = [p for p in pessoas if not _v98_rg_normalizado(p.get('rg'))]
+        if sem_rg:
+            faltas.append(f'{titulo}: {len(sem_rg)} pessoa(s) sem RG registrado na mesa.')
+    if not _v110_assinaturas_ok(dados):
+        faltas.append('Assinaturas: as duas imagens oficiais (Diretor Geral e Diretor DICOR) precisam estar disponíveis.')
+    return faltas
+
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    ft = _v103_pendencias_texto(req)
+    fm = _v103_pendencias_midia(dados)
+    fe = _v103_pendencias_estrutura(dados)
+    if not ft and not fm and not fe:
+        contagens = {
+            'painel': len(_v110_evidencias(dados, 'painel', 100, somente_imagem=True)),
+            'local': len(_v110_evidencias(dados, 'localizacao', 100, somente_imagem=True)),
+            'bau_l': len(_v110_evidencias(dados, 'baus_lider', 100, somente_imagem=True)),
+            'bau_m': len(_v110_evidencias(dados, 'baus_membros', 100, somente_imagem=True)),
+            'res': len(_v110_evidencias(dados, 'residencia', 100, somente_imagem=True)),
+        }
+        return cortar_discord(
+            '✅ **DOSSIÊ VALIDADO E PRONTO**\n'
+            'A mesa foi reanalisada por tópico e as pendências obrigatórias estão atendidas.\n\n'
+            f"🖼️ Painel: **{contagens['painel']}** | Localização: **{contagens['local']}** | "
+            f"Baú líder: **{contagens['bau_l']}** | Baú membros: **{contagens['bau_m']}** | Residência: **{contagens['res']}**\n\n"
+            'Clique em **Gerar Dossiê**.', 1950)
+    linhas = ['📋 **REVISÃO FINAL DO DOSSIÊ**', 'O bot reanalisou a própria mesa. Abaixo estão apenas itens que ainda precisam de ação humana.']
+    if ft:
+        linhas += ['', f'📝 **Informações obrigatórias ({len(ft)}):**']
+        for chave in ft:
+            linhas.append(f'• {_V103_LABELS.get(chave, chave)}')
+    if fm:
+        linhas += ['', f'🖼️ **Evidências obrigatórias ({len(fm)}):**'] + [f'• {x}' for x in fm]
+    if fe:
+        linhas += ['', f'📌 **Estrutura/cadastro ({len(fe)}):**'] + [f'• {x}' for x in fe]
+    linhas += ['', 'Depois de corrigir a mesa, clique em **Reanalisar Mesa**. O dossiê só deve ser gerado quando esta revisão estiver limpa.']
+    return cortar_discord('\n'.join(linhas), 1950)
+
+
+def _v110_valor_status(valor: Any) -> str:
+    s = str(valor or '').strip()
+    n = normalizar_busca(s)
+    if not s:
+        return 'PENDENTE'
+    if 'nao se aplica' in n:
+        return 'NÃO SE APLICA'
+    return 'ATENDIDO'
+
+
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    req = dict(req or _v110_preparar_requisitos(dados))
+    assinatura = _v110_assinaturas_ok(dados)
+    crimes_txt = bool(_v110_limpar_resumo((dados.get('resumos') or {}).get('crimes')))
+    local_ok = bool(_v110_texto_real(req.get('endereco_exato')) and _v110_tem_midia(dados, 'localizacao'))
+    return [
+        ('Identificação do procedimento', 'ATENDIDO'),
+        ('Requerente formal', 'ATENDIDO'),
+        ('Disposições do mandado', 'ATENDIDO' if _v110_texto_real(req.get('mandado_resumo')) else 'PENDENTE'),
+        ('Planejamento operacional', 'ATENDIDO' if _v110_texto_real(req.get('planejamento_resumo')) else 'PENDENTE'),
+        ('Proteção da população', 'ATENDIDO' if _v110_texto_real(req.get('planejamento_resumo')) else 'PENDENTE'),
+        ('Painel da organização', 'ATENDIDO' if _v110_tem_midia(dados, 'painel') else 'PENDENTE'),
+        ('Lideranças', 'ATENDIDO' if dados.get('liderancas') else 'PENDENTE'),
+        ('Integrantes', 'ATENDIDO' if dados.get('integrantes') else 'PENDENTE'),
+        ('Localização', 'ATENDIDO' if local_ok else 'PENDENTE'),
+        ('Visão aérea/estratégica', 'ATENDIDO' if _v110_tem_midia(dados, 'localizacao') else 'PENDENTE'),
+        ('Materiais/produtos', 'ATENDIDO' if _v110_tem_midia(dados, 'producao') else 'PENDENTE'),
+        ('Informantes', 'ATENDIDO' if dados.get('informantes') else 'NÃO SE APLICA'),
+        ('Baú de membros', 'ATENDIDO' if _v110_tem_midia(dados, 'baus_membros') else 'PENDENTE'),
+        ('Baú de líder/gerente', 'ATENDIDO' if _v110_tem_midia(dados, 'baus_lider') else 'PENDENTE'),
+        ('Fabricação/produção', 'ATENDIDO' if _v110_tem_midia(dados, 'producao') else 'PENDENTE'),
+        ('Residência do líder', 'ATENDIDO' if _v110_tem_midia(dados, 'residencia') else 'PENDENTE'),
+        ('Motivação da pacificação', 'ATENDIDO' if _v102_valor_util(req.get('motivacao')) else 'PENDENTE'),
+        ('Crimes', 'ATENDIDO' if crimes_txt and _v110_tem_midia(dados, 'crimes') else ('ATENDIDO' if crimes_txt else 'PENDENTE')),
+        ('Prisão preventiva', _v110_valor_status(req.get('prisao_preventiva'))),
+        ('Dispositivo jurídico', _v110_valor_status(req.get('artigo_juridico'))),
+        ('Ameaças/violência', _v110_valor_status(req.get('ameacas'))),
+        ('Confrontos com forças de segurança', _v110_valor_status(req.get('confrontos'))),
+        ('Dificuldade de acesso/controle territorial', _v110_valor_status(req.get('dificuldade_acesso'))),
+        ('Responsáveis/assinaturas', 'ATENDIDO' if assinatura else 'PENDENTE'),
+    ]
+
+
+def _v110_pdf_preflight_dados(dados: Dict[str, Any]) -> List[str]:
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    erros = []
+    for chave, nome in _v110_status_textual(req):
+        erros.append(f'Informação obrigatória ausente: {nome}.')
+    erros.extend(_v103_pendencias_midia(dados))
+    erros.extend(_v103_pendencias_estrutura(dados))
+    return erros
+
+
+def _v110_pdf_preflight_arquivo(caminho: Path) -> List[str]:
+    erros: List[str] = []
+    try:
+        if not caminho.exists() or caminho.stat().st_size < 5000:
+            return ['PDF não foi gerado corretamente ou está vazio.']
+        if fitz is None:
+            return []
+        doc = fitz.open(str(caminho))
+        try:
+            if len(doc) < 15:
+                erros.append(f'PDF gerou apenas {len(doc)} página(s); estrutura esperada não foi preservada.')
+            texto_total = '\n'.join(page.get_text('text') for page in doc)
+            proibidos = (
+                'Nenhuma imagem anexada nesta seção',
+                'Envie aqui **foto da residência',
+                'Localização registrada nas evidências visuais do tópico Residência',
+            )
+            for p in proibidos:
+                if normalizar_busca(p) in normalizar_busca(texto_total):
+                    erros.append(f'Texto técnico indevido permaneceu no PDF: {p[:55]}.')
+            # Páginas visuais críticas precisam conter a legenda de origem da evidência.
+            # Isso é mais seguro que contar imagens, pois brasões/marca-d'água também são XObjects.
+            for page in doc:
+                txt = page.get_text('text')
+                ntxt = normalizar_busca(txt)
+                if '10. bau do lider gerente' in ntxt or '10 1 bau dos membros' in ntxt:
+                    if 'topico' not in ntxt:
+                        erros.append('Página de baú foi gerada sem evidência visual incorporada.')
+                if '12. residencia local de residencia' in ntxt and 'topico' not in ntxt:
+                    erros.append('Página de residência foi gerada sem foto/mapa incorporado.')
+                if 'continuacao' in ntxt:
+                    # Uma continuação só existe quando realmente carrega conteúdo/imagens.
+                    corpo = re.sub(r'policia federal\s+dicor|capital morada do valley|\d+[\.\d]*\s+[^\n]*continuacao', ' ', ntxt)
+                    if len(re.sub(r'\s+', '', corpo)) < 20 and 'topico' not in ntxt:
+                        erros.append('Foi detectada uma página de continuação vazia.')
+        finally:
+            doc.close()
+    except Exception as erro:
+        erros.append(f'Falha no preflight do PDF: {type(erro).__name__}: {erro}')
+    return erros
+
+
+def _v110_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    """Gerador V110: mesmo visual institucional, layout seguro e sem páginas vazias."""
+    if canvas is None or A4 is None:
+        raise RuntimeError('Dependência ausente: instale reportlab.')
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(caminho_pdf), pagesize=A4)
+    largura, altura = A4
+    cores = _cores_documento_dicor()
+    mx = 1.35 * cm
+    util = largura - 2 * mx
+    topo = altura - 4.35 * cm
+    base = 1.45 * cm
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+
+    def seguro(v: Any, padrao: str='—') -> str:
+        s = str(v if v is not None else '').replace('\r', '').strip()
+        return s or padrao
+
+    titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
+
+    def pagina(titulo: str, continuacao: bool=False) -> float:
+        nonlocal titulo_atual
+        titulo_atual = titulo
+        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=18.0)
+        c.saveState(); _alpha_pdf(c, 0.82, 1); c.setFillColor(cores['painel'])
+        c.roundRect(mx - 0.12 * cm, base, util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=1, stroke=0); c.restoreState()
+        _desenhar_marca_dagua_visivel(c, largura, altura)
+        c.setStrokeColor(cores['linha']); c.roundRect(mx - 0.12 * cm, base, util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=0, stroke=1)
+        fy = topo - 0.63 * cm
+        c.setFillColor(cores['azul']); c.rect(mx, fy, util, 0.62 * cm, fill=1, stroke=0)
+        c.setStrokeColor(cores['dourado_claro']); c.rect(mx, fy, util, 0.62 * cm, fill=0, stroke=1)
+        c.setFillColor(cores['branco']); c.setFont('Courier-Bold', 13.0)
+        tt = titulo + (' - CONTINUAÇÃO' if continuacao else '')
+        c.drawString(mx + 0.18 * cm, fy + 0.2 * cm, tt[:88])
+        return fy - 0.38 * cm
+
+    def nova(titulo: str) -> float:
+        if c.getPageNumber() > 0:
+            c.showPage()
+        return pagina(titulo, False)
+
+    def garantir(y: float, h: float) -> float:
+        if y - h < base + 0.38 * cm:
+            c.showPage()
+            return pagina(titulo_atual, True)
+        return y
+
+    def sub(t: str, y: float) -> float:
+        y = garantir(y, 0.75 * cm)
+        c.setFillColor(cores['painel_sec']); c.setStrokeColor(cores['dourado'])
+        c.roundRect(mx + 0.1 * cm, y - 0.5 * cm, util - 0.2 * cm, 0.5 * cm, 4, fill=1, stroke=1)
+        c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 9.7)
+        c.drawString(mx + 0.25 * cm, y - 0.33 * cm, str(t).upper()[:96])
+        return y - 0.82 * cm
+
+    def par(t: Any, y: float, tam: float=9.25, leading: float=0.38*cm, recuo: float=0.23*cm) -> float:
+        s = str(t or '').strip()
+        if not s:
+            return y
+        linhas = _linhas_pdf_seguras(c, s, 'Courier', tam, util - recuo - 0.25 * cm)
+        for ln in linhas:
+            y = garantir(y, leading)
+            if not ln:
+                y -= leading * .55; continue
+            c.setFillColor(cores['texto']); c.setFont('Courier', tam)
+            c.drawString(mx + recuo, y, ln[:166]); y -= leading
+        return y
+
+    def rotulo_valor(label: str, valor: Any, y: float, *, sempre_vertical: bool=False) -> float:
+        label = str(label or '').strip(); valor = seguro(valor)
+        lw = c.stringWidth(label + ':', 'Courier-Bold', 8.9)
+        vertical = sempre_vertical or lw > 4.4 * cm or len(label) >= 18
+        if vertical:
+            linhas = _linhas_pdf_seguras(c, valor, 'Courier', 8.9, util - 0.75*cm) or ['—']
+            h = 0.42*cm + len(linhas[:10])*0.33*cm + 0.08*cm
+            y = garantir(y, h)
+            c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 8.9); c.drawString(mx+0.22*cm, y, label + ':')
+            yy = y - 0.34*cm; c.setFillColor(cores['texto']); c.setFont('Courier', 8.9)
+            for ln in linhas[:10]:
+                c.drawString(mx+0.48*cm, yy, ln[:156]); yy -= 0.33*cm
+            return y - h
+        label_w = max(5.2*cm, lw + 0.35*cm)
+        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 8.9, util-label_w-0.25*cm) or ['—']
+        h = max(0.42*cm, len(linhas[:8])*0.33*cm+0.06*cm)
+        y = garantir(y, h)
+        c.setFillColor(cores['dourado']); c.setFont('Courier-Bold',8.9); c.drawString(mx+0.22*cm,y,label+':')
+        c.setFillColor(cores['texto']); c.setFont('Courier',8.9); x=mx+label_w
+        for i,ln in enumerate(linhas[:8]): c.drawString(x,y-i*0.33*cm,ln[:148])
+        return y-h
+
+    def tabela(rows: List[Tuple[Any,Any]], y: float, *, label_w: float=7.1*cm, tam: float=8.6) -> float:
+        for label, value in rows:
+            val = seguro(value)
+            lns = _linhas_pdf_seguras(c,val,'Courier',tam,util-label_w-0.5*cm) or ['—']
+            h = max(0.48*cm, len(lns[:6])*0.31*cm+0.10*cm)
+            y = garantir(y,h)
+            c.setFillColor(colors.HexColor('#F7F3E9')); c.setStrokeColor(cores['linha'])
+            c.roundRect(mx+0.12*cm,y-h+0.05*cm,util-0.24*cm,h-0.02*cm,3,fill=1,stroke=1)
+            c.setFillColor(cores['dourado']); c.setFont('Courier-Bold',tam); c.drawString(mx+0.28*cm,y-0.29*cm,str(label)[:58])
+            c.setFillColor(cores['texto']); c.setFont('Courier',tam)
+            for i,ln in enumerate(lns[:6]): c.drawString(mx+label_w,y-0.29*cm-i*0.31*cm,ln[:110])
+            y -= h+0.08*cm
+        return y
+
+    def img_existe(ev: Dict[str,Any]) -> bool:
+        try:
+            p=Path(str(ev.get('local') or '')); return p.exists() and p.stat().st_size>0
+        except Exception: return False
+
+    def desenhar_imagem(ev: Dict[str,Any], x: float, ytop: float, w: float, h: float) -> None:
+        p=Path(str(ev.get('local') or ''))
+        c.drawImage(str(p),x,ytop-h,width=w,height=h,preserveAspectRatio=True,anchor='c',mask='auto')
+
+    def grade_imagens(secao: str, y: float, *, limite: int=80, intro: str='') -> float:
+        imgs=[e for e in _v110_evidencias(dados,secao,limite,somente_imagem=True) if img_existe(e)]
+        if intro and imgs: y=par(intro,y,tam=8.9)
+        if not imgs:
+            # O preflight deve impedir esta situação; a frase serve apenas como defesa técnica.
+            return par('Evidência visual obrigatória não pôde ser incorporada ao arquivo.',y,tam=8.8)
+        col_w=(util-0.42*cm)/2; card_h=6.55*cm; img_h=4.92*cm
+        xs=[mx+0.1*cm,mx+0.1*cm+col_w+0.22*cm]
+        i=0
+        while i<len(imgs):
+            y=garantir(y,card_h+0.2*cm)
+            for j,x in enumerate(xs):
+                if i+j>=len(imgs): break
+                ev=imgs[i+j]
+                c.setFillColor(colors.HexColor('#F7F3E9')); c.setStrokeColor(cores['linha']); c.roundRect(x,y-card_h,col_w,card_h,4,fill=1,stroke=1)
+                try: desenhar_imagem(ev,x+0.12*cm,y-0.12*cm,col_w-0.24*cm,img_h)
+                except Exception: pass
+                origem=seguro(ev.get('origem'),'Tópico da mesa'); autor=seguro(ev.get('autor'),'N/I'); data=seguro(ev.get('data'),'N/I')
+                legenda=f'Tópico: {origem} | Autor: {autor} | Data: {data}'
+                yy=y-img_h-0.38*cm; c.setFillColor(cores['texto_suave']); c.setFont('Courier',6.8)
+                for ln in _linhas_pdf_seguras(c,legenda,'Courier',6.8,col_w-0.24*cm)[:3]:
+                    c.drawString(x+0.12*cm,yy,ln[:110]); yy-=0.22*cm
+            y-=card_h+0.2*cm; i+=2
+        return y
+
+    def cards_pessoas(chave: str, y: float, vazio: str) -> float:
+        pessoas=list(dados.get(chave) or [])
+        if not pessoas: return par(vazio,y,tam=8.9)
+        for idx,pessoa in enumerate(pessoas[:70],1):
+            obs=str(_v98_texto_observacoes_pessoa(pessoa) or '').strip()
+            detalhes=[f"RG: {seguro(pessoa.get('rg'))}",f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}"]
+            if obs: detalhes.append(f'Informações adicionais: {obs}')
+            linhas=[]
+            for d in detalhes: linhas.extend(_linhas_pdf_seguras(c,d,'Courier',8.4,util-3.1*cm)[:3])
+            h=max(2.45*cm,0.95*cm+len(linhas)*0.28*cm)
+            y=garantir(y,h+0.16*cm)
+            c.setFillColor(colors.HexColor('#F7F3E9')); c.setStrokeColor(cores['linha']); c.roundRect(mx+0.12*cm,y-h,util-0.24*cm,h,4,fill=1,stroke=1)
+            foto=str(pessoa.get('foto') or '').strip()
+            if foto and Path(foto).exists():
+                try: c.drawImage(foto,mx+0.20*cm,y-min(h-0.25*cm,2.18*cm),width=1.9*cm,height=1.9*cm,preserveAspectRatio=True,anchor='c',mask='auto')
+                except Exception: pass
+            tx=mx+2.42*cm; c.setFillColor(cores['dourado']); c.setFont('Courier-Bold',9.2); c.drawString(tx,y-0.34*cm,f"{idx}. {seguro(pessoa.get('nome'))[:68]}")
+            yy=y-0.75*cm; c.setFillColor(cores['texto']); c.setFont('Courier',8.4)
+            for ln in linhas:
+                c.drawString(tx,yy,ln[:142]); yy-=0.28*cm
+            y-=h+0.18*cm
+        return y
+
+    def assinaturas(y: float) -> float:
+        regs=list(obter_assinaturas_dossie(dados) or [])[:2]
+        if len(regs)<2:
+            return par('PENDENTE - assinaturas institucionais oficiais não localizadas.',y,tam=8.8)
+        y=garantir(y,3.2*cm); gap=.38*cm; total=min(util-.45*cm,16.55*cm); w=(total-gap)/2; h=2.75*cm; x0=(largura-total)/2
+        for idx,reg in enumerate(regs):
+            x=x0+idx*(w+gap); c.setFillColor(colors.HexColor('#F7F3E9')); c.setStrokeColor(cores['linha']); c.roundRect(x,y-h,w,h,5,fill=1,stroke=1)
+            arq=limpar_imagem_assinatura_dossie(reg.get('imagem')) or reg.get('imagem') or reg.get('arquivo')
+            if arq and Path(str(arq)).exists():
+                try: c.drawImage(str(arq),x+.24*cm,y-1.32*cm,width=w-.48*cm,height=1.10*cm,preserveAspectRatio=True,anchor='c',mask='auto')
+                except Exception: pass
+            c.setStrokeColor(cores['texto_suave']); c.line(x+.34*cm,y-1.48*cm,x+w-.34*cm,y-1.48*cm)
+            nome=str(reg.get('nome') or reg.get('texto') or 'AUTORIDADE').upper(); cargo=str(reg.get('titulo') or reg.get('cargo') or 'AUTORIDADE').upper()
+            c.setFillColor(cores['texto']); c.setFont('Courier-Bold',8.5); c.drawCentredString(x+w/2,y-1.88*cm,nome[:36]); c.setFont('Courier',7.9); c.drawCentredString(x+w/2,y-2.22*cm,cargo[:34])
+        return y-3.02*cm
+
+    # 1
+    y=pagina('DOSSIÊ OPERACIONAL DICOR')
+    y=sub('Identificação do Procedimento',y)
+    identificacao=[
+        ('Processo Nº',dados.get('processo')),('Investigação Nº',dados.get('numero_investigacao')),('Nome da Operação',dados.get('nome_operacao')),
+        ('Comunidade Investigada',dados.get('comunidade')),('Cidade Operacional',dados.get('cidade_operacional',DOSSIE_CIDADE_OPERACIONAL)),
+        ('Data de Abertura',dados.get('data_abertura')),('Data de Encerramento',dados.get('data_encerramento')),
+        ('Delegado Responsável','Buiu Gomes'),('Agente do Encerramento',dados.get('agente_encerramento')),
+        ('Integrantes registrados',', '.join(dados.get('integrantes_investigacao',[]) or []) or '—'),
+        ('Nº do Pedido de Pacificação',req.get('pedido_numero')),('Data de Expedição',req.get('data_expedicao')),('Requerente formal',req.get('requerente')),
+        ('Local da pacificação',_v102_primeiro(_v110_texto_real(req.get('endereco_exato')),req.get('local_pacificacao'),dados.get('comunidade'))),
+    ]
+    for a,b in identificacao: y=rotulo_valor(a,b,y)
+
+    # 2
+    y=nova('2. RESUMO EXECUTIVO E OBJETIVO'); y=sub('Objetivo da Investigação',y); y=par(dados.get('objetivo') or 'Consolidar informações de inteligência e registrar as evidências da investigação.',y,9.6)
+    y=sub('Contexto Operacional',y); y=par(resumo_contexto_operacional(dados),y,9.35)
+
+    # 3
+    y=nova('3. DISPOSIÇÕES DO MANDADO / BUSCA E PACIFICAÇÃO'); y=sub('Diretrizes consolidadas',y); y=par(req.get('mandado_resumo'),y,9.65,0.40*cm)
+
+    # 4/5
+    y=nova('4. LIDERANÇAS IDENTIFICADAS'); y=cards_pessoas('liderancas',y,'Nenhuma liderança foi registrada na própria mesa.')
+    y=nova('5. INTEGRANTES IDENTIFICADOS'); y=cards_pessoas('integrantes',y,'Nenhum integrante foi registrado na própria mesa.')
+
+    # 6
+    y=nova('6. PAINEL DA ORGANIZAÇÃO')
+    painel_txt=_v110_texto_real(req.get('painel_descricao')) or 'Os registros visuais abaixo documentam o painel interno da organização investigada.'
+    y=par(painel_txt,y,9.4); y=grade_imagens('painel',y)
+
+    # 7 - sem texto depois das imagens; isso elimina a página vazia de continuação.
+    y=nova('7. LOCALIZAÇÃO')
+    local_txt=_v110_limpar_resumo((dados.get('resumos') or {}).get('localizacao'),1200)
+    if local_txt: y=par(local_txt,y,9.2)
+    y=tabela([
+        ('Comunidade/Base',dados.get('comunidade')),('Cidade operacional',dados.get('cidade_operacional',DOSSIE_CIDADE_OPERACIONAL)),
+        ('Localização específica',_v110_texto_real(req.get('endereco_exato')) or req.get('local_pacificacao')),('Canal de reabertura',dados.get('reabrir_url') or '—'),
+    ],y,label_w=5.3*cm,tam=8.3)
+    visao=_v110_texto_real(req.get('visao_aerea'))
+    if visao: y=rotulo_valor('Referência estratégica',visao,y,sempre_vertical=True)
+    y=grade_imagens('localizacao',y)
+
+    # 8
+    y=nova('8. CRIMES DA COMUNIDADE')
+    crimes=_v110_limpar_resumo((dados.get('resumos') or {}).get('crimes'),2400)
+    y=par(crimes or 'Nenhum delito foi registrado no tópico correspondente.',y,9.7,0.40*cm)
+    fund=_v110_texto_real(req.get('fundamentacao_crimes'))
+    if fund:
+        try:
+            if _v109_contem_mesmos_delitos(crimes,fund) or _v107_textos_muito_parecidos(crimes,fund): fund=''
+        except Exception: pass
+    if fund: y=rotulo_valor('Fundamentação complementar',fund,y,sempre_vertical=True)
+    y=grade_imagens('crimes',y)
+
+    # 9
+    y=nova('9. PRODUÇÃO E FABRICAÇÃO')
+    prod_txt=_v110_limpar_resumo((dados.get('resumos') or {}).get('producao'),2200)
+    if prod_txt: y=par(prod_txt,y,9.3)
+    prod_rows=[]
+    for lab,ch in (('Material/produto','produto_material'),('Local de fabricação','producao_local'),('Descrição','producao_descricao')):
+        val=_v110_texto_real(req.get(ch))
+        if val and (not prod_txt or normalizar_busca(val) not in normalizar_busca(prod_txt)):
+            prod_rows.append((lab,val))
+    if prod_rows: y=tabela(prod_rows,y,label_w=5.2*cm,tam=8.3)
+    y=grade_imagens('producao',y)
+
+    # 10/10.1 - cada baú em página própria. A descrição é factual e vem da
+    # complementação/mesa; as imagens vêm exclusivamente do tópico correspondente.
+    y=nova('10. BAÚ DO LÍDER / GERENTE')
+    bau_lider_txt=_v110_texto_real(req.get('baus_lider_conteudo'))
+    if bau_lider_txt:
+        y=sub('Conteúdo identificado',y); y=par(bau_lider_txt,y,9.25,0.38*cm)
+    y=grade_imagens('baus_lider',y)
+
+    y=nova('10.1 BAÚ DOS MEMBROS')
+    bau_membros_txt=_v110_texto_real(req.get('baus_membros_conteudo'))
+    if bau_membros_txt:
+        y=sub('Conteúdo identificado',y); y=par(bau_membros_txt,y,9.25,0.38*cm)
+    y=grade_imagens('baus_membros',y)
+
+    # 11
+    y=nova('11. INFORMANTES'); y=cards_pessoas('informantes',y,'Nenhum informante foi registrado na própria mesa.')
+    extra=_v110_texto_real(req.get('informantes_info'))
+    if extra:
+        try: extra=_v106_informante_extra_sem_repeticao(extra,dados.get('informantes',[]))
+        except Exception: pass
+    if extra: y=sub('Informações adicionais relevantes',y); y=par(extra,y,9.2)
+
+    # 12 - mídia como fonte principal; sem instruções do bot nem frases artificiais.
+    y=nova('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA')
+    res_desc=_v110_texto_real(_v107_limpar_residencia_texto(req.get('residencia')))
+    res_loc=_v110_texto_real(_v107_limpar_residencia_texto(req.get('residencia_endereco')))
+    lider_nome=''
+    for pessoa in list(dados.get('liderancas') or []):
+        cargo_n=normalizar_busca((pessoa or {}).get('funcao') or (pessoa or {}).get('cargo') or '')
+        if 'lider' in cargo_n:
+            lider_nome=str((pessoa or {}).get('nome') or '').strip(); break
+    if lider_nome:
+        y=sub(f'Residência vinculada a {lider_nome}',y)
+    if res_desc: y=rotulo_valor('Descrição registrada',res_desc,y,sempre_vertical=True)
+    if res_loc and normalizar_busca(res_loc)!=normalizar_busca(res_desc): y=rotulo_valor('Referência de localização',res_loc,y,sempre_vertical=True)
+    # Se só houver mapa/foto, não imprime texto genérico: as evidências falam por si.
+    y=grade_imagens('residencia',y)
+
+    # 13
+    y=nova('13. PLANEJAMENTO OPERACIONAL'); y=sub('Planejamento consolidado',y); y=par(req.get('planejamento_resumo'),y,9.55,0.40*cm)
+
+    # 14 - tabela resolve qualquer sobreposição.
+    y=nova('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO')
+    motiv=_v110_texto_real(req.get('motivacao'))
+    if motiv: y=par(motiv,y,9.45,0.39*cm)
+    y=tabela([
+        ('Prisão preventiva',req.get('prisao_preventiva')),('Dispositivo jurídico',req.get('artigo_juridico')),
+        ('Ameaças/violência',req.get('ameacas')),('Histórico de confrontos',req.get('confrontos')),
+        ('Acesso/controle territorial',req.get('dificuldade_acesso')),
+    ],y,label_w=6.0*cm,tam=8.25)
+
+    # 15
+    y=nova('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS')
+    y=sub('Delegado responsável',y)
+    resp=[('Nome','Buiu Gomes'),('Cargo',req.get('delegado_responsavel_cargo') or 'Delegado Responsável')]
+    if _v110_texto_real(req.get('delegado_responsavel_registro')): resp.append(('Matrícula/RG',req.get('delegado_responsavel_registro')))
+    resp.append(('Data',req.get('delegado_responsavel_data') or _v104_data_documento()))
+    y=tabela(resp,y,label_w=4.0*cm,tam=8.5)
+    y=sub('Direção DICOR',y)
+    dic=[('Nome','Arthur Fleker'),('Cargo','Diretor DICOR')]
+    if _v110_texto_real(req.get('delegado_adjunto_registro')): dic.append(('Matrícula/RG',req.get('delegado_adjunto_registro')))
+    dic.append(('Data',req.get('delegado_adjunto_data') or _v104_data_documento()))
+    y=tabela(dic,y,label_w=4.0*cm,tam=8.5)
+    y=sub('Assinaturas institucionais',y); y=assinaturas(y)
+
+    # 16
+    y=nova('16. INDICADORES E SÍNTESE DE ENCERRAMENTO')
+    est=dict(dados.get('estatisticas') or {})
+    y=tabela([
+        ('Mensagens analisadas',_v110_int(est.get('mensagens_analisadas',est.get('mensagens',0)))),('Evidências coletadas',_v110_int(est.get('evidencias',0))),
+        ('Imagens anexadas',_v110_int(est.get('imagens',0))),('Vídeos anexados',_v110_int(est.get('videos',0))),('Links registrados',_v110_int(est.get('links',0))),
+    ],y,label_w=7.1*cm,tam=8.6)
+    y=sub('Síntese de encerramento',y); y=par(montar_conclusao_dossie(dados),y,9.2,0.39*cm)
+
+    # 17 - checklist tabular, compacto e alinhado.
+    y=nova('17. CHECKLIST FINAL DE CONFORMIDADE COM O PADRÃO DRAGONS')
+    y=tabela(_v102_checklist(dados,req),y,label_w=10.2*cm,tam=7.75)
+    y=par('Validação final: os itens acima são conferidos a partir dos registros da própria mesa e das complementações formalizadas no encerramento. Dados não comprovados não são inventados.',y-0.08*cm,8.25,0.33*cm)
+    c.save()
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    caminho_pdf=Path(caminho_pdf)
+    dados_leves=_dados_dossie_otimizados(dados,caminho_pdf.parent)
+    dados_leves['requisitos_pacificacao']=dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    _v110_recalcular_estatisticas(dados_leves)
+    _v110_gerar_pdf_modelo_final(dados_leves,caminho_pdf)
+    erros=_v110_pdf_preflight_arquivo(caminho_pdf)
+    if erros:
+        raise RuntimeError('Preflight do dossiê reprovado: ' + ' | '.join(erros[:6]))
+
+
+def _v110_gerar_docx_modelo_final(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    if Document is None:
+        return
+    caminho_docx=Path(caminho_docx); caminho_docx.parent.mkdir(parents=True,exist_ok=True)
+    req=dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados)); est=dict(dados.get('estatisticas') or {})
+    doc=Document()
+    try:
+        sec=doc.sections[0]; sec.top_margin=Inches(.6); sec.bottom_margin=Inches(.6); sec.left_margin=Inches(.65); sec.right_margin=Inches(.65)
+    except Exception: pass
+    def h(t): docx_add_heading(doc,t,1)
+    def p(t):
+        if str(t or '').strip(): docx_add_paragraph(doc,str(t).strip())
+    def tab(rows): docx_add_info_table(doc,[['Campo','Informação']]+[[str(a),str(b)] for a,b in rows])
+    def br(): doc.add_page_break()
+    docx_add_heading(doc,'DOSSIÊ OPERACIONAL DICOR',0); p(f"POLÍCIA FEDERAL - DICOR\n{dados.get('cidade_operacional',DOSSIE_CIDADE_OPERACIONAL)}")
+    h('1. IDENTIFICAÇÃO DO PROCEDIMENTO'); tab([
+        ('Processo Nº',dados.get('processo')),('Investigação Nº',dados.get('numero_investigacao')),('Nome da Operação',dados.get('nome_operacao')),('Comunidade Investigada',dados.get('comunidade')),('Cidade Operacional',dados.get('cidade_operacional',DOSSIE_CIDADE_OPERACIONAL)),('Data de Abertura',dados.get('data_abertura')),('Data de Encerramento',dados.get('data_encerramento')),('Delegado Responsável','Buiu Gomes'),('Agente do Encerramento',dados.get('agente_encerramento')),('Nº do Pedido de Pacificação',req.get('pedido_numero')),('Data de Expedição',req.get('data_expedicao')),('Requerente formal',req.get('requerente')),('Local da pacificação',_v102_primeiro(_v110_texto_real(req.get('endereco_exato')),req.get('local_pacificacao'),dados.get('comunidade')))])
+    br(); h('2. RESUMO EXECUTIVO E OBJETIVO'); p(dados.get('objetivo')); p(resumo_contexto_operacional(dados))
+    br(); h('3. DISPOSIÇÕES DO MANDADO / BUSCA E PACIFICAÇÃO'); p(req.get('mandado_resumo'))
+    br(); h('4. LIDERANÇAS IDENTIFICADAS'); docx_add_pessoas(doc,dados.get('liderancas',[]),'Nenhuma liderança registrada.')
+    br(); h('5. INTEGRANTES IDENTIFICADOS'); docx_add_pessoas(doc,dados.get('integrantes',[]),'Nenhum integrante registrado.')
+    br(); h('6. PAINEL DA ORGANIZAÇÃO'); p(req.get('painel_descricao')); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'painel',80),80)
+    br(); h('7. LOCALIZAÇÃO'); tab([('Comunidade/Base',dados.get('comunidade')),('Cidade operacional',dados.get('cidade_operacional',DOSSIE_CIDADE_OPERACIONAL)),('Localização específica',_v110_texto_real(req.get('endereco_exato')) or req.get('local_pacificacao')),('Canal de reabertura',dados.get('reabrir_url') or '—')]); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'localizacao',80),80)
+    br(); h('8. CRIMES DA COMUNIDADE'); p(_v110_limpar_resumo((dados.get('resumos') or {}).get('crimes'),2400)); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'crimes',80),80)
+    br(); h('9. PRODUÇÃO E FABRICAÇÃO'); p(_v110_limpar_resumo((dados.get('resumos') or {}).get('producao'),2200)); tab([('Material/produto',_v110_texto_real(req.get('produto_material'))),('Local de fabricação',_v110_texto_real(req.get('producao_local'))),('Descrição',_v110_texto_real(req.get('producao_descricao')))]); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'producao',100),100)
+    br(); h('10. BAÚ DO LÍDER / GERENTE'); p(_v110_texto_real(req.get('baus_lider_conteudo'))); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'baus_lider',80),80)
+    br(); h('10.1 BAÚ DOS MEMBROS'); p(_v110_texto_real(req.get('baus_membros_conteudo'))); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'baus_membros',80),80)
+    br(); h('11. INFORMANTES'); docx_add_pessoas(doc,dados.get('informantes',[]),'Nenhum informante registrado.'); p(_v110_texto_real(req.get('informantes_info')))
+    br(); h('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA'); p(_v110_texto_real(req.get('residencia'))); p(_v110_texto_real(req.get('residencia_endereco'))); docx_add_imagens_evidencias(doc,_v110_evidencias(dados,'residencia',80),80)
+    br(); h('13. PLANEJAMENTO OPERACIONAL'); p(req.get('planejamento_resumo'))
+    br(); h('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO'); p(req.get('motivacao')); tab([('Prisão preventiva',req.get('prisao_preventiva')),('Dispositivo jurídico',req.get('artigo_juridico')),('Ameaças/violência',req.get('ameacas')),('Histórico de confrontos',req.get('confrontos')),('Acesso/controle territorial',req.get('dificuldade_acesso'))])
+    br(); h('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS'); tab([('Delegado responsável','Buiu Gomes'),('Cargo','Delegado Responsável'),('Data',req.get('delegado_responsavel_data')),('Diretor DICOR','Arthur Fleker'),('Cargo Diretor DICOR','Diretor DICOR'),('Data Diretor DICOR',req.get('delegado_adjunto_data'))]); docx_add_assinaturas_dossie(doc,dados)
+    br(); h('16. INDICADORES E SÍNTESE DE ENCERRAMENTO'); tab([('Mensagens analisadas',_v110_int(est.get('mensagens_analisadas',0))),('Evidências coletadas',_v110_int(est.get('evidencias',0))),('Imagens anexadas',_v110_int(est.get('imagens',0))),('Vídeos anexados',_v110_int(est.get('videos',0))),('Links registrados',_v110_int(est.get('links',0)))]); p(montar_conclusao_dossie(dados))
+    br(); h('17. CHECKLIST FINAL DE CONFORMIDADE COM O PADRÃO DRAGONS'); tab(_v102_checklist(dados,req)); p('Validação final baseada nos registros da própria mesa e nas complementações formalizadas no encerramento.')
+    doc.save(str(caminho_docx))
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    caminho_docx=Path(caminho_docx); dados_leves=_dados_dossie_otimizados(dados,caminho_docx.parent)
+    dados_leves['requisitos_pacificacao']=dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados)); _v110_recalcular_estatisticas(dados_leves)
+    _v110_gerar_docx_modelo_final(dados_leves,caminho_docx)
+
+
+# O botão de geração já passa pela revisão V103; esta camada apenas impede que a etapa
+# final prossiga se a coleta completa ainda encontrar uma pendência real.
+_V110_FECHAR_CORE_ANTERIOR = _V103_FECHAR_CORE_ORIGINAL
+async def _v110_fechar_core_validado(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
+    canal=getattr(interaction,'channel',None)
+    if not isinstance(canal,discord.TextChannel):
+        return await _V110_FECHAR_CORE_ANTERIOR(interaction,motivo,dados_confirmacao)
+    # A revisão detalhada já ocorre antes do usuário apertar Gerar. Não duplicamos uma
+    # coleta cara aqui; o gerador possui preflight de arquivo e aborta em inconsistência.
+    return await _V110_FECHAR_CORE_ANTERIOR(interaction,motivo,dados_confirmacao)
+
+_V103_FECHAR_CORE_ORIGINAL = _v110_fechar_core_validado
+
+print('✅ V110 carregada — dossiê validado: tópicos canônicos, baús recuperados, mídia materializada, layout tabular sem sobreposição, páginas vazias eliminadas e checklist alinhado ao padrão de pacificação.', flush=True)
+
+
+
+# V110c - matriz de conformidade final baseada nas pendências anotadas pela chefia.
+# Mantém poucos formulários: um texto consolidado por assunto e somente fatos que
+# não podem ser inferidos nem criados pelo bot.
+_V103_SECOES = {
+    'mandado': {
+        'titulo': 'Disposições da busca',
+        'campos': [('mandado_resumo','Diretrizes completas','Inclua: abrangência da busca; terceiros; OAB/advogado; extensão da busca; cofres/baús/porta-malas; encaminhamento de detidos.',4000,True)],
+    },
+    'localizacao': {
+        'titulo': 'Localização específica',
+        'campos': [('endereco_exato','Localização específica','Informe a referência/endereço específico da área quando isso não estiver escrito na mesa.',1200,True)],
+    },
+    'provas': {
+        'titulo': 'Materiais e baús',
+        'campos': [
+            ('produto_material','Material/produto','Identifique objetivamente o material/produto comprovado pelas evidências.',1200,True),
+            ('producao_local','Local de fabricação','Informe a referência objetiva do local/rota de fabricação quando não estiver escrita na mesa.',1200,True),
+            ('producao_descricao','Descrição da produção','Descreva de forma objetiva o processo/local comprovado pelos registros da mesa.',1600,True),
+            ('baus_lider_conteudo','Conteúdo - baú liderança','Descreva objetivamente o conteúdo visível no baú do líder/gerente.',1600,True),
+            ('baus_membros_conteudo','Conteúdo - baú membros','Descreva objetivamente o conteúdo visível no baú dos membros.',1600,True),
+        ],
+    },
+    'planejamento': {
+        'titulo': 'Planejamento operacional',
+        'campos': [('planejamento_resumo','Planejamento completo','Inclua: efetivo/equipes; recursos; estratégia/setores; controle de acessos; negociação; proteção da população; apoio médico; acompanhamento institucional.',4000,True)],
+    },
+    'fundamentacao': {
+        'titulo': 'Fundamentação factual',
+        'campos': [
+            ('prisao_preventiva','Prisão preventiva','Informe o registro. Se não houver, escreva NÃO SE APLICA.',1200,True),
+            ('artigo_juridico','Dispositivo jurídico','Informe o fundamento/dispositivo. Se não houver, escreva NÃO SE APLICA.',1200,True),
+            ('ameacas','Ameaças/violência','Informe o registro comprovado. Se não houver, escreva NÃO SE APLICA.',1500,True),
+            ('confrontos','Confrontos','Informe o histórico comprovado. Se não houver, escreva NÃO SE APLICA.',1500,True),
+            ('dificuldade_acesso','Acesso/controle territorial','Informe a situação comprovada. Se não houver, escreva NÃO SE APLICA.',1500,True),
+        ],
+    },
+    'autoridades': {
+        'titulo': 'Registros das autoridades',
+        'campos': [
+            ('delegado_responsavel_registro','Matrícula/RG - Buiu Gomes','Somente se o bot não conseguir localizar automaticamente.',180,False),
+            ('delegado_adjunto_registro','Matrícula/RG - Arthur Fleker','Somente se o bot não conseguir localizar automaticamente.',180,False),
+        ],
+    },
+}
+_V103_LABELS = {campo[0]: campo[1] for sec in _V103_SECOES.values() for campo in sec['campos']}
+_V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo in sec['campos']]
+
+
+def _v110_requisitos_mandado_faltantes(texto: Any) -> List[str]:
+    n=normalizar_busca(texto)
+    if not n: return ['abrangência','terceiros','OAB/advogado','extensão','compartimentos','detidos']
+    grupos=[
+        ('abrangência',('abrang','andar','sala','instalacao','veiculo')),
+        ('terceiros',('terceir','familiar','residente')),
+        ('OAB/advogado',('oab','advog')),
+        ('extensão',('extens','amplia','novos elementos','elementos adicionais')),
+        ('compartimentos',('arromb','cofre','bau','porta malas','compartimento')),
+        ('detidos',('detid','preso','encaminh','autoridade competente')),
+    ]
+    return [nome for nome,chaves in grupos if not any(k in n for k in chaves)]
+
+
+def _v110_requisitos_planejamento_faltantes(texto: Any) -> List[str]:
+    n=normalizar_busca(texto)
+    if not n: return ['efetivo/equipes','recursos','estratégia/setores','controle de acessos','negociação','proteção da população','apoio médico','acompanhamento institucional']
+    grupos=[
+        ('efetivo/equipes',('efetivo','equipe','agentes','policiais','reforco')),
+        ('recursos',('viatura','drone','aeronave','helicopter','recurso','equipamento','apoio aereo')),
+        ('estratégia/setores',('estrateg','setor','abordagem','perimetro')),
+        ('controle de acessos',('barreira','acesso','bloqueio','entrada','saida')),
+        ('negociação',('negoci','nao se aplica')),
+        ('proteção da população',('populacao','morador','civil','evacu','seguranca dos moradores')),
+        ('apoio médico',('medic','saude','ambulancia','hospital','nao se aplica')),
+        ('acompanhamento institucional',('institucional','comando','superintend','diretoria','acompanhamento')),
+    ]
+    return [nome for nome,chaves in grupos if not any(k in n for k in chaves)]
+
+
+def _v110_autoridade_registro(req: Dict[str,str], chave: str) -> str:
+    valor=str(req.get(chave) or '').strip()
+    return valor if _v110_texto_real(valor) else ''
+
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    req=dict(req or {}); faltas=[]
+    if not _v110_texto_real(req.get('mandado_resumo')) or _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')):
+        faltas.append('mandado_resumo')
+    if not _v110_texto_real(req.get('endereco_exato')): faltas.append('endereco_exato')
+    if not _v110_texto_real(req.get('produto_material')): faltas.append('produto_material')
+    if not _v110_texto_real(req.get('producao_local')): faltas.append('producao_local')
+    if not _v110_texto_real(req.get('producao_descricao')): faltas.append('producao_descricao')
+    if not _v110_texto_real(req.get('baus_lider_conteudo')): faltas.append('baus_lider_conteudo')
+    if not _v110_texto_real(req.get('baus_membros_conteudo')): faltas.append('baus_membros_conteudo')
+    if not _v110_texto_real(req.get('planejamento_resumo')) or _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')):
+        faltas.append('planejamento_resumo')
+    for chave in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        if not _v102_valor_util(req.get(chave)): faltas.append(chave)
+    for chave in ('delegado_responsavel_registro','delegado_adjunto_registro'):
+        if not _v110_autoridade_registro(req,chave): faltas.append(chave)
+    # estável/sem duplicação
+    out=[]
+    for k in faltas:
+        if k not in out: out.append(k)
+    return out
+
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    req=dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados)); ft=_v103_pendencias_texto(req); fm=_v103_pendencias_midia(dados); fe=_v103_pendencias_estrutura(dados)
+    if not ft and not fm and not fe:
+        return cortar_discord('✅ **DOSSIÊ VALIDADO E PRONTO**\nTodas as exigências do checklist de pacificação foram conferidas na própria mesa ou formalizadas no encerramento.\n\n' + f"🖼️ Painel: **{len(_v110_evidencias(dados, 'painel', 100, True))}** | Localização: **{len(_v110_evidencias(dados, 'localizacao', 100, True))}** | Baú líder: **{len(_v110_evidencias(dados, 'baus_lider', 100, True))}** | Baú membros: **{len(_v110_evidencias(dados, 'baus_membros', 100, True))}** | Residência: **{len(_v110_evidencias(dados, 'residencia', 100, True))}**\n\nClique em **Gerar Dossiê**.", 1950)
+    linhas=['📋 **REVISÃO FINAL DO DOSSIÊ**','O bot já preencheu tudo que pôde obter com segurança. Só restam os pontos abaixo.']
+    if ft:
+        linhas+=['',f'📝 **Informações que exigem confirmação ({len(ft)}):**']
+        for k in ft:
+            detalhe=''
+            if k=='mandado_resumo':
+                miss=_v110_requisitos_mandado_faltantes(req.get(k)); detalhe=(' - faltam: '+', '.join(miss)) if miss else ''
+            elif k=='planejamento_resumo':
+                miss=_v110_requisitos_planejamento_faltantes(req.get(k)); detalhe=(' - faltam: '+', '.join(miss)) if miss else ''
+            linhas.append(f"• {_V103_LABELS.get(k,k)}{detalhe}")
+    if fm: linhas+=['',f'🖼️ **Evidências que realmente faltam ({len(fm)}):**']+[f'• {x}' for x in fm]
+    if fe: linhas+=['',f'📌 **Estrutura/cadastro ({len(fe)}):**']+[f'• {x}' for x in fe]
+    linhas+=['','Corrija somente esses pontos e clique em **Reanalisar Mesa**. Nenhum campo já comprovado será solicitado de novo.']
+    return cortar_discord('\n'.join(linhas),1950)
+
+
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    req=dict(req or _v110_preparar_requisitos(dados)); crimes_txt=bool(_v110_limpar_resumo((dados.get('resumos') or {}).get('crimes')))
+    mand_ok=bool(_v110_texto_real(req.get('mandado_resumo')) and not _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')))
+    plan_ok=bool(_v110_texto_real(req.get('planejamento_resumo')) and not _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')))
+    resp_ok=bool(_v110_assinaturas_ok(dados) and _v110_autoridade_registro(req,'delegado_responsavel_registro') and _v110_autoridade_registro(req,'delegado_adjunto_registro'))
+    local_ok=bool(_v110_texto_real(req.get('endereco_exato')) and _v110_tem_midia(dados,'localizacao'))
+    return [
+        ('Identificação do procedimento','ATENDIDO'),('Requerente formal','ATENDIDO'),('Disposições do mandado','ATENDIDO' if mand_ok else 'PENDENTE'),
+        ('Planejamento operacional','ATENDIDO' if plan_ok else 'PENDENTE'),('Proteção da população','ATENDIDO' if plan_ok else 'PENDENTE'),
+        ('Painel da organização','ATENDIDO' if _v110_tem_midia(dados,'painel') else 'PENDENTE'),('Lideranças','ATENDIDO' if dados.get('liderancas') else 'PENDENTE'),('Integrantes','ATENDIDO' if dados.get('integrantes') else 'PENDENTE'),
+        ('Localização','ATENDIDO' if local_ok else 'PENDENTE'),('Visão aérea/estratégica','ATENDIDO' if _v110_tem_midia(dados,'localizacao') else 'PENDENTE'),
+        ('Materiais/produtos','ATENDIDO' if _v110_texto_real(req.get('produto_material')) and _v110_tem_midia(dados,'producao') else 'PENDENTE'),
+        ('Informantes','ATENDIDO' if dados.get('informantes') else 'NÃO SE APLICA'),
+        ('Baú de membros','ATENDIDO' if _v110_texto_real(req.get('baus_membros_conteudo')) and _v110_tem_midia(dados,'baus_membros') else 'PENDENTE'),
+        ('Baú de líder/gerente','ATENDIDO' if _v110_texto_real(req.get('baus_lider_conteudo')) and _v110_tem_midia(dados,'baus_lider') else 'PENDENTE'),
+        ('Fabricação/produção','ATENDIDO' if _v110_texto_real(req.get('producao_local')) and _v110_texto_real(req.get('producao_descricao')) and _v110_tem_midia(dados,'producao') else 'PENDENTE'),('Residência do líder','ATENDIDO' if _v110_tem_midia(dados,'residencia') else 'PENDENTE'),
+        ('Motivação da pacificação','ATENDIDO' if _v102_valor_util(req.get('motivacao')) else 'PENDENTE'),('Crimes','ATENDIDO' if crimes_txt else 'PENDENTE'),
+        ('Prisão preventiva',_v110_valor_status(req.get('prisao_preventiva'))), ('Dispositivo jurídico',_v110_valor_status(req.get('artigo_juridico'))), ('Ameaças/violência',_v110_valor_status(req.get('ameacas'))), ('Confrontos com forças de segurança',_v110_valor_status(req.get('confrontos'))), ('Dificuldade de acesso/controle territorial',_v110_valor_status(req.get('dificuldade_acesso'))),
+        ('Responsáveis/assinaturas','ATENDIDO' if resp_ok else 'PENDENTE'),
+    ]
+
+
+def _v110_pdf_preflight_dados(dados: Dict[str, Any]) -> List[str]:
+    req=dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados)); erros=[]
+    for k in _v103_pendencias_texto(req):
+        if k=='mandado_resumo':
+            miss=_v110_requisitos_mandado_faltantes(req.get(k)); erros.append('Disposições da busca incompletas: '+', '.join(miss)+'.')
+        elif k=='planejamento_resumo':
+            miss=_v110_requisitos_planejamento_faltantes(req.get(k)); erros.append('Planejamento incompleto: '+', '.join(miss)+'.')
+        else: erros.append(f'Informação obrigatória ausente: {_V103_LABELS.get(k,k)}.')
+    erros.extend(_v103_pendencias_midia(dados)); erros.extend(_v103_pendencias_estrutura(dados)); return erros
+
+
+
+# V110b - transação segura de encerramento: só arquiva depois que coleta, validação,
+# PDF, DOCX e pelo menos um envio forem concluídos com sucesso.
+async def _v110_fechar_core_transacional(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
+    inicio_total=time.monotonic(); canal=getattr(interaction,'channel',None)
+    if not isinstance(canal,discord.TextChannel): return
+    try:
+        if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True,thinking=True)
+    except Exception: pass
+    guild=getattr(interaction,'guild',None)
+    if guild is None:
+        await responder_interacao(interaction,'❌ Use dentro de um servidor.',ephemeral=True); return
+    if not usuario_pode_fechar_mesa(interaction.user):
+        await responder_interacao(interaction,mensagem_sem_permissao_fechar_mesa(),ephemeral=True); return
+
+    msg_aviso=None; pasta_dossie=None
+    try:
+        msg_aviso=await canal.send('🔎 **[DICOR] Validação final iniciada.**\nA mesa continuará aberta até o dossiê ser validado, gerado e enviado com sucesso.')
+    except Exception: pass
+    try:
+        await interaction.followup.send('✅ Validação final iniciada. A mesa só será arquivada depois que PDF e DOCX estiverem íntegros.',ephemeral=True)
+    except Exception: pass
+
+    try:
+        mesa=None
+        try: mesa=buscar_mesa_por_canal(canal.id)
+        except Exception as erro: await enviar_log(f'⚠️ V110 mesa não localizada no cadastro durante fechamento: {erro}')
+        processo_base=str((dados_confirmacao or {}).get('processo') or f'PF-DICOR-{canal.id}').replace(' ','-')
+        processo_limpo=slugify(processo_base).upper().replace('-','_') or str(canal.id)
+        pasta_persistente=DOSSIES_DIR/processo_limpo
+        pasta_dossie=_v97_pasta_temporaria_dossie(processo_limpo)
+
+        await editar_progresso_dossie(msg_aviso,'🔎 **[DICOR] Etapa 1/6 - Coleta e validação**\nLendo novamente tópicos ativos/arquivados, anexos, embeds, fotos e registros textuais.')
+        t_coleta=time.monotonic(); global _V99_DOSSIE_ATIVO; _V99_DOSSIE_ATIVO+=1
+        try:
+            dados_dossie=await coletar_dados_operacionais_mesa(canal,mesa,interaction,pasta_dossie,dados_confirmacao=dados_confirmacao)
+        finally:
+            _V99_DOSSIE_ATIVO=max(0,_V99_DOSSIE_ATIVO-1)
+        tempo_coleta=time.monotonic()-t_coleta
+        dados_dossie['requisitos_pacificacao']=_v110_preparar_requisitos(dados_dossie)
+        _v110_recalcular_estatisticas(dados_dossie)
+        pendencias=_v110_pdf_preflight_dados(dados_dossie)
+        if pendencias:
+            texto='\n'.join(f'• {x}' for x in pendencias[:14])
+            await editar_progresso_dossie(msg_aviso,'⚠️ **[DICOR] Encerramento interrompido com segurança.**\nAinda existem pendências reais; a mesa permaneceu aberta.\n'+texto[:1450])
+            try: await interaction.followup.send('⚠️ O dossiê não foi gerado porque a validação encontrou pendências reais. Corrija a mesa e use **Reanalisar Mesa**.\n'+texto[:1400],ephemeral=True)
+            except Exception: pass
+            return
+
+        nome_pdf=f'DOSSIE_OPERACIONAL_{processo_limpo}.pdf'; nome_docx=f'DOSSIE_OPERACIONAL_{processo_limpo}.docx'
+        caminho_pdf=Path(pasta_dossie)/nome_pdf; caminho_docx=Path(pasta_dossie)/nome_docx
+        await editar_progresso_dossie(msg_aviso,'📄 **[DICOR] Etapa 2/6 - PDF**\nGerando e validando visualmente a estrutura do Dossiê Operacional...')
+        t_pdf=time.monotonic(); await asyncio.to_thread(gerar_pdf_dossie,dados_dossie,caminho_pdf); tempo_pdf=time.monotonic()-t_pdf
+        if not caminho_pdf.exists() or caminho_pdf.stat().st_size<=0:
+            raise RuntimeError('PDF não foi criado.')
+        erros_pdf=_v110_pdf_preflight_arquivo(caminho_pdf)
+        if erros_pdf: raise RuntimeError('PDF reprovado no preflight: '+' | '.join(erros_pdf[:6]))
+
+        await editar_progresso_dossie(msg_aviso,'📝 **[DICOR] Etapa 3/6 - DOCX**\nGerando a cópia editável com a mesma organização de conteúdo...')
+        t_docx=time.monotonic(); await asyncio.to_thread(gerar_docx_dossie,dados_dossie,caminho_docx); tempo_docx=time.monotonic()-t_docx
+        if not caminho_docx.exists() or caminho_docx.stat().st_size<=0:
+            raise RuntimeError('DOCX não foi criado.')
+        arquivos={'pdf':str(caminho_pdf),'docx':str(caminho_docx)}
+
+        await editar_progresso_dossie(msg_aviso,'📤 **[DICOR] Etapa 4/6 - Envio seguro**\nEnviando os arquivos antes de bloquear ou arquivar a mesa...')
+        canal_dest=guild.get_channel(DOSSIE_CHANNEL_ID) or guild.get_channel(BACKUP_CHANNEL_ID)
+        mensagem_dossie_url=''; enviado=False; erros_envio=[]
+        if canal_dest:
+            try:
+                m=await enviar_arquivos_dossie_destino(canal_dest,dados_dossie,arquivos,nome_pdf,nome_docx,canal,interaction.user)
+                if m: mensagem_dossie_url=m.jump_url; enviado=True
+            except Exception as erro: erros_envio.append(f'canal oficial: {erro}')
+        if DOSSIE_ENVIAR_NA_MESA or not enviado:
+            try:
+                if not canal_dest or getattr(canal_dest,'id',None)!=canal.id:
+                    m=await enviar_arquivos_dossie_destino(canal,dados_dossie,arquivos,nome_pdf,nome_docx,canal,interaction.user,titulo='📎 CÓPIA DO DOSSIÊ OPERACIONAL DICOR')
+                    if m:
+                        mensagem_dossie_url=mensagem_dossie_url or m.jump_url; enviado=True
+            except Exception as erro: erros_envio.append(f'mesa: {erro}')
+        if not enviado:
+            raise RuntimeError('PDF/DOCX foram gerados, mas nenhum destino confirmou o recebimento. '+(' | '.join(erros_envio) if erros_envio else ''))
+
+        await editar_progresso_dossie(msg_aviso,'🔒 **[DICOR] Etapa 5/6 - Arquivamento**\nArquivos confirmados. Bloqueando a mesa, protegendo os tópicos e registrando o encerramento...')
+        try: await bloquear_mesa_para_novas_mensagens(canal)
+        except Exception as erro: await enviar_log(f'⚠️ V110 falha parcial ao bloquear mesa {canal.id}: {erro}')
+        try:
+            threads=await listar_threads_da_mesa(canal,mesa); await travar_threads_mesa(threads)
+        except Exception as erro: await enviar_log(f'⚠️ V110 falha parcial ao travar tópicos {canal.id}: {erro}')
+
+        try: arquivos_registro=await asyncio.to_thread(_v97_persistir_finais_sync,arquivos,pasta_persistente)
+        except Exception as erro:
+            arquivos_registro={}; await enviar_log(f'⚠️ V110 cópia persistente dos finais falhou, mas arquivos já estão no Discord: {erro}')
+        await atualizar_status_mesa_fechada(canal.id,dados_dossie,arquivos_registro)
+        registrar_dossie_operacional({'processo':dados_dossie.get('processo'),'numero_investigacao':dados_dossie.get('numero_investigacao'),'nome_operacao':dados_dossie.get('nome_operacao'),'canal_id':canal.id,'canal_nome':canal.name,'guild_id':guild.id,'gerado_em':agora_br(),'encerrado_por':str(interaction.user),'encerrado_por_id':interaction.user.id,'pdf':arquivos_registro.get('pdf'),'docx':arquivos_registro.get('docx'),'mensagem_dossie_url':mensagem_dossie_url,'estatisticas':dados_dossie.get('estatisticas',{}),'tempos_segundos':{'coleta':round(tempo_coleta,2),'pdf':round(tempo_pdf,2),'docx':round(tempo_docx,2),'total':round(time.monotonic()-inicio_total,2)}})
+        try:
+            categoria=guild.get_channel(CATEGORIA_MESAS_FECHADAS_ID) if CATEGORIA_MESAS_FECHADAS_ID else None
+            novo=canal.name if canal.name.startswith('🔒') else f'🔒-{canal.name}'
+            if categoria: await canal.edit(category=categoria,name=novo,reason='Mesa encerrada e dossiê validado pela DICOR')
+            else: await canal.edit(name=novo,reason='Mesa encerrada e dossiê validado pela DICOR')
+        except Exception as erro: await enviar_log(f'⚠️ V110 não conseguiu mover/renomear a mesa {canal.id}: {erro}')
+
+        await editar_progresso_dossie(msg_aviso,'✅ **[DICOR] Etapa 6/6 - Concluído**\nDossiê validado, PDF/DOCX enviados e investigação arquivada.')
+        stats=dados_dossie.get('estatisticas',{}) or {}
+        emb=discord.Embed(title='🏛️ Polícia Federal - DICOR',description='✅ **Mesa encerrada com sucesso.**\n\nO dossiê passou pela validação final antes do arquivamento. PDF e DOCX foram enviados e as evidências da mesa foram preservadas.',color=discord.Color.from_rgb(0,43,91))
+        emb.add_field(name='Processo',value=f"`{dados_dossie.get('processo')}`",inline=True); emb.add_field(name='Investigação',value=f"`{dados_dossie.get('numero_investigacao')}`",inline=True); emb.add_field(name='Evidências',value=f"`{stats.get('evidencias',0)}`",inline=True)
+        if mensagem_dossie_url: emb.add_field(name='Arquivos',value=f'[Abrir PDF/DOCX]({mensagem_dossie_url})',inline=False)
+        try: await canal.send(embed=emb,view=ReabrirMesaView())
+        except Exception: pass
+        try: await interaction.followup.send('✅ Mesa encerrada somente após a validação e o envio dos arquivos.',ephemeral=True)
+        except Exception: pass
+        try: await enviar_log(f"✅ V110 mesa encerrada com validação transacional: {canal.id} | processo {dados_dossie.get('processo')} | evidências {stats.get('evidencias',0)} | {time.monotonic()-inicio_total:.1f}s")
+        except Exception: pass
+    except Exception as erro:
+        detalhe=f'{type(erro).__name__}: {erro}'
+        await enviar_log(f'❌ V110 fechamento abortado sem arquivar a mesa {getattr(canal,"id",0)}: {detalhe}')
+        await editar_progresso_dossie(msg_aviso,'❌ **[DICOR] Encerramento abortado com segurança.**\nA mesa permaneceu aberta porque a geração/validação não terminou corretamente.\n`'+cortar_discord(detalhe,900)+'`')
+        try: await interaction.followup.send('❌ O fechamento foi interrompido para evitar arquivar uma mesa com dossiê incompleto. A mesa continua aberta.\n`'+cortar_discord(detalhe,1200)+'`',ephemeral=True)
+        except Exception: pass
+    finally:
+        if pasta_dossie is not None:
+            try: await asyncio.to_thread(_v97_limpar_temp_dossie_sync,Path(pasta_dossie))
+            except Exception: pass
+
+# Esta é a rotina final chamada pelo botão V103 após a revisão das pendências.
+_V103_FECHAR_CORE_ORIGINAL = _v110_fechar_core_transacional
+
+
+print('✅ V110 FINAL carregada — dossiê e fechamento revisados com validação de conteúdo, mídia, layout e arquivamento transacional.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
