@@ -10433,7 +10433,7 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
             c.drawString(tx, y - 0.34 * cm, f"{idx}. {seguro(pessoa.get('nome'))[:68]}")
             c.setFillColor(cores['texto'])
             c.setFont('Courier', 8.55)
-            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}", f'Observações: {_v98_texto_observacoes_pessoa(pessoa)}']
+            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}"]
             ly = y - 0.76 * cm
             for det in detalhes:
                 for ln in _linhas_pdf_seguras(c, det, 'Courier', 8.55, largura_util - 2.85 * cm)[:2]:
@@ -45930,7 +45930,14 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             c.setFillColor(cores['texto']); c.setFont('Courier', tam); c.drawString(margem_x + 0.24 * cm, y, linha[:166]); y -= leading
         return y
     def campo(label: str, valor: Any, y: float, label_w: float=4.9 * cm) -> float:
-        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_util - label_w - 0.45 * cm)
+        # V106: largura do rótulo é calculada dinamicamente para nunca escrever texto por cima do valor.
+        try:
+            largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05) + 0.42 * cm
+        except Exception:
+            largura_rotulo = label_w
+        label_w = max(label_w, min(largura_rotulo, 7.35 * cm))
+        largura_valor = max(4.2 * cm, largura_util - label_w - 0.45 * cm)
+        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_valor)
         h = max(0.45 * cm, len(linhas) * 0.34 * cm + 0.08 * cm); y = quebra(y, h)
         c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 9.05); c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
         c.setFillColor(cores['texto']); c.setFont('Courier', 9.0); xx = margem_x + label_w
@@ -46024,10 +46031,11 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     # 6. PAINEL
     y = nova_secao('6. PAINEL DA ORGANIZAÇÃO')
     painel = _v102_primeiro(_v102_valor_util((dados.get('resumos') or {}).get('painel')), req.get('painel_descricao'))
-    y = texto(painel or 'Nenhum registro textual específico foi encontrado neste tópico.', y)
-    nomes_int = ', '.join([str(p.get('nome') or '').strip() for p in list(dados.get('integrantes') or []) if str(p.get('nome') or '').strip()])
-    if nomes_int: y = campo('Relação dos integrantes', nomes_int, y)
-    else: y = texto(_v102_pendencia('Relação dos integrantes — registrar os integrantes na própria mesa.'), y)
+    painel_prof = _v106_texto_profissional_local(
+        painel,
+        fallback='O painel da organização foi documentado por registros visuais extraídos diretamente da mesa de investigação, preservando a composição e a estrutura identificadas no material original.'
+    )
+    y = texto(painel_prof, y, tam=9.7, leading=0.40 * cm)
     painel_imgs = _v102_evidencias(dados, ['painel', 'informações gerais', 'informacoes gerais'])
     if not painel_imgs: y = texto(_v102_pendencia('Mídia/imagens do painel: anexar ou conferir as imagens originais.'), y)
     y = imagens(painel_imgs, y)
@@ -46068,30 +46076,32 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     if not prod_imgs: y = texto(_v102_pendencia('Fotos/vídeos comprobatórios — conferir/anexar.'), y)
     y = imagens(prod_imgs, y)
 
-    # 10. BAÚS — V104: líder/gerente e membros permanecem separados como na mesa.
-    y = nova_secao('10. BAÚS E ARMAZENAMENTO')
-    y = subtitulo('Baú do líder / gerente', y)
-    y = texto(req.get('baus_lider_conteudo') or 'Nenhum texto adicional; evidências abaixo preservam o conteúdo original do tópico.', y)
+    # 10. BAÚS — V106: cada tipo de baú começa em página própria.
+    y = nova_secao('10. BAÚ DO LÍDER / GERENTE')
+    texto_bau_lider = _v106_texto_bau(req.get('baus_lider_conteudo'), 'líder/gerente')
+    if texto_bau_lider: y = texto(texto_bau_lider, y, tam=9.5)
     y = imagens(_v102_evidencias(dados, ['baú de líder', 'bau de lider', 'baú do líder', 'bau do lider', 'gerente']), y)
-    y = subtitulo('Baú dos membros', y)
-    y = texto(req.get('baus_membros_conteudo') or 'Nenhum texto adicional; evidências abaixo preservam o conteúdo original do tópico.', y)
+
+    y = nova_secao('10.1 BAÚ DOS MEMBROS')
+    texto_bau_membros = _v106_texto_bau(req.get('baus_membros_conteudo'), 'membros')
+    if texto_bau_membros: y = texto(texto_bau_membros, y, tam=9.5)
     y = imagens(_v102_evidencias(dados, ['baú de membros', 'bau de membros', 'baú dos membros', 'bau dos membros']), y)
 
-    # 11. INFORMANTES
+    # 11. INFORMANTES — V106: cartões já exibem nome/RG/cargo; não repetir os mesmos dados embaixo.
     y = nova_secao('11. INFORMANTES')
     y = pessoas(dados.get('informantes', []), y, 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.')
-    y = subtitulo('Informações fornecidas', y)
-    y = texto(_v102_valor_ou_pendencia(req.get('informantes_info'), 'Informações fornecidas pelos informantes não constam no texto extraído. Preencher somente se houver registro comprovável.'), y)
+    info_extra = _v106_informante_extra_sem_repeticao(req.get('informantes_info'), dados.get('informantes', []))
+    if info_extra:
+        y = subtitulo('Informações relevantes adicionais', y)
+        y = texto(info_extra, y, tam=9.4)
 
-    # 12. RESIDÊNCIA
+    # 12. RESIDÊNCIA — V106: texto limpo, sem instruções do bot e sem campos sobrepostos.
     y = nova_secao('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA')
-    lider_nome = req.get('residencia_lider_nome') or 'líder identificado'
-    y = campos([
-        [f'Residência de {lider_nome}', _v102_valor_ou_pendencia(req.get('residencia'), f'Residência do líder {lider_nome} — não consta na mesa.')],
-        ['Endereço/Localização', _v102_valor_ou_pendencia(req.get('residencia_endereco'), 'Endereço/localização da residência — preencher.')],
-    ], y)
+    residencia_txt = _v106_residencia_texto(req.get('residencia'), req.get('residencia_endereco'))
+    if residencia_txt:
+        y = texto(residencia_txt, y, tam=9.7, leading=0.40 * cm)
     resid_imgs = _v102_evidencias(dados, ['residencia', 'residência', 'moradia', 'casa'])
-    if not resid_imgs: y = texto(_v102_pendencia('Fotos e vídeos da residência — anexar/conferir.'), y)
+    if not resid_imgs: y = texto(_v102_pendencia('Residência: é necessária evidência visual ou mapa no tópico próprio.'), y)
     y = imagens(resid_imgs, y)
 
     # 13. PLANEJAMENTO — V104: redação consolidada; evita nove campos manuais.
@@ -46099,15 +46109,15 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     y = subtitulo('Planejamento consolidado', y)
     y = texto(_v102_valor_ou_pendencia(req.get('planejamento_resumo'), 'Registrar o planejamento operacional que não consta na mesa.'), y, tam=10.0, leading=0.42 * cm)
 
-    # 14. MOTIVAÇÃO
+    # 14. MOTIVAÇÃO — V106: dados sensíveis/factuais ausentes são perguntados; nunca são inventados como ausência.
     y = nova_secao('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO')
     y = campos([
-        ['Justificativa específica', _v102_valor_ou_pendencia(req.get('motivacao'), 'Justificativa específica para necessidade da pacificação — preencher.')],
-        ['Prisão preventiva', _v102_valor_ou_pendencia(req.get('prisao_preventiva'), 'Prisão preventiva decretada — preencher somente se houver decisão/registro.')],
-        ['Artigo/Dispositivo jurídico', _v102_valor_ou_pendencia(req.get('artigo_juridico'), 'Artigo/dispositivo jurídico utilizado — preencher conforme documento que fundamenta a medida.')],
-        ['Ameaças/violência', _v102_valor_ou_pendencia(req.get('ameacas'), 'Ameaças ou violência contra moradores — não consta.')],
-        ['Histórico de confrontos', _v102_valor_ou_pendencia(req.get('confrontos'), 'Histórico de confrontos entre criminosos e forças de segurança — não consta.')],
-        ['Acesso policial/controle territorial', _v102_valor_ou_pendencia(req.get('dificuldade_acesso'), 'Dificuldade de acesso da Polícia à região por controle territorial — não consta.')],
+        ['Justificativa específica', _v106_texto_profissional_local(req.get('motivacao'), fallback='PENDENTE — informar a justificativa específica da medida.')],
+        ['Prisão preventiva', _v106_texto_profissional_local(req.get('prisao_preventiva'), fallback='PENDENTE — informar se há prisão preventiva e o respectivo fundamento.')],
+        ['Artigo/Dispositivo jurídico', _v106_texto_profissional_local(req.get('artigo_juridico'), fallback='PENDENTE — informar o dispositivo jurídico aplicável.')],
+        ['Ameaças/violência', _v106_texto_profissional_local(req.get('ameacas'), fallback='PENDENTE — informar eventual registro de ameaça/violência.')],
+        ['Histórico de confrontos', _v106_texto_profissional_local(req.get('confrontos'), fallback='PENDENTE — informar eventual histórico de confrontos.')],
+        ['Acesso policial/controle territorial', _v106_texto_profissional_local(req.get('dificuldade_acesso'), fallback='PENDENTE — informar eventual dificuldade de acesso/controle territorial.')],
     ], y)
 
     # 15. RESPONSÁVEIS / ASSINATURAS
@@ -46164,9 +46174,10 @@ def _v102_gerar_docx_modelo_final(dados: Dict[str, Any], caminho_docx: Path) -> 
     doc.add_page_break(); h('7. LOCALIZAÇÃO'); p(_v102_valor_util((dados.get('resumos') or {}).get('localizacao')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Comunidade/Base', dados.get('comunidade')], ['Canal de reabertura', dados.get('reabrir_url') or 'Não informado'], ['Cidade operacional', dados.get('cidade_operacional', DOSSIE_CIDADE_OPERACIONAL)], ['Endereço/Localização exata', _v102_valor_ou_pendencia(req.get('endereco_exato'), 'Endereço/localização exata — preencher.')], ['Coordenadas geográficas', _v102_valor_ou_pendencia(req.get('coordenadas'), 'Coordenadas geográficas — preencher.')], ['Visão aérea/estratégica', _v102_valor_ou_pendencia(req.get('visao_aerea'), 'Visão aérea/estratégica — descrever a referência visual registrada na mesa.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['localizacao','localização','mapa']), 40)
     doc.add_page_break(); h('8. CRIMES DA COMUNIDADE'); p(_v102_valor_util((dados.get('resumos') or {}).get('crimes')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Fundamentação da pacificação', _v102_valor_ou_pendencia(req.get('fundamentacao_crimes'), 'Fundamentação específica para pedido de pacificação — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['crimes','crime','comunidade','ocorrencia','ocorrência']), 40)
     doc.add_page_break(); h('9. PRODUÇÃO E FABRICAÇÃO'); p(_v102_valor_util((dados.get('resumos') or {}).get('producao')) or 'Nenhum registro textual específico foi encontrado neste tópico.'); info([['Material/Produto', _v102_valor_ou_pendencia(req.get('produto_material'), 'Identificação objetiva do material comercializado e evidência correspondente — complementar.')], ['Local exato de fabricação', _v102_valor_ou_pendencia(req.get('producao_local'), 'Local exato de fabricação — preencher.')], ['Descrição do local', _v102_valor_ou_pendencia(req.get('producao_descricao'), 'Descrição do local de fabricação — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['producao','produção','farm','ingredientes','rota','fabricacao','fabricação']), 50)
-    doc.add_page_break(); h('10. BAÚS E ARMAZENAMENTO'); p('BAÚ DO LÍDER / GERENTE'); p(req.get('baus_lider_conteudo') or 'Evidências preservadas no tópico correspondente.'); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de líder','bau de lider','baú do líder','bau do lider','gerente']), 30); p('BAÚ DOS MEMBROS'); p(req.get('baus_membros_conteudo') or 'Evidências preservadas no tópico correspondente.'); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de membros','bau de membros','baú dos membros','bau dos membros']), 30)
-    doc.add_page_break(); h('11. INFORMANTES'); docx_add_pessoas(doc, dados.get('informantes', []), 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.'); p('INFORMAÇÕES FORNECIDAS'); p(_v102_valor_ou_pendencia(req.get('informantes_info'), 'Informações fornecidas pelos informantes não constam no texto extraído. Preencher somente se houver registro comprovável.'))
-    doc.add_page_break(); h('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA'); lider_nome = req.get('residencia_lider_nome') or 'líder identificado'; info([[f'Residência de {lider_nome}', _v102_valor_ou_pendencia(req.get('residencia'), f'Residência do líder {lider_nome} — não consta na mesa.')], ['Endereço/Localização', _v102_valor_ou_pendencia(req.get('residencia_endereco'), 'Endereço/localização da residência — preencher.')]]); docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['residencia','residência','moradia','casa']), 30)
+    doc.add_page_break(); h('10. BAÚ DO LÍDER / GERENTE'); tb1=_v106_texto_bau(req.get('baus_lider_conteudo'),'líder/gerente'); p(tb1) if tb1 else None; docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de líder','bau de lider','baú do líder','bau do lider','gerente']), 30)
+    doc.add_page_break(); h('10.1 BAÚ DOS MEMBROS'); tb2=_v106_texto_bau(req.get('baus_membros_conteudo'),'membros'); p(tb2) if tb2 else None; docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['baú de membros','bau de membros','baú dos membros','bau dos membros']), 30)
+    doc.add_page_break(); h('11. INFORMANTES'); docx_add_pessoas(doc, dados.get('informantes', []), 'Nenhum informante foi identificado automaticamente nos tópicos da mesa.'); extra_inf=_v106_informante_extra_sem_repeticao(req.get('informantes_info'), dados.get('informantes', [])); p('INFORMAÇÕES RELEVANTES ADICIONAIS') if extra_inf else None; p(extra_inf) if extra_inf else None
+    doc.add_page_break(); h('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA'); rt=_v106_residencia_texto(req.get('residencia'), req.get('residencia_endereco')); p(rt) if rt else None; docx_add_imagens_evidencias(doc, _v102_evidencias(dados, ['residencia','residência','moradia','casa']), 30)
     doc.add_page_break(); h('13. PLANEJAMENTO OPERACIONAL'); p('PLANEJAMENTO CONSOLIDADO'); p(_v102_valor_ou_pendencia(req.get('planejamento_resumo'), 'Registrar o planejamento operacional que não consta na mesa.'))
     doc.add_page_break(); h('14. MOTIVAÇÃO DO PEDIDO DE PACIFICAÇÃO'); info([['Justificativa específica', _v102_valor_ou_pendencia(req.get('motivacao'), 'Justificativa específica para necessidade da pacificação — preencher.')], ['Prisão preventiva', _v102_valor_ou_pendencia(req.get('prisao_preventiva'), 'Prisão preventiva decretada — preencher somente se houver decisão/registro.')], ['Artigo/Dispositivo jurídico', _v102_valor_ou_pendencia(req.get('artigo_juridico'), 'Artigo/dispositivo jurídico utilizado — preencher conforme documento que fundamenta a medida.')], ['Ameaças/violência', _v102_valor_ou_pendencia(req.get('ameacas'), 'Ameaças ou violência contra moradores — não consta.')], ['Histórico de confrontos', _v102_valor_ou_pendencia(req.get('confrontos'), 'Histórico de confrontos entre criminosos e forças de segurança — não consta.')], ['Acesso policial/controle territorial', _v102_valor_ou_pendencia(req.get('dificuldade_acesso'), 'Dificuldade de acesso da Polícia à região por controle territorial — não consta.')]])
     doc.add_page_break(); h('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS'); info([['Delegado responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel'), 'Delegado responsável — preencher.')], ['Cargo do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_cargo'), 'Cargo do delegado responsável — preencher.')], ['Matrícula/RG responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_registro'), 'Matrícula/RG do delegado responsável — preencher.')], ['Data do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_data'), 'Data da formalização pelo delegado responsável — preencher.')], ['Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')], ['Cargo do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do Diretor DICOR — preencher.')], ['Matrícula/RG Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do Diretor DICOR — preencher.')], ['Data do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo Diretor DICOR — preencher.')]]); docx_add_assinaturas_dossie(doc, dados)
@@ -46606,6 +46617,7 @@ class V103DossieComplementoModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         alteracoes = {chave: str(inp.value or '').strip() for chave, inp in self.inputs.items() if str(inp.value or '').strip()}
         if alteracoes:
+            alteracoes = await _v106_aprimorar_campos_ia(alteracoes)
             _v103_salvar_complementos(self.painel.canal_id, alteracoes, interaction.user)
         self.painel.dados['complementos_pacificacao'] = _v103_complementos_canal(self.painel.canal_id)
         self.painel.dados['requisitos_pacificacao'] = _v102_montar_requisitos(self.painel.dados)
@@ -46803,6 +46815,16 @@ _V103_SECOES = {
             ('motivacao', 'Justificativa', 'Preencha somente se os crimes/evidências da mesa não permitirem identificar a motivação.', 2500, True),
         ],
     },
+    'fundamentacao': {
+        'titulo': 'Fundamentação complementar',
+        'campos': [
+            ('prisao_preventiva', 'Prisão preventiva', 'Informe o que consta no caso. Se não houver, escreva NÃO SE APLICA.', 1000, True),
+            ('artigo_juridico', 'Dispositivo jurídico', 'Informe o artigo/fundamento aplicável. Se não houver, escreva NÃO SE APLICA.', 1000, True),
+            ('ameacas', 'Ameaças/violência', 'Informe o registro comprovado. Se não houver, escreva NÃO SE APLICA.', 1200, True),
+            ('confrontos', 'Confrontos', 'Informe o histórico comprovado. Se não houver, escreva NÃO SE APLICA.', 1200, True),
+            ('dificuldade_acesso', 'Acesso/controle territorial', 'Informe o que consta na investigação. Se não houver, escreva NÃO SE APLICA.', 1200, True),
+        ],
+    },
 }
 _V103_LABELS = {campo[0]: campo[1] for sec in _V103_SECOES.values() for campo in sec['campos']}
 _V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo in sec['campos']]
@@ -46879,7 +46901,7 @@ def _v102_montar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
     informantes_resumo = _v104_resumo_topicos(dados, ['informantes'], 1500)
     mandado_resumo = _v102_primeiro(req.get('mandado_resumo'), _v104_resumo_topicos(dados, ['mandado'], 3000))
     planejamento_resumo = _v102_primeiro(req.get('planejamento_resumo'), _v104_resumo_topicos(dados, ['planejamento'], 3500))
-    residencia_resumo = _v104_resumo_topicos(dados, ['residencia'], 1400)
+    residencia_resumo = _v106_limpar_resumo_residencia(_v104_resumo_topicos(dados, ['residencia'], 1400))
     baus_lider = _v104_resumo_topicos(dados, ['baus_lider'], 1400)
     baus_membros = _v104_resumo_topicos(dados, ['baus_membros'], 1400)
 
@@ -46922,11 +46944,6 @@ def _v102_montar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
     if crimes_resumo:
         req['fundamentacao_crimes'] = _v102_primeiro(req.get('fundamentacao_crimes'), crimes_resumo)
         req['motivacao'] = _v102_primeiro(req.get('motivacao'), f'A necessidade da medida decorre dos crimes e evidências consolidados nesta investigação: {crimes_resumo}')
-    req['prisao_preventiva'] = _v102_primeiro(req.get('prisao_preventiva'), 'Não consta decisão específica de prisão preventiva na mesa.')
-    req['artigo_juridico'] = _v102_primeiro(req.get('artigo_juridico'), 'Não consta dispositivo jurídico específico adicional na mesa.')
-    req['ameacas'] = _v102_primeiro(req.get('ameacas'), 'Não consta registro específico de ameaças/violência contra moradores na mesa.')
-    req['confrontos'] = _v102_primeiro(req.get('confrontos'), 'Não consta registro específico de confrontos com forças de segurança na mesa.')
-    req['dificuldade_acesso'] = _v102_primeiro(req.get('dificuldade_acesso'), 'Não consta registro específico de dificuldade de acesso/controle territorial na mesa.')
 
     # Produção: texto e mídia já existentes são suficientes; não pede transcrição manual de imagem.
     if producao_resumo:
@@ -46939,8 +46956,8 @@ def _v102_montar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
         req['producao_descricao'] = _v102_primeiro(req.get('producao_descricao'), 'Produção/fabricação documentada pelas evidências preservadas na mesa.')
 
     # Baús: cada tópico é independente. Não pedir ao agente para redigitar o que já está nas fotos.
-    req['baus_lider_conteudo'] = _v102_primeiro(baus_lider, 'Conteúdo preservado nas imagens do tópico Baú de líder/gerente.' if _v104_tem_evidencia(dados, ['baú de líder','bau de lider','gerente']) else '')
-    req['baus_membros_conteudo'] = _v102_primeiro(baus_membros, 'Conteúdo preservado nas imagens do tópico Baú de membros.' if _v104_tem_evidencia(dados, ['baú de membros','bau de membros']) else '')
+    req['baus_lider_conteudo'] = _v102_primeiro(baus_lider, '')
+    req['baus_membros_conteudo'] = _v102_primeiro(baus_membros, '')
     req['baus_conteudo'] = _v102_primeiro(req.get('baus_conteudo'), '\n'.join(x for x in [req.get('baus_lider_conteudo'), req.get('baus_membros_conteudo')] if x))
     if req.get('baus_lider_conteudo') or req.get('baus_membros_conteudo'):
         req['baus_local'] = _v102_primeiro(req.get('baus_local'), 'Registros separados nos tópicos Baú de líder/gerente e Baú de membros.')
@@ -46949,7 +46966,7 @@ def _v102_montar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
     if informantes_resumo:
         req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), _v102_resumo_informantes_extra(dados), informantes_resumo)
     elif dados.get('informantes'):
-        req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), 'Informações individualizadas nos registros dos informantes exibidos acima.')
+        req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), '')
     else:
         req['informantes_info'] = _v102_primeiro(req.get('informantes_info'), 'Nenhum informante foi identificado na mesa.')
 
@@ -46983,6 +47000,9 @@ def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
         faltas.append('planejamento_resumo')
     if not _v102_valor_util(req.get('motivacao')):
         faltas.append('motivacao')
+    for chave in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        if not _v102_valor_util(req.get(chave)):
+            faltas.append(chave)
     return faltas
 
 
@@ -47415,6 +47435,148 @@ async def _v103_diagnostico_mesa(canal: discord.TextChannel, mesa: Optional[Dict
     await _v105_garantir_topico_residencia(canal, mesa)
     return await _V105_DIAGNOSTICO_BASE(canal, mesa, interaction, dados_confirmacao)
 
+
+
+
+# =====================================================
+# V106 — REFINO DE CONTEÚDO / LAYOUT / IA DE REDAÇÃO
+# =====================================================
+_V106_BOILERPLATE_RESIDENCIA = (
+    'envie aqui', 'foto da residência', 'foto da residencia', 'print/mapa',
+    'descrição curta do local', 'descricao curta do local', 'o dossiê usa este tópico',
+    'o dossie usa este topico', 'não é necessário repetir', 'nao e necessario repetir',
+)
+
+def _v106_texto_profissional_local(valor: Any, fallback: str='') -> str:
+    txt = texto_limpo_dossie(str(valor or ''), 3500).strip()
+    if not txt:
+        return str(fallback or '').strip()
+    # Remove cabeçalhos/ruído repetitivo sem mudar fatos.
+    linhas=[]
+    vistos=set()
+    for ln in txt.splitlines():
+        l=' '.join(str(ln).split()).strip(' •-\t')
+        if not l:
+            continue
+        chave=normalizar_busca(l)
+        if chave in vistos:
+            continue
+        vistos.add(chave); linhas.append(l)
+    txt='\n'.join(linhas).strip()
+    if len(txt) > 40 and txt[-1] not in '.:;!?':
+        txt += '.'
+    return txt
+
+def _v106_limpar_resumo_residencia(valor: Any) -> str:
+    txt = _v106_texto_profissional_local(valor)
+    if not txt:
+        return ''
+    partes=[]
+    for ln in txt.splitlines():
+        n=normalizar_busca(ln)
+        if any(normalizar_busca(x) in n for x in _V106_BOILERPLATE_RESIDENCIA):
+            continue
+        if n in {'residencia do lider','residencia lider'}:
+            continue
+        partes.append(ln)
+    return '\n'.join(partes).strip()
+
+def _v106_residencia_texto(residencia: Any, local: Any) -> str:
+    r=_v106_limpar_resumo_residencia(residencia)
+    l=_v106_limpar_resumo_residencia(local)
+    genericos=('localização conforme registros/evidências da mesa','localizacao conforme registros/evidencias da mesa')
+    if normalizar_busca(l) in {normalizar_busca(x) for x in genericos}:
+        l=''
+    if r and l and normalizar_busca(l) not in normalizar_busca(r):
+        return f'{r}\nLocalização vinculada: {l}'
+    if r:
+        return r
+    if l:
+        return f'A residência vinculada à liderança foi documentada na mesa. Localização vinculada: {l}'
+    return 'A residência vinculada à liderança foi documentada por evidências visuais anexadas no tópico próprio.'
+
+def _v106_texto_bau(valor: Any, tipo: str) -> str:
+    txt=_v106_texto_profissional_local(valor)
+    if not txt:
+        return ''
+    n=normalizar_busca(txt)
+    if 'conteudo preservado nas imagens' in n or 'evidencias preservadas no topico' in n:
+        return ''
+    return txt
+
+def _v106_informante_extra_sem_repeticao(valor: Any, pessoas: Any) -> str:
+    txt=_v106_texto_profissional_local(valor)
+    if not txt:
+        return ''
+    n=normalizar_busca(txt)
+    # Se o texto extra contém apenas os mesmos nomes/RGs dos cartões, omite por completo.
+    termos=[]
+    for p in list(pessoas or []):
+        nome=str((p or {}).get('nome') or '').strip(); rg=str((p or {}).get('rg') or '').strip()
+        if nome: termos.append(normalizar_busca(nome))
+        if rg: termos.append(normalizar_busca(rg))
+    resto=n
+    for t in termos:
+        if t: resto=resto.replace(t,' ')
+    resto=re.sub(r'\b(rg|nome|informante|informantes)\b',' ',resto)
+    resto=re.sub(r'[^a-z0-9]+',' ',resto).strip()
+    if not resto or len(resto) < 18:
+        return ''
+    return txt
+
+async def _v106_aprimorar_texto_ia(chave: str, texto_original: str) -> str:
+    texto_original=str(texto_original or '').strip()
+    if not texto_original:
+        return texto_original
+    # NÃO SE APLICA é uma decisão factual do agente; não reformular.
+    if normalizar_busca(texto_original) in {'nao se aplica','n a','na'}:
+        return 'NÃO SE APLICA'
+    local=_v106_texto_profissional_local(texto_original)
+    if not globals().get('DOSSIE_IA_OPENAI_API_KEY'):
+        return local
+    try:
+        instrucao=(
+            'Reescreva o texto abaixo em português brasileiro formal, objetivo e profissional, adequado a um dossiê institucional fictício de RP. '
+            'NÃO invente fatos, nomes, datas, crimes, fundamentos jurídicos, conclusões ou informações que não estejam no texto. '
+            'Preserve integralmente o significado e apenas melhore clareza, gramática, coesão e tom. Retorne somente o texto final, sem título e sem explicações.\n\n'
+            f'Campo: {chave}\nTexto: {local}'
+        )
+        payload={'model': DOSSIE_IA_OPENAI_MODEL, 'input': instrucao}
+        timeout=aiohttp.ClientTimeout(total=min(float(DOSSIE_IA_OPENAI_TIMEOUT or 60), 35.0))
+        async with aiohttp.ClientSession(timeout=timeout) as sessao:
+            async with sessao.post('https://api.openai.com/v1/responses', headers={'Authorization': f'Bearer {DOSSIE_IA_OPENAI_API_KEY}', 'Content-Type':'application/json'}, json=payload) as resp:
+                if resp.status >= 400:
+                    return local
+                data=await resp.json()
+        saida=''
+        for item in list(data.get('output') or []):
+            for cont in list((item or {}).get('content') or []):
+                if isinstance(cont,dict) and cont.get('type') in {'output_text','text'}:
+                    saida += str(cont.get('text') or '')
+        saida=saida.strip()
+        return _v106_texto_profissional_local(saida) if saida else local
+    except Exception as erro:
+        print(f'⚠️ V106 IA de redação usou fallback local em {chave}: {type(erro).__name__}', flush=True)
+        return local
+
+async def _v106_aprimorar_campos_ia(campos: Dict[str, Any]) -> Dict[str, str]:
+    resultado={}
+    for chave, valor in dict(campos or {}).items():
+        resultado[chave]=await _v106_aprimorar_texto_ia(str(chave), str(valor or ''))
+    return resultado
+
+# V106: tenta restaurar automaticamente as imagens oficiais das assinaturas guardadas no canal de backup/e-mail
+# antes de gerar documentos, sem substituir o modelo visual.
+_V106_COLETAR_ASSIN_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    try:
+        await _restaurar_assinaturas_do_discord(getattr(canal,'guild',None))
+    except Exception as erro:
+        print(f'⚠️ V106: não foi possível restaurar assinatura do canal de backup: {type(erro).__name__}', flush=True)
+    dados=await _V106_COLETAR_ASSIN_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    return dados
+
+print('✅ V106 carregada — layout sem sobreposição, observações removidas dos cartões, painel refinado, baús em páginas separadas, informantes sem repetição, residência limpa, fundamentação factual perguntada e redação profissional com IA opcional/fallback local.', flush=True)
 
 print('✅ V105 carregada — tópico 🏠 Residência do Líder criado automaticamente em novas mesas e recuperado/criado nas mesas antigas durante a revisão do dossiê.', flush=True)
 
