@@ -2090,26 +2090,46 @@ def extrair_blocos_pessoas(textos: List[str], funcao_padrao: str='Integrante') -
     return pessoas[:80]
 
 def filtrar_evidencias_por_topico(evidencias: List[Dict[str, Any]], topicos: List[str], limite: int=12) -> List[Dict[str, Any]]:
-    topicos_norm = {normalizar_busca(t) for t in topicos}
+    """V107: associação estrita por tópico para impedir imagens de uma seção vazarem para outra."""
+    topicos_norm = {normalizar_busca(t) for t in topicos if normalizar_busca(t)}
     saida = []
+    vistos = set()
     for ev in evidencias:
         chave = normalizar_busca(ev.get('topico', ''))
-        titulo = normalizar_busca(ev.get('origem', ''))
-        if chave in topicos_norm or any((t in titulo for t in topicos_norm)):
-            saida.append(ev)
+        origem = normalizar_busca(ev.get('origem', ''))
+        corresponde = False
+        if chave:
+            corresponde = chave in topicos_norm
+        elif origem:
+            # Fallback apenas quando não existe tópico identificado; exige palavra/frase inteira.
+            corresponde = any(re.search(r'(?<![a-z0-9])' + re.escape(t) + r'(?![a-z0-9])', origem) for t in topicos_norm)
+        if not corresponde:
+            continue
+        ident = (str(ev.get('mensagem_id') or ''), str(ev.get('local') or ev.get('url') or ''), chave)
+        if ident in vistos:
+            continue
+        vistos.add(ident)
+        saida.append(ev)
     return saida[:limite]
 
 def resumir_textos_topico(textos: List[str], limite: int=1200) -> str:
     relevantes = []
+    vistos = set()
     for texto in textos:
-        t = texto_limpo_dossie(texto, 500)
+        t = texto_limpo_dossie(texto, 700).strip()
         if not t:
             continue
-        if 'Tópicos da investigação' in t or 'Envie aqui' in t or 'Para encerrar esta mesa' in t:
+        n = normalizar_busca(t)
+        if len(n) < 4:
             continue
+        if any(x in n for x in ('topicos da investigacao', 'envie aqui', 'para encerrar esta mesa', 'utilize este espaco para registrar')):
+            continue
+        if n in vistos:
+            continue
+        vistos.add(n)
         relevantes.append(t)
     if not relevantes:
-        return 'Nenhum registro textual específico foi encontrado neste tópico.'
+        return ''
     return texto_limpo_dossie('\n\n'.join(relevantes[:8]), limite)
 
 def gerar_qr_code_dossie(valor: str, pasta: Path, nome: str='qr_reabertura.png') -> Optional[Path]:
@@ -44601,7 +44621,7 @@ def _v98_texto_observacoes_pessoa(pessoa: Dict[str, Any]) -> str:
         if valor not in partes:
             partes.append(valor)
     if not partes:
-        return 'Não informado'
+        return ''
     return ' | '.join(partes)[:310]
 
 def _v98_assinatura_diretor_geral() -> Dict[str, Any]:
@@ -45078,7 +45098,10 @@ def _v100_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             c.drawString(tx, y - 0.34 * cm, f"{idx}. {seguro(pessoa.get('nome'))[:68]}")
             c.setFillColor(cores['texto'])
             c.setFont('Courier', 8.55)
-            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}", f'Observações: {_v98_texto_observacoes_pessoa(pessoa)}']
+            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}"]
+            _obs = _v98_texto_observacoes_pessoa(pessoa)
+            if _v98_valor_util(_obs):
+                detalhes.append(f'Observações: {_obs}')
             ly = y - 0.76 * cm
             for det in detalhes:
                 for ln in _linhas_pdf_seguras(c, det, 'Courier', 8.55, largura_util - 2.85 * cm)[:2]:
@@ -45930,14 +45953,29 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             c.setFillColor(cores['texto']); c.setFont('Courier', tam); c.drawString(margem_x + 0.24 * cm, y, linha[:166]); y -= leading
         return y
     def campo(label: str, valor: Any, y: float, label_w: float=4.9 * cm) -> float:
-        # V106: largura do rótulo é calculada dinamicamente para nunca escrever texto por cima do valor.
+        # V107: rótulo longo nunca divide a mesma linha com o valor.
+        label = str(label or '').strip()
+        valor = str(valor or '').strip()
         try:
-            largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05) + 0.42 * cm
+            largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05)
         except Exception:
-            largura_rotulo = label_w
-        label_w = max(label_w, min(largura_rotulo, 7.35 * cm))
+            largura_rotulo = 0
+        empilhar = bool(len(label) >= 22 or largura_rotulo > 6.15 * cm)
+        if empilhar:
+            largura_valor = largura_util - 0.72 * cm
+            linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_valor) or ['—']
+            h = 0.45 * cm + max(1, len(linhas[:8])) * 0.34 * cm + 0.10 * cm
+            y = quebra(y, h)
+            c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 9.05)
+            c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
+            c.setFillColor(cores['texto']); c.setFont('Courier', 9.0)
+            yy = y - 0.36 * cm
+            for ln in linhas[:8]:
+                c.drawString(margem_x + 0.54 * cm, yy, ln[:154]); yy -= 0.33 * cm
+            return y - h
+        label_w = max(label_w, largura_rotulo + 0.45 * cm)
         largura_valor = max(4.2 * cm, largura_util - label_w - 0.45 * cm)
-        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_valor)
+        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_valor) or ['—']
         h = max(0.45 * cm, len(linhas) * 0.34 * cm + 0.08 * cm); y = quebra(y, h)
         c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 9.05); c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
         c.setFillColor(cores['texto']); c.setFont('Courier', 9.0); xx = margem_x + label_w
@@ -45994,7 +46032,7 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             arquivo = limpar_imagem_assinatura_dossie(assinatura.get('imagem')) or assinatura.get('imagem') or assinatura.get('arquivo')
             if arquivo and Path(str(arquivo)).exists(): desenhar_imagem(arquivo, x + 0.24 * cm, y - 1.32 * cm, caixa_w - 0.48 * cm, 1.15 * cm)
             else:
-                nome_fallback = str(assinatura.get('texto') or assinatura.get('nome') or 'Autoridade'); c.setFillColor(cores['texto_suave']); c.setFont('Courier-Oblique', 8.6); c.drawCentredString(x + caixa_w / 2, y - 0.88 * cm, nome_fallback[:36])
+                c.setFillColor(cores['texto_suave']); c.setFont('Courier', 7.6); c.drawCentredString(x + caixa_w / 2, y - 0.88 * cm, 'ASSINATURA DIGITAL NÃO LOCALIZADA')
             c.setStrokeColor(cores['texto_suave']); c.line(x + 0.34 * cm, y - 1.5 * cm, x + caixa_w - 0.34 * cm, y - 1.5 * cm)
             nome_ass = str(assinatura.get('nome') or assinatura.get('texto') or 'AUTORIDADE').upper(); titulo_ass = str(assinatura.get('titulo') or assinatura.get('cargo') or 'AUTORIDADE').upper()
             c.setFillColor(cores['texto']); c.setFont('Courier-Bold', 8.7); c.drawCentredString(x + caixa_w / 2, y - 1.91 * cm, nome_ass[:36]); c.setFont('Courier', 8.0); c.drawCentredString(x + caixa_w / 2, y - 2.25 * cm, titulo_ass[:34])
@@ -47580,6 +47618,566 @@ print('✅ V106 carregada — layout sem sobreposição, observações removidas
 
 print('✅ V105 carregada — tópico 🏠 Residência do Líder criado automaticamente em novas mesas e recuperado/criado nas mesas antigas durante a revisão do dossiê.', flush=True)
 
+
+
+# =====================================================
+# V107 — REVISÃO FINAL DO DOSSIÊ + COFRE REMOTO DE DADOS
+# - evita repetição de crimes/fundamentação;
+# - limpa residência e textos de instrução;
+# - refina campos manuais de forma profissional sem inventar fatos;
+# - reconstrói procurados a partir do Discord + Banco DICOR;
+# - mantém um espelho remoto no Backblaze B2 com SQLite + JSONs críticos;
+# - restaura/mescla dados remotos sem apagar informações locais válidas.
+# =====================================================
+
+V107_REMOTE_DB_ENABLED = _v78_env_bool('DICOR_REMOTE_DB_ENABLED', True)
+V107_REMOTE_SYNC_MINUTES = max(5, env_int('DICOR_REMOTE_SYNC_MINUTES', 15))
+V107_REBUILD_PROCURADOS_ON_START = _v78_env_bool('DICOR_REBUILD_PROCURADOS_ON_START', True)
+V107_REMOTE_PREFIX = (str(os.getenv('DICOR_REMOTE_PREFIX', '') or '').strip().strip('/') or ((V79_B2_PREFIX + '/database') if V79_B2_PREFIX else 'dicor/database'))
+V107_REMOTE_INDEX_FILE = DATA_DIR / 'v107_remote_mirror_index.json'
+_V107_REMOTE_LOCK = asyncio.Lock()
+_V107_START_DONE = False
+_V107_B2_CLIENT = None
+_V107_B2_LOCK = threading.RLock()
+
+
+def _v107_util(valor: Any) -> str:
+    s = str(valor or '').strip()
+    if normalizar_busca(s) in {'', 'nao informado', 'nao informada', 'nao consta', 'n i', 'ni', 'nenhum', 'nenhuma'}:
+        return ''
+    return s
+
+
+def _v107_linhas_significativas(txt: Any) -> List[str]:
+    linhas=[]
+    for ln in str(txt or '').splitlines():
+        n=normalizar_busca(ln)
+        n=re.sub(r'\b\d+(?:\.\d+)*\b',' ',n)
+        n=re.sub(r'\b\d+\s*mes(?:es)?\b',' ',n)
+        n=re.sub(r'[^a-z0-9]+',' ',n).strip()
+        if len(n) >= 4:
+            linhas.append(n)
+    return linhas
+
+
+def _v107_textos_muito_parecidos(a: Any, b: Any) -> bool:
+    la=set(_v107_linhas_significativas(a)); lb=set(_v107_linhas_significativas(b))
+    if not la or not lb:
+        return False
+    inter=len(la & lb)
+    return inter >= 2 or inter / max(1, min(len(la), len(lb))) >= .55
+
+
+def _v107_limpar_residencia_texto(valor: Any) -> str:
+    saida=[]
+    for ln in str(valor or '').splitlines():
+        bruto=' '.join(ln.replace('**','').replace('##','').replace('>',' ').split()).strip(' •-#')
+        n=normalizar_busca(bruto)
+        if not bruto:
+            continue
+        if n.startswith('residencia do lider') and len(n) <= 28:
+            continue
+        if any(x in n for x in ('envie aqui', 'foto da residencia', 'print mapa da localizacao', 'descricao curta do local', 'o dossie usa este topico')):
+            continue
+        saida.append(bruto)
+    return '\n'.join(saida).strip()
+
+
+def _v107_refino_local_campo(chave: str, valor: Any) -> str:
+    txt=' '.join(str(valor or '').split()).strip()
+    if not txt:
+        return ''
+    n=normalizar_busca(txt)
+    if n in {'nao se aplica','n a','na'}:
+        return 'NÃO SE APLICA'
+    mapa={
+        'ameacas': {
+            'ja houve': 'Há registro de ameaças ou episódios de violência relacionados à investigação.',
+            'sim': 'Há registro de ameaças ou episódios de violência relacionados à investigação.',
+            'nao': 'Não houve registro de ameaças ou violência informado para este item.'},
+        'confrontos': {
+            'diversos': 'Foram registrados diversos confrontos envolvendo os investigados e as forças de segurança.',
+            'sim': 'Há registro de confrontos envolvendo os investigados e as forças de segurança.',
+            'nao': 'Não houve registro de confrontos informado para este item.'},
+        'prisao_preventiva': {
+            'nao': 'Não há prisão preventiva informada para este item.',
+            'nao ha': 'Não há prisão preventiva informada para este item.',
+            'sim': 'Há prisão preventiva informada nos registros da investigação.'},
+        'artigo_juridico': {
+            'nao ha': 'Não há dispositivo jurídico adicional informado para este item.',
+            'nao': 'Não há dispositivo jurídico adicional informado para este item.'},
+    }
+    if chave in mapa and n in mapa[chave]:
+        return mapa[chave][n]
+    if chave == 'dificuldade_acesso' and len(txt) > 10:
+        txt = txt[0].upper() + txt[1:]
+    if len(txt) > 28 and txt[-1] not in '.!?;:':
+        txt += '.'
+    return txt
+
+
+async def _v107_refinar_campos_ia_batch(campos: Dict[str, Any]) -> Dict[str, str]:
+    base={k:_v107_refino_local_campo(k,v) for k,v in dict(campos or {}).items() if _v107_util(v)}
+    if not base or not globals().get('DOSSIE_IA_OPENAI_API_KEY'):
+        return base
+    try:
+        prompt=(
+            'Você revisa campos de um dossiê institucional fictício de GTA RP. '
+            'Reescreva SOMENTE para melhorar português, clareza, objetividade e tom profissional. '
+            'É proibido inventar fatos, nomes, números, crimes, leis, datas, conclusões ou detalhes. '
+            'Preserve NÃO SE APLICA exatamente. Retorne somente um objeto JSON com as mesmas chaves e strings.\n\n'
+            + json.dumps(base, ensure_ascii=False)
+        )
+        timeout=aiohttp.ClientTimeout(total=min(float(DOSSIE_IA_OPENAI_TIMEOUT or 60), 35.0))
+        async with aiohttp.ClientSession(timeout=timeout) as sessao:
+            async with sessao.post('https://api.openai.com/v1/responses', headers={'Authorization': f'Bearer {DOSSIE_IA_OPENAI_API_KEY}', 'Content-Type':'application/json'}, json={'model':DOSSIE_IA_OPENAI_MODEL,'input':prompt}) as resp:
+                if resp.status >= 400:
+                    return base
+                data=await resp.json()
+        out=''
+        for item in list(data.get('output') or []):
+            for cont in list((item or {}).get('content') or []):
+                if isinstance(cont,dict) and cont.get('type') in {'output_text','text'}:
+                    out += str(cont.get('text') or '')
+        out=out.strip()
+        if out.startswith('```'):
+            out=re.sub(r'^```(?:json)?\s*|\s*```$','',out,flags=re.I|re.S).strip()
+        obj=json.loads(out)
+        if isinstance(obj,dict):
+            for k in list(base):
+                nv=str(obj.get(k) or '').strip()
+                if nv:
+                    base[k]=nv[:3500]
+    except Exception as erro:
+        print(f'⚠️ V107 IA de redação em lote usou fallback local: {type(erro).__name__}', flush=True)
+    return base
+
+
+def _v107_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, Any]:
+    req=dict(dados.get('requisitos_pacificacao') or _v102_montar_requisitos(dados))
+    crimes=_v107_util((dados.get('resumos') or {}).get('crimes'))
+    fund=_v107_util(req.get('fundamentacao_crimes'))
+    if crimes and fund and _v107_textos_muito_parecidos(crimes,fund):
+        req['fundamentacao_crimes']='A fundamentação decorre do conjunto de delitos e evidências documentados nesta seção, considerados de forma integrada para o pedido de pacificação.'
+    motiv=_v107_util(req.get('motivacao'))
+    if crimes and motiv and _v107_textos_muito_parecidos(crimes,motiv):
+        req['motivacao']='A necessidade da medida decorre do conjunto de delitos e evidências consolidados na investigação, conforme registros apresentados na seção de crimes.'
+    req['residencia']=_v107_limpar_residencia_texto(req.get('residencia'))
+    req['residencia_endereco']=_v107_limpar_residencia_texto(req.get('residencia_endereco'))
+    # Nunca usar texto automático de ausência como se fosse conclusão factual.
+    for k in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        v=str(req.get(k) or '').strip()
+        n=normalizar_busca(v)
+        if n.startswith('nao consta') or n.startswith('nenhum registro'):
+            req[k]=''
+    return req
+
+
+_V107_COLETAR_DADOS_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados=await _V107_COLETAR_DADOS_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    req=_v107_preparar_requisitos(dados)
+    chaves=('mandado_resumo','planejamento_resumo','motivacao','prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso','residencia','residencia_endereco')
+    refinados=await _v107_refinar_campos_ia_batch({k:req.get(k) for k in chaves if _v107_util(req.get(k))})
+    req.update(refinados)
+    dados['requisitos_pacificacao']=req
+    return dados
+
+
+_V107_GERAR_PDF_BASE = gerar_pdf_dossie
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    d=dict(dados or {})
+    d['requisitos_pacificacao']=_v107_preparar_requisitos(d)
+    return _V107_GERAR_PDF_BASE(d, caminho_pdf)
+
+
+_V107_GERAR_DOCX_BASE = gerar_docx_dossie
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    d=dict(dados or {})
+    d['requisitos_pacificacao']=_v107_preparar_requisitos(d)
+    return _V107_GERAR_DOCX_BASE(d, caminho_docx)
+
+
+# -------- PROCURADOS: reconstrução e enriquecimento --------
+def _v107_caminho_publico_de_arquivo(caminho: Any, rg: str, tipo: str) -> str:
+    s=str(caminho or '').strip()
+    if not s:
+        return ''
+    try:
+        p=Path(s)
+        if not p.is_absolute():
+            p=BASE_DIR / p
+        if not p.exists() or not p.is_file():
+            return ''
+        try:
+            rel=p.resolve().relative_to(PUBLIC_DIR.resolve())
+            return str(rel).replace('\\','/')
+        except Exception:
+            pass
+        ext=p.suffix.lower() if p.suffix.lower() in {'.png','.jpg','.jpeg','.webp','.gif'} else '.png'
+        destino=UPLOADS_DIR / f'v107-{slugify(rg or "sem-rg")}-{slugify(tipo)}{ext}'
+        if not destino.exists() or destino.stat().st_size != p.stat().st_size:
+            shutil.copy2(str(p), str(destino))
+        return f'uploads/{destino.name}'
+    except Exception:
+        return ''
+
+
+def _v107_individuos_banco() -> Dict[str, Dict[str, Any]]:
+    saida={}
+    try:
+        inicializar_banco_dicor()
+        with sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=20) as db:
+            db.row_factory=sqlite3.Row
+            cols={r[1] for r in db.execute('PRAGMA table_info(individuos)').fetchall()}
+            desejadas=['id','rg','nome','apelido','telefone','faccao_atual','cargo_faccao','observacoes','status','foto_individuo_path','foto_rg_path','foto_individuo_url','foto_rg_url','mesa_canal_id','mesa_nome','criado_em','atualizado_em']
+            use=[c for c in desejadas if c in cols]
+            if not use:
+                return {}
+            for row in db.execute('SELECT '+','.join(use)+' FROM individuos').fetchall():
+                d=dict(row); rg=limpar_rg(d.get('rg',''))
+                if rg: saida[rg]=d
+    except Exception as erro:
+        print(f'⚠️ V107 não conseguiu indexar indivíduos: {type(erro).__name__}: {erro}', flush=True)
+    return saida
+
+
+def _v107_enriquecer_procurado(reg: Dict[str, Any], indice: Optional[Dict[str, Dict[str, Any]]]=None) -> Dict[str, Any]:
+    r=dict(reg or {}); rg=limpar_rg(r.get('rg',''))
+    indice=indice if indice is not None else _v107_individuos_banco()
+    b=dict(indice.get(rg) or {}) if rg else {}
+    for campo_banco, campo_reg in (('nome','nome'),('telefone','telefone'),('apelido','apelido'),('faccao_atual','faccao'),('cargo_faccao','cargo_faccao')):
+        if not registro_tem_valor_util(r.get(campo_reg)) and registro_tem_valor_util(b.get(campo_banco)):
+            r[campo_reg]=b.get(campo_banco)
+    if not registro_tem_valor_util(r.get('foto_individuo')):
+        r['foto_individuo']=str(b.get('foto_individuo_url') or '') or _v107_caminho_publico_de_arquivo(b.get('foto_individuo_path'), rg, 'individuo')
+    if not registro_tem_valor_util(r.get('foto_rg')):
+        r['foto_rg']=str(b.get('foto_rg_url') or '') or _v107_caminho_publico_de_arquivo(b.get('foto_rg_path'), rg, 'rg')
+    extras=dict(r.get('dados_banco') or {})
+    for k in ('nome','rg','apelido','telefone','faccao_atual','cargo_faccao','observacoes','status','mesa_nome'):
+        if registro_tem_valor_util(b.get(k)):
+            extras[k]=b.get(k)
+    if extras: r['dados_banco']=extras
+    return r
+
+
+def _v107_mesclar_registro_procurado(lista: List[Dict[str, Any]], novo: Dict[str, Any]) -> bool:
+    novo=dict(novo or {}); novo['status']=_normalizar_status_procurado(novo)
+    rg=limpar_rg(novo.get('rg',''))
+    status=novo['status']
+    candidato=None
+    for item in reversed(lista):
+        if limpar_rg(item.get('rg','')) != rg or not rg:
+            continue
+        if _normalizar_status_procurado(item) == status:
+            candidato=item; break
+    if candidato is None:
+        lista.append(novo); return True
+    mudou=False
+    campos=('nome','telefone','apelido','faccao','cargo_faccao','crimes','ultimo_avistamento','informacoes','numero_boletim','foto_individuo','foto_rg','mensagem_id','mensagem_url','mensagem_arquivada_id','mensagem_arquivada_url','motivo_retirada','data_retirada','dados_banco')
+    for campo in campos:
+        nv=novo.get(campo); av=candidato.get(campo)
+        if isinstance(nv,dict):
+            mes=dict(av or {}); antes=dict(mes); mes.update({k:v for k,v in nv.items() if registro_tem_valor_util(v)}); candidato[campo]=mes
+            mudou = mudou or mes != antes
+        elif registro_tem_valor_util(nv) and not registro_tem_valor_util(av):
+            candidato[campo]=nv; mudou=True
+    return mudou
+
+
+async def _v107_reconstruir_procurados(guild: Optional[discord.Guild]) -> Dict[str,int]:
+    if guild is None: return {'analisados':0,'novos':0,'atualizados':0}
+    lista=list(carregar_procurados()); idx=_v107_individuos_banco(); analisados=novos=atualizados=0
+    async def varrer(canal_id: int, status: str):
+        nonlocal analisados, novos, atualizados
+        if not canal_id: return
+        canal=bot.get_channel(int(canal_id))
+        if canal is None:
+            try: canal=await bot.fetch_channel(int(canal_id))
+            except Exception: return
+        if not hasattr(canal,'history'): return
+        async for msg in canal.history(limit=2000, oldest_first=True):
+            analisados += 1
+            try: reg=await importar_mensagem_antiga(msg)
+            except Exception: reg=None
+            if not reg: continue
+            reg['status']=status
+            if status=='A PROCURAR':
+                reg['mensagem_id']=msg.id; reg['mensagem_url']=msg.jump_url
+            else:
+                reg['mensagem_arquivada_id']=msg.id; reg['mensagem_arquivada_url']=msg.jump_url; reg['mensagem_url']=msg.jump_url
+            reg=_v107_enriquecer_procurado(reg,idx)
+            antes=len(lista)
+            mudou=_v107_mesclar_registro_procurado(lista,reg)
+            if len(lista)>antes: novos += 1
+            elif mudou: atualizados += 1
+    await varrer(PROCURADOS_CHANNEL_ID,'A PROCURAR')
+    await varrer(HISTORICO_PROCURADOS_ID,'RETIRADO')
+    # Enriquecer também registros já existentes com o Banco DICOR.
+    lista=[_v107_enriquecer_procurado(x,idx) for x in lista]
+    salvar_procurados(lista); gerar_catalogo_html()
+    return {'analisados':analisados,'novos':novos,'atualizados':atualizados}
+
+
+# -------- BACKBLAZE B2: cofre remoto de dados críticos --------
+def _v107_b2_configurado() -> bool:
+    return bool(V107_REMOTE_DB_ENABLED and _v78_boto3 is not None and V79_B2_ENDPOINT_URL and V79_B2_REGION and V79_B2_ACCESS_KEY_ID and V79_B2_SECRET_ACCESS_KEY and V79_B2_BUCKET)
+
+
+def _v107_b2_client():
+    global _V107_B2_CLIENT
+    if not _v107_b2_configurado(): return None
+    with _V107_B2_LOCK:
+        if _V107_B2_CLIENT is None:
+            kwargs={'service_name':'s3','endpoint_url':V79_B2_ENDPOINT_URL,'aws_access_key_id':V79_B2_ACCESS_KEY_ID,'aws_secret_access_key':V79_B2_SECRET_ACCESS_KEY,'region_name':V79_B2_REGION}
+            if _V78BotoConfig is not None:
+                kwargs['config']=_V78BotoConfig(signature_version='s3v4', retries={'max_attempts':4,'mode':'standard'}, connect_timeout=12, read_timeout=90, s3={'addressing_style':'path'})
+            _V107_B2_CLIENT=_v78_boto3.client(**kwargs)
+        return _V107_B2_CLIENT
+
+
+def _v107_remote_key(rel: str) -> str:
+    return f'{V107_REMOTE_PREFIX}/{str(rel).lstrip("/")}'
+
+
+def _v107_upload_bytes(chave: str, conteudo: bytes, content_type: str='application/octet-stream') -> bool:
+    cli=_v107_b2_client()
+    if cli is None: return False
+    try:
+        cli.put_object(Bucket=V79_B2_BUCKET, Key=_v107_remote_key(chave), Body=conteudo, ContentType=content_type, Metadata={'origem':'dicor-intelligence-v107'})
+        return True
+    except Exception as erro:
+        print(f'⚠️ V107 B2 falhou em {chave}: {type(erro).__name__}: {erro}', flush=True)
+        return False
+
+
+def _v107_upload_file_estavel(caminho: Path, chave: str) -> bool:
+    cli=_v107_b2_client()
+    if cli is None or not caminho.exists() or not caminho.is_file(): return False
+    try:
+        mime=_v78_mimetypes.guess_type(caminho.name)[0] or 'application/octet-stream'
+        cli.upload_file(str(caminho), V79_B2_BUCKET, _v107_remote_key(chave), ExtraArgs={'ContentType':mime,'Metadata':{'origem':'dicor-intelligence-v107'}})
+        return True
+    except Exception as erro:
+        print(f'⚠️ V107 B2 upload falhou em {caminho.name}: {type(erro).__name__}: {erro}', flush=True)
+        return False
+
+
+def _v107_download_json(chave: str) -> Optional[Dict[str,Any]]:
+    cli=_v107_b2_client()
+    if cli is None: return None
+    try:
+        obj=cli.get_object(Bucket=V79_B2_BUCKET, Key=_v107_remote_key(chave))
+        raw=obj['Body'].read()
+        dado=json.loads(raw.decode('utf-8'))
+        return dado if isinstance(dado,dict) else None
+    except Exception:
+        return None
+
+
+def _v107_ler_tabela(db: sqlite3.Connection, tabela: str, limite: int=50000) -> List[Dict[str,Any]]:
+    try:
+        existe=db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?",(tabela,)).fetchone()
+        if not existe: return []
+        db.row_factory=sqlite3.Row
+        return [dict(r) for r in db.execute(f'SELECT * FROM {tabela} LIMIT ?', (int(limite),)).fetchall()]
+    except Exception:
+        return []
+
+
+def _v107_master_snapshot() -> Dict[str,Any]:
+    master={'versao':107,'gerado_em':datetime.datetime.now(datetime.timezone.utc).isoformat(),'procurados':carregar_procurados(),'procurados_pendentes':carregar_json(PROCURADOS_PENDENTES_JSON,{}),'mesas':carregar_mesas(),'organizacoes':carregar_json(ORGANIZACOES_JSON,[]),'historico_organizacoes':carregar_json(HISTORICO_ORGANIZACOES_JSON,[]),'tabelas':{}}
+    try:
+        inicializar_banco_dicor()
+        with sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=30) as db:
+            for tabela in ('individuos','veiculos','faccoes','faccao_membros','historico_banco','evidencias_banco','vinculos_individuo_veiculo','fichas_confirmadas_persistentes','arquivos_ficha_geral','identificadores_ficha','historico_prisoes','fontes_ficha_individuo','rg_aparicoes_automaticas'):
+                master['tabelas'][tabela]=_v107_ler_tabela(db,tabela)
+    except Exception as erro:
+        master['erro_sqlite']=f'{type(erro).__name__}: {erro}'
+    return master
+
+
+def _v107_arquivos_criticos() -> List[Path]:
+    candidatos=[]
+    nomes=('CATALOGO_JSON','PROCURADOS_PENDENTES_JSON','MESAS_JSON','ORGANIZACOES_JSON','HISTORICO_ORGANIZACOES_JSON','BOLETINS_JSON','BOLETINS_PENDENTES_JSON','BOLETIM_ATENDIMENTOS_JSON','BOLETINS_CONTADOR_JSON','PERICIA_ATENDIMENTOS_JSON','COMPARECIMENTOS_JSON','AUTORIZACOES_JSON','DOSSIES_JSON','ASSINATURAS_DOSSIE_JSON','TAREFAS_MESAS_JSON','CRIMES_SESSOES_JSON','CENTRAL_BO_CANAL_SNAPSHOT_JSON','CENTRAL_PERICIAS_SNAPSHOT_JSON')
+    for nome in nomes:
+        p=globals().get(nome)
+        if p:
+            try:
+                pp=Path(p)
+                if pp.exists() and pp.is_file(): candidatos.append(pp)
+            except Exception: pass
+    return candidatos
+
+
+def _v107_backup_sqlite_temporario() -> Optional[Path]:
+    if not BANCO_DADOS_SQLITE.exists(): return None
+    destino=Path(tempfile.gettempdir()) / 'dicor-banco-v107-current.sqlite3'
+    try:
+        origem=sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=60)
+        alvo=sqlite3.connect(str(destino), timeout=60)
+        try:
+            origem.execute('PRAGMA wal_checkpoint(PASSIVE)')
+            origem.backup(alvo); alvo.commit()
+        finally:
+            alvo.close(); origem.close()
+        return destino if _banco_db_integro(destino) else None
+    except Exception as erro:
+        print(f'⚠️ V107 não conseguiu criar snapshot SQLite: {type(erro).__name__}: {erro}', flush=True)
+        return None
+
+
+def _v107_carregar_indice_midia() -> Dict[str,Any]:
+    d=carregar_json(V107_REMOTE_INDEX_FILE,{})
+    return d if isinstance(d,dict) else {}
+
+
+def _v107_salvar_indice_midia(d: Dict[str,Any]) -> None:
+    _banco_json_atomico(V107_REMOTE_INDEX_FILE,d)
+
+
+def _v107_sync_midia_incremental(max_arquivos: int=24) -> int:
+    indice=_v107_carregar_indice_midia(); enviados=0
+    raizes=[UPLOADS_DIR, BANCO_ARQUIVOS_DIR, _BANCO_FICHAS_DURAVEIS_DIR]
+    for raiz in raizes:
+        try: raiz=Path(raiz)
+        except Exception: continue
+        if not raiz.exists(): continue
+        for p in raiz.rglob('*'):
+            if enviados >= max_arquivos: break
+            try:
+                if not p.is_file() or p.stat().st_size <= 0: continue
+                rel=str(p.resolve().relative_to(DATA_DIR.resolve())).replace('\\','/') if str(p.resolve()).startswith(str(DATA_DIR.resolve())) else f'media/{p.name}'
+                sig=f'{p.stat().st_size}:{int(p.stat().st_mtime)}'
+                if indice.get(rel)==sig: continue
+                if _v107_upload_file_estavel(p, f'files/{rel}'):
+                    indice[rel]=sig; enviados += 1
+            except Exception: continue
+        if enviados >= max_arquivos: break
+    if enviados: _v107_salvar_indice_midia(indice)
+    return enviados
+
+
+def _v107_mesclar_master_remoto(master: Dict[str,Any]) -> Dict[str,int]:
+    res={'procurados':0,'individuos':0}
+    if not isinstance(master,dict): return res
+    # Procurados: só completa campos ausentes, nunca apaga/retira automaticamente.
+    locais=list(carregar_procurados())
+    for remoto in list(master.get('procurados') or []):
+        if isinstance(remoto,dict) and _v107_mesclar_registro_procurado(locais,remoto): res['procurados']+=1
+    if res['procurados']:
+        salvar_procurados(locais); gerar_catalogo_html()
+    # Indivíduos: restaura registro ausente e completa apenas células vazias.
+    remotos=((master.get('tabelas') or {}).get('individuos') or [])
+    try:
+        inicializar_banco_dicor()
+        with sqlite3.connect(str(BANCO_DADOS_SQLITE), timeout=30) as db:
+            for r in remotos:
+                if not isinstance(r,dict): continue
+                rg=str(r.get('rg') or '').strip(); nome=str(r.get('nome') or '').strip()
+                if not rg or not nome: continue
+                ex=db.execute('SELECT id,nome,apelido,telefone,faccao_atual,cargo_faccao,observacoes,status,foto_individuo_path,foto_rg_path,foto_individuo_url,foto_rg_url FROM individuos WHERE rg=?',(rg,)).fetchone()
+                if ex is None:
+                    agora=_banco_agora_iso()
+                    db.execute('INSERT OR IGNORE INTO individuos(rg,nome,apelido,telefone,faccao_atual,cargo_faccao,observacoes,status,foto_individuo_path,foto_rg_path,foto_individuo_url,foto_rg_url,origem,mesa_canal_id,mesa_nome,criado_por_id,criado_em,atualizado_em) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(rg,nome,str(r.get('apelido') or ''),str(r.get('telefone') or ''),str(r.get('faccao_atual') or ''),str(r.get('cargo_faccao') or ''),str(r.get('observacoes') or ''),str(r.get('status') or 'CADASTRADO'),str(r.get('foto_individuo_path') or ''),str(r.get('foto_rg_path') or ''),str(r.get('foto_individuo_url') or ''),str(r.get('foto_rg_url') or ''),'restaurado_b2_v107',int(r.get('mesa_canal_id') or 0),str(r.get('mesa_nome') or ''),0,str(r.get('criado_em') or agora),agora))
+                    res['individuos']+=1
+                else:
+                    cols=('nome','apelido','telefone','faccao_atual','cargo_faccao','observacoes','status','foto_individuo_path','foto_rg_path','foto_individuo_url','foto_rg_url')
+                    atual=dict(zip(['id']+list(cols),ex)); updates={}
+                    for c in cols:
+                        if not _v107_util(atual.get(c)) and _v107_util(r.get(c)): updates[c]=r.get(c)
+                    if updates:
+                        updates['atualizado_em']=_banco_agora_iso(); sets=','.join(f'{k}=?' for k in updates); db.execute(f'UPDATE individuos SET {sets} WHERE rg=?',tuple(updates.values())+(rg,)); res['individuos']+=1
+            db.commit()
+    except Exception as erro:
+        print(f'⚠️ V107 merge remoto SQLite falhou: {type(erro).__name__}: {erro}', flush=True)
+    return res
+
+
+async def _v107_sync_remoto(*, snapshot_versionado: bool=False) -> Dict[str,int]:
+    if not _v107_b2_configurado(): return {'arquivos':0,'midias':0}
+    async with _V107_REMOTE_LOCK:
+        master=await asyncio.to_thread(_v107_master_snapshot)
+        bruto=json.dumps(master,ensure_ascii=False,indent=2,default=str).encode('utf-8')
+        ok=await asyncio.to_thread(_v107_upload_bytes,'current/master_records.json',bruto,'application/json')
+        arquivos=1 if ok else 0
+        sqlite_tmp=await asyncio.to_thread(_v107_backup_sqlite_temporario)
+        if sqlite_tmp and await asyncio.to_thread(_v107_upload_file_estavel,sqlite_tmp,'current/dicor_banco_dados.sqlite3'):
+            arquivos += 1
+        for p in _v107_arquivos_criticos():
+            if await asyncio.to_thread(_v107_upload_file_estavel,p,f'current/{p.name}'):
+                arquivos += 1
+        if snapshot_versionado:
+            stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')
+            await asyncio.to_thread(_v107_upload_bytes,f'snapshots/{stamp}/master_records.json',bruto,'application/json')
+            if sqlite_tmp: await asyncio.to_thread(_v107_upload_file_estavel,sqlite_tmp,f'snapshots/{stamp}/dicor_banco_dados.sqlite3')
+        midias=await asyncio.to_thread(_v107_sync_midia_incremental,24)
+        return {'arquivos':arquivos,'midias':midias}
+
+
+async def _v107_rotina_remota():
+    await bot.wait_until_ready()
+    ciclo=0
+    while not bot.is_closed():
+        try:
+            ciclo += 1
+            await _v107_sync_remoto(snapshot_versionado=(ciclo==1 or ciclo % max(1,int((6*60)/V107_REMOTE_SYNC_MINUTES))==0))
+        except Exception as erro:
+            print(f'⚠️ V107 rotina remota: {type(erro).__name__}: {erro}', flush=True)
+        await asyncio.sleep(V107_REMOTE_SYNC_MINUTES*60)
+
+
+async def _v107_startup_listener():
+    global _V107_START_DONE
+    if _V107_START_DONE: return
+    _V107_START_DONE=True
+    await asyncio.sleep(5)
+    try:
+        if _v107_b2_configurado():
+            remoto=await asyncio.to_thread(_v107_download_json,'current/master_records.json')
+            if remoto:
+                restaurados=await asyncio.to_thread(_v107_mesclar_master_remoto,remoto)
+                print(f"✅ V107 cofre remoto lido: {restaurados['individuos']} indivíduo(s) e {restaurados['procurados']} procurado(s) recuperados/completados.",flush=True)
+        if V107_REBUILD_PROCURADOS_ON_START:
+            guild=bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if bot.guilds else None)
+            r=await _v107_reconstruir_procurados(guild)
+            print(f"✅ V107 procurados reconstruídos: {r['analisados']} mensagem(ns), {r['novos']} novo(s), {r['atualizados']} atualizado(s).",flush=True)
+        if _v107_b2_configurado():
+            await _v107_sync_remoto(snapshot_versionado=True)
+    except Exception as erro:
+        print(f'⚠️ V107 startup de recuperação: {type(erro).__name__}: {erro}',flush=True)
+    try:
+        asyncio.create_task(_v107_rotina_remota(),name='dicor-v107-remote-vault')
+    except Exception: pass
+
+bot.add_listener(_v107_startup_listener,'on_ready')
+
+try:
+    @bot.tree.command(name='reconstruirprocurados', description='Reconstrói e enriquece o catálogo usando Discord + Banco DICOR.')
+    async def _v107_cmd_reconstruirprocurados(interaction: discord.Interaction):
+        if not isinstance(interaction.user,discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Apenas Inspetor+ pode executar a reconstrução.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        r=await _v107_reconstruir_procurados(interaction.guild)
+        if _v107_b2_configurado(): await _v107_sync_remoto(snapshot_versionado=True)
+        await interaction.followup.send(f"✅ Reconstrução concluída. Mensagens: `{r['analisados']}` • novos: `{r['novos']}` • atualizados: `{r['atualizados']}`.\nOs dados importantes também foram enviados ao cofre remoto quando o B2 está configurado.",ephemeral=True)
+except Exception as _v107_cmd_erro:
+    print(f'⚠️ V107 comando reconstruirprocurados não registrado: {_v107_cmd_erro}',flush=True)
+
+try:
+    @bot.tree.command(name='backupdados', description='Força um snapshot dos dados críticos no cofre remoto B2.')
+    async def _v107_cmd_backupdados(interaction: discord.Interaction):
+        if not isinstance(interaction.user,discord.Member) or not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Apenas Inspetor+ pode executar o backup.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        if not _v107_b2_configurado():
+            return await interaction.followup.send('⚠️ Backblaze B2 ainda não está configurado. O banco local continua funcionando, mas o cofre remoto não pode receber o snapshot.',ephemeral=True)
+        r=await _v107_sync_remoto(snapshot_versionado=True)
+        await interaction.followup.send(f"✅ Snapshot remoto concluído: `{r['arquivos']}` arquivo(s) crítico(s) + `{r['midias']}` mídia(s) incremental(is).",ephemeral=True)
+except Exception as _v107_cmd2_erro:
+    print(f'⚠️ V107 comando backupdados não registrado: {_v107_cmd2_erro}',flush=True)
+
+print('✅ V107 carregada — dossiê sem crimes repetidos/sobreposição, evidências separadas por tópico, cartões sem “Não informado”, residência limpa, redação profissional; procurados reconstruídos e dados críticos espelhados no Backblaze B2.',flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
