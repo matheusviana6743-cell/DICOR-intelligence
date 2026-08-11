@@ -40692,18 +40692,40 @@ import tempfile as _v78_tempfile
 def _v78_env_bool(nome: str, padrao: bool=False) -> bool:
     valor = str(os.getenv(nome, '1' if padrao else '0') or '').strip().lower()
     return valor in {'1', 'true', 'yes', 'sim', 'on'}
+def _v108_env_limpo(nome: str, padrao: str='') -> str:
+    """Aceita valor puro ou, por engano, 'NOME_VARIAVEL=valor'.
+    Uma variável B2 mal colada nunca deve derrubar o bot.
+    """
+    bruto = str(os.getenv(nome, padrao) or padrao).strip()
+    if len(bruto) >= 2 and bruto[0] == bruto[-1] and bruto[0] in {'"', "'"}:
+        bruto = bruto[1:-1].strip()
+    if '=' in bruto:
+        esquerda, direita = bruto.split('=', 1)
+        if esquerda.strip().upper() == nome.upper():
+            bruto = direita.strip()
+            if len(bruto) >= 2 and bruto[0] == bruto[-1] and bruto[0] in {'"', "'"}:
+                bruto = bruto[1:-1].strip()
+    return bruto
+
 V79_B2_ENABLED = _v78_env_bool('B2_ENABLED', False)
 V79_B2_AUTO_MIGRATE = _v78_env_bool('B2_AUTO_MIGRATE', False)
-V79_B2_ACCESS_KEY_ID = str(os.getenv('B2_ACCESS_KEY_ID', '') or '').strip()
-V79_B2_SECRET_ACCESS_KEY = str(os.getenv('B2_SECRET_ACCESS_KEY', '') or '').strip()
-V79_B2_BUCKET = str(os.getenv('B2_BUCKET', '') or '').strip()
-V79_B2_ENDPOINT_URL = str(os.getenv('B2_ENDPOINT_URL', '') or '').strip()
-V79_B2_REGION = str(os.getenv('B2_REGION', '') or '').strip()
-V79_B2_PREFIX = str(os.getenv('B2_PREFIX', 'dicor') or 'dicor').strip().strip('/')
-if not V79_B2_REGION and V79_B2_ENDPOINT_URL:
-    _v79_match_region = re.search('https?://s3\\.([a-z0-9-]+)\\.backblazeb2\\.com', V79_B2_ENDPOINT_URL, flags=re.I)
+V79_B2_ACCESS_KEY_ID = _v108_env_limpo('B2_ACCESS_KEY_ID')
+V79_B2_SECRET_ACCESS_KEY = _v108_env_limpo('B2_SECRET_ACCESS_KEY')
+V79_B2_BUCKET = _v108_env_limpo('B2_BUCKET')
+V79_B2_ENDPOINT_URL = _v108_env_limpo('B2_ENDPOINT_URL').rstrip('/')
+V79_B2_REGION = _v108_env_limpo('B2_REGION')
+V79_B2_PREFIX = _v108_env_limpo('B2_PREFIX', 'dicor').strip('/')
+
+_v108_region_valida = bool(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', V79_B2_REGION or '', flags=re.I))
+if (not _v108_region_valida) and V79_B2_ENDPOINT_URL:
+    _v79_match_region = re.search(r'https?://s3\.([a-z0-9-]+)\.backblazeb2\.com', V79_B2_ENDPOINT_URL, flags=re.I)
     if _v79_match_region:
         V79_B2_REGION = _v79_match_region.group(1)
+        _v108_region_valida = True
+if V79_B2_REGION and not _v108_region_valida:
+    print(f"⚠️ V108 B2_REGION inválida ignorada: {V79_B2_REGION!r}. O bot continuará online com armazenamento local.", flush=True)
+    V79_B2_REGION = ''
+
 V79_B2_PRESIGNED_SECONDS = max(300, min(604800, env_int('B2_PRESIGNED_SECONDS', 604800)))
 V79_B2_AUTO_TRIGGER_PERCENT = max(50, min(95, env_int('B2_AUTO_TRIGGER_PERCENT', 72)))
 V79_B2_AUTO_TARGET_PERCENT = max(35, min(V79_B2_AUTO_TRIGGER_PERCENT - 5, env_int('B2_AUTO_TARGET_PERCENT', 58)))
@@ -40731,16 +40753,21 @@ def _v78_r2_configurado() -> bool:
     return bool(V79_B2_ENABLED and _v78_boto3 is not None and V79_B2_ENDPOINT_URL and V79_B2_REGION and V79_B2_ACCESS_KEY_ID and V79_B2_SECRET_ACCESS_KEY and V79_B2_BUCKET)
 
 def _v78_r2_client():
-    """Cliente S3 compatível do Backblaze B2."""
+    """Cliente S3 compatível do Backblaze B2. Falhas de configuração não derrubam o bot."""
     global _V78_R2_CLIENT
     if not _v78_r2_configurado():
         return None
     with _V78_R2_CLIENT_LOCK:
         if _V78_R2_CLIENT is None:
-            kwargs = {'service_name': 's3', 'endpoint_url': V79_B2_ENDPOINT_URL, 'aws_access_key_id': V79_B2_ACCESS_KEY_ID, 'aws_secret_access_key': V79_B2_SECRET_ACCESS_KEY, 'region_name': V79_B2_REGION}
-            if _V78BotoConfig is not None:
-                kwargs['config'] = _V78BotoConfig(signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'standard'}, connect_timeout=10, read_timeout=60, s3={'addressing_style': 'path'})
-            _V78_R2_CLIENT = _v78_boto3.client(**kwargs)
+            try:
+                kwargs = {'service_name': 's3', 'endpoint_url': V79_B2_ENDPOINT_URL, 'aws_access_key_id': V79_B2_ACCESS_KEY_ID, 'aws_secret_access_key': V79_B2_SECRET_ACCESS_KEY, 'region_name': V79_B2_REGION}
+                if _V78BotoConfig is not None:
+                    kwargs['config'] = _V78BotoConfig(signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'standard'}, connect_timeout=10, read_timeout=60, s3={'addressing_style': 'path'})
+                _V78_R2_CLIENT = _v78_boto3.client(**kwargs)
+            except Exception as erro:
+                print(f'⚠️ V108 cliente B2 indisponível: {type(erro).__name__}: {erro}. Fallback local mantido.', flush=True)
+                _V78_R2_CLIENT = None
+                return None
         return _V78_R2_CLIENT
 
 def _v78_index_init() -> None:
@@ -47926,13 +47953,19 @@ def _v107_b2_configurado() -> bool:
 
 def _v107_b2_client():
     global _V107_B2_CLIENT
-    if not _v107_b2_configurado(): return None
+    if not _v107_b2_configurado():
+        return None
     with _V107_B2_LOCK:
         if _V107_B2_CLIENT is None:
-            kwargs={'service_name':'s3','endpoint_url':V79_B2_ENDPOINT_URL,'aws_access_key_id':V79_B2_ACCESS_KEY_ID,'aws_secret_access_key':V79_B2_SECRET_ACCESS_KEY,'region_name':V79_B2_REGION}
-            if _V78BotoConfig is not None:
-                kwargs['config']=_V78BotoConfig(signature_version='s3v4', retries={'max_attempts':4,'mode':'standard'}, connect_timeout=12, read_timeout=90, s3={'addressing_style':'path'})
-            _V107_B2_CLIENT=_v78_boto3.client(**kwargs)
+            try:
+                kwargs={'service_name':'s3','endpoint_url':V79_B2_ENDPOINT_URL,'aws_access_key_id':V79_B2_ACCESS_KEY_ID,'aws_secret_access_key':V79_B2_SECRET_ACCESS_KEY,'region_name':V79_B2_REGION}
+                if _V78BotoConfig is not None:
+                    kwargs['config']=_V78BotoConfig(signature_version='s3v4', retries={'max_attempts':4,'mode':'standard'}, connect_timeout=12, read_timeout=90, s3={'addressing_style':'path'})
+                _V107_B2_CLIENT=_v78_boto3.client(**kwargs)
+            except Exception as erro:
+                print(f'⚠️ V108 cofre B2 indisponível: {type(erro).__name__}: {erro}. Dados locais e Procurados continuam funcionando.', flush=True)
+                _V107_B2_CLIENT=None
+                return None
         return _V107_B2_CLIENT
 
 
@@ -48159,8 +48192,18 @@ try:
             return await interaction.response.send_message('❌ Apenas Inspetor+ pode executar a reconstrução.',ephemeral=True)
         await interaction.response.defer(ephemeral=True,thinking=True)
         r=await _v107_reconstruir_procurados(interaction.guild)
-        if _v107_b2_configurado(): await _v107_sync_remoto(snapshot_versionado=True)
-        await interaction.followup.send(f"✅ Reconstrução concluída. Mensagens: `{r['analisados']}` • novos: `{r['novos']}` • atualizados: `{r['atualizados']}`.\nOs dados importantes também foram enviados ao cofre remoto quando o B2 está configurado.",ephemeral=True)
+        remoto_estado='ℹ️ B2 não configurado; reconstrução local concluída normalmente.'
+        if _v107_b2_configurado():
+            try:
+                rr=await _v107_sync_remoto(snapshot_versionado=True)
+                if (rr or {}).get('arquivos',0) or (rr or {}).get('midias',0):
+                    remoto_estado='☁️ Cofre remoto B2 atualizado.'
+                else:
+                    remoto_estado='⚠️ Reconstrução concluída, mas o B2 não confirmou uploads. Dados locais preservados.'
+            except Exception as erro:
+                print(f'⚠️ V108 backup remoto após reconstrução falhou: {type(erro).__name__}: {erro}',flush=True)
+                remoto_estado='⚠️ Reconstrução concluída; B2 indisponível no momento. Dados locais preservados.'
+        await interaction.followup.send(f"✅ Reconstrução concluída. Mensagens: `{r['analisados']}` • novos: `{r['novos']}` • atualizados: `{r['atualizados']}`.\n{remoto_estado}",ephemeral=True)
 except Exception as _v107_cmd_erro:
     print(f'⚠️ V107 comando reconstruirprocurados não registrado: {_v107_cmd_erro}',flush=True)
 
@@ -48172,12 +48215,18 @@ try:
         await interaction.response.defer(ephemeral=True,thinking=True)
         if not _v107_b2_configurado():
             return await interaction.followup.send('⚠️ Backblaze B2 ainda não está configurado. O banco local continua funcionando, mas o cofre remoto não pode receber o snapshot.',ephemeral=True)
-        r=await _v107_sync_remoto(snapshot_versionado=True)
-        await interaction.followup.send(f"✅ Snapshot remoto concluído: `{r['arquivos']}` arquivo(s) crítico(s) + `{r['midias']}` mídia(s) incremental(is).",ephemeral=True)
+        try:
+            r=await _v107_sync_remoto(snapshot_versionado=True)
+            if not ((r or {}).get('arquivos',0) or (r or {}).get('midias',0)):
+                return await interaction.followup.send('⚠️ B2 não confirmou nenhum upload. O banco local permanece intacto; verifique as variáveis do B2.',ephemeral=True)
+            await interaction.followup.send(f"✅ Snapshot remoto concluído: `{r['arquivos']}` arquivo(s) crítico(s) + `{r['midias']}` mídia(s) incremental(is).",ephemeral=True)
+        except Exception as erro:
+            print(f'⚠️ V108 /backupdados: {type(erro).__name__}: {erro}',flush=True)
+            await interaction.followup.send('⚠️ Falha no B2, mas nenhum dado local foi perdido e o bot continua online.',ephemeral=True)
 except Exception as _v107_cmd2_erro:
     print(f'⚠️ V107 comando backupdados não registrado: {_v107_cmd2_erro}',flush=True)
 
-print('✅ V107 carregada — dossiê sem crimes repetidos/sobreposição, evidências separadas por tópico, cartões sem “Não informado”, residência limpa, redação profissional; procurados reconstruídos e dados críticos espelhados no Backblaze B2.',flush=True)
+print('✅ V108 carregada — B2 protegido contra variáveis mal coladas; falhas remotas não derrubam Procurados/reconstrução e o fallback local é preservado.',flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
