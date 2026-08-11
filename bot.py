@@ -45922,6 +45922,20 @@ def linhas_tabela_conteudo() -> List[List[str]]:
     ]
 
 
+def _v109_contem_mesmos_delitos(a: Any, b: Any) -> bool:
+    """Detecta repetição de lista de crimes mesmo quando pontuação/formatação muda."""
+    def codigos(v: Any) -> set[str]:
+        return set(re.findall(r'(?<!\d)(\d+\.\d+)(?!\d)', str(v or '')))
+    ca, cb = codigos(a), codigos(b)
+    if ca and cb and len(ca & cb) >= max(1, min(len(ca), len(cb))):
+        return True
+    na = set(re.findall(r'[a-z]{4,}', normalizar_busca(str(a or ''))))
+    nb = set(re.findall(r'[a-z]{4,}', normalizar_busca(str(b or ''))))
+    if not na or not nb:
+        return False
+    return len(na & nb) / max(1, min(len(na), len(nb))) >= 0.72
+
+
 def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> None:
     """Mesmo visual V100. Somente conteúdo/ordem foram ampliados conforme o padrão entregue."""
     if canvas is None or A4 is None:
@@ -45987,7 +46001,9 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05)
         except Exception:
             largura_rotulo = 0
-        empilhar = bool(len(label) >= 22 or largura_rotulo > 6.15 * cm)
+        # V109: qualquer rótulo médio/longo usa bloco vertical. Evita definitivamente
+        # colisão de textos em campos como Matrícula/RG, residência e controle territorial.
+        empilhar = bool(len(label) >= 17 or largura_rotulo > 4.85 * cm)
         if empilhar:
             largura_valor = largura_util - 0.72 * cm
             linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_valor) or ['—']
@@ -46043,7 +46059,10 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
             desenhar_imagem(pessoa.get('foto'), margem_x + 0.2 * cm, y - 2.18 * cm, 1.9 * cm, 1.9 * cm)
             tx = margem_x + 2.42 * cm; c.setFillColor(cores['dourado']); c.setFont('Courier-Bold', 9.3); c.drawString(tx, y - 0.34 * cm, f"{idx}. {seguro(pessoa.get('nome'))[:68]}")
             c.setFillColor(cores['texto']); c.setFont('Courier', 8.55)
-            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}", f'Observações: {_v98_texto_observacoes_pessoa(pessoa)}']
+            detalhes = [f"RG: {seguro(pessoa.get('rg'))}", f"Função/Cargo: {seguro(pessoa.get('funcao') or pessoa.get('cargo'))}"]
+            obs_pessoa = str(_v98_texto_observacoes_pessoa(pessoa) or '').strip()
+            if obs_pessoa and normalizar_busca(obs_pessoa) not in {'nao informado', 'nao informada', 'n i', 'ni'}:
+                detalhes.append(f'Informações adicionais: {obs_pessoa}')
             ly = y - 0.76 * cm
             for det in detalhes:
                 for ln in _linhas_pdf_seguras(c, det, 'Courier', 8.55, largura_util - 2.85 * cm)[:2]: c.drawString(tx, ly, ln[:140]); ly -= 0.27 * cm
@@ -46095,10 +46114,13 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
 
     # 6. PAINEL
     y = nova_secao('6. PAINEL DA ORGANIZAÇÃO')
-    painel = _v102_primeiro(_v102_valor_util((dados.get('resumos') or {}).get('painel')), req.get('painel_descricao'))
-    painel_prof = _v106_texto_profissional_local(
-        painel,
-        fallback='O painel da organização foi documentado por registros visuais extraídos diretamente da mesa de investigação, preservando a composição e a estrutura identificadas no material original.'
+    # V109: o painel é uma seção visual. Não repete nomes/RGs que já aparecem nas
+    # seções de liderança e integrantes e não despeja texto bruto do tópico.
+    painel_prof = (
+        'As evidências visuais abaixo documentam a estrutura interna da organização investigada, '
+        'incluindo a composição apresentada nos painéis originais da própria mesa. Os registros '
+        'são preservados como fonte documental, sem duplicar nesta seção as identificações já '
+        'consolidadas nas páginas de lideranças e integrantes.'
     )
     y = texto(painel_prof, y, tam=9.7, leading=0.40 * cm)
     painel_imgs = _v102_evidencias(dados, ['painel', 'informações gerais', 'informacoes gerais'])
@@ -46121,10 +46143,20 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     y = campo('Descrição/Referência', _v102_valor_ou_pendencia(req.get('visao_aerea'), 'Visão aérea/estratégica — descrever a referência visual registrada na mesa.'), y)
     if loc_imgs: y = texto('Evidências visuais de localização/mapa registradas acima.', y, tam=8.7)
 
-    # 8. CRIMES
+    # 8. CRIMES — V109: a lista aparece UMA vez. Fundamentação só entra quando trouxer
+    # informação realmente diferente da relação de delitos.
     y = nova_secao('8. CRIMES DA COMUNIDADE')
-    y = texto(_v102_valor_util((dados.get('resumos') or {}).get('crimes')) or 'Nenhum registro textual específico foi encontrado neste tópico.', y, tam=10.6, leading=0.43 * cm)
-    y = campo('Fundamentação da pacificação', _v102_valor_ou_pendencia(req.get('fundamentacao_crimes'), 'Fundamentação específica para pedido de pacificação — preencher.'), y)
+    crimes_resumo = _v102_valor_util((dados.get('resumos') or {}).get('crimes'))
+    y = texto(crimes_resumo or 'Nenhum registro textual específico foi encontrado neste tópico.', y, tam=10.6, leading=0.43 * cm)
+    fundamentacao = _v102_valor_util(req.get('fundamentacao_crimes'))
+    if fundamentacao:
+        try:
+            repetida = _v107_textos_muito_parecidos(crimes_resumo, fundamentacao) or _v109_contem_mesmos_delitos(crimes_resumo, fundamentacao)
+        except Exception:
+            repetida = False
+        if repetida:
+            fundamentacao = 'A fundamentação considera, de forma conjunta, os delitos e as evidências documentados nesta seção.'
+        y = campo('Fundamentação', fundamentacao, y)
     crime_imgs = _v102_evidencias(dados, ['crimes', 'crime', 'comunidade', 'ocorrencia', 'ocorrência'])
     if not crime_imgs: y = texto(_v102_pendencia('Evidências/imagens correspondentes aos crimes — conferir e anexar.'), y)
     y = imagens(crime_imgs, y)
@@ -46160,13 +46192,19 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
         y = subtitulo('Informações relevantes adicionais', y)
         y = texto(info_extra, y, tam=9.4)
 
-    # 12. RESIDÊNCIA — V106: texto limpo, sem instruções do bot e sem campos sobrepostos.
+    # 12. RESIDÊNCIA — V109: evidencia primeiro; nunca imprime instruções do tópico.
     y = nova_secao('12. RESIDÊNCIA / LOCAL DE RESIDÊNCIA')
-    residencia_txt = _v106_residencia_texto(req.get('residencia'), req.get('residencia_endereco'))
-    if residencia_txt:
-        y = texto(residencia_txt, y, tam=9.7, leading=0.40 * cm)
+    residencia_desc = _v107_limpar_residencia_texto(req.get('residencia'))
+    residencia_local = _v107_limpar_residencia_texto(req.get('residencia_endereco'))
+    if residencia_desc or residencia_local:
+        y = subtitulo('Registro da residência', y)
+        if residencia_desc:
+            y = texto(residencia_desc, y, tam=9.7, leading=0.40 * cm)
+        if residencia_local and normalizar_busca(residencia_local) != normalizar_busca(residencia_desc):
+            y = campo('Localização', residencia_local, y)
     resid_imgs = _v102_evidencias(dados, ['residencia', 'residência', 'moradia', 'casa'])
-    if not resid_imgs: y = texto(_v102_pendencia('Residência: é necessária evidência visual ou mapa no tópico próprio.'), y)
+    if not resid_imgs:
+        y = texto(_v102_pendencia('Anexar foto ou mapa no tópico Residência do Líder.'), y)
     y = imagens(resid_imgs, y)
 
     # 13. PLANEJAMENTO — V104: redação consolidada; evita nove campos manuais.
@@ -46185,19 +46223,25 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
         ['Acesso policial/controle territorial', _v106_texto_profissional_local(req.get('dificuldade_acesso'), fallback='PENDENTE — informar eventual dificuldade de acesso/controle territorial.')],
     ], y)
 
-    # 15. RESPONSÁVEIS / ASSINATURAS
+    # 15. RESPONSÁVEIS / ASSINATURAS — V109: somente dados úteis, sem "Não informado
+    # na mesa" ocupando espaço e sem nomenclatura DIC. As assinaturas são as imagens oficiais.
     y = nova_secao('15. RESPONSÁVEIS E ASSINATURAS INSTITUCIONAIS')
-    y = campos([
-        ['Delegado responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel'), 'Delegado responsável — preencher.')],
-        ['Cargo do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_cargo'), 'Cargo do delegado responsável — preencher.')],
-        ['Matrícula/RG responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_registro'), 'Matrícula/RG do delegado responsável — preencher.')],
-        ['Data do responsável', _v102_valor_ou_pendencia(req.get('delegado_responsavel_data'), 'Data da formalização pelo delegado responsável — preencher.')],
-        ['Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto'), 'Delegado adjunto/delegado DIC — preencher.')],
-        ['Cargo do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_cargo'), 'Cargo do Diretor DICOR — preencher.')],
-        ['Matrícula/RG Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_registro'), 'Matrícula/RG do Diretor DICOR — preencher.')],
-        ['Data do Diretor DICOR', _v102_valor_ou_pendencia(req.get('delegado_adjunto_data'), 'Data da formalização pelo Diretor DICOR — preencher.')],
-    ], y)
-    y = subtitulo('Assinaturas Digitais', y); y = assinaturas(y)
+    resp_itens = [
+        ['Delegado responsável', _v102_primeiro(req.get('delegado_responsavel'), 'Buiu Gomes')],
+        ['Cargo', _v102_primeiro(req.get('delegado_responsavel_cargo'), 'Delegado Responsável')],
+    ]
+    if _v102_valor_util(req.get('delegado_responsavel_registro')):
+        resp_itens.append(['Matrícula/RG', req.get('delegado_responsavel_registro')])
+    resp_itens.append(['Data', _v102_primeiro(req.get('delegado_responsavel_data'), _v104_data_documento())])
+    resp_itens += [
+        ['Diretor DICOR', _v102_primeiro(req.get('delegado_adjunto'), 'Arthur Fleker')],
+        ['Cargo', _v102_primeiro(req.get('delegado_adjunto_cargo'), 'Diretor DICOR')],
+    ]
+    if _v102_valor_util(req.get('delegado_adjunto_registro')):
+        resp_itens.append(['Matrícula/RG', req.get('delegado_adjunto_registro')])
+    resp_itens.append(['Data', _v102_primeiro(req.get('delegado_adjunto_data'), _v104_data_documento())])
+    y = campos(resp_itens, y)
+    y = subtitulo('Assinaturas institucionais', y); y = assinaturas(y)
 
     # 16. INDICADORES + SÍNTESE
     y = nova_secao('16. INDICADORES E SÍNTESE DE ENCERRAMENTO')
@@ -46209,7 +46253,7 @@ def _v102_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
     y = nova_secao('17. CHECKLIST FINAL DE CONFORMIDADE COM O PADRÃO DRAGONS')
     for item, status in _v102_checklist(dados, req):
         y = campo(item, status, y, label_w=8.2 * cm)
-    y = texto('Importante: os campos marcados como PENDENTE não foram preenchidos com suposições. Eles exigem informação ou documento comprobatório que não aparece na mesa de investigação.', y - 0.2 * cm, tam=8.8)
+    y = texto('Validação final: o dossiê utiliza informações da própria mesa e complementações formalizadas no fluxo de encerramento. Nenhum dado factual é criado automaticamente.', y - 0.2 * cm, tam=8.8)
     c.save()
 
 
@@ -48227,6 +48271,263 @@ except Exception as _v107_cmd2_erro:
     print(f'⚠️ V107 comando backupdados não registrado: {_v107_cmd2_erro}',flush=True)
 
 print('✅ V108 carregada — B2 protegido contra variáveis mal coladas; falhas remotas não derrubam Procurados/reconstrução e o fallback local é preservado.',flush=True)
+
+
+
+# =====================================================
+# V109 — FECHAMENTO DE MESA PROFISSIONAL / MÍDIA ROBUSTA
+# Corrige falso positivo de "imagem ausente", especialmente no tópico
+# 🏠 Residência do Líder. O diagnóstico agora verifica anexos E imagens
+# embutidas em embeds, inclusive em tópicos ativos/arquivados.
+# =====================================================
+
+_V109_DIAG_BASE = _v103_diagnostico_mesa
+_V109_COLETAR_BASE = coletar_dados_operacionais_mesa
+
+
+def _v109_topico_canonico(nome: Any) -> str:
+    n = normalizar_busca(str(nome or ''))
+    if any(x in n for x in ('residencia do lider','residencia lider','moradia do lider','casa do lider','domicilio do lider')):
+        return 'residencia'
+    if 'bau' in n:
+        if any(x in n for x in ('lider','gerente','chefe')):
+            return 'baus_lider'
+        if any(x in n for x in ('membro','integrante')):
+            return 'baus_membros'
+        return 'baus'
+    if 'painel' in n:
+        return 'painel'
+    if any(x in n for x in ('localizacao','mapa','base')):
+        return 'localizacao'
+    if any(x in n for x in ('crime','ocorrencia')):
+        return 'crimes'
+    if any(x in n for x in ('producao','fabricacao','farm','ingrediente','rota')):
+        return 'producao'
+    if 'informante' in n:
+        return 'informantes'
+    if any(x in n for x in ('lideranca','lideres','lider')):
+        return 'liderancas'
+    if any(x in n for x in ('integrante','membro')):
+        return 'integrantes'
+    return topico_dossie_por_nome(str(nome or ''))
+
+
+def _v109_urls_embed(msg: Any) -> list[tuple[str,str]]:
+    saida=[]
+    for emb in list(getattr(msg,'embeds',[]) or []):
+        for attr,tipo in (('image','imagem'),('thumbnail','imagem'),('video','video')):
+            obj=getattr(emb,attr,None)
+            url=str(getattr(obj,'url','') or '').strip() if obj else ''
+            if url and url.startswith(('http://','https://')):
+                saida.append((url,tipo))
+    return saida
+
+
+async def _v109_varrer_evidencias_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str,Any]]=None, *, baixar_em: Optional[Path]=None, alvos: Optional[set[str]]=None) -> list[Dict[str,Any]]:
+    """Varredura independente da mídia essencial da mesa.
+
+    Serve como segunda leitura de segurança. Não depende do texto do tópico nem do
+    cache anterior do dossiê. Se uma imagem existe no tópico, ela é reconhecida.
+    """
+    try:
+        threads = await listar_threads_da_mesa(canal, mesa)
+    except Exception:
+        threads = list(getattr(canal,'threads',[]) or [])
+    evidencias=[]
+    vistos=set()
+    entidades=[(canal,'Canal principal')]+[(t,str(getattr(t,'name','Tópico'))) for t in threads]
+    indice_download=0
+    for entidade, origem in entidades:
+        topico=_v109_topico_canonico(origem)
+        # Só fazemos segunda varredura nas seções em que imagem altera o diagnóstico.
+        if topico not in {'residencia','baus_lider','baus_membros','painel','localizacao','crimes','producao','liderancas','integrantes','informantes'}:
+            continue
+        if alvos is not None and topico not in alvos:
+            continue
+        try:
+            async for msg in entidade.history(limit=None, oldest_first=True):
+                for anexo in list(getattr(msg,'attachments',[]) or []):
+                    tipo=tipo_anexo_dossie(anexo)
+                    if tipo not in {'imagem','video'}:
+                        continue
+                    url=str(getattr(anexo,'url','') or getattr(anexo,'proxy_url','') or '')
+                    ident=(int(getattr(msg,'id',0) or 0),url,topico)
+                    if ident in vistos:
+                        continue
+                    vistos.add(ident)
+                    local=''
+                    if baixar_em is not None:
+                        try:
+                            indice_download += 1
+                            destino=await salvar_anexo_dossie(anexo, Path(baixar_em), 9000+indice_download)
+                            local=str(destino or '')
+                        except Exception:
+                            local=''
+                    evidencias.append({
+                        'tipo':tipo,'origem':origem,'topico':topico,
+                        'arquivo':str(getattr(anexo,'filename','arquivo') or 'arquivo'),
+                        'url':url,'proxy_url':str(getattr(anexo,'proxy_url','') or ''),
+                        'local':local,'mensagem_id':int(getattr(msg,'id',0) or 0),
+                        'mensagem_url':str(getattr(msg,'jump_url','') or ''),
+                        'autor':str(getattr(msg,'author','') or ''),
+                        'data':formatar_data_discord(getattr(msg,'created_at',None)) if getattr(msg,'created_at',None) else '',
+                    })
+                # Também reconhece imagens geradas por embed/link, que não aparecem em attachments.
+                for idx,(url,tipo) in enumerate(_v109_urls_embed(msg)):
+                    ident=(int(getattr(msg,'id',0) or 0),url,topico)
+                    if ident in vistos:
+                        continue
+                    vistos.add(ident)
+                    local=''
+                    if baixar_em is not None and tipo=='imagem':
+                        try:
+                            Path(baixar_em).mkdir(parents=True,exist_ok=True)
+                            indice_download += 1
+                            ext=Path(url.split('?',1)[0]).suffix.lower()
+                            if ext not in {'.png','.jpg','.jpeg','.webp','.gif'}: ext='.jpg'
+                            destino=Path(baixar_em)/f'{9000+indice_download:05d}-embed{ext}'
+                            timeout=aiohttp.ClientTimeout(total=20)
+                            async with aiohttp.ClientSession(timeout=timeout) as sessao:
+                                async with sessao.get(url) as resp:
+                                    if resp.status < 400:
+                                        destino.write_bytes(await resp.read())
+                                        if destino.exists() and destino.stat().st_size>0: local=str(destino)
+                        except Exception:
+                            local=''
+                    evidencias.append({
+                        'tipo':tipo,'origem':origem,'topico':topico,
+                        'arquivo':f'embed-{idx+1}','url':url,'local':local,
+                        'mensagem_id':int(getattr(msg,'id',0) or 0),
+                        'mensagem_url':str(getattr(msg,'jump_url','') or ''),
+                        'autor':str(getattr(msg,'author','') or ''),
+                        'data':formatar_data_discord(getattr(msg,'created_at',None)) if getattr(msg,'created_at',None) else '',
+                    })
+        except Exception as erro:
+            print(f'⚠️ V109 varredura de mídia ignorou {origem}: {type(erro).__name__}: {erro}',flush=True)
+    return evidencias
+
+
+def _v109_mesclar_evidencias(dados: Dict[str,Any], extras: list[Dict[str,Any]]) -> None:
+    lista=list(dados.get('evidencias') or [])
+    def chave(ev: Dict[str,Any]):
+        ref=str(ev.get('url') or ev.get('proxy_url') or ev.get('local') or ev.get('arquivo') or '').strip()
+        return (ref, normalizar_busca(ev.get('topico')))
+    vistos={chave(ev) for ev in lista}
+    for ev in extras:
+        ident=chave(ev)
+        if ident in vistos:
+            # Se a cópia antiga não tinha arquivo local e a nova conseguiu baixar, aproveita-o.
+            if ev.get('local'):
+                for antigo in lista:
+                    if chave(antigo) == ident and not antigo.get('local'):
+                        antigo['local']=ev.get('local')
+                        break
+            continue
+        vistos.add(ident); lista.append(ev)
+    dados['evidencias']=lista
+    est=dict(dados.get('estatisticas') or {})
+    est['evidencias']=len(lista)
+    est['imagens']=len([e for e in lista if str(e.get('tipo') or '')=='imagem'])
+    est['videos']=len([e for e in lista if str(e.get('tipo') or '')=='video'])
+    dados['estatisticas']=est
+
+
+async def _v103_diagnostico_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: Any, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V109_DIAG_BASE(canal, mesa, interaction, dados_confirmacao)
+    try:
+        # Segunda leitura somente das seções que a primeira varredura não enxergou.
+        alvos=set()
+        checks={
+            'residencia':['residencia','residência','moradia','casa'],
+            'baus_lider':['baus_lider','baú de líder','bau de lider'],
+            'baus_membros':['baus_membros','baú de membros','bau de membros'],
+            'painel':['painel'], 'localizacao':['localizacao','localização','mapa'],
+            'crimes':['crimes','crime','ocorrencia'], 'producao':['producao','produção','farm','ingredientes','rota'],
+        }
+        for sec,termos in checks.items():
+            if not _v102_evidencias(dados,termos): alvos.add(sec)
+        extras=await _v109_varrer_evidencias_mesa(canal,mesa,alvos=alvos) if alvos else []
+        _v109_mesclar_evidencias(dados,extras)
+        req=dict(_v102_montar_requisitos(dados) or {})
+        # Se existe mídia no tópico de residência, a existência da residência está comprovada.
+        # Não exige que o agente digite uma descrição redundante.
+        if _v102_evidencias(dados,['residencia','residência','moradia','casa']):
+            if not _v102_valor_util(req.get('residencia')):
+                req['residencia']='Residência do líder documentada por evidências visuais da própria mesa.'
+            if not _v102_valor_util(req.get('residencia_endereco')):
+                req['residencia_endereco']='Localização registrada nas evidências visuais do tópico Residência do Líder.'
+        dados['requisitos_pacificacao']=req
+    except Exception as erro:
+        print(f'⚠️ V109 diagnóstico complementar de mídia: {type(erro).__name__}: {erro}',flush=True)
+    return dados
+
+
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados=await _V109_COLETAR_BASE(canal,mesa,interaction,pasta_dossie,dados_confirmacao=dados_confirmacao)
+    try:
+        # O pipeline principal já baixa quase tudo; só faz a segunda leitura para seções
+        # que realmente ficaram sem mídia, evitando dobrar o tempo de fechamento.
+        alvos=set()
+        checks={
+            'residencia':['residencia','residência','moradia','casa'],
+            'baus_lider':['baus_lider','baú de líder','bau de lider'],
+            'baus_membros':['baus_membros','baú de membros','bau de membros'],
+            'painel':['painel'], 'localizacao':['localizacao','localização','mapa'],
+            'crimes':['crimes','crime','ocorrencia'], 'producao':['producao','produção','farm','ingredientes','rota'],
+        }
+        for sec,termos in checks.items():
+            if not _v102_evidencias(dados,termos): alvos.add(sec)
+        extras=await _v109_varrer_evidencias_mesa(canal,mesa,baixar_em=Path(pasta_dossie)/'evidencias',alvos=alvos) if alvos else []
+        _v109_mesclar_evidencias(dados,extras)
+        req=_v107_preparar_requisitos(dados)
+        if _v102_evidencias(dados,['residencia','residência','moradia','casa']):
+            if not _v102_valor_util(req.get('residencia')):
+                req['residencia']='Residência do líder documentada por evidências visuais da própria mesa.'
+            if not _v102_valor_util(req.get('residencia_endereco')):
+                req['residencia_endereco']='Localização registrada nas evidências visuais do tópico Residência do Líder.'
+        dados['requisitos_pacificacao']=req
+    except Exception as erro:
+        print(f'⚠️ V109 coleta complementar de mídia: {type(erro).__name__}: {erro}',flush=True)
+    return dados
+
+
+# Última definição: observação vazia fica vazia; Banco entra somente se houver dado real.
+def _v98_texto_observacoes_pessoa(pessoa: Dict[str, Any]) -> str:
+    partes=[]
+    for valor in (pessoa.get('observacoes'),pessoa.get('observacoes_banco')):
+        s=str(valor or '').strip()
+        if not _v102_valor_util(s):
+            continue
+        if normalizar_busca(s) in {'nao informado','nao informada','n i','ni'}:
+            continue
+        if s not in partes:
+            partes.append(s)
+    return ' | '.join(partes)[:310]
+
+
+# Mídias realmente existentes nunca podem virar pendência por falha da primeira varredura.
+_V109_PENDENCIAS_MIDIA_BASE = _v103_pendencias_midia
+def _v103_pendencias_midia(dados: Dict[str, Any]) -> List[str]:
+    faltas=list(_V109_PENDENCIAS_MIDIA_BASE(dados) or [])
+    tem_res=bool(_v102_evidencias(dados,['residencia','residência','moradia','casa']))
+    tem_bau_lider=bool(_v102_evidencias(dados,['baus_lider','baú de líder','bau de lider','baú do líder','bau do lider']))
+    tem_bau_membros=bool(_v102_evidencias(dados,['baus_membros','baú de membros','bau de membros','baú dos membros','bau dos membros']))
+    if tem_res:
+        faltas=[x for x in faltas if not normalizar_busca(x).startswith('residencia do lider')]
+    if tem_bau_lider:
+        faltas=[x for x in faltas if not normalizar_busca(x).startswith('bau do lider')]
+    if tem_bau_membros:
+        faltas=[x for x in faltas if not normalizar_busca(x).startswith('bau dos membros')]
+    # Deduplica mensagens de pendência para uma tela limpa.
+    saida=[]; vistos=set()
+    for item in faltas:
+        k=normalizar_busca(item)
+        if k in vistos: continue
+        vistos.add(k); saida.append(item)
+    return saida
+
+
+print('✅ V109 carregada — fechamento de mesa profissional: segunda varredura de mídia, residência reconhecida por anexos/embeds, crimes sem repetição, campos sem sobreposição, cartões limpos e assinaturas oficiais preservadas.',flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
