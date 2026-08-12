@@ -15,7 +15,7 @@ import zipfile
 import shutil
 import traceback
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from urllib.parse import quote, urlparse
 import threading
 import threading as _v70_threading
@@ -54781,6 +54781,552 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 
 
 print('✅ V123 carregada — dossiê operacional guiado por tarefas ativo somente para mesas tarefas_mesas_v122; legado preservado para mesas antigas.', flush=True)
+
+
+# =====================================================
+# V124 — Busca por semelhança visual de personagens do RP
+# - Algoritmo local, sem API externa e sem GPU.
+# - Índice persistente em /data/visual_search.
+# - Integrado ao Banco de Dados/Fichas com reconstrução Inspetor+.
+# - Resultados sempre tratados como indícios visuais, nunca identificação.
+# =====================================================
+
+VISUAL_SEARCH_DIR = DATA_DIR / 'visual_search'
+VISUAL_SEARCH_MAX_UPLOAD_MB = int(os.getenv('VISUAL_SEARCH_MAX_UPLOAD_MB', '12') or 12)
+
+
+def _v124_visual_index() -> Any:
+    from visual_search import VisualSearchIndex
+    return VisualSearchIndex(VISUAL_SEARCH_DIR)
+
+
+def _v124_visual_resolver_path(valor: Any) -> str:
+    texto = str(valor or '').strip()
+    if not texto:
+        return ''
+    if texto.startswith(('b2://', 'r2://')):
+        try:
+            materializado = _v78_materializar_sync(texto)
+            if materializado and Path(materializado).exists():
+                return str(materializado)
+        except Exception as erro:
+            print(f'⚠️ V124 busca visual não materializou arquivo remoto: {type(erro).__name__}: {erro}', flush=True)
+        return ''
+    candidato = Path(texto)
+    if candidato.is_absolute() and candidato.exists() and candidato.is_file():
+        return str(candidato)
+    nomes = [texto]
+    try:
+        nomes.append(Path(texto).name)
+    except Exception:
+        pass
+    bases = [DATA_DIR, BASE_DIR, _BANCO_FICHA_GERAL_DIR, BANCO_ARQUIVOS_DIR, V90_FICHA_TMP_DIR]
+    vistos: set[str] = set()
+    for nome in nomes:
+        if not nome or nome in vistos:
+            continue
+        vistos.add(nome)
+        for base in bases:
+            try:
+                caminho = Path(base) / nome
+                if caminho.exists() and caminho.is_file():
+                    return str(caminho)
+            except Exception:
+                continue
+    return ''
+
+
+def _v124_visual_row_dict(row: Any) -> Dict[str, Any]:
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _v124_visual_registro_valido(individuo: Dict[str, Any]) -> bool:
+    status = normalizar_busca(individuo.get('status'))
+    if status in {'excluido', 'excluida', 'apagado', 'apagada', 'removido', 'removida'}:
+        return False
+    return bool(int(individuo.get('id') or 0) and (str(individuo.get('rg') or '').strip() or str(individuo.get('nome') or '').strip()))
+
+
+def _v124_visual_adicionar_record(saida: List[Dict[str, Any]], *, image_id: str, individuo: Dict[str, Any], caminho_original: Any, url: Any='', source: str='', mime_type: str='', description: str='') -> None:
+    from visual_search import is_supported_visual_file
+    caminho = _v124_visual_resolver_path(caminho_original)
+    if not caminho:
+        return
+    if not is_supported_visual_file(caminho, str(mime_type or '')):
+        return
+    iid = int(individuo.get('id') or 0)
+    saida.append({
+        'image_id': image_id,
+        'rg': str(individuo.get('rg') or '').strip(),
+        'nome': str(individuo.get('nome') or 'Ficha sem nome').strip(),
+        'individuo_id': iid,
+        'registro_id': iid,
+        'path': caminho,
+        'url': str(url or '').strip(),
+        'source': source,
+        'mime_type': str(mime_type or ''),
+        'description': str(description or ''),
+    })
+
+
+def _v124_visual_coletar_records(individuo_id: Optional[int]=None) -> List[Dict[str, Any]]:
+    inicializar_banco_dicor()
+    records: List[Dict[str, Any]] = []
+    with _banco_conexao() as db:
+        if individuo_id:
+            linhas_individuos = db.execute('SELECT * FROM individuos WHERE id=?', (int(individuo_id),)).fetchall()
+        else:
+            linhas_individuos = db.execute('SELECT * FROM individuos').fetchall()
+        individuos = [_v124_visual_row_dict(row) for row in linhas_individuos]
+        individuos = [ind for ind in individuos if _v124_visual_registro_valido(ind)]
+        por_id = {int(ind.get('id') or 0): ind for ind in individuos}
+        for ind in individuos:
+            iid = int(ind.get('id') or 0)
+            for path_key, url_key, source in (
+                ('foto_individuo_path', 'foto_individuo_url', 'foto_individuo'),
+                ('foto_ficha_path', 'foto_ficha_url', 'foto_ficha'),
+                ('foto_rg_path', 'foto_rg_url', 'foto_rg'),
+            ):
+                valor = str(ind.get(path_key) or '').strip()
+                if not valor:
+                    continue
+                _v124_visual_adicionar_record(
+                    records,
+                    image_id=f'individuo:{iid}:{source}',
+                    individuo=ind,
+                    caminho_original=valor,
+                    url=ind.get(url_key),
+                    source=source,
+                    mime_type='image/jpeg',
+                    description=f'Imagem principal da ficha: {source}',
+                )
+        try:
+            if individuo_id:
+                linhas_arquivos = db.execute('''
+                    SELECT a.*, i.rg AS rg, i.nome AS nome, i.status AS status
+                    FROM arquivos_ficha_geral a
+                    LEFT JOIN individuos i ON i.id = a.individuo_id
+                    WHERE a.individuo_id=?
+                    ''', (int(individuo_id),)).fetchall()
+            else:
+                linhas_arquivos = db.execute('''
+                    SELECT a.*, i.rg AS rg, i.nome AS nome, i.status AS status
+                    FROM arquivos_ficha_geral a
+                    LEFT JOIN individuos i ON i.id = a.individuo_id
+                    WHERE a.individuo_id > 0
+                    ''').fetchall()
+        except Exception:
+            linhas_arquivos = []
+        for row in linhas_arquivos:
+            arq = _v124_visual_row_dict(row)
+            iid = int(arq.get('individuo_id') or 0)
+            ind = dict(por_id.get(iid) or {'id': iid, 'rg': arq.get('rg'), 'nome': arq.get('nome'), 'status': arq.get('status')})
+            if not _v124_visual_registro_valido(ind):
+                continue
+            _v124_visual_adicionar_record(
+                records,
+                image_id=f'arquivo_ficha_geral:{int(arq.get("id") or 0)}',
+                individuo=ind,
+                caminho_original=arq.get('caminho'),
+                url=arq.get('url_original'),
+                source='arquivo_ficha_geral',
+                mime_type=str(arq.get('mime_type') or ''),
+                description=str(arq.get('descricao') or arq.get('nome_arquivo') or ''),
+            )
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        dedup[str(record.get('image_id') or '')] = record
+    return list(dedup.values())
+
+
+def _v124_visual_rebuild_sync(progress_callback: Optional[Callable[[Dict[str, Any]], None]]=None) -> Dict[str, Any]:
+    records = _v124_visual_coletar_records()
+    if progress_callback:
+        progress_callback({'phase': 'collect', 'total_records': len(records)})
+    indice = _v124_visual_index()
+    stats = indice.build_or_update(records, prune=True, progress_callback=progress_callback)
+    stats['records_collected'] = len(records)
+    return stats
+
+
+def _v124_visual_indexar_individuo_sync(individuo_id: int) -> Dict[str, Any]:
+    iid = int(individuo_id or 0)
+    if not iid:
+        return {'records_collected': 0, 'indexed_images': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'invalid': 0}
+    records = _v124_visual_coletar_records(iid)
+    indice = _v124_visual_index()
+    stats = indice.build_or_update(records, prune=False)
+    stats['records_collected'] = len(records)
+    return stats
+
+
+def _v124_visual_buscar_sync(image_bytes: bytes, modo: str) -> Dict[str, Any]:
+    indice = _v124_visual_index()
+    return indice.search_bytes(image_bytes, mode=modo, top_k=5)
+
+
+def _v124_visual_resumo_indice_sync() -> Dict[str, Any]:
+    indice = _v124_visual_index()
+    indice.load()
+    return indice.summary()
+
+
+def _v124_visual_formatar_tamanho(bytes_total: int) -> str:
+    from visual_search import format_index_size
+    return format_index_size(int(bytes_total or 0))
+
+
+def _v124_visual_embed_resultados(resultado: Dict[str, Any], modo_label: str) -> discord.Embed:
+    resultados = list(resultado.get('results') or [])
+    resumo = dict(resultado.get('summary') or {})
+    embed = discord.Embed(
+        title='🔎 BUSCA POR SEMELHANÇA VISUAL',
+        description=f'**Modo:** {modo_label}\nResultado técnico por semelhança visual. **Não é confirmação de identidade**; use apenas como triagem investigativa e confira a ficha oficial.',
+        color=discord.Color.from_rgb(20, 72, 130),
+    )
+    if not resultados:
+        motivo = str(resultado.get('reason') or 'nenhum resultado acima do limiar mínimo')
+        aviso = str(resultado.get('warning') or resumo.get('warning') or '').strip()
+        texto = f'Nenhuma ficha ficou acima do limiar de segurança.\nMotivo: `{motivo}`'
+        if aviso:
+            texto += f'\nAviso do índice: `{aviso}`'
+        embed.add_field(name='Resultado', value=texto[:1024], inline=False)
+    for pos, item in enumerate(resultados, start=1):
+        explicacoes = list(item.get('explanations') or [])
+        detalhes = [
+            f'**RG:** `{str(item.get("rg") or "N/I")}`',
+            f'**Similaridade geral:** `{float(item.get("score") or 0):.1f}%`',
+            f'**Roupa:** `{float(item.get("clothing_score") or 0):.1f}%`',
+            f'**Aparência:** `{float(item.get("appearance_score") or 0):.1f}%`',
+            f'**Acessórios/silhueta:** `{float(item.get("accessory_score") or 0):.1f}%`',
+            f'**Fotos da ficha consideradas:** `{int(item.get("matches_count") or 1)}`',
+            '**Elementos semelhantes:** ' + '; '.join(explicacoes[:3]),
+        ]
+        embed.add_field(name=f'{pos}. {str(item.get("nome") or "Ficha sem nome")[:80]}', value='\n'.join(detalhes)[:1024], inline=False)
+    melhor = (resultados[0].get('best_image') if resultados else {}) or {}
+    thumb = str(melhor.get('url') or '').strip()
+    if thumb.startswith('http'):
+        embed.set_thumbnail(url=thumb)
+    embed.add_field(
+        name='Índice',
+        value=f'Imagens indexadas: `{int(resumo.get("entries") or 0)}` • Fichas: `{int(resumo.get("records") or 0)}` • Tamanho: `{_v124_visual_formatar_tamanho(int(resumo.get("index_bytes") or 0))}`',
+        inline=False,
+    )
+    embed.set_footer(text='DICOR • Busca Visual V124 • indício técnico, não identificação definitiva')
+    return embed
+
+
+class V124VisualAbrirFichaButton(discord.ui.Button):
+
+    def __init__(self, registro_id: int, indice: int):
+        label = 'Ver ficha' if indice == 0 else f'Ver ficha {indice + 1}'
+        super().__init__(label=label[:80], emoji='📂', style=discord.ButtonStyle.primary, custom_id=f'v124_visual_ver_ficha:{int(registro_id)}:{secrets.token_hex(4)}')
+        self.registro_id = int(registro_id or 0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            perfil = await asyncio.wait_for(asyncio.to_thread(_v63_carregar_ficha_segura, 'geral', self.registro_id), timeout=30)
+            if not perfil:
+                return await interaction.edit_original_response(content='❌ A ficha vinculada a este resultado não foi encontrada.', embed=None, view=None)
+            await interaction.edit_original_response(content=None, embed=_v63_embed_seguro(perfil), view=V63FichaGeralView(int(interaction.user.id), perfil))
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await enviar_log(f'❌ V124 abrir ficha visual `{self.registro_id}` | {type(erro).__name__}: {erro}')
+            except Exception:
+                pass
+            await interaction.edit_original_response(content='❌ Não foi possível abrir esta ficha. O diagnóstico foi enviado aos logs.', embed=None, view=None)
+
+
+class V124VisualResultadosView(View):
+
+    def __init__(self, usuario_id: int, resultados: List[Dict[str, Any]]):
+        super().__init__(timeout=600)
+        self.usuario_id = int(usuario_id)
+        for indice, item in enumerate(list(resultados or [])[:5]):
+            registro_id = int(item.get('registro_id') or item.get('individuo_id') or 0)
+            if registro_id:
+                self.add_item(V124VisualAbrirFichaButton(registro_id, indice))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.usuario_id or usuario_e_administrador(interaction.user):
+            return True
+        await interaction.response.send_message('❌ Esta busca visual pertence a outro agente.', ephemeral=True)
+        return False
+
+
+class V124VisualModoView(View):
+
+    def __init__(self, usuario_id: int, image_bytes: bytes, filename: str):
+        super().__init__(timeout=300)
+        self.usuario_id = int(usuario_id)
+        self.image_bytes = bytes(image_bytes)
+        self.filename = str(filename or 'imagem')[:120]
+        self.processando = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.usuario_id:
+            return True
+        await interaction.response.send_message('❌ Esta busca visual pertence a outro agente.', ephemeral=True)
+        return False
+
+    async def _executar(self, interaction: discord.Interaction, modo: str, modo_label: str) -> None:
+        if self.processando:
+            return await interaction.response.send_message('⏳ Esta imagem já está sendo comparada.', ephemeral=True)
+        self.processando = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultado = await asyncio.wait_for(asyncio.to_thread(_v124_visual_buscar_sync, self.image_bytes, modo), timeout=45)
+            embed = _v124_visual_embed_resultados(resultado, modo_label)
+            view = V124VisualResultadosView(int(interaction.user.id), list(resultado.get('results') or []))
+            await interaction.edit_original_response(content=None, embed=embed, view=view if view.children else None)
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await enviar_log(f'❌ V124 busca visual falhou `{self.filename}` | {type(erro).__name__}: {erro}')
+            except Exception:
+                pass
+            await interaction.edit_original_response(content=f'❌ Não foi possível processar a busca visual: `{type(erro).__name__}: {str(erro)[:160]}`', embed=None, view=None)
+        finally:
+            self.processando = False
+
+    @discord.ui.button(label='Visual completo', emoji='🔎', style=discord.ButtonStyle.primary, custom_id='v124_busca_visual_modo_completo')
+    async def completo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._executar(interaction, 'full', 'Visual completo')
+
+    @discord.ui.button(label='Roupa', emoji='👕', style=discord.ButtonStyle.secondary, custom_id='v124_busca_visual_modo_roupa')
+    async def roupa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._executar(interaction, 'roupa', 'Roupa/vestimenta')
+
+
+async def _v124_visual_solicitar_imagem(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        resumo = await asyncio.to_thread(_v124_visual_resumo_indice_sync)
+    except Exception:
+        resumo = {'entries': 0, 'records': 0}
+    await interaction.followup.send(
+        '📷 **Envie agora uma imagem neste canal para busca por semelhança visual.**\n'
+        f'• Limite: **{VISUAL_SEARCH_MAX_UPLOAD_MB} MB**.\n'
+        '• A imagem será usada apenas para a comparação desta busca.\n'
+        '• Depois do envio, escolha o modo **Visual completo** ou **Roupa**.\n'
+        f'• Índice atual: `{int(resumo.get("entries") or 0)}` imagem(ns) em `{int(resumo.get("records") or 0)}` ficha(s).\n'
+        'Prazo: **3 minutos**.',
+        ephemeral=True,
+    )
+    canal_id = int(getattr(interaction.channel, 'id', 0) or 0)
+    usuario_id = int(interaction.user.id)
+
+    def check(msg: discord.Message) -> bool:
+        return int(getattr(msg.author, 'id', 0) or 0) == usuario_id and int(getattr(msg.channel, 'id', 0) or 0) == canal_id and bool(msg.attachments)
+
+    try:
+        msg = await bot.wait_for('message', timeout=180, check=check)
+    except asyncio.TimeoutError:
+        return await interaction.followup.send('⌛ Tempo esgotado. Inicie a busca visual novamente quando quiser enviar a imagem.', ephemeral=True)
+    anexo = msg.attachments[0]
+    nome = Path(str(getattr(anexo, 'filename', 'imagem') or 'imagem')).name
+    mime = str(getattr(anexo, 'content_type', '') or '')
+    tamanho = int(getattr(anexo, 'size', 0) or 0)
+    from visual_search import is_supported_visual_file
+    if tamanho > VISUAL_SEARCH_MAX_UPLOAD_MB * 1024 * 1024:
+        return await interaction.followup.send(f'❌ `{nome}` excede o limite de {VISUAL_SEARCH_MAX_UPLOAD_MB} MB.', ephemeral=True)
+    if not is_supported_visual_file(nome, mime):
+        return await interaction.followup.send('❌ Envie uma imagem válida: JPG, PNG, WEBP, BMP ou GIF.', ephemeral=True)
+    try:
+        image_bytes = bytes(await asyncio.wait_for(anexo.read(use_cached=True), timeout=40))
+    except Exception as erro:
+        return await interaction.followup.send(f'❌ Não consegui baixar a imagem enviada: `{type(erro).__name__}`.', ephemeral=True)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await interaction.followup.send(
+        f'✅ Imagem `{nome}` recebida. Escolha o tipo de comparação:',
+        view=V124VisualModoView(usuario_id, image_bytes, nome),
+        ephemeral=True,
+    )
+
+
+async def _v124_visual_rebuild_interaction(interaction: discord.Interaction) -> None:
+    from visual_search import can_rebuild_visual_index
+    permitido = can_rebuild_visual_index(
+        is_inspector_plus=isinstance(interaction.user, discord.Member) and _membro_inspetor_mais(interaction.user),
+        is_admin=usuario_e_administrador(interaction.user),
+    )
+    if not permitido:
+        return await interaction.response.send_message('❌ Apenas **Inspetor+** pode atualizar o índice visual.', ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    progresso: Dict[str, Any] = {'phase': 'start'}
+
+    def callback(dados: Dict[str, Any]) -> None:
+        progresso.update(dict(dados or {}))
+
+    tarefa = asyncio.create_task(asyncio.to_thread(_v124_visual_rebuild_sync, callback))
+    while not tarefa.done():
+        fase = str(progresso.get('phase') or 'indexing')
+        atual = int(progresso.get('current') or 0)
+        total = int(progresso.get('total') or progresso.get('total_records') or 0)
+        adicionados = int(progresso.get('added') or 0)
+        atualizados = int(progresso.get('updated') or 0)
+        ignorados = int(progresso.get('skipped') or 0)
+        invalidos = int(progresso.get('invalid') or 0)
+        texto = f'🔄 **Atualizando índice visual V124...**\nFase: `{fase}`\nArquivos: `{atual}/{total}`\nAdicionados: `{adicionados}` • Atualizados: `{atualizados}` • Sem mudança: `{ignorados}` • Ignorados: `{invalidos}`'
+        try:
+            await interaction.edit_original_response(content=texto[:1900], embed=None, view=None)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    try:
+        stats = await tarefa
+        resumo = dict(stats.get('summary') or {})
+        erros = list(stats.get('errors') or [])
+        texto = (
+            '✅ **Índice visual V124 atualizado.**\n'
+            f'• Registros coletados: `{int(stats.get("records_collected") or 0)}`\n'
+            f'• Imagens indexadas: `{int(stats.get("indexed_images") or 0)}`\n'
+            f'• Adicionadas: `{int(stats.get("added") or 0)}`\n'
+            f'• Atualizadas: `{int(stats.get("updated") or 0)}`\n'
+            f'• Sem mudança: `{int(stats.get("skipped") or 0)}`\n'
+            f'• Ignoradas/inválidas: `{int(stats.get("invalid") or 0)}`\n'
+            f'• Fichas com imagens: `{int(resumo.get("records") or 0)}`\n'
+            f'• Tamanho do índice: `{_v124_visual_formatar_tamanho(int(resumo.get("index_bytes") or 0))}`'
+        )
+        if erros:
+            texto += '\n\n⚠️ Primeiros itens ignorados:\n' + '\n'.join(f'• `{str(e)[:140]}`' for e in erros[:5])
+        await interaction.edit_original_response(content=texto[:1900], embed=None, view=None)
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'❌ V124 rebuild índice visual | {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+        await interaction.edit_original_response(content=f'❌ A atualização do índice visual falhou: `{type(erro).__name__}: {str(erro)[:160]}`', embed=None, view=None)
+
+
+class BancoDadosViewV124(View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member):
+            return True
+        await interaction.response.send_message('❌ Use o painel dentro do servidor.', ephemeral=True)
+        return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        if _v14_erro_interacao_duplicada(error):
+            return
+        traceback.print_exception(type(error), error, error.__traceback__)
+        try:
+            await enviar_log(f"❌ V124 painel Banco | item `{getattr(item, 'custom_id', '?')}` | {type(error).__name__}: {error}\n```py\n{traceback.format_exc()[-2200:]}\n```")
+        except Exception:
+            pass
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send('❌ O painel apresentou uma falha. O diagnóstico foi enviado aos logs.', ephemeral=True)
+            else:
+                await interaction.response.send_message('❌ O painel apresentou uma falha. O diagnóstico foi enviado aos logs.', ephemeral=True)
+        except Exception:
+            pass
+
+    @discord.ui.button(label='Criar ficha', emoji='📋', style=discord.ButtonStyle.primary, custom_id='pf_banco_criar_ficha_v90', row=0)
+    async def criar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _v90_abrir_sala_ficha(interaction)
+
+    @discord.ui.button(label='Pesquisar fichas', emoji='🔎', style=discord.ButtonStyle.secondary, custom_id='pf_banco_pesquisar_v90', row=0)
+    async def pesquisar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BancoConsultaIntegradaModalV61())
+
+    @discord.ui.button(label='Buscar por imagem', emoji='🖼️', style=discord.ButtonStyle.secondary, custom_id='pf_banco_busca_visual_v124', row=0)
+    async def buscar_visual(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v124_visual_solicitar_imagem(interaction)
+
+    @discord.ui.button(label='Painel', emoji='🏴', style=discord.ButtonStyle.secondary, custom_id='pf_banco_painel_v90', row=1)
+    async def painel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not _membro_inspetor_mais(interaction.user):
+            return await interaction.response.send_message('❌ Apenas **Inspetor+** pode importar/atualizar painéis.', ephemeral=True)
+        await _v12_banco_importar(interaction)
+
+    @discord.ui.button(label='Atualizar índice visual', emoji='🧭', style=discord.ButtonStyle.secondary, custom_id='pf_banco_atualizar_indice_visual_v124', row=1)
+    async def atualizar_visual(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _v124_visual_rebuild_interaction(interaction)
+
+
+BancoDadosViewV90 = BancoDadosViewV124
+BancoDadosView = BancoDadosViewV124
+_V124_EMBED_BANCO_ANTERIOR = banco_embed_painel
+
+
+def banco_embed_painel() -> discord.Embed:
+    embed = _V124_EMBED_BANCO_ANTERIOR()
+    embed.title = '🏛️ CENTRAL DE DADOS — POLÍCIA FEDERAL'
+    embed.description = 'Banco operacional da DICOR para indivíduos, veículos, organizações, vínculos investigativos e triagem visual.\nA criação de ficha usa sala privada temporária, revisão obrigatória e gravação protegida no volume persistente.'
+    for indice, campo in enumerate(list(embed.fields)):
+        if 'AÇÕES' in str(campo.name or '').upper() or 'AÃ‡' in str(campo.name or '').upper():
+            embed.set_field_at(
+                indice,
+                name='🧭 AÇÕES',
+                value='**Criar ficha — Inspetor+:** abre sala privada, coleta imagens/textos, revisa e salva.\n**Pesquisar fichas — todos:** nome, RG, telefone, placa, organização, evidências e anexos.\n**Buscar por imagem — todos:** compara uma imagem enviada com fichas indexadas, sem afirmar identidade.\n**Painel — Inspetor+:** importar ou atualizar formação de organização.\n**Atualizar índice visual — Inspetor+:** reconstrói o índice local em `/data/visual_search`.',
+                inline=False,
+            )
+            break
+    embed.set_footer(text='Polícia Federal • DICOR • Banco V124 com busca visual local e revisão humana obrigatória')
+    return embed
+
+
+_V124_SALVAR_FICHA_MELHORADA_ANTES = _v90_salvar_ficha_melhorada
+
+
+def _v90_salvar_ficha_melhorada(sessao: Dict[str, Any], usuario_id: int) -> Dict[str, Any]:
+    perfil = _V124_SALVAR_FICHA_MELHORADA_ANTES(sessao, usuario_id)
+    try:
+        ind = dict(perfil.get('individuo') or {}) if isinstance(perfil, dict) else {}
+        individuo_id = int(ind.get('id') or perfil.get('registro_id') or 0)
+        if individuo_id:
+            _v124_visual_indexar_individuo_sync(individuo_id)
+    except Exception as erro:
+        print(f'⚠️ V124 índice visual não atualizou após criação de ficha: {type(erro).__name__}: {erro}', flush=True)
+    return perfil
+
+
+_V124_ATUALIZAR_FICHA_GERAL_ANTES = _banco_ficha_geral_atualizar_sync
+
+
+def _banco_ficha_geral_atualizar_sync(tipo: str, registro_id: int, **kwargs: Any) -> Dict[str, Any]:
+    perfil = _V124_ATUALIZAR_FICHA_GERAL_ANTES(tipo, registro_id, **kwargs)
+    try:
+        ind = dict(perfil.get('individuo') or {}) if isinstance(perfil, dict) else {}
+        individuo_id = int(ind.get('id') or 0)
+        if individuo_id:
+            _v124_visual_indexar_individuo_sync(individuo_id)
+    except Exception as erro:
+        print(f'⚠️ V124 índice visual não atualizou após edição de ficha: {type(erro).__name__}: {erro}', flush=True)
+    return perfil
+
+
+_V124_ADICIONAR_ARQUIVOS_FICHA_ANTES = _banco_ficha_geral_adicionar_arquivos
+
+
+async def _banco_ficha_geral_adicionar_arquivos(interaction: discord.Interaction, tipo: str, registro_id: int) -> None:
+    await _V124_ADICIONAR_ARQUIVOS_FICHA_ANTES(interaction, tipo, registro_id)
+    try:
+        perfil = await asyncio.to_thread(_banco_ficha_geral_carregar, tipo, int(registro_id or 0))
+        ind = dict(perfil.get('individuo') or {}) if isinstance(perfil, dict) else {}
+        individuo_id = int(ind.get('id') or (int(registro_id or 0) if str(tipo or '') in {'geral', 'individuo'} else 0))
+        if individuo_id:
+            await asyncio.to_thread(_v124_visual_indexar_individuo_sync, individuo_id)
+    except Exception as erro:
+        print(f'⚠️ V124 índice visual não atualizou após anexar arquivo: {type(erro).__name__}: {erro}', flush=True)
+
+
+print('✅ V124 carregada — busca visual local por semelhança integrada ao Banco de Dados com índice persistente em /data/visual_search.', flush=True)
 
 
 if __name__ == '__main__':
