@@ -40713,14 +40713,54 @@ def _v108_env_limpo(nome: str, padrao: str='') -> str:
                 bruto = bruto[1:-1].strip()
     return bruto
 
+def _v119_normalizar_b2_endpoint(valor: Any, regiao_hint: str='') -> str:
+    """Normaliza endpoints S3 do Backblaze B2 sem expor credenciais.
+
+    Aceita, por exemplo:
+      s3.us-east-005.backblazeb2.com
+      ss.us-east-005.backblazeb2.com  (erro de digitação comum)
+      us-east-005.backblazeb2.com
+      https://s3.us-east-005.backblazeb2.com/
+    e sempre devolve https://s3.<regiao>.backblazeb2.com.
+    """
+    bruto = str(valor or '').strip().strip('\"\'').rstrip('/')
+    if not bruto:
+        return ''
+    if '://' not in bruto:
+        bruto = 'https://' + bruto
+    try:
+        parsed = urlparse(bruto)
+        host = str(parsed.hostname or '').strip().lower().rstrip('.')
+    except Exception:
+        host = bruto.split('://', 1)[-1].split('/', 1)[0].strip().lower().rstrip('.')
+    if not host:
+        return ''
+
+    regiao = str(regiao_hint or '').strip().lower()
+    if host.endswith('.backblazeb2.com'):
+        # Formatos S3 corretos ou quase corretos (inclui "ss." visto no Railway).
+        m = re.search(r'(?:^|\.)(?:s3|ss)\.([a-z0-9-]+)\.backblazeb2\.com$', host, flags=re.I)
+        if m:
+            regiao = m.group(1).lower()
+        else:
+            m2 = re.search(r'(?:^|\.)([a-z]{2,}(?:-[a-z0-9]+)+)\.backblazeb2\.com$', host, flags=re.I)
+            if m2:
+                regiao = m2.group(1).lower()
+        if regiao and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', regiao, flags=re.I):
+            host = f's3.{regiao}.backblazeb2.com'
+    return 'https://' + host
+
 V79_B2_ENABLED = _v78_env_bool('B2_ENABLED', False)
 V79_B2_AUTO_MIGRATE = _v78_env_bool('B2_AUTO_MIGRATE', False)
 V79_B2_ACCESS_KEY_ID = _v108_env_limpo('B2_ACCESS_KEY_ID')
 V79_B2_SECRET_ACCESS_KEY = _v108_env_limpo('B2_SECRET_ACCESS_KEY')
 V79_B2_BUCKET = _v108_env_limpo('B2_BUCKET')
-V79_B2_ENDPOINT_URL = _v108_env_limpo('B2_ENDPOINT_URL').rstrip('/')
 V79_B2_REGION = _v108_env_limpo('B2_REGION')
+_V119_B2_ENDPOINT_BRUTO = _v108_env_limpo('B2_ENDPOINT_URL').rstrip('/')
+V79_B2_ENDPOINT_URL = _v119_normalizar_b2_endpoint(_V119_B2_ENDPOINT_BRUTO, V79_B2_REGION)
 V79_B2_PREFIX = _v108_env_limpo('B2_PREFIX', 'dicor').strip('/')
+if _V119_B2_ENDPOINT_BRUTO and V79_B2_ENDPOINT_URL and _V119_B2_ENDPOINT_BRUTO.rstrip('/') != V79_B2_ENDPOINT_URL:
+    print(f'✅ V119 B2 endpoint normalizado para {V79_B2_ENDPOINT_URL}.', flush=True)
 
 _v108_region_valida = bool(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', V79_B2_REGION or '', flags=re.I))
 if (not _v108_region_valida) and V79_B2_ENDPOINT_URL:
@@ -40754,6 +40794,18 @@ _V78_R2_CLIENT = None
 _V78_R2_CLIENT_LOCK = threading.RLock()
 _V78_R2_MIGRATION_LOCK = asyncio.Lock()
 _V78_R2_AUTO_STARTED = False
+_V119_B2_WARN_LOCK = threading.RLock()
+_V119_B2_WARN_ULTIMO: Dict[str, float] = {}
+
+def _v119_b2_warn_once(chave: str, mensagem: str, intervalo: float=300.0) -> None:
+    """Evita centenas de linhas idênticas no Railway quando o B2 estiver indisponível."""
+    agora = time.monotonic()
+    with _V119_B2_WARN_LOCK:
+        ultimo = float(_V119_B2_WARN_ULTIMO.get(str(chave), 0.0) or 0.0)
+        if ultimo and (agora - ultimo) < float(intervalo):
+            return
+        _V119_B2_WARN_ULTIMO[str(chave)] = agora
+    print(mensagem, flush=True)
 
 def _v78_r2_configurado() -> bool:
     return bool(V79_B2_ENABLED and _v78_boto3 is not None and V79_B2_ENDPOINT_URL and V79_B2_REGION and V79_B2_ACCESS_KEY_ID and V79_B2_SECRET_ACCESS_KEY and V79_B2_BUCKET)
@@ -40771,7 +40823,7 @@ def _v78_r2_client():
                     kwargs['config'] = _V78BotoConfig(signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'standard'}, connect_timeout=10, read_timeout=60, s3={'addressing_style': 'path'})
                 _V78_R2_CLIENT = _v78_boto3.client(**kwargs)
             except Exception as erro:
-                print(f'⚠️ V108 cliente B2 indisponível: {type(erro).__name__}: {erro}. Fallback local mantido.', flush=True)
+                _v119_b2_warn_once('cliente-b2-principal', f'⚠️ V119 cliente B2 indisponível: {type(erro).__name__}: {erro}. Fallback local mantido.')
                 _V78_R2_CLIENT = None
                 return None
         return _V78_R2_CLIENT
@@ -48013,7 +48065,7 @@ def _v107_b2_client():
                     kwargs['config']=_V78BotoConfig(signature_version='s3v4', retries={'max_attempts':4,'mode':'standard'}, connect_timeout=12, read_timeout=90, s3={'addressing_style':'path'})
                 _V107_B2_CLIENT=_v78_boto3.client(**kwargs)
             except Exception as erro:
-                print(f'⚠️ V108 cofre B2 indisponível: {type(erro).__name__}: {erro}. Dados locais e Procurados continuam funcionando.', flush=True)
+                _v119_b2_warn_once('cofre-b2', f'⚠️ V119 cofre B2 indisponível: {type(erro).__name__}: {erro}. Dados locais e Procurados continuam funcionando.')
                 _V107_B2_CLIENT=None
                 return None
         return _V107_B2_CLIENT
@@ -51842,7 +51894,17 @@ async def _v112_recuperar_canal_procurado_orfao(canal: discord.TextChannel) -> s
     except Exception:
         pass
 
-    if 'procurado' not in normalizar_busca(getattr(canal, 'name', '')):
+    nome_canal_norm = normalizar_busca(getattr(canal, 'name', ''))
+    if 'procurado' not in nome_canal_norm:
+        return 'ignorado'
+    # V119: canais de controle/painel nunca são tratados como cadastro órfão.
+    # A recuperação assistida continua disponível apenas em canais temporários reais de procurado.
+    canais_controle = (
+        'cadastrar procurado',
+        'procurados arquivados',
+        'prioridade procurados',
+    )
+    if any(rotulo in nome_canal_norm for rotulo in canais_controle) or nome_canal_norm.strip() == 'procurados':
         return 'ignorado'
 
     base = await _v115_dados_basicos_canal(canal)
@@ -52292,1275 +52354,52 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
 
 
 def _v116_progresso_texto(estado: Dict[str, Any]) -> str:
-    item = int(estado.get('item') or 1)
-    etapa = int(estado.get('etapa') or 1)
-    concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
-    linhas = [
-        '🧭 **ROTEIRO GUIADO DE INVESTIGAÇÃO — V116**',
-        f'✅ Itens concluídos: **{len(concluidos)}/13**',
-    ]
-    if str(estado.get('status') or '').upper() == 'CONCLUIDA':
-        linhas.append('🏁 Status: **INVESTIGAÇÃO CONCLUÍDA E CONFERIDA**')
-        return '\n'.join(linhas)
-    linhas.append(f'📌 Item atual: **{item}/13 — {_v116_item_titulo(item)}**')
-    if item in {5, 11, 12}:
-        linhas.append(f'🧩 Etapa atual: **{etapa}/2**')
-    faltas = _v116_faltando(estado)
-    if faltas:
-        linhas.append('⏳ Falta agora: **' + '; '.join(faltas[:5]) + '**')
-    else:
-        linhas.append('🟢 Material mínimo atual completo. Use o fluxo indicado para avançar.')
-    return '\n'.join(linhas)
-
-
-async def _v116_editar_mensagem_segura(canal: Any, mensagem_id: int, **kwargs) -> Optional[discord.Message]:
-    if not mensagem_id:
-        return None
-    try:
-        msg = await canal.fetch_message(int(mensagem_id))
-        await msg.edit(**kwargs)
-        return msg
-    except Exception:
-        return None
-
-
-async def _v116_atualizar_painel(canal: discord.TextChannel, estado: Dict[str, Any]) -> None:
-    texto = _v116_progresso_texto(estado) + '\n\nUse os botões abaixo para continuar, conferir o progresso ou reanalisar o item atual.'
-    mid = int(estado.get('painel_mensagem_id') or 0)
-    msg = await _v116_editar_mensagem_segura(canal, mid, content=texto, view=V116InvestigacaoGuiadaView()) if mid else None
-    if msg is None:
-        try:
-            historico = [m async for m in canal.history(limit=80)]
-            existente = next((m for m in historico if getattr(m.author, 'bot', False) and 'ROTEIRO GUIADO DE INVESTIGAÇÃO — V116' in str(m.content or '')), None)
-            if existente:
-                await existente.edit(content=texto, view=V116InvestigacaoGuiadaView())
-                msg = existente
-            else:
-                msg = await canal.send(texto, view=V116InvestigacaoGuiadaView())
-        except Exception as erro:
-            await enviar_log(f'⚠️ V116 não publicou painel guiado na mesa {canal.id}: {erro}')
-            return
-    estado['painel_mensagem_id'] = int(msg.id)
-    _v116_gravar_estado(estado)
-
-
-async def _v116_publicar_tarefa_atual(canal: discord.TextChannel, estado: Dict[str, Any], *, nova: bool=False) -> None:
-    if str(estado.get('status') or '').upper() == 'CONCLUIDA':
-        return
-    item = int(estado.get('item') or 1)
-    etapa = int(estado.get('etapa') or 1)
-    topico = await _v116_topico_item(canal, item)
-    if topico is None:
-        await enviar_log(f'⚠️ V116: tópico do item {item} não encontrado na mesa {canal.id}.')
-        return
-    texto = '🎯 **TAREFA GUIADA ATUAL**\n\n' + _v116_prompt(estado) + '\n\n> Envie o material **neste tópico**. O bot validará automaticamente e informará exatamente o que faltar.'
-    mesma = int(estado.get('tarefa_item') or 0) == item and int(estado.get('tarefa_etapa') or 0) == etapa and int(estado.get('tarefa_topico_id') or 0) == int(topico.id)
-    msg = None
-    if mesma and not nova:
-        msg = await _v116_editar_mensagem_segura(topico, int(estado.get('tarefa_mensagem_id') or 0), content=texto, view=V116InvestigacaoGuiadaView())
-    if msg is None:
-        try:
-            msg = await topico.send(texto, view=V116InvestigacaoGuiadaView())
-        except Exception as erro:
-            await enviar_log(f'⚠️ V116 não publicou tarefa do item {item} na mesa {canal.id}: {erro}')
-            return
-    estado['tarefa_mensagem_id'] = int(msg.id)
-    estado['tarefa_topico_id'] = int(topico.id)
-    estado['tarefa_item'] = item
-    estado['tarefa_etapa'] = etapa
-    _v116_gravar_estado(estado)
-
-
-async def _v116_marcar_tarefa_anterior(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
-    topico_id = int(estado.get('tarefa_topico_id') or 0)
-    mid = int(estado.get('tarefa_mensagem_id') or 0)
-    if not topico_id or not mid:
-        return
-    topico = canal.guild.get_thread(topico_id) or canal.guild.get_channel(topico_id)
-    if topico is None:
-        try:
-            topico = await canal.guild.fetch_channel(topico_id)
-        except Exception:
-            topico = None
-    if topico is not None:
-        await _v116_editar_mensagem_segura(topico, mid, content=f'✅ **CONCLUÍDO — ITEM {item}: {_v116_item_titulo(item)}' + (f' • ETAPA {etapa}/2' if item in {5,11,12} else '') + '**', view=None)
-
-
-async def _v116_auditoria_final(canal: discord.TextChannel, estado: Dict[str, Any]) -> str:
-    dados = estado.setdefault('dados', {})
-    incompletos: List[str] = []
-    sem_prova: List[str] = []
-    correcoes: List[str] = []
-    contradicoes: List[str] = []
-    for i in range(1, 14):
-        if str(i) not in (estado.get('concluidos') or {}):
-            incompletos.append(f'Item {i} — {_v116_item_titulo(i)}')
-    for crime in list(dados.get('crimes') or []):
-        if not list((crime or {}).get('provas') or []):
-            sem_prova.append(str((crime or {}).get('descricao') or 'Crime sem identificação'))
-    pessoas: List[Tuple[str, Dict[str, Any]]] = []
-    for p in list(dados.get('liderancas') or []): pessoas.append(('liderança', p))
-    for p in list(dados.get('membros') or []): pessoas.append(('membro', p))
-    inf = dados.get('informante')
-    if isinstance(inf, dict): pessoas.append(('informante', inf))
-    por_rg: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-    por_nome: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-    for tipo, p in pessoas:
-        nome = str(p.get('nome') or '').strip()
-        rg = str(p.get('rg') or '').strip()
-        if rg: por_rg[rg].append((tipo, nome))
-        if nome: por_nome[_v116_norm(nome)].append((tipo, rg))
-    for rg, regs in por_rg.items():
-        nomes = {n for _, n in regs if n}
-        if len(regs) > 1:
-            if len(nomes) > 1:
-                contradicoes.append(f'RG {rg} aparece ligado a nomes diferentes: ' + ', '.join(sorted(nomes)))
-            else:
-                correcoes.append(f'RG {rg} aparece repetido em mais de um registro; conferir se é a mesma pessoa.')
-    for nome_norm, regs in por_nome.items():
-        rgs = {rg for _, rg in regs if rg}
-        if len(rgs) > 1:
-            nome_exemplo = next((p.get('nome') for _, p in pessoas if _v116_norm(p.get('nome')) == nome_norm), nome_norm)
-            contradicoes.append(f'{nome_exemplo} aparece com RGs diferentes: ' + ', '.join(sorted(rgs)))
-    if len(list(dados.get('membros') or [])) != 7:
-        incompletos.append(f'Fotos dos membros: há {len(list(dados.get("membros") or []))}/7 membros.')
-    if not list(dados.get('liderancas') or []):
-        incompletos.append('Nenhuma liderança foi registrada.')
-    linhas = [
-        '🏁 **CONFERÊNCIA GERAL DA INVESTIGAÇÃO**',
-        '',
-        f'✅ **Concluído:** {13 - len([x for x in range(1,14) if str(x) not in (estado.get("concluidos") or {})])}/13 itens',
-        f'⚠️ **Incompleto:** {len(incompletos)}',
-        f'📎 **Sem prova:** {len(sem_prova)}',
-        f'🛠️ **Precisa conferir/corrigir:** {len(correcoes)}',
-        f'🔁 **Contraditório:** {len(contradicoes)}',
-    ]
-    def bloco(titulo: str, itens: List[str]):
-        linhas.append('')
-        linhas.append(f'**{titulo}**')
-        linhas.extend([f'• {x}' for x in itens[:20]] if itens else ['• Nenhum.'])
-    bloco('ITENS INCOMPLETOS', incompletos)
-    bloco('REGISTROS SEM PROVA', sem_prova)
-    bloco('INFORMAÇÕES REPETIDAS / A CONFERIR', correcoes)
-    bloco('INFORMAÇÕES CONTRADITÓRIAS', contradicoes)
-    pronto = not incompletos and not sem_prova and not contradicoes
-    linhas.append('')
-    linhas.append('✅ **MATERIAL ORGANIZADO E PRONTO PARA O DOSSIÊ FINAL.**' if pronto else '⚠️ **O material foi organizado, mas há pendências acima antes do dossiê final.**')
-    resumo = '\n'.join(linhas)
-    estado['auditoria_final'] = {
-        'gerada_em': agora_br(), 'incompletos': incompletos, 'sem_prova': sem_prova,
-        'correcoes': correcoes, 'contradicoes': contradicoes, 'pronto': pronto,
-    }
-    _v116_gravar_estado(estado)
-    try:
-        await canal.send(resumo[:1900])
-        if len(resumo) > 1900:
-            for i in range(1900, len(resumo), 1900):
-                await canal.send(resumo[i:i+1900])
-    except Exception:
-        pass
-    return resumo
-
-
-async def _v116_avancar_item(canal: discord.TextChannel, estado: Dict[str, Any]) -> None:
-    item = int(estado.get('item') or 1)
-    etapa = int(estado.get('etapa') or 1)
-    await _v116_marcar_tarefa_anterior(canal, estado, item, etapa)
-    concluidos = estado.setdefault('concluidos', {})
-    concluidos[str(item)] = {'concluido_em': agora_br(), 'etapa_final': etapa}
-    estado['rascunho'] = {}
-    estado['item'] = item + 1
-    estado['etapa'] = 1
-    estado['tarefa_mensagem_id'] = 0
-    estado['tarefa_topico_id'] = 0
-    estado['tarefa_item'] = 0
-    estado['tarefa_etapa'] = 0
-    if int(estado['item']) > 13:
-        estado['item'] = 14
-        estado['status'] = 'CONCLUIDA'
-        estado['concluida_em'] = agora_br()
-        _v116_gravar_estado(estado)
-        await _v116_atualizar_painel(canal, estado)
-        await _v116_auditoria_final(canal, estado)
-        return
-    _v116_gravar_estado(estado)
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado, nova=True)
-
-
-async def _v116_mudar_etapa(canal: discord.TextChannel, estado: Dict[str, Any], nova_etapa: int) -> None:
-    item = int(estado.get('item') or 1)
-    etapa_antiga = int(estado.get('etapa') or 1)
-    await _v116_marcar_tarefa_anterior(canal, estado, item, etapa_antiga)
-    estado['etapa'] = int(nova_etapa)
-    estado['rascunho'] = {}
-    estado['tarefa_mensagem_id'] = 0
-    estado['tarefa_topico_id'] = 0
-    estado['tarefa_item'] = 0
-    estado['tarefa_etapa'] = 0
-    _v116_gravar_estado(estado)
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado, nova=True)
-
-
-async def _v116_responder(msg: discord.Message, texto: str) -> None:
-    try:
-        await msg.reply(texto[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        try:
-            await msg.channel.send(texto[:1900], allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            pass
-
-
-def _v116_registrar_mensagem(estado: Dict[str, Any], msg_id: int) -> None:
-    ids = [int(x) for x in list(estado.get('mensagens_processadas') or []) if str(x).isdigit()]
-    if int(msg_id) not in ids:
-        ids.append(int(msg_id))
-    estado['mensagens_processadas'] = ids[-3000:]
-
-
-async def _v116_processar_pessoa(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, lideranca: bool=False, membro: bool=False, silencioso: bool=False) -> None:
-    if membro and len(list((estado.get('dados') or {}).get('membros') or [])) >= 7:
-        if not silencioso:
-            await _v116_responder(msg, '🟢 Os **7/7 membros** já foram registrados. Revise os dados e clique em **Concluir item** para confirmar o Item 3.')
-        return
-    rasc = estado.setdefault('rascunho', {})
-    p = rasc.get('pessoa') if isinstance(rasc.get('pessoa'), dict) else {}
-    campos = _v116_extrair_pessoa(str(msg.content or ''))
-    for k in ('nome', 'cargo', 'rg'):
-        if campos.get(k): p[k] = campos[k]
-    imagens = _v116_imagens(msg)
-    if imagens and not p.get('foto'):
-        p['foto'] = imagens[0]
-    p.setdefault('mensagens', [])
-    if int(msg.id) not in p['mensagens']:
-        p['mensagens'].append(int(msg.id))
-    rasc['pessoa'] = p
-    estado['rascunho'] = rasc
-    faltas = _v116_faltando_pessoa(estado, lideranca=lideranca)
-    if faltas:
-        _v116_gravar_estado(estado)
-        if not silencioso:
-            await _v116_responder(msg, '⏳ Material recebido, mas esta pessoa ainda está incompleta.\n**Falta:** ' + '; '.join(faltas) + '.')
-        return
-    dados = estado.setdefault('dados', {})
-    chave = 'liderancas' if lideranca else 'membros'
-    lista = list(dados.get(chave) or [])
-    rg = str(p.get('rg') or '')
-    existente = next((x for x in lista if str(x.get('rg') or '') == rg), None)
-    registro = dict(p)
-    registro['registrado_em'] = agora_br()
-    if existente:
-        existente.update(registro)
-    else:
-        lista.append(registro)
-    dados[chave] = lista
-    estado['dados'] = dados
-    estado['rascunho'] = {}
-    _v116_gravar_estado(estado)
-    if membro and len(lista) >= 7:
-        if not silencioso:
-            await _v116_responder(msg, f'✅ Membro **7/7** registrado: {registro.get("nome")} — RG `{registro.get("rg")}`.\n🟢 ITEM 3 completo. Clique em **Concluir item** para confirmar e liberar o próximo item.')
-        await _v116_atualizar_painel(canal, estado)
-        await _v116_publicar_tarefa_atual(canal, estado)
-        return
-    if not silencioso:
-        if lideranca:
-            await _v116_responder(msg, f'✅ Liderança registrada: **{registro.get("nome")}** — {registro.get("cargo")} — RG `{registro.get("rg")}`.\nEnvie a próxima liderança ou use **Concluir item** quando tiver registrado todas.')
-        else:
-            await _v116_responder(msg, f'✅ Membro **{len(lista)}/7** registrado: **{registro.get("nome")}** — RG `{registro.get("rg")}`.\nEnvie o membro {len(lista)+1}/7.')
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado)
-
-
-async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, silencioso: bool=False) -> None:
-    item = int(estado.get('item') or 1)
-    etapa = int(estado.get('etapa') or 1)
-    dados = estado.setdefault('dados', {})
-    conteudo = str(msg.content or '').strip()
-    imagens = _v116_imagens(msg)
-
-    if item == 1:
-        try:
-            canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
-        except Exception as erro:
-            membros, pendencias, metricas, canonico = [], [], {}, ''
-            await enviar_log(f'⚠️ V116 OCR/transcrição do painel falhou na mensagem {msg.id}: {erro}')
-        if pendencias:
-            nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
-            dados['painel_pendencias'] = pendencias
-            estado['dados'] = dados
-            _v116_gravar_estado(estado)
-            if not silencioso:
-                await _v116_responder(msg, '⚠️ O painel foi lido, mas ainda há linhas incompletas/sem RG: ' + ', '.join(nomes) + '.\nReenvie o print mais nítido ou envie essas linhas em texto antes de concluir.')
-            return
-        transcricao = ''
-        if membros:
-            linhas = []
-            for idx, p in enumerate(membros, 1):
-                tel = f" | TEL {p.get('telefone')}" if p.get('telefone') else ''
-                linhas.append(f"{idx:02d}. {p.get('nome')} | RG {p.get('rg')} | {p.get('cargo') or 'MEMBRO'}{tel}")
-            transcricao = '\n'.join(linhas)
-            dados['painel_membros'] = membros
-        elif conteudo:
-            transcricao = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())
-        else:
-            prefixo = str(globals().get('_BANCO_V6_ORIGINAL_PREFIX') or '')
-            if prefixo and prefixo in str(canonico or ''):
-                bruto = str(canonico).split(prefixo, 1)[-1].strip()
-                bruto = re.sub(r'^\[OCR IMAGEM \d+\]\s*', '', bruto, flags=re.MULTILINE)
-                transcricao = bruto.strip()
-        if not transcricao:
-            _v116_gravar_estado(estado)
-            if not silencioso:
-                await _v116_responder(msg, '❌ Não consegui transcrever o painel com segurança. Envie um print mais nítido ou cole o texto do painel.')
-            return
-        dados['painel_transcricao'] = transcricao
-        dados['painel_origem_mensagem_id'] = int(msg.id)
-        dados['painel_metricas'] = metricas
-        estado['dados'] = dados
-        _v116_gravar_estado(estado)
-        if not silencioso:
-            cab = '📱 **TRANSCRIÇÃO DO PAINEL — PRONTA PARA O CELULAR IN-GAME**\n```\n'
-            rod = '\n```'
-            blocos = [transcricao[i:i+1650] for i in range(0, len(transcricao), 1650)] or ['']
-            await _v116_responder(msg, cab + blocos[0] + rod)
-            for bloco in blocos[1:]:
-                try: await msg.channel.send('```\n' + bloco + '\n```')
-                except Exception: pass
-        await _v116_atualizar_painel(canal, estado)
-        await _v116_publicar_tarefa_atual(canal, estado)
-        if not silencioso:
-            await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e clique em **Concluir item** para confirmar e liberar o próximo item.')
-        return
-
-    if item == 2:
-        return await _v116_processar_pessoa(canal, estado, msg, lideranca=True, silencioso=silencioso)
-    if item == 3:
-        return await _v116_processar_pessoa(canal, estado, msg, membro=True, silencioso=silencioso)
-    if item == 4:
-        if not conteudo:
-            if not silencioso: await _v116_responder(msg, '⏳ Falta informar a numeração/frequência da rádio em texto.')
-            return
-        dados['radio'] = conteudo[:800]
-        dados['radio_mensagem_id'] = int(msg.id)
-        _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, '✅ Rádio registrada. 🟢 ITEM 4 completo. Clique em **Concluir item** para confirmar e liberar o próximo item.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    if item == 5:
-        if etapa == 1:
-            lista = _v116_adicionar_unicos(list(dados.get('localizacao_etapa1') or []), imagens)
-            dados['localizacao_etapa1'] = lista[:2]
-            estado['dados'] = dados; _v116_gravar_estado(estado)
-            faltas = _v116_faltando(estado)
-            if faltas:
-                if not silencioso: await _v116_responder(msg, '⏳ Etapa 1 ainda incompleta.\n**Falta:** ' + '; '.join(faltas) + '.')
-                return
-            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
-            await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-            return
-        lista = _v116_adicionar_unicos(list(dados.get('localizacao_aereas') or []), imagens)
-        dados['localizacao_aereas'] = lista[:4]
-        estado['dados'] = dados; _v116_gravar_estado(estado)
-        faltas = _v116_faltando(estado)
-        if faltas:
-            if not silencioso: await _v116_responder(msg, f'📸 Fotos aéreas registradas: **{len(lista)}/4**.\n**Falta:** {faltas[0]}.')
-            return
-        if not silencioso: await _v116_responder(msg, '✅ 4 fotos aéreas registradas. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 5.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    if item == 6:
-        rasc = estado.setdefault('rascunho', {})
-        crime = rasc.get('crime') if isinstance(rasc.get('crime'), dict) else {'descricao': '', 'provas': [], 'mensagens': []}
-        if conteudo:
-            descricao = _v116_rotulo(conteudo, ['crime', 'delito', 'descri[cç][aã]o'], 1000) or conteudo
-            # Remove URLs da descrição quando a mensagem é basicamente crime + link.
-            descricao = re.sub(r'https?://[^\s<>]+', '', descricao).strip(' \n-•')
-            if descricao: crime['descricao'] = descricao[:1200]
-        crime['provas'] = _v116_adicionar_unicos(list(crime.get('provas') or []), _v116_anexos_prova(msg))
-        crime.setdefault('mensagens', [])
-        if int(msg.id) not in crime['mensagens']: crime['mensagens'].append(int(msg.id))
-        rasc['crime'] = crime; estado['rascunho'] = rasc
-        faltas = []
-        if not str(crime.get('descricao') or '').strip(): faltas.append('nome/descrição do crime')
-        if not list(crime.get('provas') or []): faltas.append('prova/evidência')
-        if faltas:
-            _v116_gravar_estado(estado)
-            if not silencioso: await _v116_responder(msg, '⏳ Crime atual incompleto.\n**Falta:** ' + '; '.join(faltas) + '.')
-            return
-        crimes = list(dados.get('crimes') or [])
-        assinatura = _v116_norm(crime.get('descricao'))
-        existente = next((x for x in crimes if _v116_norm(x.get('descricao')) == assinatura), None)
-        registro = dict(crime); registro['registrado_em'] = agora_br()
-        if existente:
-            existente['provas'] = _v116_adicionar_unicos(list(existente.get('provas') or []), list(registro.get('provas') or []))
-            existente['mensagens'] = list(dict.fromkeys(list(existente.get('mensagens') or []) + list(registro.get('mensagens') or [])))
-        else:
-            crimes.append(registro)
-        dados['crimes'] = crimes; estado['dados'] = dados; estado['rascunho'] = {}
-        _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, f'✅ Crime registrado com prova: **{registro.get("descricao")[:160]}**.\nTotal: **{len(crimes)}**. Envie o próximo crime ou use **Concluir item**.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    mapa = {
-        7: ('bau_lider', 'Baú de líder'),
-        8: ('bau_membros', 'Baú de membros'),
-        9: ('rota_farm', 'Rota de farm'),
-        10: ('rota_producao', 'Rota de produção'),
-    }
-    if item in mapa:
-        chave, nome = mapa[item]
-        lista = _v116_adicionar_unicos(list(dados.get(chave) or []), imagens)
-        dados[chave] = lista[:2]; estado['dados'] = dados; _v116_gravar_estado(estado)
-        faltas = _v116_faltando(estado)
-        if faltas:
-            if not silencioso: await _v116_responder(msg, f'📸 {nome}: **{len(lista)}/2** registro(s).\n**Falta:** ' + '; '.join(faltas) + '.')
-            return
-        if not silencioso: await _v116_responder(msg, f'✅ {nome} com os 2 registros obrigatórios. 🟢 ITEM {item} completo. Clique em **Concluir item** para confirmar.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    if item == 11:
-        if etapa == 1:
-            dados['ingredientes_fotos'] = _v116_adicionar_unicos(list(dados.get('ingredientes_fotos') or []), imagens)
-            estado['dados'] = dados; _v116_gravar_estado(estado)
-            if not dados['ingredientes_fotos']:
-                if not silencioso: await _v116_responder(msg, '⏳ Falta a foto dos ingredientes necessários para a produção.')
-                return
-            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
-            await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-            return
-        dados['produto_final_fotos'] = _v116_adicionar_unicos(list(dados.get('produto_final_fotos') or []), imagens)
-        estado['dados'] = dados; _v116_gravar_estado(estado)
-        if not dados['produto_final_fotos']:
-            if not silencioso: await _v116_responder(msg, '⏳ Falta a foto do produto final produzido pela organização.')
-            return
-        if not silencioso: await _v116_responder(msg, '✅ Produto final registrado. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 11.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    if item == 12:
-        if etapa == 1:
-            inf_salvo = dados.get('informante')
-            if isinstance(inf_salvo, dict) and inf_salvo.get('foto') and inf_salvo.get('documento') and str(inf_salvo.get('nome') or '').strip() and str(inf_salvo.get('rg') or '').strip():
-                if not silencioso:
-                    await _v116_responder(msg, '🟢 O informante da ETAPA 1/2 já está completo. Revise e clique em **Concluir item** para confirmar esta etapa.')
-                return
-            rasc = estado.setdefault('rascunho', {})
-            p = rasc.get('informante') if isinstance(rasc.get('informante'), dict) else {}
-            campos = _v116_extrair_pessoa(conteudo)
-            if campos.get('nome'): p['nome'] = campos['nome']
-            if campos.get('rg'): p['rg'] = campos['rg']
-            imagens_info = _v116_imagens(msg)
-            for img in imagens_info:
-                if not p.get('foto'): p['foto'] = img
-                elif not p.get('documento'): p['documento'] = img
-            p.setdefault('mensagens', [])
-            if int(msg.id) not in p['mensagens']: p['mensagens'].append(int(msg.id))
-            rasc['informante'] = p; estado['rascunho'] = rasc
-            faltas = _v116_faltando_pessoa(estado, informante=True)
-            if faltas:
-                _v116_gravar_estado(estado)
-                if not silencioso: await _v116_responder(msg, '⏳ Informante ainda incompleto.\n**Falta:** ' + '; '.join(faltas) + '.')
-                return
-            dados['informante'] = dict(p); estado['dados'] = dados; estado['rascunho'] = {}
-            _v116_gravar_estado(estado)
-            if not silencioso: await _v116_responder(msg, f'✅ Informante registrado: **{p.get("nome")}** — RG `{p.get("rg")}`.\n🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
-            await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-            return
-        if not conteudo:
-            if not silencioso: await _v116_responder(msg, '⏳ Falta o resumo de como o informante realizou a operação.')
-            return
-        dados['informante_resumo'] = conteudo[:3500]
-        dados['informante_resumo_mensagem_id'] = int(msg.id)
-        estado['dados'] = dados; _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, '✅ Resumo do informante registrado somente com as informações fornecidas. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 12.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-    if item == 13:
-        lista = _v116_adicionar_unicos(list(dados.get('residencia_fotos') or []), imagens)
-        dados['residencia_fotos'] = lista
-        estado['dados'] = dados; _v116_gravar_estado(estado)
-        if not lista:
-            if not silencioso: await _v116_responder(msg, '⏳ Falta ao menos uma foto da residência/casa do líder.')
-            return
-        if not silencioso: await _v116_responder(msg, f'✅ Foto(s) da residência registrada(s): **{len(lista)}**.\nSe houver mais, envie agora. Quando terminar, use **Concluir item**.')
-        await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
-        return
-
-
-async def _v116_resolver_contexto(canal_atual: Any) -> Tuple[Optional[discord.TextChannel], Optional[Dict[str, Any]]]:
-    canal_mesa, mesa = await _resolver_mesa_tarefas(canal_atual)
-    if not isinstance(canal_mesa, discord.TextChannel):
-        return None, None
-    return canal_mesa, mesa
-
-
-async def _v116_ativar_mesa(canal: discord.TextChannel) -> Optional[Dict[str, Any]]:
-    if not isinstance(canal, discord.TextChannel):
-        return None
-    estado = _v116_estado(int(canal.id), True)
-    if estado is None:
-        return None
-    if str(estado.get('status') or '').upper() != 'CONCLUIDA':
-        estado['status'] = 'ATIVA'
-    _v116_gravar_estado(estado)
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado)
-    return estado
-
-
-async def _v116_concluir_manual(canal: discord.TextChannel, estado: Dict[str, Any]) -> Tuple[bool, str]:
-    item = int(estado.get('item') or 1)
-    etapa = int(estado.get('etapa') or 1)
-    if str(estado.get('status') or '').upper() == 'CONCLUIDA':
-        return True, '✅ A investigação guiada já está concluída.'
-    faltas = _v116_faltando(estado)
-    if faltas:
-        return False, '❌ O passo atual ainda está incompleto.\n**Falta:** ' + '; '.join(faltas) + '.'
-    # Nos itens de duas etapas, a Etapa 2 só é liberada após confirmação explícita da Etapa 1.
-    if item in {5, 11, 12} and etapa == 1:
-        await _v116_mudar_etapa(canal, estado, 2)
-        return True, f'✅ Item {item} — ETAPA 1/2 confirmada. A ETAPA 2/2 foi liberada agora.'
-    await _v116_avancar_item(canal, estado)
-    return True, f'✅ Item {item} — {_v116_item_titulo(item)} confirmado e concluído.'
-
-
-async def _v116_reanalisar(canal: discord.TextChannel, estado: Dict[str, Any]) -> str:
-    item_inicial = int(estado.get('item') or 1)
-    etapa_inicial = int(estado.get('etapa') or 1)
-    topico = await _v116_topico_item(canal, item_inicial)
-    if topico is None:
-        return '❌ O tópico do item atual não foi encontrado.'
-    processadas = 0
-    try:
-        mensagens = [m async for m in topico.history(limit=250, oldest_first=True)]
-    except Exception as erro:
-        return f'❌ Não foi possível ler o histórico do tópico: {erro}'
-    for msg in mensagens:
-        if getattr(msg.author, 'bot', False):
-            continue
-        if int(estado.get('item') or 1) != item_inicial or int(estado.get('etapa') or 1) != etapa_inicial:
-            break
-        ids = {int(x) for x in list(estado.get('mensagens_processadas') or []) if str(x).isdigit()}
-        if int(msg.id) in ids:
-            continue
-        await _v116_processar_item(canal, estado, msg, silencioso=True)
-        _v116_registrar_mensagem(estado, int(msg.id))
-        _v116_gravar_estado(estado)
-        processadas += 1
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado)
-    faltas = _v116_faltando(estado)
-    if int(estado.get('item') or 1) != item_inicial or int(estado.get('etapa') or 1) != etapa_inicial:
-        return f'✅ Reanálise concluída. {processadas} mensagem(ns) antiga(s) foram aproveitadas e o fluxo avançou para o próximo passo.'
-    if faltas:
-        return f'🔎 Reanálise concluída. {processadas} mensagem(ns) antiga(s) aproveitada(s).\n**Ainda falta:** ' + '; '.join(faltas) + '.'
-    return f'✅ Reanálise concluída. {processadas} mensagem(ns) antiga(s) aproveitada(s). O material mínimo do item atual está completo.'
-
-
-class V116InvestigacaoGuiadaView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label='Continuar investigação', emoji='▶️', style=discord.ButtonStyle.green, custom_id='dic_v116_investigacao_continuar', row=0)
-    async def continuar(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
-        if canal is None:
-            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa válida.', ephemeral=True)
-        async with _v116_lock(canal.id):
-            estado = await _v116_ativar_mesa(canal)
-            topico = await _v116_topico_item(canal, int(estado.get('item') or 1)) if estado else None
-            if estado is None:
-                return await interaction.followup.send('❌ Não consegui carregar o roteiro desta mesa.', ephemeral=True)
-            if str(estado.get('status') or '').upper() == 'CONCLUIDA':
-                return await interaction.followup.send('✅ A investigação guiada já foi concluída. Use o fechamento da mesa para montar o dossiê.', ephemeral=True)
-            destino = f'\n\n📌 Envie em: {topico.mention}' if topico else ''
-            await interaction.followup.send(_v116_prompt(estado) + destino, ephemeral=True)
-
-    @discord.ui.button(label='Concluir item', emoji='✅', style=discord.ButtonStyle.primary, custom_id='dic_v116_investigacao_concluir', row=0)
-    async def concluir(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
-        if canal is None:
-            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa válida.', ephemeral=True)
-        async with _v116_lock(canal.id):
-            estado = _v116_estado(canal.id, True)
-            ok, texto = await _v116_concluir_manual(canal, estado)
-            await interaction.followup.send(texto, ephemeral=True)
-
-    @discord.ui.button(label='Ver progresso', emoji='📊', style=discord.ButtonStyle.secondary, custom_id='dic_v116_investigacao_progresso', row=1)
-    async def progresso(self, interaction: discord.Interaction, button: Button):
-        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
-        if canal is None:
-            return await interaction.response.send_message('❌ Este painel não está vinculado a uma mesa válida.', ephemeral=True)
-        estado = _v116_estado(canal.id, True)
-        await interaction.response.send_message(_v116_progresso_texto(estado), ephemeral=True)
-
-    @discord.ui.button(label='Reanalisar evidências', emoji='🔄', style=discord.ButtonStyle.secondary, custom_id='dic_v116_investigacao_reanalisar', row=1)
-    async def reanalisar(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
-        if canal is None:
-            return await interaction.edit_original_response(content='❌ Este painel não está vinculado a uma mesa válida.')
-        async with _v116_lock(canal.id):
-            estado = _v116_estado(canal.id, True)
-            texto = await _v116_reanalisar(canal, estado)
-        await interaction.edit_original_response(content=texto)
-
-
-# V116 torna o painel de tarefas útil mesmo quando ainda não existem tarefas manuais:
-# a tarefa guiada atual sempre aparece como pendência da mesa.
-class GerenciamentoTarefasView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label='Criar Tarefa', emoji='➕', style=discord.ButtonStyle.green, custom_id='dic_mesa_criar_tarefa_v1')
-    async def criar(self, interaction: discord.Interaction, button: Button):
-        if not usuario_e_administrador(interaction.user):
-            return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas manuais.', ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        canal_mesa, mesa = await _resolver_mesa_tarefas(interaction.channel)
-        if canal_mesa is None:
-            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa de investigação válida.', ephemeral=True)
-        topicos = await _listar_topicos_tarefa(canal_mesa, mesa)
-        if not topicos:
-            return await interaction.followup.send('❌ Nenhum tópico da mesa foi encontrado.', ephemeral=True)
-        await interaction.followup.send('📌 **CRIAR TAREFA MANUAL**\n\nEscolha em qual tópico a tarefa será publicada.', view=SelecionarTopicoTarefaView(int(canal_mesa.id), topicos), ephemeral=True)
-
-    @discord.ui.button(label='Ver Tarefas Pendentes', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_mesa_ver_tarefas_v1')
-    async def ver(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        canal_mesa, _mesa = await _resolver_mesa_tarefas(interaction.channel)
-        if canal_mesa is None:
-            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa de investigação válida.', ephemeral=True)
-        linhas: List[str] = []
-        estado = _v116_estado(canal_mesa.id, True)
-        if estado and str(estado.get('status') or '').upper() != 'CONCLUIDA':
-            item = int(estado.get('item') or 1)
-            etapa = int(estado.get('etapa') or 1)
-            topico = await _v116_topico_item(canal_mesa, item)
-            destino = topico.mention if topico else 'tópico não encontrado'
-            cab_etapa = f' • Etapa {etapa}/2' if item in {5,11,12} else ''
-            linhas.append(f'🧭 **ROTEIRO GUIADO — ITEM {item}/13{cab_etapa}**\n**{_v116_item_titulo(item)}**\nDestino: {destino}\nFalta: ' + ('; '.join(_v116_faltando(estado)) if _v116_faltando(estado) else 'material mínimo completo'))
-        tarefas = [t for t in _carregar_tarefas().values() if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id) and t.get('status') != 'CONCLUIDA']
-        tarefas.sort(key=lambda t: int(t.get('numero') or 0))
-        for t in tarefas[:24]:
-            st = '⏳ Pendente' if t.get('status') == 'PENDENTE' else '🟡 Aguardando encerramento'
-            topico_id = int(t.get('topico_destino_id') or t.get('canal_id') or 0)
-            destino = f'<#{topico_id}>' if topico_id else 'Não informado'
-            linhas.append(f"**Tarefa manual Nº {int(t.get('numero', 0)):03d}** — {st}\nResponsável: <@{t.get('responsavel_id')}>\nTópico: {destino}\nObjetivo: {str(t.get('objetivo', ''))[:180]}")
-        if not linhas:
-            return await interaction.followup.send('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
-        await interaction.followup.send('📋 **TAREFAS PENDENTES DA MESA**\n\n' + '\n\n'.join(linhas)[:1900], ephemeral=True)
-
-
-@bot.listen('on_message')
-async def v116_coletar_investigacao_guiada(msg: discord.Message) -> None:
-    """V117: cada tópico da mesa recebe e processa a própria tarefa guiada."""
-    if getattr(msg.author, 'bot', False) or msg.guild is None:
-        return
-    if not isinstance(msg.channel, discord.Thread):
-        return
-    canal_mesa = msg.channel.parent
-    if not isinstance(canal_mesa, discord.TextChannel):
-        return
-    if not _v118_mesa_guiada_habilitada(int(canal_mesa.id)):
-        return
-    estado = _v116_estado(canal_mesa.id, False)
-    if not isinstance(estado, dict) or str(estado.get('status') or '').upper() != 'ATIVA':
-        return
-    item = _v117_item_do_topico(msg.channel)
-    if not item:
-        return
-    if str(item) in (estado.get('concluidos') or {}):
-        return
-    async with _v116_lock(canal_mesa.id):
-        estado = _v116_estado(canal_mesa.id, True)
-        _v117_migrar_estado(estado)
-        ids = {int(x) for x in list(estado.get('mensagens_processadas') or []) if str(x).isdigit()}
-        if int(msg.id) in ids:
-            return
-        try:
-            await _v117_processar_mensagem_item(canal_mesa, estado, item, msg, silencioso=False)
-        except Exception as erro:
-            traceback.print_exc()
-            await enviar_log(f'❌ V117 falhou ao processar item {item} da mesa {canal_mesa.id}: {type(erro).__name__}: {erro}')
-            await _v116_responder(msg, '❌ Ocorreu um erro ao validar este material. Nada foi apagado; tente novamente ou use **Reanalisar evidências**.')
-        finally:
-            estado_atual = _v116_estado(canal_mesa.id, True)
-            _v117_migrar_estado(estado_atual)
-            _v116_registrar_mensagem(estado_atual, int(msg.id))
-            _v117_sincronizar_item_referencia(estado_atual)
-            _v116_gravar_estado(estado_atual)
-
-
-# Novas mesas: o fluxo antigo continua criando canal/tópicos normalmente e, ao final,
-# o V116 injeta o roteiro guiado sem quebrar os recursos existentes.
-_V116_CRIAR_MESA_CORE_BASE = criar_mesa_core
-async def criar_mesa_core(interaction: discord.Interaction, apelido: str, familia: str, observacao: str=''):
-    antes = {int(m.get('canal_id') or 0) for m in carregar_mesas() if isinstance(m, dict)}
-    resultado = await _V116_CRIAR_MESA_CORE_BASE(interaction, apelido, familia, observacao)
-    try:
-        candidatos = [m for m in carregar_mesas() if isinstance(m, dict) and int(m.get('canal_id') or 0) not in antes]
-        if not candidatos:
-            candidatos = [m for m in carregar_mesas() if isinstance(m, dict) and int(m.get('autor_id') or 0) == int(interaction.user.id) and _v116_norm(m.get('familia')) == _v116_norm(familia)]
-        if candidatos:
-            mesa = candidatos[-1]
-            canal = interaction.guild.get_channel(int(mesa.get('canal_id') or 0)) if interaction.guild else None
-            if isinstance(canal, discord.TextChannel):
-                # V118: marca explicitamente esta mesa como NOVA antes de ativar o roteiro.
-                _v118_marcar_mesa_nova(int(canal.id))
-                await _v116_ativar_mesa(canal)
-    except Exception as erro:
-        await enviar_log(f'⚠️ V116: mesa criada, mas roteiro guiado não foi ativado automaticamente: {erro}')
-    return resultado
-
-
-# =====================================================
-# V116 — PROCURADOS: idempotência + resposta garantida
-# =====================================================
-_V116_V115_CONCLUIR_VINCULO_BASE = _v115_concluir_vinculo_bo
-async def _v115_concluir_vinculo_bo(canal: discord.TextChannel, *, numero_bo: str, rg_manual: str='', usuario: Optional[discord.Member]=None) -> Tuple[bool, str]:
-    async with _v116_procurado_lock(int(canal.id)):
-        atual = cadastros_pendentes.get(int(canal.id))
-        numero_pedido = numero_curto_boletim(str(numero_bo or ''))
-        if isinstance(atual, dict):
-            status = str(atual.get('status') or '').upper()
-            bo_atual = numero_curto_boletim(str(atual.get('numero_boletim') or atual.get('boletim') or ''))
-            if status in {'RECUPERADO_AGUARDANDO_FINALIZACAO', 'AGUARDANDO AUTORIZAÇÃO', 'AGUARDANDO_AUTORIZACAO'} and bo_atual and bo_atual == numero_pedido:
-                return True, f'✅ Este procurado já está vinculado ao BO `{bo_atual}`. Use o painel existente para continuar; nenhuma etapa duplicada foi criada.'
-        return await _V116_V115_CONCLUIR_VINCULO_BASE(canal, numero_bo=numero_bo, rg_manual=rg_manual, usuario=usuario)
-
-
-# Finalizador substituído para nunca deixar a interação presa em "está pensando".
-class FinalizarProcuradoView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label='Finalizar Cadastro', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_finalizar_procurado')
-    async def finalizar(self, interaction: discord.Interaction, button: Button):
-        canal = interaction.channel
-        if not isinstance(canal, discord.TextChannel):
-            return await interaction.response.send_message('❌ Canal temporário inválido.', ephemeral=True)
-        lock = _v116_procurado_lock(canal.id)
-        if lock.locked():
-            return await interaction.response.send_message('⏳ Este cadastro já está sendo processado. Aguarde a resposta do primeiro clique.', ephemeral=True)
-        async with lock:
-            dados = cadastros_pendentes.get(int(canal.id))
-            if not isinstance(dados, dict) or not dados.get('_fluxo_fotos_v58'):
-                return await interaction.response.send_message('❌ Não encontrei os dados deste cadastro.', ephemeral=True)
-            if interaction.user.id != int(dados.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user):
-                return await interaction.response.send_message('❌ Apenas quem iniciou o cadastro ou Inspetor+ pode concluir.', ephemeral=True)
-            atendimento = _v56_atendimento_por_id(dados.get('_atendimento_id'))
-            if not atendimento:
-                return await interaction.response.send_message('❌ O atendimento do boletim não foi localizado.', ephemeral=True)
-            membro = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if membro is None:
-                return await interaction.response.send_message('❌ Não consegui verificar seu cargo.', ephemeral=True)
-            existente = _v111_registro_ativo_por_rg(dados.get('rg'))
-            dados['_modo_procurado'] = 'ATUALIZAR' if existente else 'NOVO'
-            if not existente and not _fotos_procurado_validas(dados):
-                return await interaction.response.send_message('❌ A foto do indivíduo e a foto do RG precisam estar confirmadas.', ephemeral=True)
-            if existente:
-                enriquecido = _v111_enriquecer_existente(existente)
-                dados['foto_individuo'] = dados.get('foto_individuo') or enriquecido.get('foto_individuo')
-                dados['foto_rg'] = dados.get('foto_rg') or enriquecido.get('foto_rg')
-            eh_inspetor = _v111_inspetor_mais(membro)
-            precisa = usuario_precisa_autorizacao_dicor(membro)
-            if not eh_inspetor and not precisa:
-                return await interaction.response.send_message('❌ Somente Estagiário, Investigador ou Inspetor+ pode concluir.', ephemeral=True)
-            # Idempotência antes de qualquer escrita/publicação.
-            status_at = str(atendimento.get('procurado_status') or '').lower()
-            if status_at in {'aguardando_autorizacao', 'publicado', 'atualizado'}:
-                texto = '✅ Este pedido já foi processado.'
-                if status_at == 'aguardando_autorizacao': texto += ' Ele já está aguardando autorização de Inspetor+.'
-                return await interaction.response.send_message(texto, ephemeral=True)
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            await interaction.edit_original_response(content='⏳ Validando cadastro e salvando o pedido...')
-            try:
-                dados = dict(dados)
-                pedido_id = str(dados.get('_pedido_id') or f'PRQ-TEMP-{int(canal.id)}')
-                dados.update({
-                    '_pedido_id': pedido_id,
-                    '_canal_temporario_id': int(canal.id), '_canal_fluxo_id': int(canal.id),
-                    '_solicitante_id': int(dados.get('autor_id') or interaction.user.id),
-                    '_solicitante_nome': str(dados.get('autor_nome') or interaction.user),
-                    '_canal_bo_origem_id': int(dados.get('_canal_bo_origem_id') or atendimento.get('area_id') or 0),
-                    'numero_boletim': atendimento.get('numero'), 'boletim': atendimento.get('numero'),
-                })
-                cadastros_pendentes[int(canal.id)] = dados; salvar_cadastros_pendentes()
-                pedido = {
-                    'id': pedido_id, 'dados': dict(dados), 'status': 'pronto',
-                    'solicitante_id': int(dados.get('autor_id') or interaction.user.id),
-                    'solicitante_nome': str(dados.get('autor_nome') or interaction.user),
-                    'solicitado_em': dados.get('solicitado_em') or agora_br(), 'canal_fluxo_id': int(canal.id),
-                }
-                _guardar_pedido_atendimento(atendimento, 'procurado_pedidos', pedido_id, pedido)
-                atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
-                if eh_inspetor:
-                    await interaction.edit_original_response(content='⏳ Publicando/atualizando o procurado no canal oficial...')
-                    url = await _publicar_procurado_boletim_aprovado(atendimento, dados, membro)
-                    acao = 'atualizado' if existente else 'publicado'
-                    return await interaction.edit_original_response(content=f'✅ Procurado {acao} diretamente por Inspetor+.\n{url}')
-                await interaction.edit_original_response(content='⏳ Criando a solicitação de autorização para Inspetor+...')
-                solicitacao = await criar_solicitacao_autorizacao(
-                    interaction=interaction, tipo='procurado_boletim', dados=dados,
-                    contexto={'atendimento_id': atendimento.get('id'), 'area_id': int(dados.get('_canal_bo_origem_id') or atendimento.get('area_id') or 0), 'canal_provisorio_id': int(canal.id), 'pedido_id': pedido_id}
-                )
-                pedido['status'] = 'aguardando_autorizacao'; pedido['autorizacao_id'] = solicitacao['id']; pedido['dados'] = dict(dados)
-                _guardar_pedido_atendimento(atendimento, 'procurado_pedidos', pedido_id, pedido)
-                atendimento['procurado_status'] = 'aguardando_autorizacao'; atendimento['procurado_autorizacao_id'] = solicitacao['id']
-                atualizar_atendimento_boletim('id', atendimento.get('id'), atendimento)
-                dados['solicitacao_id'] = solicitacao['id']; dados['status'] = 'AGUARDANDO AUTORIZAÇÃO'
-                cadastros_pendentes[int(canal.id)] = dados; salvar_cadastros_pendentes()
-                try:
-                    await interaction.message.edit(content=f"📩 **{'Atualização' if existente else 'Cadastro'} aguardando autorização do Inspetor+.**\nSolicitação: `{solicitacao['id']}`", view=None)
-                except Exception:
-                    pass
-                await interaction.edit_original_response(content=f"✅ Solicitação `{solicitacao['id']}` enviada para autorização. A alteração só ocorrerá após aprovação de Inspetor+.")
-            except Exception as erro:
-                traceback.print_exc()
-                await enviar_log(f'❌ V116 erro ao finalizar procurado no canal {canal.id}: {type(erro).__name__}: {erro}')
-                try:
-                    await interaction.edit_original_response(content=f'❌ Não foi possível concluir o cadastro. Nada foi apagado.\nErro: `{type(erro).__name__}: {str(erro)[:600]}`')
-                except Exception:
-                    pass
-
-    @discord.ui.button(label='Cancelar', emoji='❌', style=discord.ButtonStyle.red, custom_id='dic_cancelar_procurado')
-    async def cancelar(self, interaction: discord.Interaction, button: Button):
-        canal = interaction.channel
-        if not isinstance(canal, discord.TextChannel):
-            return await interaction.response.send_message('❌ Canal inválido.', ephemeral=True)
-        dados = cadastros_pendentes.get(int(canal.id), {})
-        if interaction.user.id != int(dados.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user):
-            return await interaction.response.send_message('❌ Apenas quem iniciou ou Inspetor+ pode cancelar.', ephemeral=True)
-        if str(dados.get('status') or '').upper() == 'AGUARDANDO AUTORIZAÇÃO':
-            return await interaction.response.send_message('⚠️ A solicitação já foi enviada para autorização.', ephemeral=True)
-        await interaction.response.send_message('✅ Fluxo cancelado.', ephemeral=True)
-        asyncio.create_task(_v59_apagar_canal_temporario(int(canal.id), atraso=2))
-
-
-@bot.listen('on_ready')
-async def v116_bootstrap_investigacoes() -> None:
-    """V118: registra a view persistente, mas NÃO percorre nem altera mesas antigas."""
-    global _V116_BOOTSTRAP_FEITO
-    try:
-        bot.add_view(V116InvestigacaoGuiadaView())
-    except Exception:
-        pass
-    if _V116_BOOTSTRAP_FEITO:
-        return
-    _V116_BOOTSTRAP_FEITO = True
-    print('✅ V118: views da investigação guiada registradas. Mesas antigas não serão alteradas.', flush=True)
-
-
-print(
-    '✅ V116 carregada — investigação guiada em 13 itens, etapas sequenciais, validação automática, '
-    'tarefas guiadas somente em mesas novas, conferência final e fluxo de procurados idempotente.',
-    flush=True,
-)
-
-# =====================================================
-# V116 — INTEGRAÇÃO DIRETA COM DOSSIÊ + BLOQUEIO DE FECHAMENTO INCOMPLETO
-# =====================================================
-_V116_COLETAR_DOSSIE_BASE = coletar_dados_operacionais_mesa
-async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
-    dados = await _V116_COLETAR_DOSSIE_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
-    if not _v118_mesa_guiada_habilitada(int(canal.id)):
-        return dados
-    estado = _v116_estado(int(canal.id), False)
-    if not isinstance(estado, dict):
-        return dados
-    guiado = estado.get('dados') if isinstance(estado.get('dados'), dict) else {}
-    # A estrutura validada pelo roteiro tem prioridade sobre parsing solto de mensagens.
-    if list(guiado.get('liderancas') or []):
-        dados['liderancas'] = [
-            {'nome': str(p.get('nome') or ''), 'rg': str(p.get('rg') or ''), 'cargo': str(p.get('cargo') or '')}
-            for p in list(guiado.get('liderancas') or []) if isinstance(p, dict)
-        ]
-    if list(guiado.get('membros') or []):
-        dados['integrantes'] = [
-            {'nome': str(p.get('nome') or ''), 'rg': str(p.get('rg') or ''), 'cargo': str(p.get('cargo') or '')}
-            for p in list(guiado.get('membros') or []) if isinstance(p, dict)
-        ]
-    if isinstance(guiado.get('informante'), dict):
-        p = guiado['informante']
-        dados['informantes'] = [{'nome': str(p.get('nome') or ''), 'rg': str(p.get('rg') or ''), 'cargo': 'Informante'}]
-    textos = dados.get('textos_por_topico') if isinstance(dados.get('textos_por_topico'), dict) else {}
-    resumos = dados.get('resumos') if isinstance(dados.get('resumos'), dict) else {}
-    if str(guiado.get('painel_transcricao') or '').strip():
-        painel = str(guiado.get('painel_transcricao') or '').strip()
-        textos['painel'] = list(dict.fromkeys(list(textos.get('painel') or []) + [painel]))
-        resumos['painel'] = painel[:3500]
-    if str(guiado.get('radio') or '').strip():
-        radio = str(guiado.get('radio') or '').strip()
-        textos['radio'] = list(dict.fromkeys(list(textos.get('radio') or []) + [radio]))
-        resumos['radio'] = radio[:1800]
-    crimes = list(guiado.get('crimes') or [])
-    if crimes:
-        linhas_crimes = []
-        for idx, crime in enumerate(crimes, 1):
-            if not isinstance(crime, dict):
-                continue
-            descricao = str(crime.get('descricao') or '').strip()
-            provas = list(crime.get('provas') or [])
-            linhas_crimes.append(f'{idx}. {descricao} | Provas vinculadas: {len(provas)}')
-        bloco = '\n'.join(linhas_crimes)
-        if bloco:
-            textos['crimes'] = list(dict.fromkeys(list(textos.get('crimes') or []) + [bloco]))
-            resumos['crimes'] = bloco[:3500]
-    if str(guiado.get('informante_resumo') or '').strip():
-        resumo_inf = str(guiado.get('informante_resumo') or '').strip()
-        textos['informantes'] = list(dict.fromkeys(list(textos.get('informantes') or []) + [resumo_inf]))
-        resumos['informantes'] = resumo_inf[:3500]
-    dados['textos_por_topico'] = textos
-    dados['resumos'] = resumos
-    dados['investigacao_guiada_v116'] = {
-        'status': estado.get('status'),
-        'concluidos': estado.get('concluidos'),
-        'auditoria_final': estado.get('auditoria_final'),
-    }
-    return dados
-
-
-_V116_FECHAR_MESA_CORE_BASE = fechar_mesa_core
-async def fechar_mesa_core(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
-    canal = getattr(interaction, 'channel', None)
-    if isinstance(canal, discord.TextChannel) and _v118_mesa_guiada_habilitada(int(canal.id)):
-        estado = _v116_estado(int(canal.id), True)
-        if str(estado.get('status') or '').upper() != 'CONCLUIDA':
-            await _v116_ativar_mesa(canal)
-            texto = (
-                '❌ **A mesa ainda não pode ser encerrada.**\n\n'
-                'O roteiro guiado precisa ser concluído e conferido antes da geração do dossiê.\n\n'
-                + _v116_progresso_texto(estado)
-                + '\n\n' + _v116_prompt(estado)
-            )
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(texto[:1900], ephemeral=True)
-                else:
-                    await interaction.response.send_message(texto[:1900], ephemeral=True)
-            except Exception:
-                pass
-            return None
-    return await _V116_FECHAR_MESA_CORE_BASE(interaction, motivo=motivo, dados_confirmacao=dados_confirmacao)
-
-
-# O próprio botão Fechar Mesa já barra antes da tela de confirmação para não dar falsa impressão de fechamento.
-class FecharMesaView(View):
-    def __init__(self, dados_mesa=None):
-        super().__init__(timeout=None)
-        self.dados_mesa = dados_mesa or {}
-
-    @discord.ui.button(label='Fechar Mesa', emoji='🔒', style=discord.ButtonStyle.red, custom_id='dic_fechar_mesa_botao')
-    async def fechar(self, interaction: discord.Interaction, button: Button):
-        canal = interaction.channel
-        if not isinstance(canal, discord.TextChannel):
-            return await interaction.response.send_message('❌ Este botão só funciona dentro de um canal de mesa.', ephemeral=True)
-        if not usuario_pode_fechar_mesa(interaction.user):
-            return await interaction.response.send_message(mensagem_sem_permissao_fechar_mesa(), ephemeral=True)
-        if _v118_mesa_guiada_habilitada(int(canal.id)):
-            estado = _v116_estado(int(canal.id), True)
-            if str(estado.get('status') or '').upper() != 'CONCLUIDA':
-                await _v116_ativar_mesa(canal)
-                topico = await _v116_topico_item(canal, int(estado.get('item') or 1))
-                destino = f'\n📌 Tópico atual: {topico.mention}' if topico else ''
-                return await interaction.response.send_message(
-                    '❌ **Ainda existem etapas obrigatórias da investigação.**\n\n'
-                    + _v116_progresso_texto(estado)
-                    + destino
-                    + '\n\nConclua o roteiro antes de fechar a mesa e gerar o dossiê.',
-                    ephemeral=True,
-                )
-        dados = dict(self.dados_mesa or {})
-        if not dados:
-            mesa_banco = buscar_mesa_por_canal(canal.id)
-            if mesa_banco:
-                dados = {
-                    'nome': f"OPERAÇÃO {mesa_banco.get('familia', canal.name).upper()}",
-                    'comunidade': mesa_banco.get('familia', 'Mapeada em logs'),
-                    'delegado': mesa_banco.get('autor_nome', 'Superintendência DICOR'),
-                    'data_abertura': mesa_banco.get('criada_em', agora_br()),
-                    'processo': f'PF-DICOR-{canal.id}',
-                    'numero': f'INV-{str(canal.id)[-6:]}',
-                }
-        if not dados:
-            dados = {
-                'nome': canal.name.upper(), 'comunidade': 'Setor Mapeado em Campo',
-                'delegado': getattr(interaction.user, 'display_name', str(interaction.user)),
-                'data_abertura': agora_br(), 'processo': f'PF-DICOR-{canal.id}',
-                'numero': f'INV-{str(canal.id)[-6:]}',
-            }
-        self.dados_mesa = dados
-        await interaction.response.send_message(
-            '⚠️ **Confirmação DICOR:** roteiro guiado concluído. Deseja encerrar esta mesa e consolidar o Dossiê Operacional?',
-            view=ConfirmacaoFecharMesaView(dados), ephemeral=True,
-        )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
-        await enviar_log(f'❌ V116 erro no botão Fechar Mesa: {type(error).__name__}: {error}')
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send('❌ O botão de fechar mesa encontrou um erro. Nada foi apagado.', ephemeral=True)
-            else:
-                await interaction.response.send_message('❌ O botão de fechar mesa encontrou um erro. Nada foi apagado.', ephemeral=True)
-        except Exception:
-            pass
-
-
-print('✅ V116 Dossiê: dados estruturados do roteiro entram na coleta final e mesa incompleta não pode ser encerrada.', flush=True)
-
-
-# =====================================================
-# V117 — TAREFAS GUIADAS EM TODOS OS TÓPICOS DA MESA
-# =====================================================
-# Mudança principal em relação à V116:
-# - os 13 tópicos recebem sua tarefa guiada assim que a mesa é ativada;
-# - os itens 5, 11 e 12 publicam APENAS a ETAPA 1 inicialmente;
-# - a ETAPA 2 desses itens só é criada após a confirmação explícita da ETAPA 1;
-# - cada tópico pode ser preenchido sem depender do "item atual" global;
-# - conclusão, rascunho, reanálise e cards de tarefa passam a ser controlados por item.
-
-_V117_ITENS_DUAS_ETAPAS = {5, 11, 12}
-_V117_TOPICOS_CACHE: Dict[int, Tuple[float, Dict[int, discord.Thread]]] = {}
-
-
-async def _v117_mapear_topicos(canal: discord.TextChannel, *, refresh: bool=False) -> Dict[int, discord.Thread]:
-    """Carrega os tópicos uma vez por mesa e mapeia cada tópico ao item correto."""
-    chave_cache = int(canal.id)
-    agora = time.monotonic()
-    cached = _V117_TOPICOS_CACHE.get(chave_cache)
-    if not refresh and cached and (agora - float(cached[0])) < 60:
-        return dict(cached[1])
-    encontrados: Dict[int, discord.Thread] = {}
-    for t in list(getattr(canal, 'threads', []) or []):
-        if isinstance(t, discord.Thread):
-            item = _v117_item_do_topico(t)
-            if item and item not in encontrados:
-                encontrados[item] = t
-    # Mesas antigas podem ter tópicos arquivados. Faz no máximo duas leituras por mesa,
-    # em vez de duas leituras para cada um dos 13 itens.
-    for privado in (False, True):
-        try:
-            async for t in canal.archived_threads(limit=100, private=privado):
-                if not isinstance(t, discord.Thread):
-                    continue
-                item = _v117_item_do_topico(t)
-                if item and item not in encontrados:
-                    encontrados[item] = t
-        except Exception:
-            pass
-    _V117_TOPICOS_CACHE[chave_cache] = (agora, dict(encontrados))
-    return encontrados
-
-
-async def _v116_topico_item(canal: discord.TextChannel, item: int) -> Optional[discord.Thread]:
-    item = int(item)
-    if item == 13 and '_v105_garantir_topico_residencia' in globals():
-        try:
-            mesa = buscar_mesa_por_canal(int(canal.id))
-            await _v105_garantir_topico_residencia(canal, mesa)
-            _V117_TOPICOS_CACHE.pop(int(canal.id), None)
-        except Exception:
-            pass
-    mapa = await _v117_mapear_topicos(canal)
-    topico = mapa.get(item)
-    if topico is None:
-        # Uma atualização de cache cobre tópicos acabados de criar.
-        mapa = await _v117_mapear_topicos(canal, refresh=True)
-        topico = mapa.get(item)
-    if topico is not None:
-        try:
-            if bool(getattr(topico, 'archived', False)):
-                await topico.edit(archived=False, reason='V117: tarefa guiada ativa')
-        except Exception:
-            pass
-    return topico
-
-
-def _v117_migrar_estado(estado: Dict[str, Any]) -> Dict[str, Any]:
-    """Adiciona a estrutura multi-tópico sem perder nenhum dado já salvo pela V116."""
-    if not isinstance(estado, dict):
-        return estado
-    etapas = estado.get('etapas_por_item')
-    if not isinstance(etapas, dict):
-        etapas = {}
-    for item in _V117_ITENS_DUAS_ETAPAS:
-        etapas.setdefault(str(item), 1)
-    item_antigo = int(estado.get('item') or 1)
-    etapa_antiga = int(estado.get('etapa') or 1)
-    if item_antigo in _V117_ITENS_DUAS_ETAPAS and etapa_antiga in {1, 2}:
-        etapas[str(item_antigo)] = max(int(etapas.get(str(item_antigo), 1) or 1), etapa_antiga)
-    estado['etapas_por_item'] = etapas
-
-    rascunhos = estado.get('rascunhos_por_item')
-    if not isinstance(rascunhos, dict):
-        rascunhos = {}
-    rascunho_legado = estado.get('rascunho')
-    if isinstance(rascunho_legado, dict) and rascunho_legado and str(item_antigo) not in rascunhos:
-        rascunhos[str(item_antigo)] = dict(rascunho_legado)
-    estado['rascunhos_por_item'] = rascunhos
-
-    tarefas = estado.get('tarefas_guiadas')
-    if not isinstance(tarefas, dict):
-        tarefas = {}
-    mid = int(estado.get('tarefa_mensagem_id') or 0)
-    tid = int(estado.get('tarefa_topico_id') or 0)
-    ti = int(estado.get('tarefa_item') or 0)
-    te = int(estado.get('tarefa_etapa') or 0)
-    if mid and tid and ti:
-        chave = f'{ti}:{te if te in {1,2} else 1}'
-        tarefas.setdefault(chave, {
-            'mensagem_id': mid,
-            'topico_id': tid,
-            'item': ti,
-            'etapa': te if te in {1, 2} else 1,
-            'status': 'ATIVA',
-        })
-    estado['tarefas_guiadas'] = tarefas
-    estado['versao'] = max(int(estado.get('versao') or 116), 117)
-    return estado
-
-
-def _v117_etapa_item(estado: Dict[str, Any], item: int) -> int:
-    _v117_migrar_estado(estado)
-    if int(item) not in _V117_ITENS_DUAS_ETAPAS:
-        return 1
-    try:
-        etapa = int((estado.get('etapas_por_item') or {}).get(str(int(item)), 1) or 1)
-    except Exception:
-        etapa = 1
-    return 2 if etapa >= 2 else 1
-
-
-def _v117_rascunho_item(estado: Dict[str, Any], item: int) -> Dict[str, Any]:
-    _v117_migrar_estado(estado)
-    rascunhos = estado.setdefault('rascunhos_por_item', {})
-    atual = rascunhos.get(str(int(item)))
-    if not isinstance(atual, dict):
-        atual = {}
-        rascunhos[str(int(item))] = atual
-    return atual
-
-
-def _v117_item_do_topico(topico: Any) -> int:
-    nome = _v116_norm(getattr(topico, 'name', '') or '')
-    if not nome:
-        return 0
-    # Mais específicos primeiro para impedir colisões como "produção" dentro de outros títulos.
-    ordem = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
-    for item in ordem:
-        for chave in _v116_topico_chaves(item):
-            ck = _v116_norm(chave)
-            if ck and ck in nome:
-                return int(item)
-    return 0
-
-
-def _v117_com_estado_item(estado: Dict[str, Any], item: int, etapa: Optional[int]=None):
-    """Contexto simples: prepara item/etapa/rascunho para reaproveitar o validador V116."""
-    class _Ctx:
-        def __enter__(self_nonlocal):
-            _v117_migrar_estado(estado)
-            self_nonlocal.ant_item = int(estado.get('item') or 1)
-            self_nonlocal.ant_etapa = int(estado.get('etapa') or 1)
-            self_nonlocal.ant_rascunho = estado.get('rascunho') if isinstance(estado.get('rascunho'), dict) else {}
-            estado['item'] = int(item)
-            estado['etapa'] = int(etapa if etapa is not None else _v117_etapa_item(estado, item))
-            estado['rascunho'] = _v117_rascunho_item(estado, item)
-            return estado
-        def __exit__(self_nonlocal, exc_type, exc, tb):
-            estado.setdefault('rascunhos_por_item', {})[str(int(item))] = dict(estado.get('rascunho') or {})
-            estado['item'] = self_nonlocal.ant_item
-            estado['etapa'] = self_nonlocal.ant_etapa
-            estado['rascunho'] = self_nonlocal.ant_rascunho
-            return False
-    return _Ctx()
-
-
-def _v117_faltando_item(estado: Dict[str, Any], item: int, etapa: Optional[int]=None) -> List[str]:
-    with _v117_com_estado_item(estado, item, etapa):
-        return list(_v116_faltando(estado) or [])
-
-
-def _v117_prompt_item(estado: Dict[str, Any], item: int, etapa: Optional[int]=None) -> str:
-    with _v117_com_estado_item(estado, item, etapa):
-        return str(_v116_prompt(estado) or '')
-
-
-def _v117_sincronizar_item_referencia(estado: Dict[str, Any]) -> None:
-    """Mantém os campos legados item/etapa apontando para a primeira pendência."""
+    """Resumo curto para o painel principal. A lista completa fica no botão Ver tarefas."""
     _v117_migrar_estado(estado)
     concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
-    pendente = next((i for i in range(1, 14) if str(i) not in concluidos), 14)
-    estado['item'] = int(pendente)
-    estado['etapa'] = _v117_etapa_item(estado, pendente) if pendente <= 13 else 1
-    if pendente > 13:
-        estado['status'] = 'CONCLUIDA'
-        estado.setdefault('concluida_em', agora_br())
-    elif str(estado.get('status') or '').upper() != 'CONCLUIDA':
-        estado['status'] = 'ATIVA'
-
-
-def _v116_progresso_texto(estado: Dict[str, Any]) -> str:
-    _v117_migrar_estado(estado)
-    concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
+    total = len(concluidos)
+    pendente = next((i for i in range(1, 14) if str(i) not in concluidos), None)
     linhas = [
-        '🧭 **ROTEIRO GUIADO DE INVESTIGAÇÃO — V117**',
-        f'✅ Itens concluídos: **{len(concluidos)}/13**',
-        '',
+        '📋 **TAREFAS DA INVESTIGAÇÃO**',
+        f'Progresso: **{total}/13** concluídos',
     ]
-    for item in range(1, 14):
-        if str(item) in concluidos:
-            marca = '✅'
-            detalhe = 'Concluído'
-        else:
-            etapa = _v117_etapa_item(estado, item)
-            faltas = _v117_faltando_item(estado, item, etapa)
-            if item in _V117_ITENS_DUAS_ETAPAS and etapa == 2:
-                marca = '🟡' if faltas else '🟢'
-                detalhe = ('Etapa 2/2 — falta: ' + '; '.join(faltas[:2])) if faltas else 'Etapa 2/2 pronta para confirmar'
-            else:
-                marca = '⏳' if faltas else '🟢'
-                etapa_txt = 'Etapa 1/2 — ' if item in _V117_ITENS_DUAS_ETAPAS else ''
-                detalhe = (etapa_txt + 'falta: ' + '; '.join(faltas[:2])) if faltas else (etapa_txt + 'pronto para confirmar')
-        linhas.append(f'{marca} **{item}. {_v116_item_titulo(item)}** — {detalhe}')
-    if len(concluidos) >= 13:
-        linhas.extend(['', '🏁 Status: **INVESTIGAÇÃO CONCLUÍDA E CONFERIDA**'])
+    if pendente is None:
+        linhas.append('✅ **Investigação concluída.**')
     else:
-        linhas.extend(['', '📌 Todas as tarefas já estão distribuídas nos respectivos tópicos.'])
+        etapa = _v117_etapa_item(estado, pendente)
+        etapa_txt = f' • Etapa {etapa}/2' if pendente in _V117_ITENS_DUAS_ETAPAS else ''
+        faltas = _v117_faltando_item(estado, pendente, etapa)
+        situacao = 'Pronto para concluir' if not faltas else 'Pendente'
+        linhas.append(f'Atual: **{pendente}. {_v116_item_titulo(pendente)}{etapa_txt}**')
+        linhas.append(f'Status: **{situacao}**')
+    linhas.append('Use **Ver tarefas** para consultar todos os itens.')
     return '\n'.join(linhas)
 
 
 async def _v116_atualizar_painel(canal: discord.TextChannel, estado: Dict[str, Any]) -> None:
+    """V119: usa o painel de tarefas já existente; não cria um segundo painel/roteiro no canal da mesa."""
     _v117_migrar_estado(estado)
-    texto = _v116_progresso_texto(estado) + '\n\nUse os botões abaixo para consultar, concluir ou reanalisar uma tarefa.'
+    texto = _v116_progresso_texto(estado)
     mid = int(estado.get('painel_mensagem_id') or 0)
-    msg = await _v116_editar_mensagem_segura(canal, mid, content=texto, view=V116InvestigacaoGuiadaView()) if mid else None
+    msg = await _v116_editar_mensagem_segura(canal, mid, content=texto, view=GerenciamentoTarefasView()) if mid else None
     if msg is None:
         try:
-            historico = [m async for m in canal.history(limit=100)]
-            existente = next((m for m in historico if getattr(m.author, 'bot', False) and ('ROTEIRO GUIADO DE INVESTIGAÇÃO — V116' in str(m.content or '') or 'ROTEIRO GUIADO DE INVESTIGAÇÃO — V117' in str(m.content or ''))), None)
-            if existente:
-                await existente.edit(content=texto, view=V116InvestigacaoGuiadaView())
+            historico = [m async for m in canal.history(limit=120)]
+            # Prioridade: reaproveitar o painel GERENCIAMENTO DE TAREFAS criado pela mesa.
+            existente = next((m for m in historico if getattr(m.author, 'bot', False) and 'GERENCIAMENTO DE TAREFAS' in str(m.content or '')), None)
+            # Compatibilidade com uma mesa de teste criada na V116/V117: edita o painel antigo em vez de duplicar.
+            if existente is None:
+                existente = next((m for m in historico if getattr(m.author, 'bot', False) and ('ROTEIRO GUIADO DE INVESTIGAÇÃO — V116' in str(m.content or '') or 'ROTEIRO GUIADO DE INVESTIGAÇÃO — V117' in str(m.content or ''))), None)
+            if existente is not None:
+                await existente.edit(content=texto, view=GerenciamentoTarefasView())
                 msg = existente
             else:
-                msg = await canal.send(texto, view=V116InvestigacaoGuiadaView())
+                # Só ocorre se o painel base tiver sido removido manualmente.
+                msg = await canal.send(texto, view=GerenciamentoTarefasView())
         except Exception as erro:
-            await enviar_log(f'⚠️ V117 não publicou painel guiado na mesa {canal.id}: {erro}')
+            await enviar_log(f'⚠️ V119 não atualizou o painel de tarefas da mesa {canal.id}: {erro}')
             return
     estado['painel_mensagem_id'] = int(msg.id)
-    # Não altera item/etapa aqui: durante a validação de um tópico esses campos
-    # são temporariamente usados para reaproveitar o validador V116.
     _v116_gravar_estado(estado)
 
 
@@ -53868,10 +52707,48 @@ class V116InvestigacaoGuiadaView(View):
 
 
 class GerenciamentoTarefasView(View):
+    """Painel principal enxuto: consulta das tarefas + tarefa manual."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label='Criar Tarefa', emoji='➕', style=discord.ButtonStyle.green, custom_id='dic_mesa_criar_tarefa_v1')
+    @discord.ui.button(label='Ver tarefas', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_mesa_ver_tarefas_v1', row=0)
+    async def ver(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        canal_mesa, _mesa = await _resolver_mesa_tarefas(interaction.channel)
+        if canal_mesa is None:
+            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa de investigação válida.', ephemeral=True)
+        linhas: List[str] = []
+        estado = _v116_estado(canal_mesa.id, False) if _v118_mesa_guiada_habilitada(int(canal_mesa.id)) else None
+        if isinstance(estado, dict):
+            _v117_migrar_estado(estado)
+            concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
+            for item in range(1, 14):
+                if str(item) in concluidos:
+                    continue
+                etapa = _v117_etapa_item(estado, item)
+                topico = await _v116_topico_item(canal_mesa, item)
+                destino = topico.mention if topico else 'tópico não encontrado'
+                faltas = _v117_faltando_item(estado, item, etapa)
+                etapa_txt = f' • E{etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
+                status = '✅ Pronto' if not faltas else '⏳ Pendente'
+                linhas.append(f'{status} **{item}. {_v116_item_titulo(item)}{etapa_txt}** — {destino}')
+
+        tarefas = [t for t in _carregar_tarefas().values() if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id) and t.get('status') != 'CONCLUIDA']
+        tarefas.sort(key=lambda t: int(t.get('numero') or 0))
+        for t in tarefas[:8]:
+            topico_id = int(t.get('topico_destino_id') or t.get('canal_id') or 0)
+            destino = f'<#{topico_id}>' if topico_id else 'Não informado'
+            linhas.append(f"📌 **Manual {int(t.get('numero', 0)):03d}** — {destino}")
+
+        if not linhas:
+            return await interaction.followup.send('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
+        conteudo = '📋 **TAREFAS PENDENTES**\n\n' + '\n'.join(linhas)
+        partes = [conteudo[i:i+1850] for i in range(0, len(conteudo), 1850)]
+        await interaction.followup.send(partes[0], ephemeral=True)
+        for parte in partes[1:]:
+            await interaction.followup.send(parte, ephemeral=True)
+
+    @discord.ui.button(label='Tarefa manual', emoji='➕', style=discord.ButtonStyle.secondary, custom_id='dic_mesa_criar_tarefa_v1', row=0)
     async def criar(self, interaction: discord.Interaction, button: Button):
         if not usuario_e_administrador(interaction.user):
             return await interaction.response.send_message('❌ Somente Inspetor+ pode criar tarefas manuais.', ephemeral=True)
@@ -53882,49 +52759,13 @@ class GerenciamentoTarefasView(View):
         topicos = await _listar_topicos_tarefa(canal_mesa, mesa)
         if not topicos:
             return await interaction.followup.send('❌ Nenhum tópico da mesa foi encontrado.', ephemeral=True)
-        await interaction.followup.send('📌 **CRIAR TAREFA MANUAL**\n\nEscolha em qual tópico a tarefa será publicada.', view=SelecionarTopicoTarefaView(int(canal_mesa.id), topicos), ephemeral=True)
-
-    @discord.ui.button(label='Ver Tarefas Pendentes', emoji='📋', style=discord.ButtonStyle.blurple, custom_id='dic_mesa_ver_tarefas_v1')
-    async def ver(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True, thinking=False)
-        canal_mesa, _mesa = await _resolver_mesa_tarefas(interaction.channel)
-        if canal_mesa is None:
-            return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa de investigação válida.', ephemeral=True)
-        linhas: List[str] = []
-        # V118: mesas antigas continuam mostrando apenas tarefas manuais.
-        estado = _v116_estado(canal_mesa.id, False) if _v118_mesa_guiada_habilitada(int(canal_mesa.id)) else None
-        if isinstance(estado, dict):
-            _v117_migrar_estado(estado)
-            for item in range(1, 14):
-                if str(item) in (estado.get('concluidos') or {}):
-                    continue
-                etapa = _v117_etapa_item(estado, item)
-                topico = await _v116_topico_item(canal_mesa, item)
-                destino = topico.mention if topico else 'tópico não encontrado'
-                faltas = _v117_faltando_item(estado, item, etapa)
-                etapa_txt = f' • E{etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
-                situacao = ('Falta: ' + '; '.join(faltas[:2])) if faltas else 'Pronto para concluir'
-                linhas.append(f'🎯 **{item}. {_v116_item_titulo(item)}{etapa_txt}** — {destino}\n{situacao}')
-        tarefas = [t for t in _carregar_tarefas().values() if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id) and t.get('status') != 'CONCLUIDA']
-        tarefas.sort(key=lambda t: int(t.get('numero') or 0))
-        for t in tarefas[:8]:
-            topico_id = int(t.get('topico_destino_id') or t.get('canal_id') or 0)
-            destino = f'<#{topico_id}>' if topico_id else 'Não informado'
-            linhas.append(f"📌 **Manual Nº {int(t.get('numero', 0)):03d}** — {destino}\n{str(t.get('objetivo', ''))[:100]}")
-        if not linhas:
-            return await interaction.followup.send('✅ Não existem tarefas pendentes nesta mesa.', ephemeral=True)
-        conteudo = '📋 **TAREFAS PENDENTES DA MESA**\n\n' + '\n\n'.join(linhas)
-        # Discord limita mensagens; divide sem perder a visão geral.
-        partes = [conteudo[i:i+1850] for i in range(0, len(conteudo), 1850)]
-        await interaction.followup.send(partes[0], ephemeral=True)
-        for parte in partes[1:]:
-            await interaction.followup.send(parte, ephemeral=True)
+        await interaction.followup.send('Escolha o tópico da tarefa:', view=SelecionarTopicoTarefaView(int(canal_mesa.id), topicos), ephemeral=True)
 
 
 # Mantém o fechamento coerente com o novo modelo paralelo: item/etapa legado sempre aponta
 # para a primeira pendência, mas o progresso mostra todos os tópicos.
 print(
-    '✅ V118 carregada — tarefas guiadas distribuídas em TODOS os tópicos SOMENTE para mesas novas; '
+    '✅ V119 carregada — painel de tarefas unificado e enxuto; recuperação não invade canais de controle; B2 normalizado; '
     'itens 5/11/12 liberam a Etapa 2 somente após concluir a Etapa 1.',
     flush=True,
 )
