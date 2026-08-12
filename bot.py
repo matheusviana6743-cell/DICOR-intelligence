@@ -51900,6 +51900,7 @@ _V116_BOOTSTRAP_FEITO = False
 # V118: o roteiro guiado é opt-in por mesa. Somente mesas NOVAS, criadas já com
 # esta versão, recebem a marca abaixo. Mesas antigas permanecem 100% no fluxo legado.
 _V118_GUIADA_MARCADOR = 'investigacao_guiada_v118'
+_V122_TAREFAS_MESAS_MARCADOR = 'tarefas_mesas_v122'
 
 def _v118_mesa_guiada_habilitada(canal_id: int) -> bool:
     alvo = int(canal_id or 0)
@@ -51928,6 +51929,39 @@ def _v118_marcar_mesa_nova(canal_id: int) -> bool:
         mesa[_V118_GUIADA_MARCADOR] = True
         mesa['investigacao_guiada_versao'] = 118
         mesa['investigacao_guiada_ativada_em'] = agora_br()
+        alterou = True
+        break
+    if alterou:
+        salvar_mesas(mesas)
+    return alterou
+
+def _v122_mesa_tarefas_habilitada(canal_id: int) -> bool:
+    alvo = int(canal_id or 0)
+    if not alvo:
+        return False
+    try:
+        for mesa in carregar_mesas() or []:
+            if not isinstance(mesa, dict):
+                continue
+            if int(mesa.get('canal_id') or 0) != alvo:
+                continue
+            return bool(mesa.get(_V122_TAREFAS_MESAS_MARCADOR) is True)
+    except Exception:
+        traceback.print_exc()
+    return False
+
+def _v122_marcar_mesa_nova(canal_id: int) -> bool:
+    alvo = int(canal_id or 0)
+    if not alvo:
+        return False
+    mesas = carregar_mesas() or []
+    alterou = False
+    for mesa in mesas:
+        if not isinstance(mesa, dict) or int(mesa.get('canal_id') or 0) != alvo:
+            continue
+        mesa[_V122_TAREFAS_MESAS_MARCADOR] = True
+        mesa['tarefas_mesas_versao'] = 122
+        mesa['tarefas_mesas_ativada_em'] = agora_br()
         alterou = True
         break
     if alterou:
@@ -52972,7 +53006,7 @@ async def v116_coletar_investigacao_guiada(msg: discord.Message) -> None:
     canal_mesa = msg.channel.parent
     if not isinstance(canal_mesa, discord.TextChannel):
         return
-    if not _v118_mesa_guiada_habilitada(int(canal_mesa.id)):
+    if not _v122_mesa_tarefas_habilitada(int(canal_mesa.id)):
         return
     estado = _v116_estado(canal_mesa.id, False)
     if not isinstance(estado, dict) or str(estado.get('status') or '').upper() != 'ATIVA':
@@ -53585,6 +53619,123 @@ async def _v117_localizar_tarefa_existente(topico: discord.Thread, item: int, et
     return None
 
 
+def _v122_status_tarefa_guiada(registro: Dict[str, Any]) -> str:
+    status = str((registro or {}).get('status') or 'ATIVA').upper()
+    return {
+        'ATIVA': 'Pendente',
+        'AGUARDANDO_CONCLUSAO': 'Finalizada pelo agente; aguardando conclusao',
+        'CONCLUIDA': 'Concluida',
+    }.get(status, status.title() if status else 'Pendente')
+
+
+def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> str:
+    _v117_migrar_estado(estado)
+    tarefas = estado.setdefault('tarefas_guiadas', {})
+    chave = f'{int(item)}:{int(etapa)}'
+    registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+    mesa = buscar_mesa_por_canal(int(canal.id)) or {}
+    autor_id = int(mesa.get('autor_id') or 0) if isinstance(mesa, dict) else 0
+    criador = f'<@{autor_id}>' if autor_id else 'Nao identificado'
+    etapa_txt = f'\n**ETAPA {int(etapa)}/2**' if int(item) in _V117_ITENS_DUAS_ETAPAS else ''
+    responsavel_id = int((registro or {}).get('responsavel_id') or (registro or {}).get('finalizada_por_id') or 0)
+    responsavel_txt = f'\n**Responsavel:** <@{responsavel_id}>' if responsavel_id else ''
+    faltas = _v117_faltando_item(estado, int(item), int(etapa))
+    checklist = '; '.join(faltas[:4]) if faltas else 'Material minimo completo; revise e finalize a tarefa.'
+    return (
+        f'🎯 **TAREFA GUIADA — ITEM {int(item)} — {_v116_item_titulo(int(item))}**\n\n'
+        f'**Tarefa:** {_v116_item_titulo(int(item))}'
+        f'{etapa_txt}\n'
+        f'**Status:** {_v122_status_tarefa_guiada(registro)}'
+        f'{responsavel_txt}\n'
+        f'**Mesa criada por:** {criador}\n\n'
+        f'**Checklist atual:** {checklist}\n'
+        '> Envie o material neste topico. Use **Finalizar tarefa** quando estiver pronto; a conclusao definitiva exige autorizacao interna.'
+    )
+
+
+async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
+    try:
+        await interaction.message.edit(
+            content=_v122_texto_tarefa_guiada(canal, estado, item, etapa),
+            view=V122TarefaGuiadaView(),
+        )
+    except Exception:
+        pass
+
+
+class V122TarefaGuiadaView(View):
+    """Painel compacto das tarefas guiadas para mesas criadas a partir da V122."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _contexto_item(self, interaction: discord.Interaction) -> Tuple[Optional[discord.TextChannel], Optional[Dict[str, Any]], int]:
+        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
+        if canal is None or not _v122_mesa_tarefas_habilitada(int(canal.id)):
+            return None, None, 0
+        estado = _v116_estado(canal.id, True)
+        if not isinstance(estado, dict):
+            return canal, None, 0
+        _v117_migrar_estado(estado)
+        item = _v117_item_do_topico(interaction.channel) if isinstance(interaction.channel, discord.Thread) else 0
+        if not item:
+            _v117_sincronizar_item_referencia(estado)
+            item = int(estado.get('item') or 1)
+        return canal, estado, item
+
+    @discord.ui.button(label='Finalizar tarefa', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_v122_tarefa_finalizar', row=0)
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        canal, estado, item = await self._contexto_item(interaction)
+        if canal is None or estado is None:
+            return await interaction.followup.send('❌ Esta tarefa nao esta vinculada a uma mesa nova valida.', ephemeral=True)
+        async with _v116_lock(canal.id):
+            estado = _v116_estado(canal.id, True)
+            _v117_migrar_estado(estado)
+            if str(item) in (estado.get('concluidos') or {}):
+                return await interaction.followup.send('✅ Esta tarefa ja foi concluida.', ephemeral=True)
+            etapa = _v117_etapa_item(estado, item)
+            faltas = _v117_faltando_item(estado, item, etapa)
+            if faltas:
+                return await interaction.followup.send('❌ A tarefa ainda esta incompleta.\n**Falta:** ' + '; '.join(faltas) + '.', ephemeral=True)
+            tarefas = estado.setdefault('tarefas_guiadas', {})
+            chave = f'{int(item)}:{int(etapa)}'
+            registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+            registro.update({
+                'item': int(item),
+                'etapa': int(etapa),
+                'status': 'AGUARDANDO_CONCLUSAO',
+                'finalizada_por_id': int(interaction.user.id),
+                'finalizada_em': agora_br(),
+            })
+            tarefas[chave] = registro
+            _v116_gravar_estado(estado)
+            await _v122_editar_painel_tarefa(interaction, canal, estado, item, etapa)
+        await interaction.followup.send('✅ Tarefa finalizada. Agora aguarda conclusao autorizada.', ephemeral=True)
+
+    @discord.ui.button(label='Concluir tarefa', emoji='🛡️', style=discord.ButtonStyle.primary, custom_id='dic_v122_tarefa_concluir', row=0)
+    async def concluir(self, interaction: discord.Interaction, button: Button):
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message('❌ Somente usuarios autorizados podem concluir tarefas.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        canal, estado, item = await self._contexto_item(interaction)
+        if canal is None or estado is None:
+            return await interaction.followup.send('❌ Esta tarefa nao esta vinculada a uma mesa nova valida.', ephemeral=True)
+        async with _v116_lock(canal.id):
+            estado = _v116_estado(canal.id, True)
+            _v117_migrar_estado(estado)
+            if str(item) in (estado.get('concluidos') or {}):
+                return await interaction.followup.send('✅ Esta tarefa ja foi concluida.', ephemeral=True)
+            etapa = _v117_etapa_item(estado, item)
+            tarefas = estado.setdefault('tarefas_guiadas', {})
+            chave = f'{int(item)}:{int(etapa)}'
+            registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+            if str(registro.get('status') or '').upper() != 'AGUARDANDO_CONCLUSAO':
+                return await interaction.followup.send('⚠️ A tarefa precisa ser finalizada antes da conclusao.', ephemeral=True)
+            ok, texto = await _v117_concluir_item(canal, estado, item)
+        await interaction.followup.send(texto, ephemeral=True)
+
+
 async def _v117_publicar_tarefa_item(canal: discord.TextChannel, estado: Dict[str, Any], item: int, *, nova: bool=False) -> Optional[discord.Message]:
     _v117_migrar_estado(estado)
     item = int(item)
@@ -53603,32 +53754,40 @@ async def _v117_publicar_tarefa_item(canal: discord.TextChannel, estado: Dict[st
         + prompt
         + '\n\n> Envie o material **neste tópico**. O bot valida este item de forma independente e informa exatamente o que estiver faltando.'
     )
+    usar_v122 = _v122_mesa_tarefas_habilitada(int(canal.id))
+    if usar_v122:
+        texto = _v122_texto_tarefa_guiada(canal, estado, item, etapa)
+    view_tarefa = V122TarefaGuiadaView() if usar_v122 else V116InvestigacaoGuiadaView()
     tarefas = estado.setdefault('tarefas_guiadas', {})
     chave = f'{item}:{etapa}'
     registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+    status_atual = str(registro.get('status') or 'ATIVA').upper()
     msg = None
     if registro and not nova:
         rid = int(registro.get('mensagem_id') or 0)
         rtid = int(registro.get('topico_id') or 0)
         if rid and rtid == int(topico.id):
-            msg = await _v116_editar_mensagem_segura(topico, rid, content=texto, view=V116InvestigacaoGuiadaView())
+            msg = await _v116_editar_mensagem_segura(topico, rid, content=texto, view=view_tarefa)
     if msg is None:
         msg = await _v117_localizar_tarefa_existente(topico, item, etapa)
         if msg is not None:
             try:
-                await msg.edit(content=texto, view=V116InvestigacaoGuiadaView())
+                await msg.edit(content=texto, view=view_tarefa)
             except Exception:
                 msg = None
     if msg is None:
         try:
-            msg = await topico.send(texto, view=V116InvestigacaoGuiadaView())
+            msg = await topico.send(texto, view=view_tarefa)
         except Exception as erro:
             await enviar_log(f'⚠️ V117 não publicou tarefa do item {item} na mesa {canal.id}: {erro}')
             return None
-    tarefas[chave] = {
+    registro.update({
         'mensagem_id': int(msg.id), 'topico_id': int(topico.id), 'item': item,
-        'etapa': etapa, 'status': 'ATIVA', 'atualizada_em': agora_br(),
-    }
+        'etapa': etapa,
+        'status': status_atual if status_atual in {'AGUARDANDO_CONCLUSAO'} else 'ATIVA',
+        'atualizada_em': agora_br(),
+    })
+    tarefas[chave] = registro
     # Mantém os campos V116 para compatibilidade com funções antigas, sem usá-los como fonte principal.
     estado['tarefa_mensagem_id'] = int(msg.id)
     estado['tarefa_topico_id'] = int(topico.id)
@@ -53790,7 +53949,7 @@ async def _v116_ativar_mesa(canal: discord.TextChannel) -> Optional[Dict[str, An
     if not isinstance(canal, discord.TextChannel):
         return None
     # V118: nunca cria/ativa roteiro em mesa antiga, mesmo que exista estado residual da V116/V117.
-    if not _v118_mesa_guiada_habilitada(int(canal.id)):
+    if not _v122_mesa_tarefas_habilitada(int(canal.id)):
         return None
     estado = _v116_estado(int(canal.id), True)
     if estado is None:
@@ -54231,7 +54390,7 @@ class GerenciamentoTarefasView(View):
             return await interaction.followup.send('❌ Este painel não está vinculado a uma mesa válida.', ephemeral=True)
 
         linhas: List[str] = []
-        if _v118_mesa_guiada_habilitada(int(canal_mesa.id)):
+        if _v122_mesa_tarefas_habilitada(int(canal_mesa.id)):
             estado = _v116_estado(canal_mesa.id, False)
             if isinstance(estado, dict):
                 _v117_migrar_estado(estado)
@@ -54314,7 +54473,7 @@ async def _v116_ativar_mesa(canal: discord.TextChannel) -> Optional[Dict[str, An
     """V121: ativa SOMENTE mesa marcada como nova e só termina depois de tentar os 13 tópicos."""
     if not isinstance(canal, discord.TextChannel):
         return None
-    if not _v118_mesa_guiada_habilitada(int(canal.id)):
+    if not _v122_mesa_tarefas_habilitada(int(canal.id)):
         return None
 
     estado = _v116_estado(int(canal.id), True)
@@ -54324,7 +54483,7 @@ async def _v116_ativar_mesa(canal: discord.TextChannel) -> Optional[Dict[str, An
     _v117_sincronizar_item_referencia(estado)
     if len(estado.get('concluidos') or {}) < 13:
         estado['status'] = 'ATIVA'
-    estado['versao'] = max(int(estado.get('versao') or 0), 121)
+    estado['versao'] = max(int(estado.get('versao') or 0), 122)
     _v116_gravar_estado(estado)
 
     # Garante residência antes do mapeamento final.
@@ -54378,6 +54537,7 @@ async def criar_mesa_core(interaction: discord.Interaction, apelido: str, famili
             cid = int(mesa.get('canal_id') or 0)
             # É uma mesa comprovadamente criada neste clique, então pode receber o marcador.
             _v118_marcar_mesa_nova(cid)
+            _v122_marcar_mesa_nova(cid)
             canal = interaction.guild.get_channel(cid)
             if not isinstance(canal, discord.TextChannel):
                 try:
@@ -54397,6 +54557,10 @@ async def criar_mesa_core(interaction: discord.Interaction, apelido: str, famili
 async def _v121_registrar_views_persistentes() -> None:
     try:
         bot.add_view(V116InvestigacaoGuiadaView())
+    except Exception:
+        pass
+    try:
+        bot.add_view(V122TarefaGuiadaView())
     except Exception:
         pass
     try:
