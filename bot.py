@@ -52770,5 +52770,204 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V120 — CORREÇÃO DEFINITIVA DAS TAREFAS EM MESAS NOVAS
+# =====================================================
+# Correção do bug da V119: a versão mais recente de criar_mesa_core não marcava
+# a mesa como guiada e, por isso, _v116_ativar_mesa() não era executada.
+# Resultado: os tópicos eram criados, mas os cards de tarefa não apareciam.
+#
+# Regras mantidas:
+# - SOMENTE mesas novas recebem investigação guiada;
+# - mesas antigas não são migradas;
+# - todos os 13 tópicos recebem a tarefa correspondente;
+# - itens 5, 11 e 12 publicam só a Etapa 1; Etapa 2 nasce após concluir a Etapa 1.
+
+async def _v120_topicos_mesa_robusto(canal: discord.TextChannel) -> List[discord.Thread]:
+    """Localiza threads ativas/arquivadas e também pelos IDs persistidos da própria mesa."""
+    encontrados: Dict[int, discord.Thread] = {}
+
+    # 1) Cache normal do canal.
+    for t in list(getattr(canal, 'threads', []) or []):
+        if isinstance(t, discord.Thread):
+            encontrados[int(t.id)] = t
+
+    # 2) IDs salvos quando a mesa foi criada. Isso evita depender do cache do Discord
+    # imediatamente após criar todos os tópicos.
+    try:
+        mesa = buscar_mesa_por_canal(int(canal.id)) or {}
+        for tid in list(mesa.get('topicos_ids') or []):
+            try:
+                tid_int = int(tid or 0)
+            except Exception:
+                continue
+            if not tid_int or tid_int in encontrados:
+                continue
+            obj = canal.guild.get_thread(tid_int) if canal.guild else None
+            if isinstance(obj, discord.Thread):
+                encontrados[tid_int] = obj
+                continue
+            try:
+                obj = await canal.guild.fetch_channel(tid_int) if canal.guild else None
+            except Exception:
+                obj = None
+            if isinstance(obj, discord.Thread):
+                encontrados[tid_int] = obj
+    except Exception:
+        traceback.print_exc()
+
+    # 3) Arquivados, para recuperação após reinício sem recriar nada.
+    for privado in (False, True):
+        try:
+            async for t in canal.archived_threads(limit=100, private=privado):
+                if isinstance(t, discord.Thread):
+                    encontrados[int(t.id)] = t
+        except Exception:
+            pass
+
+    return list(encontrados.values())
+
+# Substitui o resolvedor usado por _v116_topico_item.
+_v116_topicos_mesa = _v120_topicos_mesa_robusto
+
+
+async def _v120_validar_publicacao_tarefas(canal: discord.TextChannel, estado: Dict[str, Any]) -> Tuple[int, List[int]]:
+    """Confere os cards visíveis de cada item e tenta publicar novamente somente os faltantes."""
+    publicados = 0
+    faltantes: List[int] = []
+    for item in range(1, 14):
+        if str(item) in (estado.get('concluidos') or {}):
+            continue
+        etapa = _v117_etapa_item(estado, item)
+        topico = await _v116_topico_item(canal, item)
+        if topico is None:
+            faltantes.append(item)
+            continue
+        existente = await _v117_localizar_tarefa_existente(topico, item, etapa)
+        if existente is None:
+            existente = await _v117_publicar_tarefa_item(canal, estado, item, nova=False)
+        if existente is None:
+            faltantes.append(item)
+        else:
+            publicados += 1
+    return publicados, faltantes
+
+
+async def criar_mesa_core(interaction: discord.Interaction, apelido: str, familia: str, observacao: str=''):
+    """V120: criação pelo painel com ativação guiada garantida apenas para a mesa recém-criada."""
+    guild = interaction.guild
+    if guild is None:
+        return await responder_interacao(interaction, '❌ Use dentro de um servidor.', ephemeral=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    categoria = guild.get_channel(CATEGORIA_MESAS_ABERTAS_ID) if CATEGORIA_MESAS_ABERTAS_ID else None
+    overwrites = cargos_equipe_permissoes(guild)
+    overwrites[interaction.user] = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        attach_files=True,
+        read_message_history=True,
+        send_messages_in_threads=True,
+    )
+
+    canal = await guild.create_text_channel(
+        name=f'🕵️┃{slugify(apelido)}-{slugify(familia)}',
+        category=categoria,
+        overwrites=overwrites,
+    )
+
+    try:
+        await canal.send(
+            f"🕵️ **Mesa de Investigação — {familia}**\n"
+            f"👮 **Agente:** {interaction.user.mention}\n"
+            f"📛 **Apelido:** {apelido}\n"
+            f"🏷️ **Organização/Família:** {familia}\n"
+            f"🕒 **Criada em:** {agora_br()}\n"
+            f"📝 **Observação:** {observacao or 'Nenhuma'}"
+        )
+
+        # Este é o ÚNICO painel geral de tarefas. A ativação guiada vai editá-lo,
+        # deixando-o compacto em vez de criar outro painel enorme.
+        await canal.send(
+            '✅ **GERENCIAMENTO DE TAREFAS**\n\nPreparando tarefas da investigação...',
+            view=GerenciamentoTarefasView(),
+        )
+
+        topicos_ids = await criar_topicos_reais_mesa(canal)
+        await canal.send('🔒 Para encerrar esta mesa, clique no botão abaixo.', view=FecharMesaView())
+
+        # O marcador já é persistido junto com o primeiro registro da mesa. Assim não
+        # existe janela em que a mesa foi criada, mas ainda parece "antiga" para o V118.
+        dados_mesa = {
+            'canal_id': canal.id,
+            'nome_canal': canal.name,
+            'apelido': apelido,
+            'familia': familia,
+            'autor_id': interaction.user.id,
+            'autor_nome': str(interaction.user),
+            'status': 'ABERTA',
+            'criada_em': agora_br(),
+            'fechada_em': None,
+            'topicos_ids': topicos_ids,
+            _V118_GUIADA_MARCADOR: True,
+            'investigacao_guiada_versao': 120,
+            'investigacao_guiada_ativada_em': agora_br(),
+        }
+        registrar_mesa(dados_mesa)
+
+        # Mantém compatibilidade com o marcador da V118 e garante a persistência mesmo
+        # se algum wrapper de registrar_mesa alterar o registro posteriormente.
+        _v118_marcar_mesa_nova(int(canal.id))
+
+        estado = await _v116_ativar_mesa(canal)
+        if estado is None:
+            raise RuntimeError('a mesa nova foi criada, mas o roteiro guiado não foi ativado')
+
+        # Validação final: não responde "mesa criada" até conferir os 13 tópicos.
+        publicados, faltantes = await _v120_validar_publicacao_tarefas(canal, estado)
+        if faltantes:
+            # Uma segunda tentativa resolve atrasos de cache/fetch de threads recém-criadas.
+            await asyncio.sleep(1.2)
+            await _v117_publicar_todas_tarefas(canal, estado)
+            publicados, faltantes = await _v120_validar_publicacao_tarefas(canal, estado)
+
+        if faltantes:
+            await enviar_log(
+                f'⚠️ V120: mesa {canal.id} criada, mas faltaram cards guiados nos itens: '
+                + ', '.join(str(x) for x in faltantes)
+            )
+            # Não polui os tópicos. Apenas registra no painel geral que houve falha parcial.
+            try:
+                await canal.send(
+                    '⚠️ **Tarefas parcialmente carregadas.** O bot registrou o erro nos logs e pode tentar novamente ao usar **Ver tarefas**.'
+                )
+            except Exception:
+                pass
+        else:
+            await enviar_log(f'✅ V120: {publicados} tarefas guiadas publicadas na nova mesa {canal.id}.')
+
+        await enviar_log(f'➕ Mesa criada: {canal.mention} | Família: {familia} | Por: {interaction.user.mention}')
+        await responder_interacao(interaction, f'✅ Mesa criada: {canal.mention}', ephemeral=True)
+
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(f'❌ V120: falha ao preparar tarefas da nova mesa {getattr(canal, "id", 0)}: {type(erro).__name__}: {erro}')
+        # A mesa não é apagada. O erro fica explícito para o criador.
+        await responder_interacao(
+            interaction,
+            f'⚠️ A mesa foi criada ({canal.mention}), mas houve falha ao carregar as tarefas automaticamente. '
+            f'Erro: `{type(erro).__name__}`. Nada foi apagado.',
+            ephemeral=True,
+        )
+
+
+print(
+    '✅ V120 carregada — criação de mesa pelo painel agora marca a mesa como nova antes da ativação, '
+    'publica as 13 tarefas nos tópicos e mantém Etapa 2 bloqueada nos itens 5/11/12.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
