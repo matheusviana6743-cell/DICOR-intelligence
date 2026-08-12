@@ -54656,5 +54656,132 @@ class PFEvidenciasModal(Modal, title='Pesquisar na Central de Evidências'):
 
 print('✅ V121 central de evidências: resultados grandes são paginados sem estourar o limite de embeds do Discord.', flush=True)
 
+# =====================================================
+# V123 — Dossiê operacional guiado por tarefas da investigação
+# - Ativo somente para mesas novas marcadas com tarefas_mesas_v122.
+# - Reaproveita a coleta real da mesa/tópicos e o modelo visual aprovado já
+#   materializado pelas funções existentes de brasões, moldura e marca d'água.
+# - Mesas antigas continuam usando integralmente o gerador legado.
+# =====================================================
+
+def _v123_assets_aprovados() -> Dict[str, str]:
+    assets: Dict[str, str] = {}
+    for chave, funcao in (
+        ('brasao_pf', caminho_brasao_pf),
+        ('brasao_dicor', caminho_brasao_dicor),
+        ('marca_dagua', caminho_marca_dagua_transparente),
+        ('moldura', caminho_moldura_dicor_aprovada),
+    ):
+        try:
+            caminho = funcao()
+            if caminho and Path(caminho).exists():
+                assets[chave] = str(caminho)
+        except Exception:
+            traceback.print_exc()
+    return assets
+
+
+def _v123_assinaturas_aprovadas(dados: Dict[str, Any]) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    try:
+        for reg in list(obter_assinaturas_dossie(dados) or [])[:2]:
+            item = dict(reg or {})
+            caminho = item.get('imagem') or item.get('arquivo')
+            if caminho:
+                item['imagem'] = str(caminho)
+            saida.append(item)
+    except Exception:
+        traceback.print_exc()
+    return saida
+
+
+def _v123_preflight_arquivo(caminho: Path, tipo: str) -> List[str]:
+    erros: List[str] = []
+    try:
+        caminho = Path(caminho)
+        minimo = 6000 if str(tipo).lower() == 'pdf' else 3500
+        if not caminho.exists() or caminho.stat().st_size < minimo:
+            return [f'{tipo.upper()} V123 não foi gerado corretamente ou está vazio.']
+        if str(tipo).lower() == 'pdf' and fitz is not None:
+            doc = fitz.open(str(caminho))
+            try:
+                if len(doc) < 15:
+                    erros.append(f'PDF V123 gerou apenas {len(doc)} página(s); esperado: capa, 13 seções e índice de evidências.')
+                texto = '\n'.join(page.get_text('text') for page in doc)
+                normalizado = normalizar_busca(texto)
+                obrigatorios = [
+                    '01 painel', '02 fotos dos lideres', '03 fotos dos membros', '04 radio',
+                    '05 localizacao', '06 crimes da comunidade', '07 bau de lider',
+                    '08 bau de membros', '09 rota de farm', '10 rota de producao',
+                    '11 ingredientes e produtos', '12 informante', '13 residencia do lider',
+                    'indice de evidencias',
+                ]
+                for termo in obrigatorios:
+                    if termo not in normalizado:
+                        erros.append(f'Seção obrigatória ausente no PDF V123: {termo}.')
+                for termo in ('tarefa guiada', 'gerenciamento de tarefas', 'checklist atual', 'finalizar tarefa', 'concluir tarefa'):
+                    if termo in normalizado:
+                        erros.append(f'Mensagem administrativa vazou para o PDF V123: {termo}.')
+            finally:
+                doc.close()
+    except Exception as erro:
+        erros.append(f'Falha no preflight {tipo.upper()} V123: {type(erro).__name__}: {erro}')
+    return erros
+
+
+_V123_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V123_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        if not isinstance(canal, discord.TextChannel) or not _v122_mesa_tarefas_habilitada(int(canal.id)):
+            return dados
+        estado = _v116_estado(int(canal.id), False) or {}
+        if isinstance(estado, dict):
+            _v117_migrar_estado(estado)
+        dados['mesa'] = dict(mesa or buscar_mesa_por_canal(int(canal.id)) or {})
+        try:
+            from dossie_v123 import build_operational_dossier_payload
+            dados['dossie_v123'] = build_operational_dossier_payload(
+                dados,
+                dict(estado or {}),
+                assets=_v123_assets_aprovados(),
+                signatures=_v123_assinaturas_aprovadas(dados),
+            )
+            dados['gerador_dossie'] = 'v123_tarefas_mesas'
+        except Exception as erro:
+            await enviar_log(f'⚠️ V123: falha ao montar payload do dossiê guiado da mesa {canal.id}: {type(erro).__name__}: {erro}. Gerador legado será usado.')
+            dados.pop('dossie_v123', None)
+    except Exception as erro:
+        await enviar_log(f'⚠️ V123: coleta seletiva ignorada na mesa {getattr(canal, "id", "?")}: {type(erro).__name__}: {erro}')
+    return dados
+
+
+_V123_GERAR_PDF_BASE = gerar_pdf_dossie
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    payload = dados.get('dossie_v123') if isinstance(dados, dict) else None
+    if not isinstance(payload, dict):
+        return _V123_GERAR_PDF_BASE(dados, caminho_pdf)
+    from dossie_v123 import generate_pdf
+    generate_pdf(payload, Path(caminho_pdf))
+    erros = _v123_preflight_arquivo(Path(caminho_pdf), 'pdf')
+    if erros:
+        raise RuntimeError('Preflight do dossiê V123 reprovado: ' + ' | '.join(erros[:8]))
+
+
+_V123_GERAR_DOCX_BASE = gerar_docx_dossie
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    payload = dados.get('dossie_v123') if isinstance(dados, dict) else None
+    if not isinstance(payload, dict):
+        return _V123_GERAR_DOCX_BASE(dados, caminho_docx)
+    from dossie_v123 import generate_docx
+    generate_docx(payload, Path(caminho_docx))
+    erros = _v123_preflight_arquivo(Path(caminho_docx), 'docx')
+    if erros:
+        raise RuntimeError('Preflight do DOCX V123 reprovado: ' + ' | '.join(erros[:8]))
+
+
+print('✅ V123 carregada — dossiê operacional guiado por tarefas ativo somente para mesas tarefas_mesas_v122; legado preservado para mesas antigas.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
