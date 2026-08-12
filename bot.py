@@ -50124,7 +50124,7 @@ class ProcuradoBoletimModal(Modal, title='Procurado via Boletim'):
             for cargo_id in set(CARGOS_ADMIN_IDS):
                 cargo=guild.get_role(int(cargo_id))
                 if cargo: overwrites[cargo]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True)
-            canal=await guild.create_text_channel(name=f'📸・procurado-{slugify(nome)[:48]}',category=categoria if isinstance(categoria,discord.CategoryChannel) else None,overwrites=overwrites,reason=f'Procurado via BO por {interaction.user}')
+            bo_slug=numero_curto_boletim(atendimento.get('numero')) or str(atendimento.get('numero') or '').strip() or 'sem-bo'; canal=await guild.create_text_channel(name=f'📸・procurado-{slugify(nome)[:34]}-bo-{slugify(str(bo_slug))[:12]}',category=categoria if isinstance(categoria,discord.CategoryChannel) else None,overwrites=overwrites,reason=f'Procurado via BO {atendimento.get("numero")} por {interaction.user}')
             dados={'nome':nome,'rg':rg,'ultimo_avistamento':ultimo,'caracteristicas':detalhes or 'Não informado','outras':detalhes or '','outras_informacoes':detalhes or '','numero_boletim':atendimento.get('numero'),'boletim':atendimento.get('numero'),'_atendimento_id':atendimento.get('id'),'_canal_bo_origem_id':getattr(interaction.channel,'id',None),'_fluxo_fotos_v58':True,'autor_id':int(interaction.user.id),'autor_nome':str(interaction.user),'etapa_fotos':'aguardando_crimes'}
             if existente:
                 existente=_v111_enriquecer_existente(existente)
@@ -50819,6 +50819,108 @@ async def v112_consistencia_final_ready() -> None:
 
 
 print('✅ V112 carregada — dossiê recalcula complementos salvos sem pendências redundantes; RGs de Buiu Gomes/Arthur Fleker persistem; procurados órfãos são recuperados; fluxo via BO e autorização de finalização permanecem ativos.', flush=True)
+
+
+# =====================================================
+# V113 — AJUSTE RÁPIDO DE CONSISTÊNCIA
+# - RG/Matrícula de Buiu Gomes e Arthur Fleker é resolvido automaticamente
+#   pelo Banco DICOR e, como fallback, pelo RG presente no apelido Discord.
+# - Dossiê não volta a pedir RG já vinculado.
+# - Canal temporário de procurado usa Nome + Nº do BO.
+# =====================================================
+
+_V113_PREPARAR_REQ_BASE = _v110_preparar_requisitos
+
+
+def _v113_rg_autoridade_banco(nome: str) -> str:
+    alvo = str(nome or '').strip()
+    if not alvo:
+        return ''
+    # 1) Banco DICOR: fonte preferencial.
+    try:
+        with _banco_conexao() as db:
+            row = _banco_v3_individuo_por_identificador(db, nome=alvo)
+            if row:
+                rg = _banco_normalizar_rg(str(row['rg'] or ''))
+                if rg:
+                    return rg
+    except Exception as erro:
+        print(f'⚠️ V113 Banco RG {alvo}: {erro}', flush=True)
+    # 2) Discord: aceita apenas número explicitamente vinculado após "|" no nome/apelido.
+    try:
+        alvo_n = normalizar_busca(alvo)
+        candidatos = []
+        for guild in list(getattr(bot, 'guilds', []) or []):
+            for membro in list(getattr(guild, 'members', []) or []):
+                exibido = str(getattr(membro, 'display_name', '') or '')
+                if alvo_n and alvo_n in normalizar_busca(exibido):
+                    m = re.search(r'\|\s*(\d{2,10})\b', exibido)
+                    if m:
+                        candidatos.append(_banco_normalizar_rg(m.group(1)))
+        candidatos = [x for x in dict.fromkeys(candidatos) if x]
+        if len(candidatos) == 1:
+            return candidatos[0]
+    except Exception:
+        pass
+    return ''
+
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    req = dict(_V113_PREPARAR_REQ_BASE(dados) or {})
+    comp = _v111_complementos_para_dados(dados)
+
+    # Nunca substitui um valor humano válido; apenas preenche se ainda estiver vazio.
+    pares = (
+        ('delegado_responsavel_registro', 'Buiu Gomes'),
+        ('delegado_adjunto_registro', 'Arthur Fleker'),
+    )
+    for chave, nome in pares:
+        manual = str(comp.get(chave) or '').strip()
+        if manual and _v102_valor_util(manual):
+            req[chave] = manual
+            continue
+        atual = str(req.get(chave) or '').strip()
+        if _v102_valor_util(atual) and normalizar_busca(atual) not in {'nao informado na mesa','nao informado'}:
+            continue
+        rg = _v113_rg_autoridade_banco(nome)
+        if rg:
+            req[chave] = rg
+
+    return {str(k): str(v or '').strip() for k, v in req.items()}
+
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    """V113: RG de autoridades só vira pendência se realmente não existir em nenhuma fonte vinculada."""
+    req = dict(req or {})
+    faltas: List[str] = []
+    if not _v110_texto_real(req.get('mandado_resumo')) or _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')):
+        faltas.append('mandado_resumo')
+    if not _v110_texto_real(req.get('produto_material')):
+        faltas.append('produto_material')
+    if not _v110_texto_real(req.get('producao_descricao')):
+        faltas.append('producao_descricao')
+    if not _v110_texto_real(req.get('baus_lider_conteudo')):
+        faltas.append('baus_lider_conteudo')
+    if not _v110_texto_real(req.get('baus_membros_conteudo')):
+        faltas.append('baus_membros_conteudo')
+    if not _v110_texto_real(req.get('planejamento_resumo')) or _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')):
+        faltas.append('planejamento_resumo')
+    for chave in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        if not _v102_valor_util(req.get(chave)):
+            faltas.append(chave)
+    # Os dois RGs são dados de cadastro institucional. O bot deve procurá-los sozinho.
+    # Não aparecem mais no formulário de fechamento da mesa.
+    return list(dict.fromkeys(faltas))
+
+
+# Remove os RGs das opções humanas; eles são automáticos a partir desta versão.
+_V103_SECOES = dict(_V103_SECOES)
+_V103_SECOES.pop('autoridades', None)
+_V103_LABELS = {campo[0]: campo[1] for sec in _V103_SECOES.values() for campo in sec['campos']}
+_V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo in sec['campos']]
+
+
+print('✅ V113 carregada — RGs institucionais resolvidos automaticamente e removidos das pendências humanas; canal de procurado usa nome + BO.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
