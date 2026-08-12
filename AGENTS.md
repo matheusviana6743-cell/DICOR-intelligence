@@ -63,6 +63,30 @@ Antes de modificar qualquer coisa:
 - Não mudar estruturas do banco sem avaliar compatibilidade, migração e rollback.
 - Em áreas com wrappers/versionamentos, verificar a cadeia final de chamadas antes de editar.
 
+## Entrega de código completo
+
+Para toda alteração solicitada neste projeto:
+
+- Não entregar apenas exemplos, pseudocódigo, trechos incompletos ou sugestões de implementação.
+- Não usar placeholders como "...", "restante do código", "implemente aqui", "adicione conforme necessário" ou equivalentes.
+- Sempre implementar a solução completa diretamente nos arquivos do projeto.
+- Escrever todo o código necessário para a funcionalidade solicitada.
+- Ao alterar função, classe, View, comando, callback ou fluxo, deixar a implementação completa e funcional.
+- Se a alteração depender de outro trecho do projeto, localizar e ajustar também esse trecho quando necessário.
+- Não deixar tarefas de programação pendentes para o usuário completar manualmente.
+- O resultado final deve ficar pronto para execução e revisão.
+- Antes de dizer que terminou, verificar sintaxe, imports, referências, nomes de funções/classes e integrações afetadas.
+- Executar validações/testes locais que forem seguros.
+- Se algo não puder ser testado localmente, informar claramente, mantendo ainda assim a implementação completa.
+- Não considerar uma tarefa concluída se existir código pela metade.
+
+Sobre "código completo":
+
+- Não é necessário copiar o `bot.py` inteiro para a conversa a cada mudança.
+- O arquivo completo e atualizado deve ficar salvo diretamente no projeto local.
+- Na resposta final, mostrar o que foi alterado, os arquivos afetados e o diff relevante.
+- Se o usuário pedir explicitamente código para copiar e colar manualmente, fornecer o bloco completo necessário, sem omissões.
+
 ## Dados persistentes
 
 O armazenamento persistente de produção deve usar `/data`, normalmente via `DICOR_DATA_DIR=/data`.
