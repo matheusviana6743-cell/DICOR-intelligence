@@ -50922,5 +50922,506 @@ _V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo
 
 print('✅ V113 carregada — RGs institucionais resolvidos automaticamente e removidos das pendências humanas; canal de procurado usa nome + BO.', flush=True)
 
+
+# =====================================================
+# V114 — FECHAMENTO DE MESA REFORMULADO
+# Fluxo novo, simples e idempotente:
+# 1) lê a mesa inteira;
+# 2) reaproveita tudo que já foi preenchido;
+# 3) pede somente fatos que não podem ser inventados;
+# 4) salva imediatamente no /data;
+# 5) reanalisa sem apagar complementos;
+# 6) só arquiva depois do PDF/DOCX validados e enviados.
+# =====================================================
+
+V114_COMPLEMENTOS_VALIDOS = {
+    'mandado_resumo',
+    'planejamento_resumo',
+    'prisao_preventiva',
+    'artigo_juridico',
+    'ameacas',
+    'confrontos',
+    'dificuldade_acesso',
+    'baus_lider_conteudo',
+    'baus_membros_conteudo',
+    'produto_material',
+    'producao_descricao',
+    'delegado_responsavel_registro',
+    'delegado_adjunto_registro',
+}
+
+def _v114_carregar_complementos(canal_id: Any) -> Dict[str, Any]:
+    try:
+        return dict(_v103_complementos_canal(int(canal_id or 0)) or {})
+    except Exception:
+        return {}
+
+def _v114_salvar_complementos(canal_id: Any, alteracoes: Dict[str, Any], usuario: Any=None) -> Dict[str, Any]:
+    """Salva sem depender da lista mutável de campos das versões anteriores."""
+    todos = _v103_todos_complementos()
+    chave = str(int(canal_id or 0))
+    atual = dict(todos.get(chave) or {})
+    for k, v in dict(alteracoes or {}).items():
+        if k not in V114_COMPLEMENTOS_VALIDOS:
+            continue
+        valor = str(v or '').strip()
+        if valor:
+            atual[k] = valor
+    atual['atualizado_em'] = agora_br()
+    atual['atualizado_por_id'] = int(getattr(usuario, 'id', 0) or 0)
+    atual['atualizado_por_nome'] = str(usuario or '')
+    todos[chave] = atual
+    salvar_json(DOSSIE_COMPLEMENTOS_PACIFICACAO_FILE, todos)
+    return atual
+
+_V114_PREPARAR_REQ_BASE = _v110_preparar_requisitos
+
+def _v114_juntar_antigos(comp: Dict[str, Any], prefixo: str, chaves: List[str]) -> str:
+    partes = []
+    for k in chaves:
+        v = str(comp.get(k) or '').strip()
+        if v and normalizar_busca(v) not in {'nao informado', 'nao informado na mesa'}:
+            partes.append(v)
+    if not partes:
+        return ''
+    saida = []
+    vistos = set()
+    for x in partes:
+        k = normalizar_busca(x)
+        if k not in vistos:
+            vistos.add(k)
+            saida.append(x)
+    return '\n'.join(saida)
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    """
+    V114: complemento humano persistido SEMPRE tem prioridade.
+    Nenhum clique em Reanalisar Mesa pode fazer um campo já salvo reaparecer.
+    """
+    req = dict(_V114_PREPARAR_REQ_BASE(dados) or {})
+    canal_id = int(dados.get('canal_id') or 0)
+    comp = _v114_carregar_complementos(canal_id) if canal_id else {}
+    comp_mem = dict(dados.get('complementos_pacificacao') or {})
+    comp.update({k: v for k, v in comp_mem.items() if str(v or '').strip()})
+    dados['complementos_pacificacao'] = dict(comp)
+
+    # Compatibilidade com formulários antigos: consolida os campos anteriores.
+    if not str(comp.get('mandado_resumo') or '').strip():
+        antigo = _v114_juntar_antigos(comp, 'mandado', [
+            'mandado_busca','mandado_terceiros','mandado_oab',
+            'mandado_extensao','mandado_arrombamento','mandado_detidos'
+        ])
+        if antigo:
+            comp['mandado_resumo'] = antigo
+
+    if not str(comp.get('planejamento_resumo') or '').strip():
+        antigo = _v114_juntar_antigos(comp, 'planejamento', [
+            'planejamento_efetivo','planejamento_equipes','planejamento_recursos',
+            'planejamento_estrategia','planejamento_barreiras','planejamento_negociacao',
+            'planejamento_protecao','planejamento_medica','planejamento_institucional'
+        ])
+        if antigo:
+            comp['planejamento_resumo'] = antigo
+
+    # Tudo digitado pelo agente vence inferências e placeholders.
+    for k, v in comp.items():
+        valor = str(v or '').strip()
+        if valor and k in V114_COMPLEMENTOS_VALIDOS:
+            req[k] = valor
+
+    # Autoridades: nunca são bloqueio humano no fechamento.
+    # Primeiro usa o que já foi salvo; depois Banco/Discord.
+    for chave, nome in (
+        ('delegado_responsavel_registro', 'Buiu Gomes'),
+        ('delegado_adjunto_registro', 'Arthur Fleker'),
+    ):
+        manual = str(comp.get(chave) or '').strip()
+        if manual:
+            req[chave] = manual
+            continue
+        atual = str(req.get(chave) or '').strip()
+        if _v102_valor_util(atual) and normalizar_busca(atual) not in {'nao informado','nao informado na mesa'}:
+            continue
+        try:
+            rg = _v113_rg_autoridade_banco(nome)
+        except Exception:
+            rg = ''
+        if rg:
+            req[chave] = rg
+
+    # Localização específica não é mais formulário humano:
+    # mídia do tópico Localização comprova a seção visual.
+    if _v110_tem_midia(dados, 'localizacao') and not _v110_texto_real(req.get('endereco_exato')):
+        req['endereco_exato'] = 'Localização documentada nas evidências visuais do tópico Localização.'
+
+    # Produção: não exige "local de fabricação" digitado.
+    # O tópico/rota e as evidências são a fonte.
+    resumo_prod = _v110_limpar_resumo((dados.get('resumos') or {}).get('producao'), 1800)
+    if resumo_prod and not _v110_texto_real(req.get('producao_descricao')):
+        req['producao_descricao'] = resumo_prod
+    if _v110_tem_midia(dados, 'producao') and not _v110_texto_real(req.get('produto_material')):
+        req['produto_material'] = 'Materiais e produtos documentados nas evidências da seção de produção/fabricação.'
+
+    # Residência: imagem/mapa basta; não pede texto redundante.
+    if _v110_tem_midia(dados, 'residencia'):
+        req['residencia_midia_ok'] = '1'
+
+    # Motivação geral pode ser construída somente com base nos crimes efetivamente registrados.
+    crimes = _v110_limpar_resumo((dados.get('resumos') or {}).get('crimes'), 2000)
+    if crimes and not _v102_valor_util(req.get('motivacao')):
+        req['motivacao'] = 'A medida é fundamentada pelos delitos e pelas evidências consolidadas nesta investigação.'
+
+    dados['complementos_pacificacao'] = dict(comp)
+    return {str(k): str(v or '').strip() for k, v in req.items()}
+
+def _v114_faltas_textuais(req: Dict[str, str]) -> List[str]:
+    """Somente o que realmente depende de decisão/declaração humana."""
+    faltas: List[str] = []
+    if not _v110_texto_real(req.get('mandado_resumo')):
+        faltas.append('mandado_resumo')
+    if not _v110_texto_real(req.get('planejamento_resumo')):
+        faltas.append('planejamento_resumo')
+    for k in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        if not _v102_valor_util(req.get(k)):
+            faltas.append(k)
+    # Baús: as imagens são automáticas; só o conteúdo precisa de descrição humana.
+    if _v110_tem_midia(_V114_DADOS_ATUAIS.get('dados', {}), 'baus_lider') and not _v110_texto_real(req.get('baus_lider_conteudo')):
+        faltas.append('baus_lider_conteudo')
+    if _v110_tem_midia(_V114_DADOS_ATUAIS.get('dados', {}), 'baus_membros') and not _v110_texto_real(req.get('baus_membros_conteudo')):
+        faltas.append('baus_membros_conteudo')
+    return list(dict.fromkeys(faltas))
+
+# Contexto curtíssimo usado apenas durante as chamadas de validação.
+_V114_DADOS_ATUAIS: Dict[str, Any] = {'dados': {}}
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    return _v114_faltas_textuais(dict(req or {}))
+
+def _v103_pendencias_midia(dados: Dict[str, Any]) -> List[str]:
+    """Mídia é validada por seção canônica; baús existentes nunca viram falsa pendência."""
+    faltas = []
+    for secao, texto in (
+        ('painel', 'Painel da organização'),
+        ('localizacao', 'Localização / visão estratégica'),
+        ('producao', 'Produção / fabricação'),
+        ('baus_lider', 'Baú do líder / gerente'),
+        ('baus_membros', 'Baú dos membros'),
+        ('residencia', 'Residência do líder'),
+    ):
+        if not _v110_tem_midia(dados, secao):
+            faltas.append(f'{texto}: falta evidência visual no tópico correspondente.')
+    return faltas
+
+def _v103_pendencias_estrutura(dados: Dict[str, Any]) -> List[str]:
+    """Somente estrutura impossível de fechar com segurança."""
+    faltas = []
+    if not list(dados.get('liderancas') or []):
+        faltas.append('Nenhuma liderança foi identificada na mesa.')
+    if not list(dados.get('integrantes') or []):
+        faltas.append('Nenhum integrante foi identificado na mesa.')
+    try:
+        if len(obter_assinaturas_dossie(dados) or []) < 2:
+            faltas.append('As duas assinaturas institucionais ainda não estão disponíveis.')
+    except Exception:
+        faltas.append('As duas assinaturas institucionais ainda não estão disponíveis.')
+    return faltas
+
+def _v103_status_requisitos(dados: Dict[str, Any]) -> Tuple[Dict[str, str], List[str], List[str], List[str]]:
+    _V114_DADOS_ATUAIS['dados'] = dados
+    req = dict(_v110_preparar_requisitos(dados) or {})
+    dados['requisitos_pacificacao'] = dict(req)
+    return req, _v114_faltas_textuais(req), _v103_pendencias_midia(dados), _v103_pendencias_estrutura(dados)
+
+_V114_LABELS = {
+    'mandado_resumo': 'Diretrizes da busca/pacificação',
+    'planejamento_resumo': 'Planejamento operacional',
+    'prisao_preventiva': 'Prisão preventiva',
+    'artigo_juridico': 'Dispositivo jurídico',
+    'ameacas': 'Ameaças/violência',
+    'confrontos': 'Confrontos com forças de segurança',
+    'dificuldade_acesso': 'Acesso/controle territorial',
+    'baus_lider_conteudo': 'Conteúdo do baú do líder/gerente',
+    'baus_membros_conteudo': 'Conteúdo do baú dos membros',
+}
+
+def _v114_status_grupo(faltas: List[str], grupo: Tuple[str, ...]) -> str:
+    return '✅ Concluído' if not any(k in faltas for k in grupo) else '🟠 Pendente'
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    req, ft, fm, fe = _v103_status_requisitos(dados)
+    linhas = [
+        '🏛️ **FECHAMENTO INTELIGENTE DA MESA — DICOR**',
+        'A mesa foi reanalisada por completo. O sistema reaproveitou textos já salvos, tópicos, imagens e registros existentes.',
+        '',
+        f"**Diretrizes:** {_v114_status_grupo(ft, ('mandado_resumo',))}",
+        f"**Planejamento:** {_v114_status_grupo(ft, ('planejamento_resumo',))}",
+        f"**Fundamentação factual:** {_v114_status_grupo(ft, ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'))}",
+        f"**Baús:** {_v114_status_grupo(ft, ('baus_lider_conteudo','baus_membros_conteudo'))}",
+        f"**Evidências obrigatórias:** {'✅ Concluído' if not fm else '🟠 '+str(len(fm))+' pendência(s)'}",
+        f"**Estrutura:** {'✅ Concluído' if not fe else '🟠 '+str(len(fe))+' pendência(s)'}",
+    ]
+    if ft:
+        linhas += ['', '📝 **Só falta preencher:**']
+        linhas.extend(f'• {_V114_LABELS.get(k, k)}' for k in ft)
+    if fm:
+        linhas += ['', '🖼️ **Só falta anexar na própria mesa:**']
+        linhas.extend(f'• {x}' for x in fm)
+    if fe:
+        linhas += ['', '⚙️ **Problemas estruturais:**']
+        linhas.extend(f'• {x}' for x in fe)
+    if not ft and not fm and not fe:
+        linhas += ['', '✅ **Tudo validado. O dossiê está pronto para ser gerado e a mesa pode ser encerrada com segurança.**']
+    else:
+        linhas += ['', 'Use os botões abaixo. Ao salvar um formulário, ele some automaticamente da lista e não será pedido de novo.']
+    return cortar_discord('\n'.join(linhas), 1950)
+
+class V114TextoModal(discord.ui.Modal):
+    def __init__(self, painel: 'V114FechamentoView', titulo: str, campos: List[Tuple[str,str,str,int,bool]]):
+        super().__init__(title=titulo[:45], timeout=900)
+        self.painel = painel
+        self.campos = campos
+        self.inputs = {}
+        comp = _v114_carregar_complementos(painel.canal_id)
+        req = dict(_v110_preparar_requisitos(painel.dados) or {})
+        for chave, label, placeholder, max_len, multiline in campos[:5]:
+            atual = str(comp.get(chave) or req.get(chave) or '').strip()
+            inp = discord.ui.TextInput(
+                label=label[:45],
+                placeholder=placeholder[:100],
+                required=True,
+                max_length=max_len,
+                style=discord.TextStyle.paragraph if multiline else discord.TextStyle.short,
+                default=atual[:max_len] or None,
+                custom_id=f'v114_{chave}'[:100],
+            )
+            self.inputs[chave] = inp
+            self.add_item(inp)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        alteracoes = {k: str(inp.value or '').strip() for k, inp in self.inputs.items() if str(inp.value or '').strip()}
+        if alteracoes:
+            try:
+                alteracoes = await _v106_aprimorar_campos_ia(alteracoes)
+            except Exception:
+                pass
+            _v114_salvar_complementos(self.painel.canal_id, alteracoes, interaction.user)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        canal = interaction.channel
+        mesa = buscar_mesa_por_canal(canal.id) if isinstance(canal, discord.TextChannel) else None
+        novos = await _v103_diagnostico_mesa(canal, mesa, interaction, self.painel.dados_mesa) if isinstance(canal, discord.TextChannel) else self.painel.dados
+        novos['complementos_pacificacao'] = _v114_carregar_complementos(self.painel.canal_id)
+        nova = V114FechamentoView(self.painel.canal_id, self.painel.dados_mesa, self.painel.motivo, novos)
+        await interaction.edit_original_response(content=_v103_resumo_diagnostico(novos), view=nova)
+
+class V114AcaoButton(discord.ui.Button):
+    def __init__(self, painel: 'V114FechamentoView', *, label: str, emoji: str, secao: str, row: int=0):
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.primary, custom_id=f'v114_{secao}', row=row)
+        self.painel = painel
+        self.secao = secao
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.secao == 'diretrizes':
+            campos = [('mandado_resumo','Diretrizes da busca','Abrangência, terceiros, advogado/OAB, extensão, compartimentos e detidos.',4000,True)]
+            return await interaction.response.send_modal(V114TextoModal(self.painel, 'Diretrizes da busca', campos))
+        if self.secao == 'planejamento':
+            campos = [('planejamento_resumo','Planejamento operacional','Efetivo, recursos, estratégia, acessos, negociação, proteção, apoio médico e acompanhamento.',4000,True)]
+            return await interaction.response.send_modal(V114TextoModal(self.painel, 'Planejamento operacional', campos))
+        if self.secao == 'fatos':
+            campos = [
+                ('prisao_preventiva','Prisão preventiva','Informe o registro ou NÃO SE APLICA.',1000,True),
+                ('artigo_juridico','Dispositivo jurídico','Informe o dispositivo ou NÃO SE APLICA.',1000,True),
+                ('ameacas','Ameaças/violência','Informe o que foi comprovado ou NÃO SE APLICA.',1200,True),
+                ('confrontos','Confrontos','Informe o que foi comprovado ou NÃO SE APLICA.',1200,True),
+                ('dificuldade_acesso','Acesso/controle territorial','Informe o que foi comprovado ou NÃO SE APLICA.',1200,True),
+            ]
+            return await interaction.response.send_modal(V114TextoModal(self.painel, 'Fundamentação factual', campos))
+        if self.secao == 'baus':
+            campos = [
+                ('baus_lider_conteudo','Baú do líder/gerente','Descreva somente o conteúdo visível nas imagens.',1600,True),
+                ('baus_membros_conteudo','Baú dos membros','Descreva somente o conteúdo visível nas imagens.',1600,True),
+            ]
+            return await interaction.response.send_modal(V114TextoModal(self.painel, 'Conteúdo dos baús', campos))
+
+class V114FechamentoView(discord.ui.View):
+    def __init__(self, canal_id: int, dados_mesa: Optional[Dict[str, Any]], motivo: str, dados: Dict[str, Any]):
+        super().__init__(timeout=1800)
+        self.canal_id = int(canal_id)
+        self.dados_mesa = dict(dados_mesa or {})
+        self.motivo = str(motivo or 'Fechada')
+        self.dados = dados
+        self._gerando = False
+        req, ft, fm, fe = _v103_status_requisitos(dados)
+
+        if 'mandado_resumo' in ft:
+            self.add_item(V114AcaoButton(self, label='Diretrizes', emoji='📜', secao='diretrizes', row=0))
+        if 'planejamento_resumo' in ft:
+            self.add_item(V114AcaoButton(self, label='Planejamento', emoji='🗺️', secao='planejamento', row=0))
+        if any(k in ft for k in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso')):
+            self.add_item(V114AcaoButton(self, label='Fundamentação', emoji='⚖️', secao='fatos', row=0))
+        if any(k in ft for k in ('baus_lider_conteudo','baus_membros_conteudo')):
+            self.add_item(V114AcaoButton(self, label='Descrever baús', emoji='📦', secao='baus', row=0))
+
+        atualizar = discord.ui.Button(label='Reanalisar tudo', emoji='🔄', style=discord.ButtonStyle.secondary, custom_id='v114_reanalisar', row=1)
+        atualizar.callback = self._reanalisar
+        self.add_item(atualizar)
+
+        gerar = discord.ui.Button(
+            label='Gerar e encerrar',
+            emoji='✅',
+            style=discord.ButtonStyle.success,
+            custom_id='v114_gerar',
+            row=1,
+            disabled=bool(ft or fm or fe),
+        )
+        gerar.callback = self._gerar
+        self.add_item(gerar)
+
+        cancelar = discord.ui.Button(label='Cancelar', emoji='✖️', style=discord.ButtonStyle.danger, custom_id='v114_cancelar', row=1)
+        cancelar.callback = self._cancelar
+        self.add_item(cancelar)
+
+    async def _reanalisar(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.edit_original_response(content='❌ Mesa não encontrada.', view=None)
+        mesa = buscar_mesa_por_canal(canal.id)
+        novos = await _v103_diagnostico_mesa(canal, mesa, interaction, self.dados_mesa)
+        novos['complementos_pacificacao'] = _v114_carregar_complementos(canal.id)
+        await interaction.edit_original_response(content=_v103_resumo_diagnostico(novos), view=V114FechamentoView(canal.id, self.dados_mesa, self.motivo, novos))
+
+    async def _gerar(self, interaction: discord.Interaction):
+        if self._gerando:
+            return await interaction.response.send_message('⏳ O fechamento já está em andamento.', ephemeral=True)
+        self._gerando = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            self._gerando = False
+            return await interaction.edit_original_response(content='❌ Mesa não encontrada.', view=None)
+        mesa = buscar_mesa_por_canal(canal.id)
+        novos = await _v103_diagnostico_mesa(canal, mesa, interaction, self.dados_mesa)
+        novos['complementos_pacificacao'] = _v114_carregar_complementos(canal.id)
+        req, ft, fm, fe = _v103_status_requisitos(novos)
+        if ft or fm or fe:
+            self._gerando = False
+            return await interaction.edit_original_response(content=_v103_resumo_diagnostico(novos), view=V114FechamentoView(canal.id, self.dados_mesa, self.motivo, novos))
+
+        todos = _v103_todos_complementos()
+        chave = str(canal.id)
+        atual = dict(todos.get(chave) or {})
+        atual['validado_em'] = agora_br()
+        atual['validado_por_id'] = int(interaction.user.id)
+        atual['validado_por_nome'] = str(interaction.user)
+        todos[chave] = atual
+        salvar_json(DOSSIE_COMPLEMENTOS_PACIFICACAO_FILE, todos)
+
+        await interaction.edit_original_response(content='✅ **Validação concluída.** Gerando PDF/DOCX e encerrando a mesa somente após a confirmação dos arquivos...', view=None)
+        confirmacao = dict(self.dados_mesa or {})
+        confirmacao['_v103_complementacao_validada'] = True
+        confirmacao['_v114_validado'] = True
+        confirmacao['_v114_validado_em'] = agora_br()
+        return await _V114_FECHAR_FINAL(interaction, self.motivo, confirmacao)
+
+    async def _cancelar(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content='❌ Encerramento cancelado. A mesa permanece aberta e tudo que já foi preenchido continua salvo.', view=None)
+
+# Núcleo transacional final da V110/V113. Não é reescrito.
+_V114_FECHAR_FINAL = _V103_FECHAR_CORE_ORIGINAL
+
+async def fechar_mesa_core(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
+    """Entrada única do novo fluxo V114."""
+    confirmacao = dict(dados_confirmacao or {})
+    if confirmacao.get('_v114_validado'):
+        return await _V114_FECHAR_FINAL(interaction, motivo, confirmacao)
+
+    canal = getattr(interaction, 'channel', None)
+    if not isinstance(canal, discord.TextChannel):
+        return await _V114_FECHAR_FINAL(interaction, motivo, confirmacao)
+    if not usuario_pode_fechar_mesa(interaction.user):
+        return await responder_interacao(interaction, mensagem_sem_permissao_fechar_mesa(), ephemeral=True)
+
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+
+    try:
+        mesa = buscar_mesa_por_canal(canal.id)
+        dados = await _v103_diagnostico_mesa(canal, mesa, interaction, confirmacao)
+        dados['complementos_pacificacao'] = _v114_carregar_complementos(canal.id)
+        view = V114FechamentoView(canal.id, confirmacao, motivo, dados)
+        conteudo = _v103_resumo_diagnostico(dados)
+        try:
+            await interaction.edit_original_response(content=conteudo, view=view)
+        except Exception:
+            await interaction.followup.send(conteudo, view=view, ephemeral=True)
+    except Exception as erro:
+        await enviar_log(f'❌ V114 diagnóstico de fechamento falhou na mesa {canal.id}: {type(erro).__name__}: {erro}')
+        try:
+            await interaction.followup.send('❌ Não consegui revisar a mesa. Nada foi fechado ou apagado. Tente novamente.', ephemeral=True)
+        except Exception:
+            pass
+
+# Coleta final também injeta os complementos persistidos antes do preflight.
+_V114_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V114_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    dados['complementos_pacificacao'] = _v114_carregar_complementos(canal.id)
+    _V114_DADOS_ATUAIS['dados'] = dados
+    dados['requisitos_pacificacao'] = _v110_preparar_requisitos(dados)
+    return dados
+
+def _v110_pdf_preflight_dados(dados: Dict[str, Any]) -> List[str]:
+    """Preflight V114: exatamente as mesmas regras da tela de fechamento."""
+    req, ft, fm, fe = _v103_status_requisitos(dados)
+    erros = []
+    erros.extend(f'Informação pendente: {_V114_LABELS.get(k, k)}.' for k in ft)
+    erros.extend(fm)
+    erros.extend(fe)
+    return list(dict.fromkeys(erros))
+
+# Checklist coerente com o novo fechamento: RG institucional não bloqueia.
+_V114_CHECKLIST_BASE = _v102_checklist
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    lista = list(_V114_CHECKLIST_BASE(dados, req) or [])
+    saida = []
+    for nome, status in lista:
+        if normalizar_busca(nome) == 'responsaveis assinaturas':
+            status = 'ATENDIDO' if _v110_assinaturas_ok(dados) else 'PENDENTE'
+        if normalizar_busca(nome) == 'localizacao':
+            status = 'ATENDIDO' if _v110_tem_midia(dados, 'localizacao') else 'PENDENTE'
+        if normalizar_busca(nome) in {'materiais produtos','fabricacao producao'}:
+            status = 'ATENDIDO' if _v110_tem_midia(dados, 'producao') else 'PENDENTE'
+        saida.append((nome, status))
+    return saida
+
+# =====================================================
+# V114b — BO com nome estável
+# Desativa a renumeração mensal antiga que fazia 0013 <-> 013.
+# =====================================================
+async def _v73_renomear_area_bo(area_id: int, numero_novo: int) -> bool:
+    return False
+
+async def _v73_reconciliar_boletins_mes(competencia: Optional[str]=None) -> Dict[str, int]:
+    try:
+        r = await _v104_realinhar_boletins_existentes()
+        return {
+            'mensagens': int(r.get('analisados', 0) or 0),
+            'atendimentos': int(r.get('analisados', 0) or 0),
+            'renumerados': 0,
+            'topicos_renomeados': int(r.get('ajustados', 0) or 0),
+            'mensagens_editadas': 0,
+            'arquivos_atualizados': 0,
+            'datas_recuperadas': int(r.get('datas_recuperadas', 0) or 0),
+            'modo': 'numero_oficial_v114',
+        }
+    except Exception as erro:
+        print(f'⚠️ V114 BO estável: {type(erro).__name__}: {erro}', flush=True)
+        return {'mensagens':0,'atendimentos':0,'renumerados':0,'topicos_renomeados':0,'mensagens_editadas':0,'arquivos_atualizados':0,'datas_recuperadas':0,'modo':'numero_oficial_v114'}
+
+print('✅ V114 carregada — fechamento de mesa reformulado, persistência corrigida, apenas pendências humanas reais, baús separados, preflight coerente e BO com nome estável.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
