@@ -51423,5 +51423,455 @@ async def _v73_reconciliar_boletins_mes(competencia: Optional[str]=None) -> Dict
 
 print('✅ V114 carregada — fechamento de mesa reformulado, persistência corrigida, apenas pendências humanas reais, baús separados, preflight coerente e BO com nome estável.', flush=True)
 
+
+# =====================================================
+# V115 — RECUPERAÇÃO ASSISTIDA DE PROCURADOS ÓRFÃOS
+# - Corrige canais antigos que recebiam aviso, mas nenhuma ação.
+# - Lê content + embeds (antes um podia esconder o outro).
+# - Recupera RG do painel antigo/embeds/anexos.
+# - Se faltar BO, oferece botão + modal para informar manualmente.
+# - Após RG + BO, renomeia o canal provisório com NOME + Nº DO BO.
+# - Preserva crimes, fotos, dados existentes e o fluxo de autorização.
+# =====================================================
+
+def _v115_texto_mensagens(msgs: List[discord.Message]) -> str:
+    partes: List[str] = []
+    for msg in list(msgs or []):
+        conteudo = str(getattr(msg, 'content', '') or '').strip()
+        if conteudo:
+            partes.append(conteudo)
+        try:
+            embed_txt = str(coletar_texto_embed(msg) or '').strip()
+        except Exception:
+            embed_txt = ''
+        if embed_txt and normalizar_busca(embed_txt) != normalizar_busca(conteudo):
+            partes.append(embed_txt)
+        # Campos/descrições dos embeds entram explicitamente como segunda rede de segurança.
+        for emb in list(getattr(msg, 'embeds', []) or []):
+            vals = []
+            try:
+                if getattr(emb, 'title', None): vals.append(str(emb.title))
+                if getattr(emb, 'description', None): vals.append(str(emb.description))
+                for campo in list(getattr(emb, 'fields', []) or []):
+                    vals.append(f'{getattr(campo, "name", "")}: {getattr(campo, "value", "")}')
+            except Exception:
+                pass
+            extra = '\n'.join(x for x in vals if str(x).strip()).strip()
+            if extra:
+                partes.append(extra)
+    # deduplica preservando ordem
+    saida, vistos = [], set()
+    for p in partes:
+        chave = normalizar_busca(p)
+        if chave and chave not in vistos:
+            vistos.add(chave); saida.append(p)
+    return '\n'.join(saida)
+
+
+def _v115_extrair_rg(texto: str) -> str:
+    rg = _v112_extrair_rg(texto)
+    if rg:
+        return _banco_normalizar_rg(rg)
+    limpo = re.sub(r'[`*_>#]', ' ', str(texto or ''))
+    padroes = [
+        r'(?i)\bRG\b[^A-Z0-9]{0,12}([0-9]{2,12})\b',
+        r'(?i)\bregistro\s+geral\b[^A-Z0-9]{0,12}([0-9]{2,12})\b',
+        r'(?i)\bpassaporte\b[^A-Z0-9]{0,12}([A-Z0-9.-]{2,24})\b',
+    ]
+    for p in padroes:
+        m = re.search(p, limpo)
+        if m:
+            valor = _banco_normalizar_rg(m.group(1))
+            if valor:
+                return valor
+    return ''
+
+
+def _v115_imagens_mensagens(msgs: List[discord.Message]) -> List[str]:
+    urls: List[str] = []
+    vistos = set()
+    def add(v):
+        s = str(v or '').strip()
+        if s.startswith(('https://','http://')) and s not in vistos:
+            vistos.add(s); urls.append(s)
+    for msg in list(msgs or []):
+        for a in list(getattr(msg, 'attachments', []) or []):
+            ct = str(getattr(a, 'content_type', '') or '').lower()
+            fn = str(getattr(a, 'filename', '') or '').lower()
+            if ct.startswith('image/') or fn.endswith(('.png','.jpg','.jpeg','.webp','.gif')):
+                add(getattr(a, 'url', None) or getattr(a, 'proxy_url', None))
+        for emb in list(getattr(msg, 'embeds', []) or []):
+            try:
+                add(getattr(getattr(emb, 'image', None), 'url', None))
+                add(getattr(getattr(emb, 'thumbnail', None), 'url', None))
+            except Exception:
+                pass
+    return urls
+
+
+def _v115_atendimento_bo(valor: Any) -> Optional[Dict[str, Any]]:
+    texto = str(valor or '').strip()
+    if not texto:
+        return None
+    atend = buscar_atendimento_por_numero(texto)
+    if atend:
+        return atend
+    alvo = numero_curto_boletim(texto)
+    for item in carregar_atendimentos_boletins():
+        try:
+            if numero_curto_boletim(item.get('numero')) == alvo:
+                return item
+        except Exception:
+            continue
+    return None
+
+
+def _v115_nome_canal_procurado(nome: Any, numero_bo: Any) -> str:
+    nome_slug = slugify(str(nome or 'procurado')).strip('-_') or 'procurado'
+    bo = numero_curto_boletim(str(numero_bo or ''))
+    return f'📸・procurado-{nome_slug}-bo-{bo}'[:100]
+
+
+async def _v115_historico_canal(canal: discord.TextChannel) -> List[discord.Message]:
+    msgs: List[discord.Message] = []
+    try:
+        async for msg in canal.history(limit=300, oldest_first=True):
+            msgs.append(msg)
+    except Exception:
+        pass
+    return msgs
+
+
+async def _v115_dados_basicos_canal(canal: discord.TextChannel) -> Dict[str, Any]:
+    msgs = await _v115_historico_canal(canal)
+    texto = _v115_texto_mensagens(msgs)
+    nome = _v112_extrair_rotulo(texto, [
+        r'Nome(?:\s+do\s+indiv[ií]duo)?',
+        r'Procurado',
+        r'Nome'
+    ]) or _v112_nome_canal_procurado(canal)
+
+    rg = _v115_extrair_rg(texto)
+    # Se o JSON pendente antigo ainda sobreviveu, usa-o antes do OCR.
+    antigo = cadastros_pendentes.get(int(canal.id))
+    if not rg and isinstance(antigo, dict):
+        rg = _banco_normalizar_rg(antigo.get('rg'))
+        if (not nome or normalizar_busca(nome) in {'nao identificado','procurado'}):
+            nome = str(antigo.get('nome') or nome)
+
+    anexos_obj: List[discord.Attachment] = []
+    for msg in msgs:
+        anexos_obj.extend([
+            a for a in list(getattr(msg, 'attachments', []) or [])
+            if str(getattr(a, 'content_type', '') or '').lower().startswith('image/')
+            or str(getattr(a, 'filename', '') or '').lower().endswith(('.png','.jpg','.jpeg','.webp','.gif'))
+        ])
+    if not rg and anexos_obj:
+        rg = await _v112_rg_por_ocr_de_anexos(anexos_obj)
+
+    return {
+        'msgs': msgs,
+        'texto': texto,
+        'nome': str(nome or 'Não identificado').strip(),
+        'rg': _banco_normalizar_rg(rg),
+        'bo_auto': _v112_extrair_bo(texto),
+        'crimes': _v112_extrair_crimes(texto),
+        'ultimo_avistamento': _v112_extrair_rotulo(
+            texto,
+            [r'[ÚU]ltimo\s+Avistamento', r'Local(?:\s+do\s+[úu]ltimo\s+avistamento)?'],
+            700
+        ),
+        'imagens': _v115_imagens_mensagens(msgs),
+    }
+
+
+async def _v115_publicar_painel_recuperacao(canal: discord.TextChannel, base: Dict[str, Any]) -> None:
+    rg = str(base.get('rg') or '').strip()
+    nome = str(base.get('nome') or 'Não identificado').strip()
+    linhas = [
+        '🛟 **RECUPERAÇÃO ASSISTIDA DE PROCURADO**',
+        '',
+        f'👤 **Nome localizado:** {nome}',
+        f'🪪 **RG localizado:** `{rg}`' if rg else '🪪 **RG:** ainda não localizado com segurança',
+        '',
+        'O canal antigo foi preservado. Agora existe uma ação para continuar a recuperação.',
+        'Clique em **Vincular BO** e informe o número do boletim. O bot usará o número oficial salvo no sistema.',
+    ]
+    if not rg:
+        linhas.append('Como o RG não foi recuperado automaticamente, o modal também permitirá informá-lo.')
+    texto = '\n'.join(linhas)
+
+    alvo = None
+    for msg in reversed(list(base.get('msgs') or [])):
+        if getattr(msg.author, 'bot', False) and 'RECUPERAÇÃO ASSISTIDA DE PROCURADO' in str(getattr(msg, 'content', '') or ''):
+            alvo = msg; break
+    try:
+        if alvo:
+            await alvo.edit(content=texto, view=V115RecuperacaoProcuradoView())
+        else:
+            await canal.send(texto, view=V115RecuperacaoProcuradoView())
+    except Exception as erro:
+        await enviar_log(f'⚠️ V115 não conseguiu publicar painel de recuperação no canal {canal.id}: {erro}')
+
+
+async def _v115_concluir_vinculo_bo(
+    canal: discord.TextChannel,
+    *,
+    numero_bo: str,
+    rg_manual: str='',
+    usuario: Optional[discord.Member]=None,
+) -> Tuple[bool, str]:
+    base = await _v115_dados_basicos_canal(canal)
+    rg = _banco_normalizar_rg(rg_manual) or str(base.get('rg') or '')
+    if not rg:
+        return False, '❌ Não consegui localizar o RG. Informe o RG no mesmo formulário junto com o BO.'
+
+    atendimento = _v115_atendimento_bo(numero_bo)
+    if not atendimento:
+        return False, f'❌ Não encontrei o BO `{numero_bo}` no sistema. Informe o número que aparece no próprio boletim, por exemplo `0013`.'
+
+    numero_oficial = str(atendimento.get('numero') or numero_bo)
+    nome = str(base.get('nome') or 'Não identificado').strip()
+    existente = _v111_registro_ativo_por_rg(rg)
+
+    autor_id = int(getattr(usuario, 'id', 0) or 0)
+    autor_nome = str(usuario or 'Recuperação assistida')
+    if not autor_id:
+        for msg in list(base.get('msgs') or []):
+            if not getattr(msg.author, 'bot', False):
+                autor_id = int(getattr(msg.author, 'id', 0) or 0)
+                autor_nome = str(msg.author)
+                break
+
+    dados: Dict[str, Any] = {
+        'nome': nome,
+        'rg': rg,
+        'crimes': str(base.get('crimes') or '').strip(),
+        'ultimo_avistamento': str(base.get('ultimo_avistamento') or '').strip(),
+        'numero_boletim': numero_oficial,
+        'boletim': numero_oficial,
+        'autor_id': autor_id,
+        'autor_nome': autor_nome,
+        '_atendimento_id': atendimento.get('id'),
+        '_canal_temporario_id': int(canal.id),
+        '_canal_fluxo_id': int(canal.id),
+        '_canal_bo_origem_id': int(atendimento.get('area_id') or atendimento.get('thread_id') or 0),
+        '_fluxo_fotos_v58': True,
+        '_modo_procurado': 'ATUALIZAR' if existente else 'NOVO',
+        'status': 'RECUPERADO_AGUARDANDO_FINALIZACAO',
+        'recuperado_v115_em': agora_br(),
+        'bo_vinculado_manualmente': True,
+    }
+
+    imagens = list(base.get('imagens') or [])
+    antigo = cadastros_pendentes.get(int(canal.id))
+    if isinstance(antigo, dict):
+        for k in ('foto_individuo','foto_rg','crimes','ultimo_avistamento','caracteristicas','outras_informacoes','outras'):
+            if not dados.get(k) and antigo.get(k):
+                dados[k] = antigo.get(k)
+
+    if imagens and not dados.get('foto_individuo'):
+        dados['foto_individuo'] = imagens[0]
+    if len(imagens) >= 2 and not dados.get('foto_rg'):
+        dados['foto_rg'] = imagens[1]
+
+    if existente:
+        e = _v111_enriquecer_existente(existente)
+        dados['_procurado_existente_id'] = e.get('id')
+        dados['foto_individuo'] = dados.get('foto_individuo') or e.get('foto_individuo')
+        dados['foto_rg'] = dados.get('foto_rg') or e.get('foto_rg')
+
+    cadastros_pendentes[int(canal.id)] = dados
+    salvar_cadastros_pendentes()
+
+    # O nome provisório passa a mostrar claramente identidade + BO oficial.
+    novo_nome = _v115_nome_canal_procurado(nome, numero_oficial)
+    try:
+        if str(getattr(canal, 'name', '')) != novo_nome:
+            await canal.edit(name=novo_nome, reason='V115: procurado recuperado e vinculado ao BO oficial')
+    except Exception as erro:
+        await enviar_log(f'⚠️ V115 recuperou o procurado, mas não renomeou o canal {canal.id}: {erro}')
+
+    modo = 'ATUALIZAÇÃO DE PROCURADO EXISTENTE' if existente else 'NOVO PROCURADO'
+    crimes = str(dados.get('crimes') or '').strip()
+    crimes_txt = crimes if crimes else 'Nenhum crime novo foi recuperado automaticamente. Os crimes podem ser adicionados pelo fluxo normal antes da conclusão.'
+
+    if not existente and not _fotos_procurado_validas(dados):
+        faltas = []
+        if not dados.get('foto_individuo'): faltas.append('foto do indivíduo')
+        if not dados.get('foto_rg'): faltas.append('foto/documento do RG')
+        dados['etapa_fotos'] = 'aguardando_foto_individuo' if not dados.get('foto_individuo') else 'aguardando_foto_rg'
+        cadastros_pendentes[int(canal.id)] = dados
+        salvar_cadastros_pendentes()
+        await canal.send(
+            '✅ **BO VINCULADO COM SUCESSO**\n'
+            f'👤 **Nome:** {nome}\n'
+            f'🪪 **RG:** `{rg}`\n'
+            f'📋 **BO:** `{numero_curto_boletim(numero_oficial)}`\n'
+            f'⚙️ **Modo:** {modo}\n\n'
+            'Ainda falta: **' + ', '.join(faltas) + '**.\n'
+            'Envie a(s) imagem(ns) neste canal. Nada antigo foi apagado.'
+        )
+        return True, f'✅ BO `{numero_curto_boletim(numero_oficial)}` vinculado. O canal foi organizado; faltam apenas as imagens obrigatórias.'
+
+    try:
+        await canal.send(
+            '✅ **RECUPERAÇÃO CONCLUÍDA — PRONTO PARA CONTINUAR**\n\n'
+            f'👤 **Nome:** {nome}\n'
+            f'🪪 **RG:** `{rg}`\n'
+            f'📋 **BO:** `{numero_curto_boletim(numero_oficial)}`\n'
+            f'⚙️ **Modo:** {modo}\n\n'
+            f'**Crimes recuperados:**\n{crimes_txt}\n\n'
+            'Clique em **Finalizar Cadastro** quando as informações estiverem corretas. '
+            'Investigador/Estagiário continuará dependendo da autorização de Inspetor+; Inspetor+ publica diretamente.',
+            view=FinalizarProcuradoView()
+        )
+    except Exception as erro:
+        await enviar_log(f'⚠️ V115 salvou a recuperação do canal {canal.id}, mas não publicou o painel final: {erro}')
+
+    return True, f'✅ Procurado recuperado e vinculado ao BO `{numero_curto_boletim(numero_oficial)}`.'
+
+
+class V115VincularBOModal(discord.ui.Modal):
+    def __init__(self, rg_detectado: str=''):
+        super().__init__(title='Vincular procurado ao BO', timeout=600)
+        self.bo = discord.ui.TextInput(
+            label='Número do BO',
+            placeholder='Ex.: 0013',
+            required=True,
+            max_length=30,
+            style=discord.TextStyle.short,
+            custom_id='v115_bo_manual',
+        )
+        self.rg = discord.ui.TextInput(
+            label='RG do procurado',
+            placeholder='Preencha somente se necessário',
+            required=not bool(str(rg_detectado or '').strip()),
+            default=str(rg_detectado or '').strip() or None,
+            max_length=30,
+            style=discord.TextStyle.short,
+            custom_id='v115_rg_manual',
+        )
+        self.add_item(self.bo)
+        self.add_item(self.rg)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.response.send_message('❌ Este canal provisório não é válido.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, mensagem = await _v115_concluir_vinculo_bo(
+            canal,
+            numero_bo=str(self.bo.value or '').strip(),
+            rg_manual=str(self.rg.value or '').strip(),
+            usuario=interaction.user if isinstance(interaction.user, discord.Member) else None,
+        )
+        await interaction.followup.send(mensagem, ephemeral=True)
+
+
+class V115RecuperacaoProcuradoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Vincular BO',
+        emoji='📋',
+        style=discord.ButtonStyle.primary,
+        custom_id='dic_v115_recuperar_vincular_bo',
+    )
+    async def vincular(self, interaction: discord.Interaction, button: Button):
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.response.send_message('❌ Canal inválido.', ephemeral=True)
+        base = await _v115_dados_basicos_canal(canal)
+        await interaction.response.send_modal(V115VincularBOModal(str(base.get('rg') or '')))
+
+    @discord.ui.button(
+        label='Reanalisar canal',
+        emoji='🔄',
+        style=discord.ButtonStyle.secondary,
+        custom_id='dic_v115_recuperar_reanalisar',
+    )
+    async def reanalisar(self, interaction: discord.Interaction, button: Button):
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await interaction.response.send_message('❌ Canal inválido.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        base = await _v115_dados_basicos_canal(canal)
+        bo_auto = str(base.get('bo_auto') or '').strip()
+        if bo_auto and base.get('rg'):
+            ok, msg = await _v115_concluir_vinculo_bo(
+                canal,
+                numero_bo=bo_auto,
+                rg_manual=str(base.get('rg') or ''),
+                usuario=interaction.user if isinstance(interaction.user, discord.Member) else None,
+            )
+            return await interaction.followup.send(msg, ephemeral=True)
+        await _v115_publicar_painel_recuperacao(canal, base)
+        falta = []
+        if not base.get('rg'): falta.append('RG')
+        if not bo_auto: falta.append('BO')
+        await interaction.followup.send(
+            '🔎 Reanálise concluída. ' + (
+                'Ainda falta: **' + ', '.join(falta) + '**.' if falta
+                else 'Os dados mínimos foram localizados.'
+            ),
+            ephemeral=True
+        )
+
+
+async def _v112_recuperar_canal_procurado_orfao(canal: discord.TextChannel) -> str:
+    """
+    V115 substitui a recuperação V112.
+    Em vez de apenas avisar que falta BO/RG, cria uma ação utilizável.
+    """
+    if int(canal.id) in cadastros_pendentes:
+        dados_atual = cadastros_pendentes.get(int(canal.id))
+        if isinstance(dados_atual, dict) and dados_atual.get('_atendimento_id'):
+            return 'ja_indexado'
+
+    try:
+        if int(canal.id) in {int(PROCURADOS_CHANNEL_ID or 0), int(HISTORICO_PROCURADOS_ID or 0)}:
+            return 'ignorado'
+    except Exception:
+        pass
+
+    if 'procurado' not in normalizar_busca(getattr(canal, 'name', '')):
+        return 'ignorado'
+
+    base = await _v115_dados_basicos_canal(canal)
+    texto = str(base.get('texto') or '')
+    if re.search(r'(?i)procurado\s+(?:publicado|cadastrado)\s+com\s+sucesso|cadastro\s+conclu[ií]do', texto):
+        return 'concluido'
+
+    bo_auto = str(base.get('bo_auto') or '').strip()
+    rg = str(base.get('rg') or '').strip()
+
+    # Se ambos forem recuperados com segurança, termina sozinho.
+    if rg and bo_auto and _v115_atendimento_bo(bo_auto):
+        ok, _ = await _v115_concluir_vinculo_bo(canal, numero_bo=bo_auto, rg_manual=rg, usuario=None)
+        return 'recuperado' if ok else 'incompleto'
+
+    # Caso contrário, a recuperação vira um painel de ação — nunca um beco sem saída.
+    await _v115_publicar_painel_recuperacao(canal, base)
+    return 'aguardando_bo'
+
+
+@bot.listen('on_ready')
+async def v115_registrar_views_recuperacao() -> None:
+    try:
+        bot.add_view(V115RecuperacaoProcuradoView())
+        print('✅ V115 view de recuperação assistida de procurados registrada.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V115 não registrou view de recuperação: {erro}', flush=True)
+
+
+print(
+    '✅ V115 carregada — canais órfãos de procurados agora possuem ação real: '
+    'RG recuperado de content/embeds/OCR, BO manual por modal, nome do canal com procurado + BO oficial '
+    'e continuidade pelo fluxo normal de autorização.',
+    flush=True
+)
+
 if __name__ == '__main__':
     asyncio.run(main())
