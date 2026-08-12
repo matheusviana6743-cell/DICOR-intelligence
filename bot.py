@@ -49815,5 +49815,1010 @@ _V103_FECHAR_CORE_ORIGINAL = _v110_fechar_core_transacional
 
 print('✅ V110 FINAL carregada — dossiê e fechamento revisados com validação de conteúdo, mídia, layout e arquivamento transacional.', flush=True)
 
+# =========================
+# V111 — PROCURADOS + BO + DOSSIÊ (correções finais de fluxo)
+# =========================
+
+# ----- Dossiê: usar complementos realmente salvos e não exigir campos redundantes -----
+_V111_PREPARAR_REQ_BASE = _v110_preparar_requisitos
+
+
+def _v111_complementos_para_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
+    comp = dict(dados.get('complementos_pacificacao') or {})
+    if not comp and dados.get('canal_id'):
+        try:
+            comp = _v103_complementos_canal(dados.get('canal_id'))
+        except Exception:
+            comp = {}
+    return comp
+
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    req = dict(_V111_PREPARAR_REQ_BASE(dados) or {})
+    comp = _v111_complementos_para_dados(dados)
+
+    # Complementação humana sempre prevalece sobre placeholders automáticos.
+    for chave, valor in comp.items():
+        if chave in {
+            'mandado_resumo', 'planejamento_resumo', 'produto_material', 'producao_descricao',
+            'baus_lider_conteudo', 'baus_membros_conteudo', 'prisao_preventiva', 'artigo_juridico',
+            'ameacas', 'confrontos', 'dificuldade_acesso', 'delegado_responsavel_registro',
+            'delegado_adjunto_registro', 'motivacao', 'residencia', 'residencia_endereco',
+        }:
+            v = str(valor or '').strip()
+            if v:
+                req[chave] = v
+
+    # Não é mais necessário pedir "Localização específica": as imagens/mapas do tópico
+    # Localização são a comprovação visual aceita no fluxo.
+    if not _v110_texto_real(req.get('endereco_exato')):
+        local_resumo = _v110_limpar_resumo((dados.get('resumos') or {}).get('localizacao'), 1400)
+        if local_resumo:
+            req['endereco_exato'] = local_resumo
+        elif _v110_tem_midia(dados, 'localizacao'):
+            req['endereco_exato'] = 'Localização documentada pelas evidências visuais do tópico próprio da mesa.'
+
+    # O local de fabricação já é comprovado pelo tópico Produção/Fabricação; não exige
+    # formulário separado. Mantemos apenas uma referência institucional no documento.
+    if not _v110_texto_real(req.get('producao_local')) and _v110_tem_midia(dados, 'producao'):
+        req['producao_local'] = 'Local/rota documentado nas evidências do tópico de produção e fabricação.'
+
+    # Se a descrição/material já estiverem escritos no tópico, usa-os automaticamente.
+    producao_resumo = _v110_limpar_resumo((dados.get('resumos') or {}).get('producao'), 2200)
+    if producao_resumo:
+        if not _v110_texto_real(req.get('produto_material')):
+            req['produto_material'] = producao_resumo
+        if not _v110_texto_real(req.get('producao_descricao')):
+            req['producao_descricao'] = producao_resumo
+
+    # Buiu Gomes / Arthur Fleker: valores cadastrados no formulário devem aparecer no PDF.
+    for chave in ('delegado_responsavel_registro', 'delegado_adjunto_registro'):
+        manual = str(comp.get(chave) or '').strip()
+        if manual:
+            req[chave] = manual
+
+    return {str(k): str(v or '').strip() for k, v in req.items()}
+
+
+# Menus de complementação: removidos os dois campos que o sistema consegue resolver.
+_V103_SECOES = {
+    'mandado': {
+        'titulo': 'Disposições da busca',
+        'campos': [('mandado_resumo','Diretrizes completas','Inclua: abrangência da busca; terceiros; OAB/advogado; extensão da busca; cofres/baús/porta-malas; encaminhamento de detidos.',4000,True)],
+    },
+    'provas': {
+        'titulo': 'Materiais e baús',
+        'campos': [
+            ('produto_material','Material/produto','Identifique objetivamente o material/produto comprovado pelas evidências.',1200,True),
+            ('producao_descricao','Descrição da produção','Descreva de forma objetiva o processo/local comprovado pelos registros da mesa.',1600,True),
+            ('baus_lider_conteudo','Conteúdo - baú liderança','Descreva objetivamente o conteúdo visível no baú do líder/gerente.',1600,True),
+            ('baus_membros_conteudo','Conteúdo - baú membros','Descreva objetivamente o conteúdo visível no baú dos membros.',1600,True),
+        ],
+    },
+    'planejamento': {
+        'titulo': 'Planejamento operacional',
+        'campos': [('planejamento_resumo','Planejamento completo','Inclua: efetivo/equipes; recursos; estratégia/setores; controle de acessos; negociação; proteção da população; apoio médico; acompanhamento institucional.',4000,True)],
+    },
+    'fundamentacao': {
+        'titulo': 'Fundamentação factual',
+        'campos': [
+            ('prisao_preventiva','Prisão preventiva','Informe o registro. Se não houver, escreva NÃO SE APLICA.',1200,True),
+            ('artigo_juridico','Dispositivo jurídico','Informe o fundamento/dispositivo. Se não houver, escreva NÃO SE APLICA.',1200,True),
+            ('ameacas','Ameaças/violência','Informe o registro comprovado. Se não houver, escreva NÃO SE APLICA.',1500,True),
+            ('confrontos','Confrontos','Informe o histórico comprovado. Se não houver, escreva NÃO SE APLICA.',1500,True),
+            ('dificuldade_acesso','Acesso/controle territorial','Informe a situação comprovada. Se não houver, escreva NÃO SE APLICA.',1500,True),
+        ],
+    },
+    'autoridades': {
+        'titulo': 'Registros das autoridades',
+        'campos': [
+            ('delegado_responsavel_registro','Matrícula/RG - Buiu Gomes','Informe apenas se o cadastro automático não localizar.',180,False),
+            ('delegado_adjunto_registro','Matrícula/RG - Arthur Fleker','Informe apenas se o cadastro automático não localizar.',180,False),
+        ],
+    },
+}
+_V103_LABELS = {campo[0]: campo[1] for sec in _V103_SECOES.values() for campo in sec['campos']}
+_V103_CAMPOS_OBRIGATORIOS = [campo[0] for sec in _V103_SECOES.values() for campo in sec['campos']]
+
+
+def _v103_pendencias_texto(req: Dict[str, str]) -> List[str]:
+    req = dict(req or {})
+    faltas: List[str] = []
+    if not _v110_texto_real(req.get('mandado_resumo')) or _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')):
+        faltas.append('mandado_resumo')
+    if not _v110_texto_real(req.get('produto_material')):
+        faltas.append('produto_material')
+    if not _v110_texto_real(req.get('producao_descricao')):
+        faltas.append('producao_descricao')
+    if not _v110_texto_real(req.get('baus_lider_conteudo')):
+        faltas.append('baus_lider_conteudo')
+    if not _v110_texto_real(req.get('baus_membros_conteudo')):
+        faltas.append('baus_membros_conteudo')
+    if not _v110_texto_real(req.get('planejamento_resumo')) or _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')):
+        faltas.append('planejamento_resumo')
+    for chave in ('prisao_preventiva','artigo_juridico','ameacas','confrontos','dificuldade_acesso'):
+        if not _v102_valor_util(req.get(chave)):
+            faltas.append(chave)
+    for chave in ('delegado_responsavel_registro','delegado_adjunto_registro'):
+        if not _v110_autoridade_registro(req, chave):
+            faltas.append(chave)
+    return list(dict.fromkeys(faltas))
+
+
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    req = dict(req or _v110_preparar_requisitos(dados))
+    crimes_txt = bool(_v110_limpar_resumo((dados.get('resumos') or {}).get('crimes')))
+    mand_ok = bool(_v110_texto_real(req.get('mandado_resumo')) and not _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')))
+    plan_ok = bool(_v110_texto_real(req.get('planejamento_resumo')) and not _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')))
+    resp_ok = bool(_v110_assinaturas_ok(dados) and _v110_autoridade_registro(req,'delegado_responsavel_registro') and _v110_autoridade_registro(req,'delegado_adjunto_registro'))
+    local_ok = bool(_v110_tem_midia(dados,'localizacao'))
+    producao_ok = bool(_v110_tem_midia(dados,'producao') and (_v110_texto_real(req.get('produto_material')) or _v110_texto_real(req.get('producao_descricao'))))
+    return [
+        ('Identificação do procedimento','ATENDIDO'),('Requerente formal','ATENDIDO'),('Disposições do mandado','ATENDIDO' if mand_ok else 'PENDENTE'),
+        ('Planejamento operacional','ATENDIDO' if plan_ok else 'PENDENTE'),('Proteção da população','ATENDIDO' if plan_ok else 'PENDENTE'),
+        ('Painel da organização','ATENDIDO' if _v110_tem_midia(dados,'painel') else 'PENDENTE'),('Lideranças','ATENDIDO' if dados.get('liderancas') else 'PENDENTE'),('Integrantes','ATENDIDO' if dados.get('integrantes') else 'PENDENTE'),
+        ('Localização','ATENDIDO' if local_ok else 'PENDENTE'),('Visão aérea/estratégica','ATENDIDO' if local_ok else 'PENDENTE'),
+        ('Materiais/produtos','ATENDIDO' if producao_ok else 'PENDENTE'),('Informantes','ATENDIDO' if dados.get('informantes') else 'NÃO SE APLICA'),
+        ('Baú de membros','ATENDIDO' if _v110_texto_real(req.get('baus_membros_conteudo')) and _v110_tem_midia(dados,'baus_membros') else 'PENDENTE'),
+        ('Baú de líder/gerente','ATENDIDO' if _v110_texto_real(req.get('baus_lider_conteudo')) and _v110_tem_midia(dados,'baus_lider') else 'PENDENTE'),
+        ('Fabricação/produção','ATENDIDO' if producao_ok else 'PENDENTE'),('Residência do líder','ATENDIDO' if _v110_tem_midia(dados,'residencia') else 'PENDENTE'),
+        ('Motivação da pacificação','ATENDIDO' if _v102_valor_util(req.get('motivacao')) else 'PENDENTE'),('Crimes','ATENDIDO' if crimes_txt else 'PENDENTE'),
+        ('Prisão preventiva',_v110_valor_status(req.get('prisao_preventiva'))),('Dispositivo jurídico',_v110_valor_status(req.get('artigo_juridico')),),('Ameaças/violência',_v110_valor_status(req.get('ameacas'))),('Confrontos com forças de segurança',_v110_valor_status(req.get('confrontos'))),('Dificuldade de acesso/controle territorial',_v110_valor_status(req.get('dificuldade_acesso'))),
+        ('Responsáveis/assinaturas','ATENDIDO' if resp_ok else 'PENDENTE'),
+    ]
+
+
+def _v110_pdf_preflight_dados(dados: Dict[str, Any]) -> List[str]:
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    erros: List[str] = []
+    for k in _v103_pendencias_texto(req):
+        if k == 'mandado_resumo':
+            erros.append('Disposições da busca incompletas: ' + ', '.join(_v110_requisitos_mandado_faltantes(req.get(k))) + '.')
+        elif k == 'planejamento_resumo':
+            erros.append('Planejamento incompleto: ' + ', '.join(_v110_requisitos_planejamento_faltantes(req.get(k))) + '.')
+        else:
+            erros.append(f'Informação obrigatória ausente: {_V103_LABELS.get(k,k)}.')
+    erros.extend(_v103_pendencias_midia(dados))
+    erros.extend(_v103_pendencias_estrutura(dados))
+    return list(dict.fromkeys(erros))
+
+
+# ----- Procurados: cadastro somente via BO e atualização aditiva de RG já ativo -----
+def _v111_inspetor_mais(membro: Any) -> bool:
+    try:
+        if isinstance(membro, discord.Member) and '_membro_inspetor_mais' in globals() and _membro_inspetor_mais(membro):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(usuario_e_administrador(membro))
+    except Exception:
+        return False
+
+
+def _v111_linhas_unicas(*textos: Any) -> str:
+    saida: List[str] = []
+    vistos = set()
+    for texto in textos:
+        bruto = str(texto or '').replace('\r', '\n')
+        for linha in bruto.split('\n'):
+            linha = re.sub(r'\s+', ' ', linha).strip(' \t•-')
+            if not linha or normalizar_busca(linha) in {'nao informado','n i','ni'}:
+                continue
+            chave = normalizar_busca(linha)
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            saida.append(linha)
+    return '\n'.join(f'• {x}' for x in saida) if saida else 'Não informado'
+
+
+def _v111_lista_boletins(registro: Dict[str, Any], novo_bo: Any=None) -> List[str]:
+    valores: List[str] = []
+    bruto = registro.get('boletins')
+    if isinstance(bruto, list):
+        valores.extend(str(x or '').strip() for x in bruto)
+    for campo in ('numero_boletim','boletim'):
+        txt = str(registro.get(campo) or '').strip()
+        if txt:
+            # Extrai BOs já concatenados sem apagar o formato anterior.
+            achados = re.findall(r'(?:BO(?:LETIM)?[^0-9]{0,20})?(\d{1,8})', txt, flags=re.I)
+            if achados:
+                valores.extend(achados)
+            else:
+                valores.append(txt)
+    if novo_bo:
+        valores.append(str(novo_bo).strip())
+    out: List[str] = []
+    vistos = set()
+    for v in valores:
+        v = str(v or '').strip()
+        if not v:
+            continue
+        n = numero_curto_boletim(v) if 'numero_curto_boletim' in globals() else v
+        n = str(n or v).strip()
+        chave = normalizar_busca(n)
+        if chave not in vistos:
+            vistos.add(chave)
+            out.append(n)
+    return out
+
+
+def _v111_registro_ativo_por_rg(rg: Any) -> Optional[Dict[str, Any]]:
+    return procurar_por_rg(str(rg or ''))
+
+
+def _v111_enriquecer_existente(registro: Dict[str, Any]) -> Dict[str, Any]:
+    r = dict(registro or {})
+    try:
+        if '_v107_enriquecer_procurado' in globals():
+            r = dict(_v107_enriquecer_procurado(r) or r)
+    except Exception:
+        pass
+    return r
+
+
+def _v111_salvar_ativo_atualizado(registro: Dict[str, Any]) -> None:
+    lista = list(carregar_procurados())
+    rg = limpar_rg(registro.get('rg',''))
+    substituido = False
+    for i in range(len(lista)-1, -1, -1):
+        item = lista[i]
+        if limpar_rg(item.get('rg','')) == rg and procurado_esta_ativo(item):
+            lista[i] = dict(registro)
+            substituido = True
+            break
+    if not substituido:
+        lista.append(dict(registro))
+    lista = remover_duplicados(lista)
+    salvar_procurados(lista)
+    try:
+        gerar_catalogo_html()
+    except Exception:
+        pass
+
+
+_V111_CRIAR_TEXTO_PROCURADO_BASE = criar_texto_procurado
+
+def criar_texto_procurado(registro: Dict[str, Any]) -> str:
+    r = dict(registro or {})
+    boletins = _v111_lista_boletins(r)
+    if boletins:
+        r['numero_boletim'] = '\n'.join(f'• Nº {b}' for b in boletins)
+    return _V111_CRIAR_TEXTO_PROCURADO_BASE(r)
+
+
+class ProcuradoBoletimModal(Modal, title='Procurado via Boletim'):
+    nome = TextInput(label='Nome', max_length=120, required=True)
+    rg = TextInput(label='RG', max_length=50, required=True)
+    ultimo_avistamento = TextInput(label='Último avistamento', placeholder='Ex.: Portugal, Vanilla ou comunidade', style=discord.TextStyle.paragraph, max_length=700, required=True)
+    detalhes = TextInput(label='Características / novas informações', style=discord.TextStyle.paragraph, max_length=900, required=False)
+
+    def __init__(self, dados: Optional[Dict[str, str]]=None, *, atendimento_id: Optional[str]=None):
+        super().__init__()
+        self.atendimento_id = str(atendimento_id or '')
+        dados = dados or {}
+        for campo, valor in ((self.nome,dados.get('nome','')),(self.rg,dados.get('rg','')),(self.ultimo_avistamento,dados.get('ultimo_avistamento') or dados.get('outras') or ''),(self.detalhes,dados.get('caracteristicas') or dados.get('outras_informacoes') or '')):
+            try: campo.default = str(valor or '')[:campo.max_length]
+            except Exception: pass
+
+    async def on_submit(self, interaction: discord.Interaction):
+        etapa='validar dados'; canal=None
+        try:
+            nome=str(self.nome.value or '').strip(); rg=_banco_normalizar_rg(str(self.rg.value or '')); ultimo=str(self.ultimo_avistamento.value or '').strip(); detalhes=str(self.detalhes.value or '').strip()
+            if not nome or not rg or not ultimo:
+                return await interaction.response.send_message('❌ Nome, RG e último avistamento são obrigatórios.',ephemeral=True)
+            atendimento=_v56_atendimento_por_id(self.atendimento_id) or await garantir_atendimento_interaction(interaction)
+            if not atendimento:
+                return await interaction.response.send_message('❌ Atendimento do boletim não encontrado.',ephemeral=True)
+            if not _usuario_pode_operar_atendimento_boletim(interaction,atendimento):
+                return await interaction.response.send_message('❌ Apenas o responsável atual ou Inspetor+ pode solicitar.',ephemeral=True)
+            existente=_v111_registro_ativo_por_rg(rg)
+            await interaction.response.defer(ephemeral=True,thinking=True)
+            guild=interaction.guild
+            if guild is None: raise RuntimeError('SERVIDOR_NAO_LOCALIZADO')
+            categoria=guild.get_channel(int(PROCURADOS_TEMP_CATEGORY_ID or 0)) if int(PROCURADOS_TEMP_CATEGORY_ID or 0) else None
+            if not isinstance(categoria,discord.CategoryChannel): categoria=getattr(interaction.channel,'category',None)
+            overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=False),interaction.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True)}
+            if guild.me: overwrites[guild.me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,manage_channels=True,manage_messages=True,attach_files=True,embed_links=True)
+            for cargo_id in set(CARGOS_ADMIN_IDS):
+                cargo=guild.get_role(int(cargo_id))
+                if cargo: overwrites[cargo]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True)
+            canal=await guild.create_text_channel(name=f'📸・procurado-{slugify(nome)[:48]}',category=categoria if isinstance(categoria,discord.CategoryChannel) else None,overwrites=overwrites,reason=f'Procurado via BO por {interaction.user}')
+            dados={'nome':nome,'rg':rg,'ultimo_avistamento':ultimo,'caracteristicas':detalhes or 'Não informado','outras':detalhes or '','outras_informacoes':detalhes or '','numero_boletim':atendimento.get('numero'),'boletim':atendimento.get('numero'),'_atendimento_id':atendimento.get('id'),'_canal_bo_origem_id':getattr(interaction.channel,'id',None),'_fluxo_fotos_v58':True,'autor_id':int(interaction.user.id),'autor_nome':str(interaction.user),'etapa_fotos':'aguardando_crimes'}
+            if existente:
+                existente=_v111_enriquecer_existente(existente)
+                dados.update({'_modo_procurado':'ATUALIZAR','_procurado_existente_id':existente.get('id'),'_procurado_existente_mensagem_id':existente.get('mensagem_id'),'foto_individuo':existente.get('foto_individuo'),'foto_rg':existente.get('foto_rg')})
+            else:
+                dados['_modo_procurado']='NOVO'
+            cadastros_pendentes[int(canal.id)]=dados; salvar_cadastros_pendentes()
+            painel=await canal.send('🔎 Preparando pesquisa de crimes...')
+            sessao={'tipo':'painel','canal_id':int(canal.id),'painel_id':int(painel.id),'autor_id':int(interaction.user.id),'nome':nome,'rg':rg,'artigos':[]}
+            _salvar_sessao_crime(str(painel.id),sessao)
+            await painel.edit(content=_texto_painel_pesquisa_crimes(sessao),view=PesquisaCrimesView())
+            if existente:
+                await canal.send(f"♻️ **ATUALIZAÇÃO DE PROCURADO EXISTENTE**\nRG: `{rg}`\nOs crimes e o BO atual serão **somados** ao cadastro existente após autorização. Nenhum crime, BO ou foto anterior será apagado.")
+                msg='✅ Atualização iniciada. Selecione somente os **novos crimes**; o BO atual será vinculado automaticamente.'
+            else:
+                msg='✅ Cadastro iniciado. Selecione os crimes e siga o fluxo de fotos.'
+            await interaction.followup.send(f'{msg}\nCanal privado: {canal.mention}',ephemeral=True)
+        except Exception as erro:
+            traceback.print_exc(); await enviar_log(f'❌ V111 procurado via BO | etapa `{etapa}` | {type(erro).__name__}: {erro}\n```py\n{traceback.format_exc()[-2400:]}\n```')
+            if canal:
+                try: await canal.delete(reason='Falha no fluxo V111')
+                except Exception: pass
+            try: await interaction.followup.send('❌ Não foi possível iniciar o cadastro/atualização. O diagnóstico foi salvo nos logs.',ephemeral=True)
+            except Exception: pass
+
+
+class PesquisaCrimesView(View):
+    def __init__(self): super().__init__(timeout=None)
+    def _sessao_id(self,interaction): return str(getattr(interaction.message,'id',''))
+
+    @discord.ui.button(label='Pesquisar Crime',emoji='🔎',style=discord.ButtonStyle.blurple,custom_id='dic_pesquisar_crime_v1')
+    async def pesquisar(self,interaction:discord.Interaction,button:Button):
+        sid=self._sessao_id(interaction); sessao=_obter_sessao_crime(sid)
+        if not sessao: return await interaction.response.send_message('❌ Sessão de crimes não encontrada.',ephemeral=True)
+        await interaction.response.send_modal(PesquisaCrimeModal(sid))
+
+    @discord.ui.button(label='Remover Último',emoji='↩️',style=discord.ButtonStyle.secondary,custom_id='dic_remover_ultimo_crime_v1')
+    async def remover(self,interaction:discord.Interaction,button:Button):
+        sid=self._sessao_id(interaction); sessao=_obter_sessao_crime(sid)
+        if not sessao: return await interaction.response.send_message('❌ Sessão não encontrada.',ephemeral=True)
+        if interaction.user.id!=int(sessao.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Esta sessão pertence a outro usuário.',ephemeral=True)
+        artigos=list(sessao.get('artigos') or []); artigos=artigos[:-1] if artigos else []; sessao['artigos']=artigos; _salvar_sessao_crime(sid,sessao)
+        await interaction.response.edit_message(content=_texto_painel_pesquisa_crimes(sessao),view=self)
+
+    @discord.ui.button(label='Finalizar Crimes',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_finalizar_crimes_v1')
+    async def finalizar(self,interaction:discord.Interaction,button:Button):
+        sid=self._sessao_id(interaction); sessao=_obter_sessao_crime(sid)
+        if not sessao: return await interaction.response.send_message('❌ Sessão não encontrada.',ephemeral=True)
+        if interaction.user.id!=int(sessao.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Esta sessão pertence a outro usuário.',ephemeral=True)
+        artigos=list(sessao.get('artigos') or [])
+        if not artigos: return await interaction.response.send_message('❌ Selecione pelo menos um crime.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        canal=interaction.channel; dados=cadastros_pendentes.get(int(getattr(canal,'id',0) or 0),{})
+        if not isinstance(canal,discord.TextChannel) or not isinstance(dados,dict): return await interaction.followup.send('❌ Canal temporário não localizado.',ephemeral=True)
+        dados['crimes']=_formatar_crimes_selecionados(artigos); dados['crimes_artigos']=artigos; dados['_fluxo_fotos_v58']=True
+        existente=_v111_registro_ativo_por_rg(dados.get('rg')) if str(dados.get('_modo_procurado'))=='ATUALIZAR' else None
+        if existente:
+            existente=_v111_enriquecer_existente(existente)
+            dados['foto_individuo']=dados.get('foto_individuo') or existente.get('foto_individuo'); dados['foto_rg']=dados.get('foto_rg') or existente.get('foto_rg'); dados['etapa_fotos']='pronto_atualizacao'
+            cadastros_pendentes[canal.id]=dados; salvar_cadastros_pendentes(); _apagar_sessao_crime(sid)
+            await interaction.message.edit(content=_texto_painel_pesquisa_crimes(sessao)+'\n\n✅ **Novos crimes selecionados.**',view=None)
+            resumo=f"♻️ **ATUALIZAÇÃO PRONTA PARA REVISÃO**\n**Nome:** {dados.get('nome')}\n**RG:** `{dados.get('rg')}`\n**BO que será adicionado:** `{dados.get('numero_boletim')}`\n\n**Novos crimes:**\n{dados.get('crimes')}\n\nNenhum registro antigo será removido."
+            await canal.send(resumo,view=FinalizarProcuradoView())
+            return await interaction.followup.send('✅ Atualização pronta. Não é necessário reenviar fotos já existentes.',ephemeral=True)
+        dados['etapa_fotos']='aguardando_foto_individuo'; cadastros_pendentes[canal.id]=dados; salvar_cadastros_pendentes()
+        await interaction.message.edit(content=_texto_painel_pesquisa_crimes(sessao)+'\n\n✅ **Seleção finalizada.**',view=None)
+        prompt=await canal.send('📸 **FOTOS OBRIGATÓRIAS — ETAPA 1 DE 2**\n\nEnvie **somente a foto do indivíduo** neste canal.\nO sistema aceitará automaticamente.',allowed_mentions=discord.AllowedMentions.none())
+        dados['foto_individuo_prompt_id']=int(prompt.id); cadastros_pendentes[canal.id]=dados; salvar_cadastros_pendentes(); _apagar_sessao_crime(sid)
+        await interaction.followup.send('✅ Crimes finalizados. Envie a foto do indivíduo.',ephemeral=True)
+
+
+def _fotos_procurado_validas(dados: Dict[str, Any]) -> bool:
+    if str(dados.get('_modo_procurado') or '').upper()=='ATUALIZAR':
+        existente=_v111_registro_ativo_por_rg(dados.get('rg'))
+        if existente:
+            existente=_v111_enriquecer_existente(existente)
+            return bool(_arquivo_upload_procurado_existe(dados.get('foto_individuo') or existente.get('foto_individuo')) and _arquivo_upload_procurado_existe(dados.get('foto_rg') or existente.get('foto_rg')))
+    return _arquivo_upload_procurado_existe(dados.get('foto_individuo')) and _arquivo_upload_procurado_existe(dados.get('foto_rg'))
+
+
+_V111_PUBLICAR_NOVO_BASE = _publicar_procurado_boletim_aprovado
+
+
+async def _v111_atualizar_procurado_existente(atendimento: Dict[str,Any], dados: Dict[str,Any], autorizador: discord.Member, existente: Dict[str,Any]) -> str:
+    reg=_v111_enriquecer_existente(existente)
+    novos_crimes=str(dados.get('crimes') or '').strip()
+    reg['crimes']=_v111_linhas_unicas(reg.get('crimes'),novos_crimes)
+    boletins=_v111_lista_boletins(reg,atendimento.get('numero') or dados.get('numero_boletim'))
+    reg['boletins']=boletins
+    reg['numero_boletim']=' • '.join(f'Nº {b}' for b in boletins) if boletins else str(reg.get('numero_boletim') or '')
+    novo_ultimo=str(dados.get('ultimo_avistamento') or '').strip()
+    if novo_ultimo: reg['ultimo_avistamento']=novo_ultimo
+    novas_info=str(dados.get('outras_informacoes') or dados.get('outras') or '').strip()
+    if novas_info and normalizar_busca(novas_info) not in {'nao informado','n i'}:
+        reg['informacoes']=_v111_linhas_unicas(reg.get('informacoes'),novas_info)
+    novas_car=str(dados.get('caracteristicas') or '').strip()
+    if novas_car and normalizar_busca(novas_car) not in {'nao informado','n i'}:
+        reg['caracteristicas']=_v111_linhas_unicas(reg.get('caracteristicas'),novas_car)
+    reg['foto_individuo']=dados.get('foto_individuo') or reg.get('foto_individuo')
+    reg['foto_rg']=dados.get('foto_rg') or reg.get('foto_rg')
+    reg['autorizado_por_id']=autorizador.id; reg['autorizado_por_nome']=str(autorizador); reg['autorizado_por_cargo']=cargo_autorizador(autorizador); reg['autorizado_em']=agora_br()
+    hist=reg.get('historico_atualizacoes') if isinstance(reg.get('historico_atualizacoes'),list) else []
+    hist.append({'tipo':'ADICAO_VIA_BO','boletim':atendimento.get('numero'),'crimes_adicionados':novos_crimes,'solicitado_por_id':dados.get('_solicitante_id') or dados.get('autor_id'),'autorizado_por_id':autorizador.id,'autorizado_por_nome':str(autorizador),'data':agora_br()})
+    reg['historico_atualizacoes']=hist[-200:]; reg['atualizado_em']=agora_br()
+    editado=False
+    try: editado=await atualizar_post_procurado_discord(reg)
+    except Exception as erro: await enviar_log(f'⚠️ V111 não editou post existente RG `{reg.get("rg")}`: {erro}')
+    if not editado:
+        # Se o mini banco tinha perdido o vínculo da mensagem, republica o registro completo.
+        msg=await postar_procurado_oficial(reg)
+        if not msg: raise RuntimeError('Não foi possível restaurar/publicar o procurado no canal oficial.')
+        reg['mensagem_id']=msg.id; reg['mensagem_url']=msg.jump_url
+    _v111_salvar_ativo_atualizado(reg)
+    atendimento.update({'procurado_status':'atualizado','procurado_publicacao_id':reg.get('mensagem_id'),'procurado_publicacao_url':reg.get('mensagem_url'),'procurado_autorizado_por_id':autorizador.id,'procurado_autorizado_por_nome':str(autorizador),'procurado_autorizado_em':agora_br()})
+    atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+    await enviar_log(f"♻️ Procurado atualizado via BO `{atendimento.get('numero')}` | RG `{reg.get('rg')}` | crimes/BO somados | autoridade `{autorizador.id}`")
+    return str(reg.get('mensagem_url') or '')
+
+
+async def _publicar_procurado_boletim_aprovado(atendimento: Dict[str, Any], dados: Dict[str, Any], autorizador: discord.Member) -> str:
+    existente=_v111_registro_ativo_por_rg(dados.get('rg'))
+    modo=str(dados.get('_modo_procurado') or '').upper()
+    if existente or modo=='ATUALIZAR':
+        if not existente: raise RuntimeError('O procurado que seria atualizado não está mais ativo.')
+        url=await _v111_atualizar_procurado_existente(atendimento,dados,autorizador,existente)
+        try: await _v59_notificar_publicacao_no_bo(atendimento,{**dados,'_modo_procurado':'ATUALIZAR'},autorizador,url)
+        except Exception as erro: await enviar_log(f'⚠️ V111 atualização concluída, mas confirmação no BO falhou: {erro}')
+        canal_temp_id=int(dados.get('_canal_temporario_id') or dados.get('_canal_fluxo_id') or 0)
+        if canal_temp_id: asyncio.create_task(_v59_apagar_canal_temporario(canal_temp_id),name=f'v111-apagar-atualizacao-{canal_temp_id}')
+        return url
+    return await _V111_PUBLICAR_NOVO_BASE(atendimento,dados,autorizador)
+
+
+class FinalizarProcuradoView(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label='Finalizar Cadastro',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_finalizar_procurado')
+    async def finalizar(self,interaction:discord.Interaction,button:Button):
+        canal=interaction.channel
+        if not isinstance(canal,discord.TextChannel): return await interaction.response.send_message('❌ Canal temporário inválido.',ephemeral=True)
+        dados=cadastros_pendentes.get(int(canal.id))
+        if not isinstance(dados,dict) or not dados.get('_fluxo_fotos_v58'): return await interaction.response.send_message('❌ Não encontrei os dados deste cadastro.',ephemeral=True)
+        if interaction.user.id!=int(dados.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Apenas quem iniciou o cadastro ou Inspetor+ pode concluir.',ephemeral=True)
+        atendimento=_v56_atendimento_por_id(dados.get('_atendimento_id'))
+        if not atendimento: return await interaction.response.send_message('❌ O atendimento do boletim não foi localizado.',ephemeral=True)
+        membro=interaction.user if isinstance(interaction.user,discord.Member) else None
+        if membro is None: return await interaction.response.send_message('❌ Não consegui verificar seu cargo.',ephemeral=True)
+        existente=_v111_registro_ativo_por_rg(dados.get('rg'))
+        if existente: dados['_modo_procurado']='ATUALIZAR'
+        else: dados['_modo_procurado']='NOVO'
+        if not existente and not _fotos_procurado_validas(dados): return await interaction.response.send_message('❌ A foto do indivíduo e a foto do RG precisam estar confirmadas.',ephemeral=True)
+        if existente:
+            enriquecido=_v111_enriquecer_existente(existente); dados['foto_individuo']=dados.get('foto_individuo') or enriquecido.get('foto_individuo'); dados['foto_rg']=dados.get('foto_rg') or enriquecido.get('foto_rg')
+        eh_inspetor=_v111_inspetor_mais(membro); precisa=usuario_precisa_autorizacao_dicor(membro)
+        if not eh_inspetor and not precisa: return await interaction.response.send_message('❌ Somente Estagiário, Investigador ou Inspetor+ pode concluir.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        dados=dict(dados); pedido_id=str(dados.get('_pedido_id') or f'PRQ-TEMP-{int(canal.id)}')
+        dados.update({'_pedido_id':pedido_id,'_canal_temporario_id':int(canal.id),'_canal_fluxo_id':int(canal.id),'_solicitante_id':int(dados.get('autor_id') or interaction.user.id),'_solicitante_nome':str(dados.get('autor_nome') or interaction.user),'_canal_bo_origem_id':int(dados.get('_canal_bo_origem_id') or atendimento.get('area_id') or 0),'numero_boletim':atendimento.get('numero'),'boletim':atendimento.get('numero')})
+        cadastros_pendentes[int(canal.id)]=dados; salvar_cadastros_pendentes()
+        pedido={'id':pedido_id,'dados':dict(dados),'status':'pronto','solicitante_id':int(dados.get('autor_id') or interaction.user.id),'solicitante_nome':str(dados.get('autor_nome') or interaction.user),'solicitado_em':dados.get('solicitado_em') or agora_br(),'canal_fluxo_id':int(canal.id)}
+        _guardar_pedido_atendimento(atendimento,'procurado_pedidos',pedido_id,pedido); atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+        if eh_inspetor:
+            url=await _publicar_procurado_boletim_aprovado(atendimento,dados,membro)
+            acao='atualizado' if existente else 'publicado'
+            return await interaction.followup.send(f'✅ Procurado {acao} diretamente por Inspetor+.\n{url}',ephemeral=True)
+        solicitacao=await criar_solicitacao_autorizacao(interaction=interaction,tipo='procurado_boletim',dados=dados,contexto={'atendimento_id':atendimento.get('id'),'area_id':int(dados.get('_canal_bo_origem_id') or atendimento.get('area_id') or 0),'canal_provisorio_id':int(canal.id),'pedido_id':pedido_id})
+        pedido['status']='aguardando_autorizacao'; pedido['autorizacao_id']=solicitacao['id']; pedido['dados']=dict(dados); _guardar_pedido_atendimento(atendimento,'procurado_pedidos',pedido_id,pedido)
+        atendimento['procurado_status']='aguardando_autorizacao'; atendimento['procurado_autorizacao_id']=solicitacao['id']; atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+        dados['solicitacao_id']=solicitacao['id']; dados['status']='AGUARDANDO AUTORIZAÇÃO'; cadastros_pendentes[int(canal.id)]=dados; salvar_cadastros_pendentes()
+        try: await interaction.message.edit(content=f"📩 **{'Atualização' if existente else 'Cadastro'} aguardando autorização do Inspetor+.**\nSolicitação: `{solicitacao['id']}`",view=None)
+        except Exception: pass
+        await interaction.followup.send(f"✅ Solicitação `{solicitacao['id']}` enviada ao tópico do BO. A alteração só ocorrerá após aprovação de Inspetor+.",ephemeral=True)
+
+    @discord.ui.button(label='Cancelar',emoji='❌',style=discord.ButtonStyle.red,custom_id='dic_cancelar_procurado')
+    async def cancelar(self,interaction:discord.Interaction,button:Button):
+        canal=interaction.channel
+        if not isinstance(canal,discord.TextChannel): return await interaction.response.send_message('❌ Canal inválido.',ephemeral=True)
+        dados=cadastros_pendentes.get(int(canal.id),{})
+        if interaction.user.id!=int(dados.get('autor_id') or 0) and not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Apenas quem iniciou ou Inspetor+ pode cancelar.',ephemeral=True)
+        if str(dados.get('status') or '').upper()=='AGUARDANDO AUTORIZAÇÃO': return await interaction.response.send_message('⚠️ A solicitação já foi enviada para autorização.',ephemeral=True)
+        await interaction.response.send_message('✅ Fluxo cancelado.',ephemeral=True); asyncio.create_task(_v59_apagar_canal_temporario(int(canal.id),atraso=2))
+
+
+# Painel de procurados: cadastro manual removido; novos procurados nascem exclusivamente do BO.
+def embed_painel_procurados_padrao() -> discord.Embed:
+    return discord.Embed(title='🚨 Sistema de Procurados - DICOR',description='Gerenciamento dos procurados ativos.\n\n📋 **Lista de Procurados** — consultar ativos.\n🚔 **Registrar captura** — retirar procurado mediante registro prisional.\n✏️ **Modificar Procurado** — manutenção administrativa.\n📄 **Abrir Catálogo** — catálogo atualizado.\n\n🔒 **Novos procurados são cadastrados exclusivamente pelo tópico do Boletim de Ocorrência.**',color=discord.Color.red())
+
+
+class PainelProcuradosView(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label='Lista de Procurados',emoji='📋',style=discord.ButtonStyle.blurple,custom_id='dic_lista_procurados')
+    async def lista(self,interaction:discord.Interaction,button:Button):
+        ativos=_v43_procurados_ativos()
+        if not ativos: return await interaction.response.send_message(f'📋 **Procurados ativos**\nNenhum registro localizado no canal <#{int(PROCURADOS_CHANNEL_ID)}>.',ephemeral=True)
+        paginas=[ativos[i:i+15] for i in range(0,len(ativos),15)]; primeira=True
+        for indice,pagina in enumerate(paginas,1):
+            embed=discord.Embed(title=f'📋 PROCURADOS ATIVOS — {indice}/{len(paginas)}',description=f'Total: **{len(ativos)}**',color=discord.Color.red())
+            for registro in pagina:
+                embed.add_field(name=f"👤 {registro.get('nome') or 'Nome não informado'}",value=f"**RG:** `{registro.get('rg') or 'N/I'}`\n**Último avistamento:** {str(registro.get('ultimo_avistamento') or 'Não informado')[:700]}",inline=False)
+            if primeira: await interaction.response.send_message(embed=embed,ephemeral=True); primeira=False
+            else: await interaction.followup.send(embed=embed,ephemeral=True)
+
+    @discord.ui.button(label='Registrar captura',emoji='🚔',style=discord.ButtonStyle.gray,custom_id='dic_retirar_procurado')
+    async def retirar(self,interaction:discord.Interaction,button:Button): await interaction.response.send_modal(RetirarProcuradoModal())
+
+    @discord.ui.button(label='Modificar Procurado',emoji='✏️',style=discord.ButtonStyle.primary,custom_id='dic_modificar_procurado',row=1)
+    async def modificar(self,interaction:discord.Interaction,button:Button):
+        if not isinstance(interaction.user,discord.Member) or not usuario_tem_equipe(interaction.user): return await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.',ephemeral=True)
+        await interaction.response.send_modal(BuscarModificarProcuradoModal())
+
+    @discord.ui.button(label='Abrir Catálogo',emoji='📄',style=discord.ButtonStyle.green,custom_id='dic_abrir_catalogo')
+    async def abrir_catalogo(self,interaction:discord.Interaction,button:Button): await interaction.response.send_message(f'📄 **Catálogo dos procurados ativos:**\n{_v16_catalogo_url()}',ephemeral=True)
+
+
+# ----- Finalização de BO: Estagiário/Investigador exige Inspetor+ -----
+_V111_FINALIZAR_BO_BASE = finalizar_boletim_atendimento
+
+
+def _v111_finalizacao_pendente(atendimento_id: Any) -> Optional[Dict[str,Any]]:
+    for item in carregar_autorizacoes().values():
+        if not isinstance(item,dict): continue
+        if str(item.get('tipo'))!='finalizar_boletim': continue
+        if str((item.get('contexto') or {}).get('atendimento_id'))!=str(atendimento_id): continue
+        if str(item.get('status') or '').upper() in {'PENDENTE','PROCESSANDO'}: return item
+    return None
+
+
+class FinalizarBoletimAutorizacaoViewV111(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def _pedido(self,interaction:discord.Interaction) -> Optional[Dict[str,Any]]:
+        todos=carregar_autorizacoes(); mid=int(getattr(getattr(interaction,'message',None),'id',0) or 0)
+        for item in todos.values():
+            if isinstance(item,dict) and str(item.get('tipo'))=='finalizar_boletim' and int(item.get('mensagem_id') or 0)==mid: return item
+        return None
+
+    @discord.ui.button(label='Autorizar Finalização',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_bo_finalizar_aprovar_v111')
+    async def aprovar(self,interaction:discord.Interaction,button:Button):
+        if not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Somente Inspetor+ pode autorizar a finalização.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        pedido=await self._pedido(interaction)
+        if not pedido: return await interaction.followup.send('❌ Solicitação de finalização não encontrada.',ephemeral=True)
+        if str(pedido.get('status') or '').upper()!='PENDENTE': return await interaction.followup.send(f"⚠️ Solicitação já está `{pedido.get('status')}`.",ephemeral=True)
+        todos=carregar_autorizacoes(); pedido['status']='PROCESSANDO'; todos[pedido['id']]=pedido; salvar_autorizacoes(todos)
+        atendimento=_atendimento_por_id(str((pedido.get('contexto') or {}).get('atendimento_id') or ''))
+        if not atendimento:
+            pedido['status']='PENDENTE'; todos=carregar_autorizacoes(); todos[pedido['id']]=pedido; salvar_autorizacoes(todos); return await interaction.followup.send('❌ Atendimento não localizado.',ephemeral=True)
+        try:
+            pedido.update({'status':'APROVADO','decidido_por_id':interaction.user.id,'decidido_por_nome':str(interaction.user),'decidido_em':agora_br()}); todos=carregar_autorizacoes(); todos[pedido['id']]=pedido; salvar_autorizacoes(todos)
+            atendimento['finalizacao_status']='AUTORIZADA'; atendimento['finalizacao_autorizada_por_id']=interaction.user.id; atendimento['finalizacao_autorizada_em']=agora_br(); atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+            await _V111_FINALIZAR_BO_BASE(interaction,str((pedido.get('dados') or {}).get('resultado') or 'Finalização autorizada pelo Inspetor+.'))
+        except Exception as erro:
+            pedido['status']='PENDENTE'; pedido['ultima_falha']=f'{type(erro).__name__}: {erro}'; todos=carregar_autorizacoes(); todos[pedido['id']]=pedido; salvar_autorizacoes(todos); await enviar_log(f'❌ V111 autorização de finalização BO falhou: {traceback.format_exc()[-2200:]}')
+            try: await interaction.followup.send('❌ A finalização falhou e a solicitação voltou para pendente. O BO não foi perdido.',ephemeral=True)
+            except Exception: pass
+
+    @discord.ui.button(label='Negar',emoji='❌',style=discord.ButtonStyle.red,custom_id='dic_bo_finalizar_negar_v111')
+    async def negar(self,interaction:discord.Interaction,button:Button):
+        if not _v111_inspetor_mais(interaction.user): return await interaction.response.send_message('❌ Somente Inspetor+ pode decidir.',ephemeral=True)
+        pedido=await self._pedido(interaction)
+        if not pedido: return await interaction.response.send_message('❌ Solicitação não encontrada.',ephemeral=True)
+        todos=carregar_autorizacoes(); pedido.update({'status':'NEGADO','decidido_por_id':interaction.user.id,'decidido_por_nome':str(interaction.user),'decidido_em':agora_br()}); todos[pedido['id']]=pedido; salvar_autorizacoes(todos)
+        atendimento=_atendimento_por_id(str((pedido.get('contexto') or {}).get('atendimento_id') or ''))
+        if atendimento:
+            atendimento['finalizacao_status']='NEGADA'; atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+        try:
+            emb=interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title='Finalização de BO')
+            emb.color=discord.Color.red(); emb.add_field(name='Decisão',value=f'❌ Negada por {interaction.user.mention}',inline=False); await interaction.response.edit_message(embed=emb,view=None)
+        except Exception:
+            if not interaction.response.is_done(): await interaction.response.send_message('❌ Finalização negada.',ephemeral=True)
+
+
+async def finalizar_boletim_atendimento(interaction: discord.Interaction, resultado: str) -> None:
+    atendimento=await garantir_atendimento_interaction(interaction)
+    if not atendimento:
+        if interaction.response.is_done(): return await interaction.followup.send('❌ Atendimento não encontrado.',ephemeral=True)
+        return await interaction.response.send_message('❌ Atendimento não encontrado.',ephemeral=True)
+    if str(atendimento.get('status') or '').upper()=='FINALIZADO':
+        if interaction.response.is_done(): return await interaction.followup.send('⚠️ Este boletim já foi finalizado.',ephemeral=True)
+        return await interaction.response.send_message('⚠️ Este boletim já foi finalizado.',ephemeral=True)
+    membro=interaction.user if isinstance(interaction.user,discord.Member) else None
+    if membro is None or not usuario_tem_equipe(membro):
+        if interaction.response.is_done(): return await interaction.followup.send('❌ Você não possui permissão para finalizar este boletim.',ephemeral=True)
+        return await interaction.response.send_message('❌ Você não possui permissão para finalizar este boletim.',ephemeral=True)
+    if not _usuario_pode_operar_atendimento_boletim(interaction,atendimento):
+        if interaction.response.is_done(): return await interaction.followup.send('❌ Apenas o responsável atual ou Inspetor+ pode solicitar a finalização.',ephemeral=True)
+        return await interaction.response.send_message('❌ Apenas o responsável atual ou Inspetor+ pode solicitar a finalização.',ephemeral=True)
+    if _v111_inspetor_mais(membro):
+        return await _V111_FINALIZAR_BO_BASE(interaction,resultado)
+    if not usuario_precisa_autorizacao_dicor(membro):
+        if interaction.response.is_done(): return await interaction.followup.send('❌ Seu cargo não pode finalizar boletins.',ephemeral=True)
+        return await interaction.response.send_message('❌ Seu cargo não pode finalizar boletins.',ephemeral=True)
+    existente=_v111_finalizacao_pendente(atendimento.get('id'))
+    if existente:
+        if interaction.response.is_done(): return await interaction.followup.send(f"⚠️ Já existe uma solicitação de finalização aguardando Inspetor+: `{existente.get('id')}`.",ephemeral=True)
+        return await interaction.response.send_message(f"⚠️ Já existe uma solicitação de finalização aguardando Inspetor+: `{existente.get('id')}`.",ephemeral=True)
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True,thinking=True)
+    codigo=f"BO-FIN-{int(getattr(interaction,'id',0) or 0)}-{datetime.datetime.now().strftime('%H%M%S')}"
+    pedido={'id':codigo,'tipo':'finalizar_boletim','status':'PENDENTE','dados':{'resultado':str(resultado or '').strip()},'contexto':{'atendimento_id':atendimento.get('id'),'area_id':getattr(interaction.channel,'id',None)},'solicitante_id':membro.id,'solicitante_nome':str(membro),'solicitado_em':agora_br(),'mensagem_id':None,'canal_autorizacao_id':getattr(interaction.channel,'id',None)}
+    todos=carregar_autorizacoes(); todos[codigo]=pedido; salvar_autorizacoes(todos)
+    emb=discord.Embed(title='📋 AUTORIZAÇÃO PARA FINALIZAR BOLETIM',description='Um Estagiário/Investigador solicitou o encerramento. O BO **não será finalizado** até decisão de Inspetor+.',color=discord.Color.orange(),timestamp=datetime.datetime.now(datetime.timezone.utc))
+    emb.add_field(name='Boletim',value=f"`{atendimento.get('numero')}`",inline=True); emb.add_field(name='Solicitante',value=membro.mention,inline=True); emb.add_field(name='Resultado proposto',value=cortar_discord(str(resultado or 'Não informado'),1000),inline=False); emb.set_footer(text='Polícia Federal • DICOR • Controle de finalização')
+    msg=await interaction.channel.send(content=mencoes_inspetor_mais(interaction.guild),embed=emb,view=FinalizarBoletimAutorizacaoViewV111(),allowed_mentions=discord.AllowedMentions(roles=True,users=True,everyone=False))
+    pedido['mensagem_id']=msg.id; todos=carregar_autorizacoes(); todos[codigo]=pedido; salvar_autorizacoes(todos)
+    atendimento['finalizacao_status']='AGUARDANDO AUTORIZAÇÃO'; atendimento['finalizacao_autorizacao_id']=codigo; atendimento['finalizacao_solicitada_por_id']=membro.id; atendimento['finalizacao_solicitada_em']=agora_br(); atualizar_atendimento_boletim('id',atendimento.get('id'),atendimento)
+    await interaction.followup.send(f'✅ Solicitação `{codigo}` enviada. O boletim só será finalizado após autorização de Inspetor+.',ephemeral=True)
+
+
+# ----- Recuperação automática de procurados que ficaram presos no fluxo -----
+async def _v111_recuperar_pendentes_atualizacao() -> Dict[str,int]:
+    stats={'revisados':0,'recuperados':0,'painel_recriado':0,'falhas':0}
+    guild=bot.get_guild(int(GUILD_ID or 0)) if int(GUILD_ID or 0) else next(iter(getattr(bot,'guilds',[]) or []),None)
+    if guild is None: return stats
+    try: await asyncio.to_thread(carregar_cadastros_pendentes_memoria)
+    except Exception: pass
+    todos_auth=carregar_autorizacoes()
+    for canal_id,original in list(cadastros_pendentes.items()):
+        if not isinstance(original,dict) or not original.get('_fluxo_fotos_v58'): continue
+        stats['revisados']+=1; dados=dict(original); rg=_banco_normalizar_rg(str(dados.get('rg') or '')); existente=_v111_registro_ativo_por_rg(rg)
+        if existente and str(dados.get('_modo_procurado') or '').upper()!='ATUALIZAR':
+            dados['_modo_procurado']='ATUALIZAR'; dados['_procurado_existente_id']=existente.get('id'); dados['foto_individuo']=dados.get('foto_individuo') or existente.get('foto_individuo'); dados['foto_rg']=dados.get('foto_rg') or existente.get('foto_rg'); cadastros_pendentes[int(canal_id)]=dados; stats['recuperados']+=1
+        atendimento=_v56_atendimento_por_id(dados.get('_atendimento_id'))
+        canal=await obter_canal_bot(int(canal_id))
+        if not atendimento or canal is None or not hasattr(canal,'send'): continue
+        status=normalizar_busca(str(dados.get('status') or ''))
+        # Se já estava em autorização, garante que a solicitação continue visível no BO, inclusive atualização de RG já existente.
+        if 'aguardando autoriz' in status:
+            pedido_id=_v93_pedido_id_dados(int(canal_id),dados); auth=None
+            for item in todos_auth.values():
+                if _v93_autorizacao_corresponde_canal(item,atendimento.get('id'),int(canal_id),pedido_id): auth=item; break
+            try:
+                if not auth or not await _v93_mensagem_autorizacao_existe(auth):
+                    nova=await _v93_criar_autorizacao_recuperada(guild,atendimento,dados,int(canal_id),pedido_id); dados['solicitacao_id']=nova['id']; cadastros_pendentes[int(canal_id)]=dados; stats['painel_recriado']+=1; todos_auth=carregar_autorizacoes()
+            except Exception as erro:
+                stats['falhas']+=1; await enviar_log(f'⚠️ V111 recuperação de autorização procurado `{canal_id}`: {erro}')
+            continue
+        # Cadastro completo que ficou parado antes do botão final: devolve painel de conclusão.
+        if dados.get('crimes') and (_fotos_procurado_validas(dados) or existente):
+            try:
+                await canal.send('🔄 **FLUXO DE PROCURADO RECUPERADO**\nOs dados existentes foram preservados. Clique abaixo para concluir ou enviar para autorização.',view=FinalizarProcuradoView())
+                dados['status']='RECUPERADO_AGUARDANDO_FINALIZACAO'; cadastros_pendentes[int(canal_id)]=dados; stats['painel_recriado']+=1
+            except Exception as erro:
+                stats['falhas']+=1; await enviar_log(f'⚠️ V111 painel de recuperação procurado `{canal_id}`: {erro}')
+    try: await asyncio.to_thread(salvar_cadastros_pendentes)
+    except Exception: pass
+    return stats
+
+
+async def _v111_limpar_painel_procurados_antigo() -> int:
+    alterados=0
+    for guild in list(getattr(bot,'guilds',[]) or []):
+        for canal in list(getattr(guild,'text_channels',[]) or []):
+            nome=normalizar_busca(getattr(canal,'name',''))
+            if 'cadastrar procurado' not in nome and nome not in {'cadastrar-procurado','procurados'}: continue
+            try:
+                async for msg in canal.history(limit=60,oldest_first=False):
+                    if not getattr(msg.author,'bot',False) or not msg.embeds: continue
+                    titulo=normalizar_busca(getattr(msg.embeds[0],'title',''))
+                    if 'sistema de procurados' not in titulo: continue
+                    await msg.edit(embed=embed_painel_procurados_padrao(),view=PainelProcuradosView()); alterados+=1; break
+            except Exception: continue
+    return alterados
+
+
+@bot.listen('on_ready')
+async def v111_registrar_e_recuperar_fluxos() -> None:
+    await asyncio.sleep(5)
+    try:
+        bot.add_view(PainelProcuradosView()); bot.add_view(PesquisaCrimesView()); bot.add_view(FinalizarProcuradoView()); bot.add_view(FinalizarBoletimAutorizacaoViewV111())
+    except Exception as erro: print(f'⚠️ V111 registro de views: {erro}',flush=True)
+    try:
+        painel=await _v111_limpar_painel_procurados_antigo(); rec=await _v111_recuperar_pendentes_atualizacao()
+        print(f"✅ V111 procurados: painel atualizado={painel} | pendentes revisados={rec.get('revisados',0)} | recuperados={rec.get('recuperados',0)} | painéis recriados={rec.get('painel_recriado',0)} | falhas={rec.get('falhas',0)}",flush=True)
+    except Exception as erro:
+        traceback.print_exc(); print(f'⚠️ V111 recuperação automática: {type(erro).__name__}: {erro}',flush=True)
+
+
+print('✅ V111 carregada — procurados somente via BO, atualização aditiva de RG existente, finalização de BO por Investigador/Estagiário com autorização Inspetor+ e dossiê sem pendências redundantes.', flush=True)
+
+
+# =====================================================
+# V112 — CONSISTÊNCIA FINAL: DOSSIÊ + PROCURADOS ÓRFÃOS
+# - Recalcula requisitos sempre com os complementos persistidos mais recentes.
+# - Remove Localização específica e Local de fabricação das pendências humanas.
+# - Recupera fluxos de procurados que ficaram em canais temporários sem entrada oficial.
+# - Mantém atualização aditiva por BO e autorização Inspetor+ da V111.
+# =====================================================
+
+# ----- Dossiê: complementos persistidos SEMPRE prevalecem -----
+def _v111_complementos_para_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
+    comp = dict(dados.get('complementos_pacificacao') or {})
+    canal_id = int(dados.get('canal_id') or 0)
+    if canal_id:
+        try:
+            persistidos = dict(_v103_complementos_canal(canal_id) or {})
+            # O arquivo persistente é a fonte mais recente do que foi digitado no formulário.
+            comp.update({k: v for k, v in persistidos.items() if str(v or '').strip()})
+        except Exception as erro:
+            print(f'⚠️ V112 não conseguiu recarregar complementos da mesa {canal_id}: {erro}', flush=True)
+    dados['complementos_pacificacao'] = dict(comp)
+    return comp
+
+
+def _v103_status_requisitos(dados: Dict[str, Any]) -> Tuple[Dict[str, str], List[str], List[str], List[str]]:
+    """V112: nunca usa requisitos antigos em cache depois de salvar um formulário."""
+    req = dict(_v110_preparar_requisitos(dados) or {})
+    dados['requisitos_pacificacao'] = dict(req)
+    return req, _v103_pendencias_texto(req), _v103_pendencias_midia(dados), _v103_pendencias_estrutura(dados)
+
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    req, faltas_texto, faltas_midia, faltas_estrutura = _v103_status_requisitos(dados)
+    total = len(faltas_texto) + len(faltas_midia) + len(faltas_estrutura)
+    linhas = [
+        '📋 **REVISÃO FINAL DO DOSSIÊ**',
+        'Tudo que a mesa, os tópicos e os complementos já informados conseguem comprovar foi preenchido automaticamente.'
+    ]
+    if total == 0:
+        linhas += ['', '✅ **Dossiê validado. Nenhuma pendência real encontrada.**', 'Clique em **Gerar Dossiê** para concluir.']
+        return cortar_discord('\n'.join(linhas), 1950)
+    linhas += ['', f'**Pendências reais restantes:** `{total}`']
+    if faltas_texto:
+        linhas.append('\n📝 **Informações que ainda exigem preenchimento humano:**')
+        linhas.extend(f'• {_V103_LABELS.get(k, k)}' for k in faltas_texto[:14])
+    if faltas_midia:
+        linhas.append('\n🖼️ **Evidências que realmente ainda não foram localizadas:**')
+        linhas.extend(f'• {x}' for x in faltas_midia[:10])
+    if faltas_estrutura:
+        linhas.append('\n📌 **Dados que precisam vir da própria mesa:**')
+        linhas.extend(f'• {x}' for x in faltas_estrutura[:8])
+    linhas += ['', 'Depois de preencher ou anexar algo novo, use **Reanalisar Mesa**. Campos já salvos não serão solicitados novamente.']
+    return cortar_discord('\n'.join(linhas), 1950)
+
+
+# ----- Procurados órfãos: recupera canal temporário que não chegou ao registro oficial -----
+def _v112_texto_mensagens(msgs: List[discord.Message]) -> str:
+    partes: List[str] = []
+    for msg in msgs:
+        try:
+            t = coletar_texto_embed(msg) or msg.content or ''
+        except Exception:
+            t = getattr(msg, 'content', '') or ''
+        if str(t).strip():
+            partes.append(str(t).strip())
+    return '\n'.join(partes)
+
+
+def _v112_nome_canal_procurado(canal: discord.TextChannel) -> str:
+    nome = str(getattr(canal, 'name', '') or '')
+    nome = re.sub(r'^[^A-Za-zÀ-ÿ0-9]*', '', nome)
+    nome = re.sub(r'(?i)^procurado[-_・\s]*', '', nome)
+    nome = nome.replace('-', ' ').replace('_', ' ').replace('・', ' ')
+    nome = re.sub(r'\s+', ' ', nome).strip()
+    return nome.title() if nome else 'Não identificado'
+
+
+def _v112_extrair_rotulo(texto: str, rotulos: List[str], limite: int=250) -> str:
+    for rotulo in rotulos:
+        m = re.search(rf'(?im)^\s*(?:[*_`>#-]+\s*)?{rotulo}\s*(?:[*_`]+)?\s*[:\-–—]\s*(.+?)\s*$', texto)
+        if m:
+            v = re.sub(r'[*_`]+', '', m.group(1)).strip()
+            if v:
+                return v[:limite]
+    return ''
+
+
+def _v112_extrair_rg(texto: str) -> str:
+    candidatos = [
+        r'(?im)\bRG\s*(?:N[º°o]\.?\s*)?[:#\-–—]?\s*`?([A-Z0-9.\-]{2,24})`?',
+        r'(?im)\bPassaporte\s*[:#\-–—]?\s*`?([A-Z0-9.\-]{2,24})`?',
+    ]
+    for p in candidatos:
+        m = re.search(p, texto)
+        if m:
+            rg = _banco_normalizar_rg(str(m.group(1) or ''))
+            if rg:
+                return rg
+    return ''
+
+
+def _v112_extrair_bo(texto: str) -> str:
+    try:
+        n = extrair_numero_boletim_seguro(texto)
+        if n:
+            return str(n)
+    except Exception:
+        pass
+    pats = [
+        r'(?im)BOLETIM\s+DE\s+OCORR[ÊE]NCIA\s*[—\-–]\s*N[º°o]?\s*([0-9]{1,8})',
+        r'(?im)\bBO(?:LETIM)?\s*(?:N[º°o]\.?\s*)?[:#\-–—]?\s*([0-9]{1,8})',
+    ]
+    for p in pats:
+        m = re.search(p, texto)
+        if m:
+            return str(m.group(1)).strip()
+    return ''
+
+
+def _v112_extrair_crimes(texto: str) -> str:
+    linhas: List[str] = []
+    vistos = set()
+    for linha in str(texto or '').splitlines():
+        limpa = re.sub(r'[*_`]+', '', linha).strip()
+        # Artigos no padrão do sistema: 3.1 - Furto..., 8.3 - Formação..., etc.
+        if not re.match(r'^[•\-]?\s*\d+(?:\.\d+)+\s*[-–—:]\s*\S+', limpa):
+            continue
+        limpa = limpa.lstrip('•- ').strip()
+        chave = normalizar_busca(limpa)
+        if chave and chave not in vistos:
+            vistos.add(chave); linhas.append(limpa)
+    return '\n'.join(f'• {x}' for x in linhas)
+
+
+async def _v112_rg_por_ocr_de_anexos(anexos: List[discord.Attachment]) -> str:
+    """OCR conservador: só aceita RG quando a imagem contém rótulo RG/Passaporte/Documento."""
+    if '_v92_ocr_rg_sync' not in globals() or not anexos:
+        return ''
+    pasta = Path(tempfile.gettempdir()) / 'dicor-v112-recuperacao-rg'
+    try:
+        await asyncio.to_thread(pasta.mkdir, parents=True, exist_ok=True)
+    except Exception:
+        pass
+    # A foto de RG costuma ser a segunda; testa do fim para o começo.
+    for idx, anexo in enumerate(reversed(anexos[-4:]), 1):
+        try:
+            nome = nome_arquivo_seguro(getattr(anexo, 'filename', f'rg-{idx}.png')) or f'rg-{idx}.png'
+            caminho = pasta / f'{int(time.time()*1000)}-{idx}-{nome}'
+            try:
+                await anexo.save(str(caminho), use_cached=True)
+            except TypeError:
+                await anexo.save(str(caminho))
+            rg = await asyncio.to_thread(_v92_ocr_rg_sync, str(caminho))
+            try: caminho.unlink(missing_ok=True)
+            except Exception: pass
+            if rg:
+                return _banco_normalizar_rg(rg)
+        except Exception:
+            continue
+    return ''
+
+
+async def _v112_recuperar_canal_procurado_orfao(canal: discord.TextChannel) -> str:
+    if int(canal.id) in cadastros_pendentes:
+        return 'ja_indexado'
+    try:
+        if int(canal.id) in {int(PROCURADOS_CHANNEL_ID or 0), int(HISTORICO_PROCURADOS_ID or 0)}:
+            return 'ignorado'
+    except Exception:
+        pass
+    nome_norm = normalizar_busca(getattr(canal, 'name', ''))
+    if 'procurado' not in nome_norm:
+        return 'ignorado'
+
+    msgs: List[discord.Message] = []
+    try:
+        async for msg in canal.history(limit=180, oldest_first=True):
+            msgs.append(msg)
+    except Exception:
+        return 'falha'
+    if not msgs:
+        return 'vazio'
+    texto = _v112_texto_mensagens(msgs)
+    if re.search(r'(?i)procurado\s+(?:publicado|cadastrado)\s+com\s+sucesso|cadastro\s+conclu[ií]do', texto):
+        return 'concluido'
+
+    anexos: List[discord.Attachment] = []
+    for msg in msgs:
+        for a in list(getattr(msg, 'attachments', []) or []):
+            ct = str(getattr(a, 'content_type', '') or '').lower()
+            fn = str(getattr(a, 'filename', '') or '').lower()
+            if ct.startswith('image/') or fn.endswith(('.png','.jpg','.jpeg','.webp','.gif')):
+                anexos.append(a)
+
+    nome = _v112_extrair_rotulo(texto, [r'Nome(?:\s+do\s+indiv[ií]duo)?', r'Procurado']) or _v112_nome_canal_procurado(canal)
+    rg = _v112_extrair_rg(texto)
+    if not rg and anexos:
+        rg = await _v112_rg_por_ocr_de_anexos(anexos)
+    bo = _v112_extrair_bo(texto)
+    crimes = _v112_extrair_crimes(texto)
+    ultimo = _v112_extrair_rotulo(texto, [r'[ÚU]ltimo\s+Avistamento', r'Local(?:\s+do\s+[úu]ltimo\s+avistamento)?'], 700)
+
+    atendimento = buscar_atendimento_por_numero(bo) if bo else None
+    # Se o BO não apareceu no texto, tenta localizar por referência ao canal de origem salva em mensagens/menções.
+    if atendimento is None:
+        for item in carregar_atendimentos_boletins():
+            if str(item.get('status') or '').upper() == 'FINALIZADO':
+                continue
+            # O nome/RG no texto do BO pode permitir associação segura.
+            n_txt = normalizar_busca(texto)
+            if rg and rg in re.sub(r'\D', '', str(item)):
+                atendimento = item; break
+            if nome and normalizar_busca(nome) and normalizar_busca(nome) in n_txt and str(item.get('numero') or '') in texto:
+                atendimento = item; break
+
+    existente = _v111_registro_ativo_por_rg(rg) if rg else None
+    # Evita reabrir um canal antigo se o mesmo RG/BO já está efetivamente publicado.
+    if existente and bo:
+        bos_existentes = _v111_lista_boletins(existente)
+        if numero_curto_boletim(bo) in {numero_curto_boletim(x) for x in bos_existentes} and not crimes:
+            return 'ja_publicado'
+
+    # Só transforma em fluxo recuperado quando há identidade e vínculo com BO suficientes.
+    if not rg or atendimento is None:
+        # Não inventa dados. Deixa um diagnóstico único no canal para a equipe completar o mínimo.
+        try:
+            if not any('RECUPERAÇÃO AUTOMÁTICA V112' in (getattr(m, 'content', '') or '') for m in msgs if getattr(m.author, 'bot', False)):
+                faltam=[]
+                if not rg: faltam.append('RG')
+                if atendimento is None: faltam.append('vínculo com o BO')
+                await canal.send('🛟 **RECUPERAÇÃO AUTOMÁTICA V112**\nO canal foi encontrado, mas não vou inventar informações. Falta localizar com segurança: **'+', '.join(faltam)+'**. Os anexos existentes foram preservados.')
+        except Exception:
+            pass
+        return 'incompleto'
+
+    autor_id = 0; autor_nome = 'Recuperação automática'
+    for msg in msgs:
+        if not getattr(msg.author, 'bot', False):
+            autor_id = int(getattr(msg.author, 'id', 0) or 0); autor_nome = str(msg.author); break
+    dados: Dict[str,Any] = {
+        'nome': nome, 'rg': rg, 'crimes': crimes, 'ultimo_avistamento': ultimo,
+        'numero_boletim': atendimento.get('numero'), 'boletim': atendimento.get('numero'),
+        'autor_id': autor_id, 'autor_nome': autor_nome,
+        '_atendimento_id': atendimento.get('id'), '_canal_temporario_id': int(canal.id), '_canal_fluxo_id': int(canal.id),
+        '_canal_bo_origem_id': int(atendimento.get('area_id') or atendimento.get('thread_id') or 0),
+        '_fluxo_fotos_v58': True, '_modo_procurado': 'ATUALIZAR' if existente else 'NOVO',
+        'status': 'RECUPERADO_AGUARDANDO_FINALIZACAO', 'recuperado_v112_em': agora_br(),
+    }
+    if anexos:
+        dados['foto_individuo'] = str(getattr(anexos[0], 'url', '') or getattr(anexos[0], 'proxy_url', '') or '')
+    if len(anexos) >= 2:
+        dados['foto_rg'] = str(getattr(anexos[1], 'url', '') or getattr(anexos[1], 'proxy_url', '') or '')
+    if existente:
+        e = _v111_enriquecer_existente(existente)
+        dados['_procurado_existente_id'] = e.get('id')
+        dados['foto_individuo'] = dados.get('foto_individuo') or e.get('foto_individuo')
+        dados['foto_rg'] = dados.get('foto_rg') or e.get('foto_rg')
+
+    # Cadastro novo precisa das duas imagens; atualização pode reutilizar as antigas.
+    if not existente and not _fotos_procurado_validas(dados):
+        try:
+            await canal.send('🛟 **RECUPERAÇÃO AUTOMÁTICA V112**\nIdentidade e BO foram recuperados, mas ainda faltam as duas fotos obrigatórias. Reenvie **foto do indivíduo** e **foto do RG** neste canal; nenhum dado existente foi apagado.')
+        except Exception: pass
+        dados['etapa_fotos']='aguardando_foto_individuo' if not dados.get('foto_individuo') else 'aguardando_foto_rg'
+        cadastros_pendentes[int(canal.id)] = dados; salvar_cadastros_pendentes(); return 'fotos_pendentes'
+
+    cadastros_pendentes[int(canal.id)] = dados
+    salvar_cadastros_pendentes()
+    try:
+        modo = 'atualização' if existente else 'cadastro'
+        extra = f"\n**Crimes recuperados:**\n{crimes}" if crimes else '\n⚠️ Nenhum crime novo foi extraído automaticamente; confira antes de concluir.'
+        await canal.send(
+            f"🛟 **FLUXO DE PROCURADO RECUPERADO**\n**Nome:** {nome}\n**RG:** `{rg}`\n**BO:** `{atendimento.get('numero')}`\n**Modo:** {modo}.{extra}\n\nOs anexos deste canal foram preservados. Clique abaixo para concluir; se você for Investigador/Estagiário, a alteração seguirá para autorização de Inspetor+.",
+            view=FinalizarProcuradoView()
+        )
+    except Exception as erro:
+        await enviar_log(f'⚠️ V112 recuperou dados do canal {canal.id}, mas não conseguiu publicar painel: {erro}')
+    return 'recuperado'
+
+
+async def _v112_varrer_procurados_orfaos() -> Dict[str,int]:
+    stats={'vistos':0,'recuperados':0,'incompletos':0,'ignorados':0,'falhas':0}
+    for guild in list(getattr(bot,'guilds',[]) or []):
+        for canal in list(getattr(guild,'text_channels',[]) or []):
+            if 'procurado' not in normalizar_busca(getattr(canal,'name','')):
+                continue
+            # Se existe categoria temporária configurada, prioriza-a; se não, usa o nome do canal.
+            if int(PROCURADOS_TEMP_CATEGORY_ID or 0) and int(getattr(canal,'category_id',0) or 0) != int(PROCURADOS_TEMP_CATEGORY_ID):
+                # Ainda permite canais órfãos antigos com prefixo explícito de fluxo.
+                if not re.search(r'(?i)procurado[-_・]', str(getattr(canal,'name',''))):
+                    continue
+            stats['vistos']+=1
+            try:
+                r=await _v112_recuperar_canal_procurado_orfao(canal)
+                if r in {'recuperado','fotos_pendentes'}: stats['recuperados']+=1
+                elif r=='incompleto': stats['incompletos']+=1
+                else: stats['ignorados']+=1
+            except Exception as erro:
+                stats['falhas']+=1
+                await enviar_log(f'⚠️ V112 varredura de procurado órfão canal `{getattr(canal,"id",0)}`: {type(erro).__name__}: {erro}')
+    return stats
+
+
+@bot.listen('on_ready')
+async def v112_consistencia_final_ready() -> None:
+    await asyncio.sleep(9)
+    try:
+        stats=await _v112_varrer_procurados_orfaos()
+        print(f"✅ V112 recuperação órfãos: vistos={stats['vistos']} | recuperados={stats['recuperados']} | incompletos={stats['incompletos']} | ignorados={stats['ignorados']} | falhas={stats['falhas']}", flush=True)
+    except Exception as erro:
+        traceback.print_exc(); print(f'⚠️ V112 recuperação órfãos falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+print('✅ V112 carregada — dossiê recalcula complementos salvos sem pendências redundantes; RGs de Buiu Gomes/Arthur Fleker persistem; procurados órfãos são recuperados; fluxo via BO e autorização de finalização permanecem ativos.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(main())
