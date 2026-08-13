@@ -56974,6 +56974,337 @@ async def _compat_reconciliar_mesas_ja_com_tarefas() -> None:
 
 print('✅ COMPAT TAREFAS EXISTENTES carregado — novas regras aplicadas a mesas que JÁ possuem tarefas; mesas legadas sem tarefas continuam intocadas.', flush=True)
 
+
+# =====================================================
+# CORE FINAL — BOTÕES CRÍTICOS + CANAIS DE CONTROLE
+# =====================================================
+# Objetivos desta camada final:
+# 1) dar um único dono lógico aos botões Finalizar/Concluir tarefa e Fechar Mesa;
+# 2) manter fallback via on_interaction para mensagens antigas após restart;
+# 3) impedir corrida/dobro de execução com claim por interaction.id;
+# 4) ACK do Fechar Mesa imediatamente, antes de qualquer consulta/validação;
+# 5) bloquear definitivamente "RECUPERAÇÃO ASSISTIDA DE PROCURADO" em canais de controle;
+# 6) apagar apenas mensagens do próprio bot com esse marcador nos canais de controle.
+
+_CRITICAL_INTERACTION_CLAIMS: Dict[int, float] = {}
+_CRITICAL_COMPONENT_IDS = {
+    'dic_v122_tarefa_finalizar',
+    'dic_v122_tarefa_concluir',
+    'dic_fechar_mesa_botao',
+    'dic_fechar_mesa',
+}
+
+
+def _critical_claim_interaction(interaction: discord.Interaction) -> bool:
+    """Garante exatamente uma execução por interaction.id entre ViewStore e fallback."""
+    agora = time.monotonic()
+    expirados = [iid for iid, ts in list(_CRITICAL_INTERACTION_CLAIMS.items()) if agora - float(ts) > 120.0]
+    for iid in expirados:
+        _CRITICAL_INTERACTION_CLAIMS.pop(iid, None)
+    iid = int(getattr(interaction, 'id', 0) or 0)
+    if not iid:
+        return True
+    if iid in _CRITICAL_INTERACTION_CLAIMS:
+        return False
+    _CRITICAL_INTERACTION_CLAIMS[iid] = agora
+    return True
+
+
+# Guarda a implementação de tarefa já validada; a View final abaixo só adiciona
+# ownership/fallback sem reescrever a regra de negócio dos 13 itens.
+_CRITICAL_TASK_VIEW_IMPL = V122TarefaGuiadaView
+
+
+async def _critical_executar_tarefa(interaction: discord.Interaction, custom_id: str) -> None:
+    try:
+        view = _CRITICAL_TASK_VIEW_IMPL()
+        item = next(
+            (x for x in list(getattr(view, 'children', []) or []) if str(getattr(x, 'custom_id', '') or '') == str(custom_id)),
+            None,
+        )
+        callback = getattr(item, 'callback', None)
+        if not callable(callback):
+            if not _v127_response_done(interaction):
+                await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='critical.task.sem_callback')
+            await _v127_safe_send(interaction, '❌ O botão da tarefa perdeu o vínculo interno. Nenhuma alteração foi aplicada.', contexto='critical.task.sem_callback')
+            return
+        await callback(interaction)
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto=f'critical.task.{custom_id}')
+        if not _v127_response_done(interaction):
+            await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='critical.task.error')
+        await _v127_safe_send(interaction, '❌ Não consegui executar esta tarefa agora. Nada foi apagado.', contexto='critical.task.error')
+
+
+class V122TarefaGuiadaView(View):
+    """Dono canônico final dos dois botões de tarefa."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Finalizar tarefa', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_v122_tarefa_finalizar', row=0)
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        if not _critical_claim_interaction(interaction):
+            return
+        await _critical_executar_tarefa(interaction, 'dic_v122_tarefa_finalizar')
+
+    @discord.ui.button(label='Concluir tarefa', emoji='🛡️', style=discord.ButtonStyle.primary, custom_id='dic_v122_tarefa_concluir', row=0)
+    async def concluir(self, interaction: discord.Interaction, button: Button):
+        if not _critical_claim_interaction(interaction):
+            return
+        await _critical_executar_tarefa(interaction, 'dic_v122_tarefa_concluir')
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _v127_view_on_error(self, interaction, error, item)
+
+
+async def _critical_fechar_mesa(interaction: discord.Interaction, dados_mesa: Optional[Dict[str, Any]]=None) -> None:
+    """Fechar Mesa com ACK na primeira operação e sem I/O antes do defer."""
+    if not await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='critical.fechar_mesa'):
+        return
+    try:
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await _v127_safe_send(interaction, '❌ Este botão só funciona dentro de um canal de mesa.', contexto='critical.fechar_mesa')
+        if not usuario_pode_fechar_mesa(interaction.user):
+            return await _v127_safe_send(interaction, mensagem_sem_permissao_fechar_mesa(), contexto='critical.fechar_mesa')
+
+        # Mesa guiada/tarefas: apenas lê o estado; não cria tarefas nem reativa mesa antiga.
+        if _v122_mesa_tarefas_habilitada(int(canal.id)) or _v118_mesa_guiada_habilitada(int(canal.id)):
+            estado = _v116_estado(int(canal.id), False)
+            if isinstance(estado, dict):
+                _v117_migrar_estado(estado)
+                if str(estado.get('status') or '').upper() != 'CONCLUIDA':
+                    item_atual = int(estado.get('item') or 1)
+                    topico = None
+                    try:
+                        topico = await asyncio.wait_for(_v116_topico_item(canal, item_atual), timeout=5.0)
+                    except Exception:
+                        topico = None
+                    destino = f'\n📌 Tópico atual: {topico.mention}' if topico else ''
+                    return await _v127_safe_send(
+                        interaction,
+                        '❌ **Ainda existem tarefas obrigatórias da investigação.**\n\n'
+                        + _v116_progresso_texto(estado)
+                        + destino
+                        + '\n\nFinalize e obtenha a conclusão de Inspetor+ antes de fechar a mesa.',
+                        contexto='critical.fechar_mesa.incompleta',
+                    )
+
+        dados = dict(dados_mesa or {})
+        if not dados:
+            mesa_banco = buscar_mesa_por_canal(canal.id)
+            if mesa_banco:
+                dados = {
+                    'nome': f"OPERAÇÃO {str(mesa_banco.get('familia') or canal.name).upper()}",
+                    'comunidade': mesa_banco.get('familia', 'Mapeada em logs'),
+                    'delegado': mesa_banco.get('autor_nome', 'Superintendência DICOR'),
+                    'data_abertura': mesa_banco.get('criada_em', agora_br()),
+                    'processo': f'PF-DICOR-{canal.id}',
+                    'numero': f'INV-{str(canal.id)[-6:]}',
+                }
+        if not dados:
+            dados = {
+                'nome': canal.name.upper(),
+                'comunidade': 'Setor Mapeado em Campo',
+                'delegado': getattr(interaction.user, 'display_name', str(interaction.user)),
+                'data_abertura': agora_br(),
+                'processo': f'PF-DICOR-{canal.id}',
+                'numero': f'INV-{str(canal.id)[-6:]}',
+            }
+        await _v127_safe_send(
+            interaction,
+            '⚠️ **Confirmação DICOR:** as tarefas obrigatórias estão concluídas. Deseja encerrar esta mesa e consolidar o Dossiê Operacional?',
+            view=ConfirmacaoFecharMesaView(dados),
+            contexto='critical.fechar_mesa.confirmacao',
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto='critical.fechar_mesa')
+        await _v127_safe_send(interaction, '❌ O botão de fechar mesa encontrou um erro. Nada foi apagado.', contexto='critical.fechar_mesa.error')
+
+
+class FecharMesaView(View):
+    """View canônica do botão atual Fechar Mesa."""
+    def __init__(self, dados_mesa=None):
+        super().__init__(timeout=None)
+        self.dados_mesa = dados_mesa or {}
+
+    @discord.ui.button(label='Fechar Mesa', emoji='🔒', style=discord.ButtonStyle.red, custom_id='dic_fechar_mesa_botao')
+    async def fechar(self, interaction: discord.Interaction, button: Button):
+        if not _critical_claim_interaction(interaction):
+            return
+        await _critical_fechar_mesa(interaction, self.dados_mesa)
+
+
+class _CriticalFecharMesaLegacyView(View):
+    """Compatibilidade para mensagens antigas que usam custom_id dic_fechar_mesa."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Fechar Mesa', emoji='🔒', style=discord.ButtonStyle.red, custom_id='dic_fechar_mesa')
+    async def fechar(self, interaction: discord.Interaction, button: Button):
+        if not _critical_claim_interaction(interaction):
+            return
+        await _critical_fechar_mesa(interaction, None)
+
+
+async def _critical_router(interaction: discord.Interaction) -> None:
+    """Fallback para mensagens antigas quando a ViewStore não encontra o custom_id após restart."""
+    try:
+        if getattr(interaction, 'type', None) != discord.InteractionType.component:
+            return
+        custom_id = str((getattr(interaction, 'data', {}) or {}).get('custom_id') or '')
+        if custom_id not in _CRITICAL_COMPONENT_IDS:
+            return
+        if not _critical_claim_interaction(interaction):
+            return
+        print(
+            f'[CRITICAL-ROUTER] custom_id={custom_id} interaction={getattr(interaction, "id", 0)} '
+            f'channel={getattr(interaction, "channel_id", 0)} phase=claimed',
+            flush=True,
+        )
+        if custom_id in {'dic_v122_tarefa_finalizar', 'dic_v122_tarefa_concluir'}:
+            await _critical_executar_tarefa(interaction, custom_id)
+        else:
+            await _critical_fechar_mesa(interaction, None)
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto='critical.router')
+        if not _v127_response_done(interaction):
+            await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='critical.router.error')
+        await _v127_safe_send(interaction, '❌ Não consegui executar este botão agora. Nada foi apagado.', contexto='critical.router.error')
+
+
+def _critical_nome_canal(valor: Any) -> str:
+    bruto = normalizar_busca(str(valor or ''))
+    return re.sub(r'[^a-z0-9]+', ' ', bruto).strip()
+
+
+def _critical_canal_controle_procurados(canal: Any) -> bool:
+    try:
+        cid = int(getattr(canal, 'id', 0) or 0)
+        if cid in {int(PROCURADOS_CHANNEL_ID or 0), int(HISTORICO_PROCURADOS_ID or 0)}:
+            return True
+    except Exception:
+        pass
+    nome = _critical_nome_canal(getattr(canal, 'name', ''))
+    tokens = set(nome.split())
+    if {'cadastrar', 'procurado'}.issubset(tokens):
+        return True
+    if {'prioridade', 'procurados'}.issubset(tokens) or {'procurados', 'arquivados'}.issubset(tokens):
+        return True
+    if nome in {'procurados', 'procurado', 'sistema procurados', 'painel procurados'}:
+        return True
+    return False
+
+
+# Defesa na origem: mesmo que qualquer varredura V112/V115 chame a publicação,
+# canais de controle nunca mais recebem o painel de recuperação.
+_CRITICAL_PUBLICAR_RECUPERACAO_BASE = _v115_publicar_painel_recuperacao
+async def _v115_publicar_painel_recuperacao(canal: discord.TextChannel, base: Dict[str, Any]) -> None:
+    if _critical_canal_controle_procurados(canal):
+        print(f'[PROCURADOS] recuperação assistida suprimida em canal de controle id={getattr(canal, "id", 0)} nome={getattr(canal, "name", "")}', flush=True)
+        return
+    return await _CRITICAL_PUBLICAR_RECUPERACAO_BASE(canal, base)
+
+
+_CRITICAL_RECUPERAR_ORFAO_BASE = _v112_recuperar_canal_procurado_orfao
+async def _v112_recuperar_canal_procurado_orfao(canal: discord.TextChannel) -> str:
+    if _critical_canal_controle_procurados(canal):
+        return 'ignorado_controle'
+    return await _CRITICAL_RECUPERAR_ORFAO_BASE(canal)
+
+
+async def _critical_limpar_recuperacao_controles() -> int:
+    """Remove somente mensagens do próprio bot com o marcador exato de recuperação assistida."""
+    removidas = 0
+    marcadores = (
+        'RECUPERAÇÃO ASSISTIDA DE PROCURADO',
+        'RECUPERACAO ASSISTIDA DE PROCURADO',
+    )
+    for guild in list(getattr(bot, 'guilds', []) or []):
+        for canal in list(getattr(guild, 'text_channels', []) or []):
+            if not _critical_canal_controle_procurados(canal):
+                continue
+            try:
+                async for msg in canal.history(limit=150):
+                    if not getattr(getattr(msg, 'author', None), 'bot', False):
+                        continue
+                    conteudo = str(getattr(msg, 'content', '') or '')
+                    if not any(m in conteudo for m in marcadores):
+                        continue
+                    try:
+                        await msg.delete()
+                        removidas += 1
+                    except Exception as erro:
+                        print(f'⚠️ [PROCURADOS] não removeu mensagem de recuperação id={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}', flush=True)
+            except Exception as erro:
+                print(f'⚠️ [PROCURADOS] limpeza do canal {getattr(canal, "id", 0)} falhou: {type(erro).__name__}: {erro}', flush=True)
+    return removidas
+
+
+_CRITICAL_SETUP_HOOK_BASE = bot.setup_hook
+async def _critical_setup_hook(self) -> None:
+    await _CRITICAL_SETUP_HOOK_BASE()
+
+    # O listener de pre-ACK antigo podia disputar o mesmo InteractionResponse com a View.
+    # O ACK agora é feito no próprio callback e pelo router somente quando ele é o dono.
+    try:
+        bot.remove_listener(_interaction_core_task_preack, 'on_interaction')
+    except Exception:
+        pass
+    try:
+        bot.remove_listener(_critical_router, 'on_interaction')
+    except Exception:
+        pass
+    bot.add_listener(_critical_router, 'on_interaction')
+
+    # Elimina donos antigos apenas dos quatro custom_ids críticos e registra exatamente
+    # as implementações finais. Os demais painéis do projeto permanecem intocados.
+    for view in list(getattr(bot, 'persistent_views', []) or []):
+        try:
+            ids_view = {
+                str(getattr(child, 'custom_id', '') or '')
+                for child in list(getattr(view, 'children', []) or [])
+            }
+            if ids_view & _CRITICAL_COMPONENT_IDS:
+                bot.remove_view(view)
+        except Exception:
+            pass
+
+    erros = []
+    for factory in (V122TarefaGuiadaView, FecharMesaView, _CriticalFecharMesaLegacyView):
+        try:
+            bot.add_view(factory())
+        except Exception as erro:
+            erros.append(f'{factory.__name__}:{type(erro).__name__}:{erro}')
+
+    ids = _v128_custom_ids_persistentes() if '_v128_custom_ids_persistentes' in globals() else set()
+    faltando = sorted(_CRITICAL_COMPONENT_IDS - set(ids))
+    print(
+        f'[CRITICAL-INTERACTIONS] registered={sorted(_CRITICAL_COMPONENT_IDS & set(ids))} '
+        f'missing={faltando} errors={erros or []} status={"READY" if not faltando and not erros else "FAILED"}',
+        flush=True,
+    )
+
+
+bot.setup_hook = _v12_types.MethodType(_critical_setup_hook, bot)
+
+
+@bot.listen('on_ready')
+async def _critical_ready_cleanup() -> None:
+    await asyncio.sleep(3.0)
+    try:
+        removidas = await _critical_limpar_recuperacao_controles()
+        print(f'[PROCURADOS] limpeza de recuperação assistida em canais de controle: removidas={removidas}', flush=True)
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ [PROCURADOS] limpeza final falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+print('✅ CORE FINAL carregado — Finalizar/Concluir tarefa e Fechar Mesa com dono único/fallback; recuperação assistida bloqueada nos canais de controle.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
 
