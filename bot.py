@@ -53711,7 +53711,7 @@ def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any]
     responsavel_id = int((registro or {}).get('responsavel_id') or (registro or {}).get('finalizada_por_id') or 0)
     responsavel_txt = f'\n**Responsavel:** <@{responsavel_id}>' if responsavel_id else ''
     faltas = _v117_faltando_item(estado, int(item), int(etapa))
-    checklist = '; '.join(faltas[:4]) if faltas else 'Material minimo completo; revise e finalize a tarefa.'
+    checklist = ('uma ou mais imagens do painel no celular in-game' if int(item) == 1 and faltas else ('; '.join(faltas[:4]) if faltas else 'Material minimo completo; revise e finalize a tarefa.'))
     return (
         f'🎯 **TAREFA GUIADA — ITEM {int(item)} — {_v116_item_titulo(int(item))}**\n\n'
         f'**Tarefa:** {_v116_item_titulo(int(item))}'
@@ -55655,94 +55655,54 @@ async def _banco_v6_extrair_mensagem_painel(msg: discord.Message) -> Tuple[str, 
 
 
 async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, silencioso: bool=False) -> None:
+    """Processa material das tarefas guiadas.
+
+    ITEM 1 usa caminho rápido: a prova é a imagem do painel já transcrito no
+    celular in-game. Nenhum OCR é executado automaticamente neste tópico. Isso
+    evita trabalho pesado concorrendo com o ACK dos botões do Discord.
+    """
     item = int(estado.get('item') or 1)
     if item != 1:
         return await _V125_V116_PROCESSAR_ITEM_ANTES(canal, estado, msg, silencioso=silencioso)
+
     dados = estado.setdefault('dados', {})
-    conteudo = str(getattr(msg, 'content', '') or '').strip()
     imagens_recebidas = _v116_imagens(msg)
+    conteudo = str(getattr(msg, 'content', '') or '').strip()
+
     if imagens_recebidas:
-        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens_recebidas)
+        dados['painel_imagens'] = _v116_adicionar_unicos(
+            list(dados.get('painel_imagens') or []),
+            imagens_recebidas,
+        )
         dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+        # OCR antigo pode ter deixado pendências que não são requisito do Item 1.
+        dados.pop('painel_pendencias', None)
         estado['dados'] = dados
         _v116_gravar_estado(estado)
-    try:
-        canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
-    except Exception as erro:
-        _v116_gravar_estado(estado)
-        if _v125_erro_ocr_indisponivel(erro):
-            await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 painel mesa msg={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
-            if not silencioso:
-                await _v116_responder(msg, '✅ Imagem do painel registrada. O OCR está indisponível, mas isso não impede finalizar a tarefa; a imagem será preservada como evidência.')
-            if imagens_recebidas:
-                await _v116_atualizar_painel(canal, estado)
-                await _v116_publicar_tarefa_atual(canal, estado)
-            return
-        await enviar_log(f'⚠️ V125 OCR/transcrição do painel falhou na mensagem {getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
-        if not silencioso:
-            await _v116_responder(msg, '✅ Imagem do painel registrada. Não consegui extrair o texto automaticamente, mas a tarefa pode ser finalizada normalmente.')
-        if imagens_recebidas:
+        try:
             await _v116_atualizar_painel(canal, estado)
             await _v116_publicar_tarefa_atual(canal, estado)
+        except Exception as erro:
+            print(f'⚠️ ITEM1 painel: atualização visual falhou sem afetar a evidência: {type(erro).__name__}: {erro}', flush=True)
+        if not silencioso:
+            await _v116_responder(
+                msg,
+                f'✅ Painel registrado: **{len(dados.get("painel_imagens") or [])} imagem(ns)** salva(s) como evidência. '
+                'Use **Finalizar tarefa**; OCR não é necessário.'
+            )
         return
-    if pendencias:
-        nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
-        dados['painel_pendencias'] = pendencias
+
+    # Texto é preservado como complemento, mas não substitui a prova visual.
+    if conteudo:
+        dados['painel_transcricao'] = conteudo
         estado['dados'] = dados
         _v116_gravar_estado(estado)
-        # Não bloqueia todo o Item 1 quando parte do painel foi reconhecida.
-        # Se houver registros válidos, eles viram a transcrição e as linhas duvidosas
-        # ficam registradas para revisão. Só bloqueamos quando ZERO registro válido existe.
-        if not membros:
-            if not silencioso:
-                await _v116_responder(msg, '⚠️ O painel foi lido, mas nenhuma linha ficou completa com Nome + RG/Passaporte. Linhas para revisão: ' + ', '.join(nomes) + '.\nReenvie um print mais nítido ou envie essas linhas em texto.')
-            return
-    transcricao = ''
-    if membros:
-        registros_painel = [{'cargo': p.get('cargo') or 'MEMBRO', 'nome': p.get('nome') or '', 'passaporte': p.get('rg') or '', 'rg': p.get('rg') or ''} for p in membros]
-        try:
-            transcricao = _v125_image_analysis().build_panel_transcription(registros_painel)
-        except Exception:
-            linhas = []
-            for idx, p in enumerate(membros, 1):
-                linhas.append(f"{idx:02d}. Cargo: {p.get('cargo') or 'MEMBRO'} | Nome: {p.get('nome')} | Passaporte: {p.get('rg')}")
-            transcricao = '\n'.join(linhas)
-        dados['painel_membros'] = membros
-    elif conteudo:
-        transcricao = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())
-    else:
-        prefixo = str(globals().get('_BANCO_V6_ORIGINAL_PREFIX') or '')
-        if prefixo and prefixo in str(canonico or ''):
-            bruto = str(canonico).split(prefixo, 1)[-1].strip()
-            bruto = re.sub(r'^\[OCR IMAGEM \d+\]\s*', '', bruto, flags=re.MULTILINE)
-            transcricao = bruto.strip()
-    if not transcricao:
-        _v116_gravar_estado(estado)
         if not silencioso:
-            await _v116_responder(msg, '❌ Não consegui transcrever o painel com segurança. Envie um print mais nítido ou cole o texto do painel.')
+            await _v116_responder(msg, '📝 Texto do painel salvo como complemento. Ainda envie pelo menos uma imagem do painel no celular in-game.')
         return
-    dados['painel_transcricao'] = transcricao
-    dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
-    dados['painel_metricas'] = metricas
-    dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), _v116_imagens(msg))
-    estado['dados'] = dados
-    _v116_gravar_estado(estado)
+
     if not silencioso:
-        cab = '📱 **TRANSCRIÇÃO DO PAINEL — PRONTA PARA O CELULAR IN-GAME**\n```\n'
-        rod = '\n```'
-        blocos = [transcricao[i:i + 1650] for i in range(0, len(transcricao), 1650)] or ['']
-        await _v116_responder(msg, cab + blocos[0] + rod)
-        for bloco in blocos[1:]:
-            try:
-                await msg.channel.send('```\n' + bloco + '\n```')
-            except Exception:
-                pass
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado)
-    if not silencioso:
-        if pendencias:
-            await _v116_responder(msg, f'⚠️ Transcrição criada com {len(membros)} registro(s) válido(s) e {len(pendencias)} linha(s) para revisão. As linhas válidas já contam como **painel transcrito**.')
-        await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e use **Finalizar tarefa**; depois um Inspetor+ pode concluir.')
+        await _v116_responder(msg, '⚠️ Envie pelo menos uma imagem válida do painel já transcrito no celular in-game.')
 
 
 class BancoImportarPainelModal(Modal, title='Importar painel completo'):
@@ -56107,20 +56067,47 @@ def _v127_response_done(interaction: discord.Interaction) -> bool:
 
 
 async def _v127_safe_defer(interaction: discord.Interaction, *, ephemeral: bool=True, thinking: bool=True, contexto: str='callback') -> bool:
+    """Reconhece a interação o mais cedo possível e diagnostica ACK tardio.
+
+    40060 significa que outro caminho já reconheceu a mesma interação e é
+    tratado como sucesso. 10062 significa que o ACK chegou tarde demais.
+    """
     if _v127_response_done(interaction):
         return True
     try:
+        try:
+            criado = getattr(interaction, 'created_at', None)
+            agora = datetime.datetime.now(datetime.timezone.utc)
+            age_ms = int(max(0.0, (agora - criado).total_seconds()) * 1000) if criado is not None else -1
+        except Exception:
+            age_ms = -1
         await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
         _V127_DEFERRED_INTERACTIONS.add(int(getattr(interaction, 'id', 0) or 0))
         try:
             data = getattr(interaction, 'data', {}) or {}
-            print(f'[INTERACTION] custom_id={str(data.get("custom_id") or "")} interaction={getattr(interaction, "id", 0)} phase=deferred contexto={contexto}', flush=True)
+            print(
+                f'[INTERACTION] custom_id={str(data.get("custom_id") or "")} interaction={getattr(interaction, "id", 0)} '
+                f'phase=deferred age_ms={age_ms} contexto={contexto}',
+                flush=True,
+            )
         except Exception:
             pass
         return True
     except discord.InteractionResponded:
         return True
     except Exception as erro:
+        codigo = int(getattr(erro, 'code', 0) or 0)
+        # Se outro handler já deu ACK, continuar o processamento é seguro.
+        if codigo == 40060:
+            _V127_DEFERRED_INTERACTIONS.add(int(getattr(interaction, 'id', 0) or 0))
+            return True
+        try:
+            criado = getattr(interaction, 'created_at', None)
+            agora = datetime.datetime.now(datetime.timezone.utc)
+            age_ms = int(max(0.0, (agora - criado).total_seconds()) * 1000) if criado is not None else -1
+            print(f'❌ [INTERACTION ACK] contexto={contexto} code={codigo} age_ms={age_ms} erro={type(erro).__name__}: {erro}', flush=True)
+        except Exception:
+            pass
         await _v127_log_interaction_error(interaction, erro, contexto=f'{contexto}:defer')
         return False
 
@@ -56461,8 +56448,13 @@ def _v128_custom_ids_persistentes() -> set:
     return ids
 
 
-async def _interaction_core_task_rescue(interaction: discord.Interaction) -> None:
-    """Resgata somente os dois botões V122 se a ViewStore não responder em 0,8 s."""
+async def _interaction_core_task_preack(interaction: discord.Interaction) -> None:
+    """ACK imediato dos dois componentes críticos das tarefas.
+
+    Não executa o callback e não cria um segundo dono da ação. A ViewStore
+    continua sendo a única responsável por Finalizar/Concluir; este listener
+    apenas garante que o Discord receba ACK antes da janela de timeout.
+    """
     try:
         if getattr(interaction, 'type', None) != discord.InteractionType.component:
             return
@@ -56470,30 +56462,33 @@ async def _interaction_core_task_rescue(interaction: discord.Interaction) -> Non
         custom_id = str(data.get('custom_id') or '')
         if custom_id not in _V128_TASK_COMPONENT_IDS:
             return
-        await asyncio.sleep(0.8)
-        if _v127_response_done(interaction):
-            return
-        print(f'[INTERACTION] custom_id={custom_id} interaction={getattr(interaction, "id", 0)} phase=rescue_dispatch', flush=True)
-        view = V122TarefaGuiadaView()
-        alvo = next((child for child in list(view.children) if str(getattr(child, 'custom_id', '') or '') == custom_id), None)
-        callback = getattr(alvo, 'callback', None)
-        if not callable(callback):
-            return await _v127_safe_send(interaction, '❌ O botão perdeu o vínculo com a tarefa. Atualize o Discord e tente novamente.', contexto='interaction_core.rescue.no_callback')
-        await callback(interaction)
-    except discord.InteractionResponded:
-        return
+        try:
+            criado = getattr(interaction, 'created_at', None)
+            agora = datetime.datetime.now(datetime.timezone.utc)
+            age_ms = int(max(0.0, (agora - criado).total_seconds()) * 1000) if criado is not None else -1
+        except Exception:
+            age_ms = -1
+        print(
+            f'[INTERACTION] custom_id={custom_id} interaction={getattr(interaction, "id", 0)} '
+            f'phase=preack_received age_ms={age_ms}',
+            flush=True,
+        )
+        await _v127_safe_defer(
+            interaction,
+            ephemeral=True,
+            thinking=True,
+            contexto='interaction_core.preack',
+        )
     except Exception as erro:
-        await _v127_log_interaction_error(interaction, erro, contexto='interaction_core.task_rescue')
-        if not _v127_response_done(interaction):
-            await _v127_safe_send(interaction, '❌ Não consegui executar este botão agora. O erro foi registrado.', contexto='interaction_core.task_rescue')
+        await _v127_log_interaction_error(interaction, erro, contexto='interaction_core.preack')
 
 
 async def _v127_setup_hook(self) -> None:
     await _V127_SETUP_HOOK_ORIGINAL()
 
-    # V14 limpa listeners antigos durante o setup. O trace e o rescue são
+    # V14 limpa listeners antigos durante o setup. O pre-ACK e o trace são
     # registrados depois dessa limpeza para existirem de verdade no runtime.
-    for listener in (_interaction_core_trace, _interaction_core_task_rescue):
+    for listener in (_interaction_core_task_preack, _interaction_core_trace):
         try:
             bot.remove_listener(listener, 'on_interaction')
         except Exception:
@@ -56568,7 +56563,7 @@ async def _v127_setup_hook(self) -> None:
             f'task_custom_ids_ok={not bool(faltando_ids)} faltando={faltando_ids}.',
             flush=True,
         )
-        print('✅ V128 fallback persistente de tarefas registrado após limpeza V14.', flush=True)
+        print('✅ Interaction Core: pre-ACK imediato das tarefas registrado após limpeza V14.', flush=True)
     except Exception:
         pass
     try:
@@ -56605,7 +56600,7 @@ bot.on_command_error = _v127_on_command_error
 bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
 
 
-print('✅ V128 carregada — hotfix de tarefas: fallback persistente, ACK/finalização segura e OCR sem bloquear o lock da mesa.', flush=True)
+print('✅ Interaction Core FIX 10062 carregado — pre-ACK imediato, callback único e Item 1 sem OCR automático.', flush=True)
 
 
 async def _interaction_core_trace(interaction: discord.Interaction) -> None:
@@ -56622,7 +56617,7 @@ async def _interaction_core_trace(interaction: discord.Interaction) -> None:
     except Exception as erro:
         print(f'[INTERACTION] trace_failed={type(erro).__name__}: {erro}', flush=True)
 
-# O trace/rescue é registrado no setup_hook final, depois da limpeza V14.
+# O trace/pre-ACK é registrado no setup_hook final, depois da limpeza V14.
 _RUNTIME_PROCESS_STARTED_AT = time.monotonic()
 
 
