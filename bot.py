@@ -55329,5 +55329,441 @@ async def _banco_ficha_geral_adicionar_arquivos(interaction: discord.Interaction
 print('✅ V124 carregada — busca visual local por semelhança integrada ao Banco de Dados com índice persistente em /data/visual_search.', flush=True)
 
 
+try:
+    import image_analysis as _dicor_image_analysis
+except Exception as _V125_IMAGE_ANALYSIS_IMPORT_ERRO:
+    _dicor_image_analysis = None
+else:
+    _V125_IMAGE_ANALYSIS_IMPORT_ERRO = None
+
+_V125_BANCO_V6_EXTRAIR_MENSAGEM_PAINEL_ANTES = _banco_v6_extrair_mensagem_painel
+_V125_BANCO_OCR_LER_IMAGEM_SYNC_ANTES = _banco_ocr_ler_imagem_sync
+_V125_BANCO_V6_OCR_BLOCOS_SYNC_ANTES = _banco_v6_ocr_blocos_sync
+_V125_V116_PROCESSAR_ITEM_ANTES = _v116_processar_item
+_V125_OCR_HEALTH: Optional[Dict[str, Any]] = None
+
+
+def _v125_image_analysis() -> Any:
+    if _dicor_image_analysis is None:
+        raise RuntimeError(f'OCR_ENGINE_UNAVAILABLE: image_analysis.py não pôde ser importado: {_V125_IMAGE_ANALYSIS_IMPORT_ERRO}')
+    return _dicor_image_analysis
+
+
+def _v125_erro_ocr_indisponivel(erro: BaseException) -> bool:
+    modulo = _dicor_image_analysis
+    classe = getattr(modulo, 'OcrEngineUnavailable', None) if modulo is not None else None
+    if classe is not None and isinstance(erro, classe):
+        return True
+    return 'OCR_ENGINE_UNAVAILABLE' in str(erro or '')
+
+
+def _v125_blocos_de_ocr_resultado(resultado: Any) -> Dict[str, Any]:
+    blocos: List[Dict[str, Any]] = []
+    for linha in list(getattr(resultado, 'lines', []) or []):
+        blocos.append({
+            'texto': str(getattr(linha, 'text', '') or '').strip(),
+            'score': float(getattr(linha, 'score', 0.0) or 0.0),
+            'x1': float(getattr(linha, 'x1', 0.0) or 0.0),
+            'y1': float(getattr(linha, 'y1', 0.0) or 0.0),
+            'x2': float(getattr(linha, 'x2', 0.0) or 0.0),
+            'y2': float(getattr(linha, 'y2', 0.0) or 0.0),
+            'cx': float(getattr(linha, 'cx', 0.0) or 0.0),
+            'cy': float(getattr(linha, 'cy', 0.0) or 0.0),
+            'h': float(getattr(linha, 'height', 1.0) or 1.0),
+        })
+    info = getattr(resultado, 'image_info', None)
+    return {
+        'blocos': blocos,
+        'largura': int(getattr(info, 'width', 0) or 0),
+        'altura': int(getattr(info, 'height', 0) or 0),
+        'preprocessamento': str(getattr(resultado, 'preprocessing', '') or ''),
+        'engine': str(getattr(resultado, 'engine', '') or 'rapidocr_onnxruntime'),
+        'backend': str(getattr(resultado, 'backend', '') or 'onnxruntime-cpu'),
+    }
+
+
+async def _v125_attachment_read_bytes(anexo: discord.Attachment, *, timeout: float=45.0) -> bytes:
+    ultimo_erro: Optional[BaseException] = None
+    try:
+        return bytes(await asyncio.wait_for(anexo.read(use_cached=True), timeout=timeout))
+    except TypeError:
+        try:
+            return bytes(await asyncio.wait_for(anexo.read(), timeout=timeout))
+        except Exception as erro:
+            ultimo_erro = erro
+    except Exception as erro:
+        ultimo_erro = erro
+    urls = [str(getattr(anexo, 'url', '') or ''), str(getattr(anexo, 'proxy_url', '') or '')]
+    for url in [u for u in urls if u]:
+        try:
+            async with aiohttp.ClientSession(timeout=ClientTimeout(total=timeout)) as session:
+                async with session.get(url) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f'HTTP {resp.status}')
+                    dados = await resp.read()
+                    if dados:
+                        return bytes(dados)
+        except Exception as erro:
+            ultimo_erro = erro
+            continue
+    raise RuntimeError(f'Falha ao baixar anexo: {type(ultimo_erro).__name__}: {ultimo_erro}')
+
+
+def _v125_anexo_imagem(anexo: discord.Attachment) -> bool:
+    nome = str(getattr(anexo, 'filename', '') or '').lower()
+    tipo = str(getattr(anexo, 'content_type', '') or '').lower()
+    return tipo.startswith('image/') or nome.endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'))
+
+
+def _v125_anexo_texto(anexo: discord.Attachment) -> bool:
+    nome = str(getattr(anexo, 'filename', '') or '').lower()
+    tipo = str(getattr(anexo, 'content_type', '') or '').lower()
+    return tipo.startswith('text/') or nome.endswith(('.txt', '.csv', '.md', '.log'))
+
+
+def _v125_decodificar_texto(dados: bytes) -> str:
+    for encoding in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            return dados.decode(encoding)
+        except Exception:
+            continue
+    return dados.decode('utf-8', errors='ignore')
+
+
+def _v125_member_from_panel(record: Dict[str, str]) -> Dict[str, str]:
+    return {
+        'nome': _banco_limpar_texto(record.get('nome'), 120).strip(),
+        'rg': _banco_normalizar_rg(record.get('passaporte') or record.get('rg')),
+        'telefone': _banco_v5_normalizar_telefone(record.get('telefone')),
+        'cargo': _banco_v5_cargo_normalizado(record.get('cargo') or 'MEMBRO'),
+    }
+
+
+def _v125_member_from_database(record: Dict[str, str]) -> Dict[str, str]:
+    return {
+        'nome': _banco_limpar_texto(record.get('nome'), 120).strip(),
+        'rg': _banco_normalizar_rg(record.get('rg') or record.get('passaporte')),
+        'telefone': _banco_v5_normalizar_telefone(record.get('telefone')),
+        'cargo': _banco_v5_cargo_normalizado(record.get('cargo') or 'MEMBRO'),
+    }
+
+
+def _v125_merge_members(registros: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    saida: List[Dict[str, str]] = []
+    por_chave: Dict[str, Dict[str, str]] = {}
+    for bruto in registros:
+        item = _v125_member_from_database(bruto)
+        nome = str(item.get('nome') or '').strip()
+        rg = _banco_normalizar_rg(item.get('rg'))
+        telefone = _banco_v5_normalizar_telefone(item.get('telefone'))
+        cargo = _banco_v5_cargo_normalizado(item.get('cargo') or 'MEMBRO')
+        if not nome:
+            continue
+        chave = f'rg:{rg}' if rg else f'nome:{normalizar_busca(nome)}'
+        existente = por_chave.get(chave)
+        if existente is None:
+            existente = {'nome': nome, 'rg': rg, 'telefone': telefone, 'cargo': cargo}
+            saida.append(existente)
+            por_chave[chave] = existente
+            continue
+        if rg and not existente.get('rg'):
+            existente['rg'] = rg
+        if telefone and not existente.get('telefone'):
+            existente['telefone'] = telefone
+        if cargo and (not existente.get('cargo') or existente.get('cargo') == 'MEMBRO'):
+            existente['cargo'] = cargo
+        if len(nome) > len(str(existente.get('nome') or '')):
+            existente['nome'] = nome
+    return saida
+
+
+def _banco_ocr_ler_imagem_sync(caminho: str) -> List[Tuple[str, float]]:
+    ia = _v125_image_analysis()
+    dados = Path(str(caminho)).read_bytes()
+    resultado = ia.run_ocr(dados, filename=Path(str(caminho)).name, content_type='', context='generic')
+    return [(str(linha.text), float(linha.score)) for linha in list(resultado.lines)]
+
+
+def _banco_v6_ocr_blocos_sync(caminho: str) -> Dict[str, Any]:
+    ia = _v125_image_analysis()
+    dados = Path(str(caminho)).read_bytes()
+    resultado = ia.run_ocr(dados, filename=Path(str(caminho)).name, content_type='', context='database')
+    return _v125_blocos_de_ocr_resultado(resultado)
+
+
+async def _banco_v6_extrair_mensagem_painel(msg: discord.Message) -> Tuple[str, List[Dict[str, str]], List[Dict[str, str]], Dict[str, int]]:
+    ia = _v125_image_analysis()
+    fontes_textuais: List[str] = []
+    textos_ocr_auditoria: List[str] = []
+    registros: List[Dict[str, str]] = []
+    pendencias: List[Dict[str, str]] = []
+    metricas = {'texto': 0, 'embeds': 0, 'arquivos_texto': 0, 'imagens_ocr': 0, 'linhas_estruturadas': 0, 'registros_duvidosos': 0, 'ocr_chars': 0}
+    if str(getattr(msg, 'content', '') or '').strip():
+        fontes_textuais.append(str(msg.content))
+        metricas['texto'] += 1
+    for embed in list(getattr(msg, 'embeds', []) or []):
+        pedacos = [str(embed.title or ''), str(embed.description or '')]
+        for field in list(getattr(embed, 'fields', []) or []):
+            pedacos.append(f'{field.name}: {field.value}')
+        bloco = '\n'.join((x for x in pedacos if str(x).strip()))
+        if bloco.strip():
+            fontes_textuais.append(bloco)
+            metricas['embeds'] += 1
+    pasta = _BANCO_V6_PAINEL_DIR / str(int(getattr(msg, 'id', 0) or 0))
+    pasta.mkdir(parents=True, exist_ok=True)
+    for indice, anexo in enumerate(list(getattr(msg, 'attachments', []) or [])[:10]):
+        nome_original = Path(str(getattr(anexo, 'filename', '') or f'anexo-{indice}')).name
+        nome_seguro = re.sub('[^0-9A-Za-z._-]+', '_', nome_original)[:150] or f'anexo-{indice}.bin'
+        destino = pasta / f'{indice:02d}-{nome_seguro}'
+        dados = await _v125_attachment_read_bytes(anexo)
+        await asyncio.to_thread(destino.write_bytes, dados)
+        content_type = str(getattr(anexo, 'content_type', '') or '')
+        if _v125_anexo_texto(anexo):
+            texto_arquivo = _v125_decodificar_texto(dados)
+            if texto_arquivo.strip():
+                fontes_textuais.append(texto_arquivo)
+                metricas['arquivos_texto'] += 1
+            continue
+        if not _v125_anexo_imagem(anexo):
+            continue
+        banco_resultado, painel_resultado = await asyncio.gather(
+            asyncio.to_thread(ia.analyze_database_image, dados, filename=nome_original, content_type=content_type),
+            asyncio.to_thread(ia.analyze_panel_image, dados, filename=nome_original, content_type=content_type),
+        )
+        banco_registros = [_v125_member_from_database(dict(x)) for x in list(banco_resultado.records or [])]
+        painel_registros = [_v125_member_from_panel(dict(x)) for x in list(painel_resultado.records or [])]
+        banco_duvidosos = [_v125_member_from_database(dict(x)) for x in list(banco_resultado.doubtful or [])]
+        painel_duvidosos = [_v125_member_from_panel(dict(x)) for x in list(painel_resultado.doubtful or [])]
+        registros.extend([x for x in banco_registros + painel_registros if x.get('nome')])
+        pendencias.extend([x for x in banco_duvidosos + painel_duvidosos if x.get('nome')])
+        metricas['imagens_ocr'] += 1
+        metricas['linhas_estruturadas'] += len(banco_registros) + len(painel_registros)
+        metricas['registros_duvidosos'] += len(banco_duvidosos) + len(painel_duvidosos)
+        metricas['ocr_chars'] += int(getattr(banco_resultado.ocr, 'chars', 0) or 0)
+        texto_ocr = str(getattr(banco_resultado.ocr, 'text', '') or '').strip()
+        if texto_ocr:
+            textos_ocr_auditoria.append(f'[OCR IMAGEM {indice + 1}]\n{texto_ocr}')
+        try:
+            await enviar_log(
+                '🧭 OCR V125 '
+                f"módulo=banco/painel msg={getattr(msg, 'id', 0)} anexo={indice + 1} "
+                f"resolução={banco_resultado.log.get('resolution')} formato={banco_resultado.log.get('format')} "
+                f"bytes={banco_resultado.log.get('bytes')} prep={banco_resultado.log.get('preprocessing')} "
+                f"chars={banco_resultado.log.get('chars')} registros={len(banco_registros) + len(painel_registros)} "
+                f"duvidosos={len(banco_duvidosos) + len(painel_duvidosos)} tempo_ms={banco_resultado.log.get('elapsed_ms')}"
+            )
+        except Exception:
+            pass
+    texto_digitado = '\n\n'.join((x.strip() for x in fontes_textuais if x and x.strip()))
+    if texto_digitado.strip():
+        try:
+            registros.extend(await asyncio.to_thread(_BANCO_EXTRAIR_MEMBROS_ANTES_V6, texto_digitado))
+        except Exception:
+            traceback.print_exc()
+        try:
+            painel_texto, ignorados_texto = await asyncio.to_thread(ia.parse_panel_people, texto_digitado)
+            registros.extend([_v125_member_from_panel(x.as_dict()) for x in painel_texto])
+            for ignorado in ignorados_texto:
+                if ignorado and len(ignorado) > 5:
+                    pendencias.append({'nome': _banco_limpar_texto(ignorado, 120), 'rg': '', 'telefone': '', 'cargo': 'MEMBRO'})
+        except Exception:
+            traceback.print_exc()
+        try:
+            banco_texto, duvidosos_texto, _ignorados = await asyncio.to_thread(ia.parse_database_table, texto_digitado)
+            registros.extend([_v125_member_from_database(x.as_member_dict()) for x in banco_texto])
+            pendencias.extend([_v125_member_from_database(x.as_member_dict()) for x in duvidosos_texto])
+        except Exception:
+            traceback.print_exc()
+    mesclados = _v125_merge_members(registros)
+    pendencias_mescladas = [x for x in _v125_merge_members(pendencias) if not x.get('rg')]
+    completos = [x for x in mesclados if x.get('nome') and x.get('rg')]
+    payload_json = _banco_json.dumps({'membros': completos}, ensure_ascii=False, separators=(',', ':'))
+    auditoria = '\n\n'.join([texto_digitado] + textos_ocr_auditoria).strip()
+    texto_canonico = _BANCO_V6_JSON_PREFIX + payload_json + '\n' + _BANCO_V6_ORIGINAL_PREFIX + '\n' + auditoria
+    return (texto_canonico, completos, pendencias_mescladas, metricas)
+
+
+async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, silencioso: bool=False) -> None:
+    item = int(estado.get('item') or 1)
+    if item != 1:
+        return await _V125_V116_PROCESSAR_ITEM_ANTES(canal, estado, msg, silencioso=silencioso)
+    dados = estado.setdefault('dados', {})
+    conteudo = str(getattr(msg, 'content', '') or '').strip()
+    try:
+        canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
+    except Exception as erro:
+        _v116_gravar_estado(estado)
+        if _v125_erro_ocr_indisponivel(erro):
+            await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 painel mesa msg={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
+            if not silencioso:
+                await _v116_responder(msg, '❌ O OCR do servidor está indisponível no momento. A imagem foi preservada; tente novamente após a correção técnica ou cole o texto do painel.')
+            return
+        await enviar_log(f'⚠️ V125 OCR/transcrição do painel falhou na mensagem {getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
+        if not silencioso:
+            await _v116_responder(msg, '❌ Não foi possível analisar este painel. A imagem foi preservada; envie um print mais nítido ou cole o texto.')
+        return
+    if pendencias:
+        nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
+        dados['painel_pendencias'] = pendencias
+        estado['dados'] = dados
+        _v116_gravar_estado(estado)
+        if not silencioso:
+            await _v116_responder(msg, '⚠️ O painel foi lido, mas ainda há linhas incompletas/sem RG ou Passaporte: ' + ', '.join(nomes) + '.\nReenvie o print mais nítido ou envie essas linhas em texto antes de concluir.')
+        return
+    transcricao = ''
+    if membros:
+        registros_painel = [{'cargo': p.get('cargo') or 'MEMBRO', 'nome': p.get('nome') or '', 'passaporte': p.get('rg') or '', 'rg': p.get('rg') or ''} for p in membros]
+        try:
+            transcricao = _v125_image_analysis().build_panel_transcription(registros_painel)
+        except Exception:
+            linhas = []
+            for idx, p in enumerate(membros, 1):
+                linhas.append(f"{idx:02d}. Cargo: {p.get('cargo') or 'MEMBRO'} | Nome: {p.get('nome')} | Passaporte: {p.get('rg')}")
+            transcricao = '\n'.join(linhas)
+        dados['painel_membros'] = membros
+    elif conteudo:
+        transcricao = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())
+    else:
+        prefixo = str(globals().get('_BANCO_V6_ORIGINAL_PREFIX') or '')
+        if prefixo and prefixo in str(canonico or ''):
+            bruto = str(canonico).split(prefixo, 1)[-1].strip()
+            bruto = re.sub(r'^\[OCR IMAGEM \d+\]\s*', '', bruto, flags=re.MULTILINE)
+            transcricao = bruto.strip()
+    if not transcricao:
+        _v116_gravar_estado(estado)
+        if not silencioso:
+            await _v116_responder(msg, '❌ Não consegui transcrever o painel com segurança. Envie um print mais nítido ou cole o texto do painel.')
+        return
+    dados['painel_transcricao'] = transcricao
+    dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+    dados['painel_metricas'] = metricas
+    dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), _v116_imagens(msg))
+    estado['dados'] = dados
+    _v116_gravar_estado(estado)
+    if not silencioso:
+        cab = '📱 **TRANSCRIÇÃO DO PAINEL — PRONTA PARA O CELULAR IN-GAME**\n```\n'
+        rod = '\n```'
+        blocos = [transcricao[i:i + 1650] for i in range(0, len(transcricao), 1650)] or ['']
+        await _v116_responder(msg, cab + blocos[0] + rod)
+        for bloco in blocos[1:]:
+            try:
+                await msg.channel.send('```\n' + bloco + '\n```')
+            except Exception:
+                pass
+    await _v116_atualizar_painel(canal, estado)
+    await _v116_publicar_tarefa_atual(canal, estado)
+    if not silencioso:
+        await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e clique em **Concluir item** para confirmar e liberar o próximo item.')
+
+
+class BancoImportarPainelModal(Modal, title='Importar painel completo'):
+
+    def __init__(self, painel_canal_id: int=0, painel_mensagem_id: int=0, *, modo: str='mesclar'):
+        super().__init__(timeout=300)
+        self.painel_canal_id = int(painel_canal_id or 0)
+        self.painel_mensagem_id = int(painel_mensagem_id or 0)
+        self.modo = 'substituir' if normalizar_busca(modo).startswith('sub') else 'mesclar'
+        self.faccao = TextInput(label='Facção ou nome da mesa', placeholder='Ex.: Olimpo', max_length=120)
+        self.add_item(self.faccao)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lock = _banco_prof_lock_usuario(int(interaction.user.id))
+        if lock.locked():
+            return await interaction.followup.send('⏳ Você já possui outra operação aberta.', ephemeral=True)
+        async with lock:
+            msg: Optional[discord.Message] = None
+            try:
+                descricao_modo = '**MESCLAR:** adiciona e atualiza os encontrados, mantendo os demais integrantes ativos.' if self.modo == 'mesclar' else '**SUBSTITUIR:** o painel enviado vira a lista atual; ausentes ficam inativos, mas fichas e histórico não são apagados.'
+                msg = await _banco_esperar_mensagem_usuario(interaction, f'🏴 **MODO SELECIONADO: {self.modo.upper()}**\n{descricao_modo}\n\nEnvie o painel em **uma única mensagem**. Prints são lidos mantendo as linhas e colunas: **RG, nome, cargo e telefone não serão misturados**.\n\nFormatos: texto, tabela, imagens/prints ou arquivo `.txt`, `.csv` e `.md`.', timeout=600)
+                if msg is None:
+                    return
+                texto, membros, pendencias, origem_metricas = await _banco_v6_extrair_mensagem_painel(msg)
+                if not membros:
+                    detalhes = ''
+                    if pendencias:
+                        detalhes = ' Linhas para revisar: ' + ', '.join((x.get('nome', '') for x in pendencias[:8]))
+                    raise ValueError('Nenhuma linha completa com NOME e RG/Passaporte foi identificada. Envie imagens mais nítidas ou uma tabela de texto.' + detalhes)
+                mesa = banco_encontrar_mesa(str(self.faccao.value))
+                embed = discord.Embed(title='📋 PRÉVIA ESTRUTURADA DO PAINEL', description='O bot preservou as linhas/colunas do print. **Telefone não é usado como nome ou RG.** Revise todos os dados antes de confirmar.', color=discord.Color.gold())
+                embed.add_field(name='🏴 Organização', value=str(self.faccao.value), inline=True)
+                embed.add_field(name='🔄 Modo', value='MESCLAR' if self.modo == 'mesclar' else 'SUBSTITUIR LISTA ATUAL', inline=True)
+                embed.add_field(name='🕵️ Mesa associada', value=str(mesa.get('nome_canal') or 'Não encontrada'), inline=False)
+                embed.add_field(name='📥 Leitura', value=f"Imagens: **{origem_metricas['imagens_ocr']}** • Linhas estruturadas: **{origem_metricas['linhas_estruturadas']}** • Duvidosas: **{origem_metricas.get('registros_duvidosos', 0)}**\nTexto/embeds/arquivos: **{origem_metricas['texto'] + origem_metricas['embeds'] + origem_metricas['arquivos_texto']}**", inline=False)
+                embed.add_field(name='📊 Resultado válido', value=f"Pessoas: **{len(membros)}** • RGs: **{sum((1 for x in membros if x.get('rg')))}** • Telefones: **{sum((1 for x in membros if x.get('telefone')))}** • Cargos: **{sum((1 for x in membros if x.get('cargo')))}**", inline=False)
+                if pendencias:
+                    exemplos = '\n'.join((f"• {x.get('nome')} • {x.get('cargo') or 'MEMBRO'} • {x.get('telefone') or 'sem telefone'}" for x in pendencias[:12]))
+                    embed.add_field(name=f'⚠️ Revisar manualmente ({len(pendencias)})', value=(exemplos or 'Nenhum')[:1024], inline=False)
+                _banco_v6_campos_embed_membros(embed, membros)
+                await interaction.followup.send(embed=embed, view=BancoConfirmarPainelView(usuario_id=int(interaction.user.id), faccao=str(self.faccao.value), modo=self.modo, texto=texto, painel_canal_id=self.painel_canal_id, painel_mensagem_id=self.painel_mensagem_id), ephemeral=True)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            except Exception as erro:
+                traceback.print_exc()
+                if _v125_erro_ocr_indisponivel(erro):
+                    try:
+                        await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 importador Banco: {type(erro).__name__}: {erro}')
+                    except Exception:
+                        pass
+                    return await interaction.followup.send('❌ O OCR do servidor está indisponível no momento. Nenhum dado foi gravado; tente novamente depois da correção técnica ou envie a tabela em texto/CSV.', ephemeral=True)
+                await _banco_prof_erro_interacao(interaction, 'Não foi possível preparar a importação estruturada.', erro)
+
+
+def _v125_ocr_health_check_sync() -> Dict[str, Any]:
+    global _V125_OCR_HEALTH
+    ia = _v125_image_analysis()
+    status = ia.health_check()
+    _V125_OCR_HEALTH = {
+        'ready': bool(status.ready),
+        'engine': str(status.engine),
+        'backend': str(status.backend),
+        'onnx_available': bool(status.onnx_available),
+        'error': str(status.error or ''),
+        'versions': dict(status.versions or {}),
+        'chars': int(status.chars or 0),
+        'records': int(status.records or 0),
+        'elapsed_ms': int(status.elapsed_ms or 0),
+    }
+    return dict(_V125_OCR_HEALTH)
+
+
+_V125_SETUP_HOOK_ORIGINAL = bot.setup_hook
+
+
+async def _v125_setup_hook(self) -> None:
+    try:
+        await _V125_SETUP_HOOK_ORIGINAL()
+    except Exception as erro:
+        print(f'⚠️ setup_hook anterior falhou antes do OCR V125: {type(erro).__name__}: {erro}', flush=True)
+    try:
+        status = await asyncio.to_thread(_v125_ocr_health_check_sync)
+        if status.get('ready'):
+            print(
+                '✅ OCR ENGINE READY '
+                f"engine={status.get('engine')} backend={status.get('backend')} "
+                f"onnx={status.get('onnx_available')} chars={status.get('chars')} "
+                f"records={status.get('records')} elapsed_ms={status.get('elapsed_ms')} "
+                f"versions={status.get('versions')}",
+                flush=True,
+            )
+        else:
+            print(
+                '❌ OCR ENGINE FAILED '
+                f"engine={status.get('engine')} backend={status.get('backend')} "
+                f"erro={status.get('error')} versions={status.get('versions')}",
+                flush=True,
+            )
+    except Exception as erro:
+        print(f'❌ OCR ENGINE FAILED erro={type(erro).__name__}: {erro}', flush=True)
+
+
+bot.setup_hook = _v12_types.MethodType(_v125_setup_hook, bot)
+
+
+print('✅ V125 carregada — camada global de OCR/análise de imagens integrada a Banco de Dados e Painel da Mesa.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
