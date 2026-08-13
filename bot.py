@@ -52271,7 +52271,9 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
     etapa = int(estado.get('etapa') or 1)
     dados = estado.setdefault('dados', {})
     if item == 1:
-        return [] if str(dados.get('painel_transcricao') or '').strip() else ['painel transcrito']
+        tem_imagem = bool(list(dados.get('painel_imagens') or []))
+        tem_texto = bool(str(dados.get('painel_transcricao') or '').strip())
+        return [] if (tem_imagem or tem_texto) else ['print/imagem do painel transcrito para o celular in-game']
     if item == 2:
         faltas = _v116_faltando_pessoa(estado, lideranca=True)
         if faltas and any((estado.get('rascunho') or {}).get('pessoa', {}).values()):
@@ -52538,12 +52540,33 @@ async def _v116_mudar_etapa(canal: discord.TextChannel, estado: Dict[str, Any], 
     await _v116_publicar_tarefa_atual(canal, estado, nova=True)
 
 
+def _v129_ajustar_resposta_tarefa_v122(texto: str) -> str:
+    """Converte instruções legadas de 'Concluir item' para o fluxo real V122."""
+    t = str(texto or '')
+    t = t.replace('**Concluir item**', '**Finalizar tarefa**')
+    t = t.replace('para confirmar e liberar o próximo item', 'para enviar a tarefa para conclusão')
+    t = t.replace('para confirmar e liberar o próximo item.', 'para enviar a tarefa para conclusão.')
+    t = t.replace('para confirmar esta etapa', 'para enviar esta etapa para conclusão')
+    t = re.sub(r'para confirmar o ITEM\s*\d+', 'para enviar a tarefa para conclusão', t, flags=re.I)
+    t = t.replace('para confirmar o Item 3', 'para enviar a tarefa para conclusão')
+    # Se a mensagem orienta finalizar e ainda não explica a segunda ação, deixa o fluxo explícito.
+    if '**Finalizar tarefa**' in t and '**Concluir tarefa**' not in t:
+        t = t.rstrip() + '\nDepois, um Inspetor+ usa **Concluir tarefa** para concluir definitivamente.'
+    return t
+
+
 async def _v116_responder(msg: discord.Message, texto: str) -> None:
     try:
-        await msg.reply(texto[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        canal_mesa = msg.channel.parent if isinstance(getattr(msg, 'channel', None), discord.Thread) else None
+        if isinstance(canal_mesa, discord.TextChannel) and '_v122_mesa_tarefas_habilitada' in globals() and _v122_mesa_tarefas_habilitada(int(canal_mesa.id)):
+            texto = _v129_ajustar_resposta_tarefa_v122(texto)
+    except Exception:
+        pass
+    try:
+        await msg.reply(str(texto)[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         try:
-            await msg.channel.send(texto[:1900], allowed_mentions=discord.AllowedMentions.none())
+            await msg.channel.send(str(texto)[:1900], allowed_mentions=discord.AllowedMentions.none())
         except Exception:
             pass
 
@@ -53284,10 +53307,15 @@ async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Opti
         dados['informantes'] = [{'nome': str(p.get('nome') or ''), 'rg': str(p.get('rg') or ''), 'cargo': 'Informante'}]
     textos = dados.get('textos_por_topico') if isinstance(dados.get('textos_por_topico'), dict) else {}
     resumos = dados.get('resumos') if isinstance(dados.get('resumos'), dict) else {}
-    if str(guiado.get('painel_transcricao') or '').strip():
-        painel = str(guiado.get('painel_transcricao') or '').strip()
-        textos['painel'] = list(dict.fromkeys(list(textos.get('painel') or []) + [painel]))
-        resumos['painel'] = painel[:3500]
+    painel_texto = str(guiado.get('painel_transcricao') or '').strip()
+    painel_imagens_guiadas = list(guiado.get('painel_imagens') or [])
+    if painel_texto:
+        textos['painel'] = list(dict.fromkeys(list(textos.get('painel') or []) + [painel_texto]))
+        resumos['painel'] = painel_texto[:3500]
+    elif painel_imagens_guiadas:
+        resumo_painel = 'Painel já transcrito/adaptado para o celular in-game, documentado pelas evidências visuais do tópico Painel.'
+        resumos['painel'] = resumo_painel
+        dados['painel_guiado_imagens'] = painel_imagens_guiadas
     if str(guiado.get('radio') or '').strip():
         radio = str(guiado.get('radio') or '').strip()
         textos['radio'] = list(dict.fromkeys(list(textos.get('radio') or []) + [radio]))
@@ -53682,6 +53710,45 @@ def _v122_status_tarefa_guiada(registro: Dict[str, Any]) -> str:
     }.get(status, status.title() if status else 'Pendente')
 
 
+def _v129_instrucao_tarefa_guiada(item: int, etapa: int) -> str:
+    """Descrição curta e fiel do que realmente valida cada tarefa V122."""
+    item = int(item or 0)
+    etapa = int(etapa or 1)
+    if item == 1:
+        return 'Envie uma ou mais imagens do painel JÁ transcrito/adaptado para o celular in-game. A própria imagem é a evidência; OCR não é obrigatório. Texto também é aceito como complemento.'
+    if item == 2:
+        return 'Registre todos os Líderes, Vice-líderes e Gerentes. Para cada pessoa: foto + cargo + nome + RG. Envie uma pessoa por vez.'
+    if item == 3:
+        return 'Registre 7 membros. Para cada pessoa: foto + cargo + nome + RG. Envie uma pessoa por vez até completar 7/7.'
+    if item == 4:
+        return 'Envie a numeração/frequência da rádio em texto.'
+    if item == 5 and etapa == 1:
+        return 'Envie 2 imagens: foto da organização/local + foto do GPS mostrando a localização.'
+    if item == 5 and etapa == 2:
+        return 'Envie 4 fotos aéreas da organização/localização.'
+    if item == 6:
+        return 'Registre os crimes da comunidade. Cada crime precisa de nome/descrição + prova/evidência. Envie um crime por vez.'
+    if item == 7:
+        return 'Envie 2 imagens: foto do baú de líder + foto/localização da entrada do baú.'
+    if item == 8:
+        return 'Envie 2 imagens: foto do baú de membros + foto/localização da entrada do baú.'
+    if item == 9:
+        return 'Envie 2 imagens: foto do NPC/gringo da rota de farm + foto do GPS.'
+    if item == 10:
+        return 'Envie 2 imagens: foto do NPC/gringo da rota de produção + foto do GPS.'
+    if item == 11 and etapa == 1:
+        return 'Envie uma ou mais fotos dos ingredientes necessários para a produção.'
+    if item == 11 and etapa == 2:
+        return 'Envie uma ou mais fotos do produto final da organização.'
+    if item == 12 and etapa == 1:
+        return 'Envie o informante com: foto + foto do RG/documento + nome + número do RG.'
+    if item == 12 and etapa == 2:
+        return 'Envie em texto um resumo de como o informante realizou a operação. O bot não inventará informações.'
+    if item == 13:
+        return 'Envie as fotos da residência/casa do líder. Uma foto é o mínimo; envie quantas forem necessárias para documentar bem.'
+    return 'Envie o material solicitado neste tópico.'
+
+
 def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> str:
     _v117_migrar_estado(estado)
     tarefas = estado.setdefault('tarefas_guiadas', {})
@@ -53689,12 +53756,24 @@ def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any]
     registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
     mesa = buscar_mesa_por_canal(int(canal.id)) or {}
     autor_id = int(mesa.get('autor_id') or 0) if isinstance(mesa, dict) else 0
-    criador = f'<@{autor_id}>' if autor_id else 'Nao identificado'
+    criador = f'<@{autor_id}>' if autor_id else 'Não identificado'
     etapa_txt = f'\n**ETAPA {int(etapa)}/2**' if int(item) in _V117_ITENS_DUAS_ETAPAS else ''
     responsavel_id = int((registro or {}).get('responsavel_id') or (registro or {}).get('finalizada_por_id') or 0)
-    responsavel_txt = f'\n**Responsavel:** <@{responsavel_id}>' if responsavel_id else ''
+    responsavel_txt = f'\n**Responsável:** <@{responsavel_id}>' if responsavel_id else ''
     faltas = _v117_faltando_item(estado, int(item), int(etapa))
-    checklist = '; '.join(faltas[:4]) if faltas else 'Material minimo completo; revise e finalize a tarefa.'
+    status_registro = str((registro or {}).get('status') or 'ATIVA').upper()
+    if status_registro == 'AGUARDANDO_CONCLUSAO':
+        checklist = '✅ Finalizada pelo agente — aguardando **Concluir tarefa** por Inspetor+.'
+    elif faltas:
+        checklist = '⏳ Falta: ' + '; '.join(faltas[:4])
+    else:
+        checklist = '✅ Material mínimo completo — pronto para **Finalizar tarefa**.'
+    instrucao = _v129_instrucao_tarefa_guiada(int(item), int(etapa))
+    fluxo = (
+        '> Quando terminar o material, use **Finalizar tarefa**. '
+        'Depois, um Inspetor+ usa **Concluir tarefa** para concluir definitivamente'
+        + (' e liberar a próxima etapa.' if int(item) in _V117_ITENS_DUAS_ETAPAS and int(etapa) == 1 else '.')
+    )
     return (
         f'🎯 **TAREFA GUIADA — ITEM {int(item)} — {_v116_item_titulo(int(item))}**\n\n'
         f'**Tarefa:** {_v116_item_titulo(int(item))}'
@@ -53702,10 +53781,10 @@ def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any]
         f'**Status:** {_v122_status_tarefa_guiada(registro)}'
         f'{responsavel_txt}\n'
         f'**Mesa criada por:** {criador}\n\n'
+        f'**O que enviar:** {instrucao}\n\n'
         f'**Checklist atual:** {checklist}\n'
-        '> Envie o material neste topico. Use **Finalizar tarefa** quando estiver pronto; a conclusao definitiva exige autorizacao interna.'
+        f'{fluxo}'
     )
-
 
 async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
     try:
@@ -54116,7 +54195,7 @@ class GerenciamentoTarefasView(View):
                 destino = topico.mention if topico else 'tópico não encontrado'
                 faltas = _v117_faltando_item(estado, item, etapa)
                 etapa_txt = f' • E{etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
-                situacao = ('Falta: ' + '; '.join(faltas[:2])) if faltas else 'Pronto para concluir'
+                situacao = ('Falta: ' + '; '.join(faltas[:2])) if faltas else 'Pronto para finalizar'
                 linhas.append(f'🎯 **{item}. {_v116_item_titulo(item)}{etapa_txt}** — {destino}\n{situacao}')
         tarefas = [t for t in _carregar_tarefas().values() if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id) and t.get('status') != 'CONCLUIDA']
         tarefas.sort(key=lambda t: int(t.get('numero') or 0))
@@ -55638,83 +55717,56 @@ async def _banco_v6_extrair_mensagem_painel(msg: discord.Message) -> Tuple[str, 
 
 
 async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, silencioso: bool=False) -> None:
+    """V129: Item 1 é prova do painel já transcrito no celular in-game.
+
+    Uma imagem válida já cumpre o requisito. OCR pode continuar existindo para o
+    Banco de Dados, mas NÃO é requisito da tarefa de investigação.
+    """
     item = int(estado.get('item') or 1)
     if item != 1:
         return await _V125_V116_PROCESSAR_ITEM_ANTES(canal, estado, msg, silencioso=silencioso)
+
     dados = estado.setdefault('dados', {})
     conteudo = str(getattr(msg, 'content', '') or '').strip()
-    try:
-        canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
-    except Exception as erro:
-        _v116_gravar_estado(estado)
-        if _v125_erro_ocr_indisponivel(erro):
-            await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 painel mesa msg={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
-            if not silencioso:
-                await _v116_responder(msg, '❌ O OCR do servidor está indisponível no momento. A imagem foi preservada; tente novamente após a correção técnica ou cole o texto do painel.')
-            return
-        await enviar_log(f'⚠️ V125 OCR/transcrição do painel falhou na mensagem {getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
-        if not silencioso:
-            await _v116_responder(msg, '❌ Não foi possível analisar este painel. A imagem foi preservada; envie um print mais nítido ou cole o texto.')
-        return
-    if pendencias:
-        nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
-        dados['painel_pendencias'] = pendencias
+    imagens = _v116_imagens(msg)
+
+    if imagens:
+        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens)
+        dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+        dados['painel_recebido_em'] = agora_br()
+        dados['painel_tipo_comprovacao'] = 'imagem'
+        # Texto escrito pelo agente é complemento opcional; não fazemos OCR obrigatório.
+        if conteudo:
+            dados['painel_transcricao'] = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())[:6000]
         estado['dados'] = dados
         _v116_gravar_estado(estado)
-        # Não bloqueia todo o Item 1 quando parte do painel foi reconhecida.
-        # Se houver registros válidos, eles viram a transcrição e as linhas duvidosas
-        # ficam registradas para revisão. Só bloqueamos quando ZERO registro válido existe.
-        if not membros:
-            if not silencioso:
-                await _v116_responder(msg, '⚠️ O painel foi lido, mas nenhuma linha ficou completa com Nome + RG/Passaporte. Linhas para revisão: ' + ', '.join(nomes) + '.\nReenvie um print mais nítido ou envie essas linhas em texto.')
-            return
-    transcricao = ''
-    if membros:
-        registros_painel = [{'cargo': p.get('cargo') or 'MEMBRO', 'nome': p.get('nome') or '', 'passaporte': p.get('rg') or '', 'rg': p.get('rg') or ''} for p in membros]
-        try:
-            transcricao = _v125_image_analysis().build_panel_transcription(registros_painel)
-        except Exception:
-            linhas = []
-            for idx, p in enumerate(membros, 1):
-                linhas.append(f"{idx:02d}. Cargo: {p.get('cargo') or 'MEMBRO'} | Nome: {p.get('nome')} | Passaporte: {p.get('rg')}")
-            transcricao = '\n'.join(linhas)
-        dados['painel_membros'] = membros
-    elif conteudo:
-        transcricao = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())
-    else:
-        prefixo = str(globals().get('_BANCO_V6_ORIGINAL_PREFIX') or '')
-        if prefixo and prefixo in str(canonico or ''):
-            bruto = str(canonico).split(prefixo, 1)[-1].strip()
-            bruto = re.sub(r'^\[OCR IMAGEM \d+\]\s*', '', bruto, flags=re.MULTILINE)
-            transcricao = bruto.strip()
-    if not transcricao:
-        _v116_gravar_estado(estado)
+        await _v116_atualizar_painel(canal, estado)
+        await _v116_publicar_tarefa_atual(canal, estado)
         if not silencioso:
-            await _v116_responder(msg, '❌ Não consegui transcrever o painel com segurança. Envie um print mais nítido ou cole o texto do painel.')
+            quantidade = len(list(dados.get('painel_imagens') or []))
+            await _v116_responder(
+                msg,
+                f'✅ Painel transcrito para o celular in-game registrado por imagem. Evidência(s): **{quantidade}**.\n'
+                'O OCR não é obrigatório nesta tarefa. Se o painel está completo, use **Finalizar tarefa**.'
+            )
         return
-    dados['painel_transcricao'] = transcricao
-    dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
-    dados['painel_metricas'] = metricas
-    dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), _v116_imagens(msg))
-    estado['dados'] = dados
+
+    if conteudo:
+        dados['painel_transcricao'] = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())[:6000]
+        dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+        dados['painel_recebido_em'] = agora_br()
+        dados['painel_tipo_comprovacao'] = 'texto'
+        estado['dados'] = dados
+        _v116_gravar_estado(estado)
+        await _v116_atualizar_painel(canal, estado)
+        await _v116_publicar_tarefa_atual(canal, estado)
+        if not silencioso:
+            await _v116_responder(msg, '✅ Texto do painel registrado. Se o material está completo, use **Finalizar tarefa**.')
+        return
+
     _v116_gravar_estado(estado)
     if not silencioso:
-        cab = '📱 **TRANSCRIÇÃO DO PAINEL — PRONTA PARA O CELULAR IN-GAME**\n```\n'
-        rod = '\n```'
-        blocos = [transcricao[i:i + 1650] for i in range(0, len(transcricao), 1650)] or ['']
-        await _v116_responder(msg, cab + blocos[0] + rod)
-        for bloco in blocos[1:]:
-            try:
-                await msg.channel.send('```\n' + bloco + '\n```')
-            except Exception:
-                pass
-    await _v116_atualizar_painel(canal, estado)
-    await _v116_publicar_tarefa_atual(canal, estado)
-    if not silencioso:
-        if pendencias:
-            await _v116_responder(msg, f'⚠️ Transcrição criada com {len(membros)} registro(s) válido(s) e {len(pendencias)} linha(s) para revisão. As linhas válidas já contam como **painel transcrito**.')
-        await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e use **Finalizar tarefa**; depois um Inspetor+ pode concluir.')
-
+        await _v116_responder(msg, '⏳ Esta tarefa precisa de ao menos uma **imagem do painel já transcrito para o celular in-game** (ou texto do painel como alternativa).')
 
 class BancoImportarPainelModal(Modal, title='Importar painel completo'):
 
@@ -56198,6 +56250,54 @@ async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: di
     )
 
 
+async def _v129_recuperar_painel_visual_do_topico(canal: discord.TextChannel, estado: Dict[str, Any], topico_atual: Any) -> bool:
+    """Recupera imagens já enviadas no tópico Painel antes da V129.
+
+    Importante: isso NÃO faz OCR. O requisito do Item 1 é a evidência visual do
+    painel que já foi transcrito para o celular dentro do jogo.
+    """
+    dados = estado.setdefault('dados', {})
+    if list(dados.get('painel_imagens') or []) or str(dados.get('painel_transcricao') or '').strip():
+        return True
+    topico = topico_atual if isinstance(topico_atual, discord.Thread) else await _v116_topico_item(canal, 1)
+    if not isinstance(topico, discord.Thread):
+        return False
+    imagens: List[Any] = []
+    texto_alternativo = ''
+    origem_id = 0
+    try:
+        mensagens = [m async for m in topico.history(limit=150, oldest_first=True)]
+    except Exception:
+        return False
+    for mensagem in mensagens:
+        if getattr(getattr(mensagem, 'author', None), 'bot', False):
+            continue
+        imgs = _v116_imagens(mensagem)
+        if imgs:
+            imagens = _v116_adicionar_unicos(imagens, imgs)
+            origem_id = int(getattr(mensagem, 'id', 0) or origem_id)
+        elif not texto_alternativo:
+            bruto = str(getattr(mensagem, 'content', '') or '').strip()
+            if bruto:
+                texto_alternativo = bruto[:6000]
+                origem_id = int(getattr(mensagem, 'id', 0) or origem_id)
+    if imagens:
+        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens)
+        dados['painel_origem_mensagem_id'] = origem_id
+        dados['painel_recebido_em'] = agora_br()
+        dados['painel_tipo_comprovacao'] = 'imagem_recuperada_historico'
+    elif texto_alternativo:
+        dados['painel_transcricao'] = texto_alternativo
+        dados['painel_origem_mensagem_id'] = origem_id
+        dados['painel_recebido_em'] = agora_br()
+        dados['painel_tipo_comprovacao'] = 'texto_recuperado_historico'
+    else:
+        return False
+    estado['dados'] = dados
+    _v116_gravar_estado(estado)
+    return True
+
+
 class V122TarefaGuiadaView(View):
     """Painel final ativo das tarefas guiadas V122, com ACK imediato e timeout controlado."""
 
@@ -56249,8 +56349,11 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
-        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
-            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Assim que a transcrição terminar, use **Finalizar tarefa** novamente.', contexto='v122.finalizar.panel_processing')
+        if int(item) == 1:
+            try:
+                await asyncio.wait_for(_v129_recuperar_painel_visual_do_topico(canal, estado, interaction.channel), timeout=8.0)
+            except Exception as erro:
+                await _v127_log_interaction_error(interaction, erro, item=button, contexto='v129.finalizar.recuperar_painel')
 
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.finalizar')
         if lock is None:
@@ -56303,9 +56406,6 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.concluir')
-        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
-            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Aguarde a transcrição terminar antes de concluir.', contexto='v122.concluir.panel_processing')
-
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.concluir')
         if lock is None:
             return
@@ -56445,6 +56545,13 @@ bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
 
 
 print('✅ V128 carregada — hotfix de tarefas: fallback persistente, ACK/finalização segura e OCR sem bloquear o lock da mesa.', flush=True)
+
+
+print(
+    '✅ V129 carregada — tarefas automáticas revisadas: Item 1 aceita imagem do painel já transcrito no celular in-game, '
+    'cards mostram requisitos reais, mensagens usam Finalizar tarefa/Concluir tarefa e o Dossiê aceita evidência visual do Painel.',
+    flush=True,
+)
 
 
 _RUNTIME_PROCESS_STARTED_AT = time.monotonic()
