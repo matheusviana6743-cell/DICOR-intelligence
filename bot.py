@@ -52227,7 +52227,12 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
         return f'ITEM 2 — FOTOS DOS LÍDERES\n\nEnvie a {ordinal} com:\n- Foto\n- Cargo (Líder, Vice-líder ou Gerente)\n- Nome\n- RG\n\nEnvie uma pessoa por vez. Quando não houver mais lideranças, use **Finalizar tarefa**.'
     if item == 3:
         total = len(list(dados.get('membros') or []))
-        return f'ITEM 3 — FOTOS DOS MEMBROS\n\nEnvie o membro {min(total + 1, 7)}/7 com:\n- Foto\n- Cargo\n- Nome\n- RG\n\nEnvie uma pessoa por vez.'
+        proximo = total + 1
+        return (
+            f'ITEM 3 — FOTOS DOS MEMBROS\n\n'
+            f'Envie o membro nº {proximo} com:\n- Foto\n- Cargo\n- Nome\n- RG\n\n'
+            'Não existe quantidade fixa de membros. Envie uma pessoa por vez e, quando terminar todos os registros disponíveis, use **Finalizar tarefa**.'
+        )
     if item == 4:
         return 'ITEM 4 — RÁDIO\n\nEnvie a numeração/frequência da rádio utilizada pela organização.'
     if item == 5 and etapa == 1:
@@ -52251,7 +52256,12 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
     if item == 12 and etapa == 1:
         return 'ITEM 12 — INFORMANTE\nETAPA 1/2\n\nEnvie o informante com:\n- Foto;\n- RG/documento;\n- Nome;\n- Número do RG.'
     if item == 12 and etapa == 2:
-        return 'ITEM 12 — INFORMANTE\nETAPA 2/2\n\nEnvie um resumo explicando como o informante realizou a operação.\nO bot manterá somente as informações que você fornecer.'
+        return (
+            'ITEM 12 — INFORMANTE\nETAPA 2/2\n\n'
+            'Envie o resumo explicando como o informante realizou a operação.\n'
+            'Pode ser enviado em **texto ou em imagem/print**. A imagem será aceita como evidência do resumo sem exigir OCR.\n'
+            'O bot manterá somente o material que você fornecer.'
+        )
     if item == 13:
         return 'ITEM 13 — RESIDÊNCIA DO LÍDER\n\nEnvie as fotos da residência/casa do líder.\nQuando tiver enviado todas as fotos necessárias, use **Finalizar tarefa**.'
     return '✅ INVESTIGAÇÃO GUIADA CONCLUÍDA. Faça a conferência final antes de fechar a mesa.'
@@ -52299,7 +52309,9 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
         if faltas and any((estado.get('rascunho') or {}).get('pessoa', {}).values()):
             return faltas
         total = len(list(dados.get('membros') or []))
-        return [] if total >= 7 else [f'{7 - total} membro(s) completo(s)']
+        # Quantidade livre: basta existir ao menos um registro completo. Depois disso,
+        # o agente decide quando terminou de cadastrar os membros disponíveis.
+        return [] if total >= 1 else ['pelo menos um membro completo']
     if item == 4:
         return [] if str(dados.get('radio') or '').strip() else ['numeração/frequência da rádio']
     if item == 5 and etapa == 1:
@@ -52337,7 +52349,9 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
             return []
         return _v116_faltando_pessoa(estado, informante=True)
     if item == 12 and etapa == 2:
-        return [] if str(dados.get('informante_resumo') or '').strip() else ['resumo da operação do informante']
+        tem_texto = bool(str(dados.get('informante_resumo') or '').strip())
+        tem_imagem = bool(list(dados.get('informante_resumo_fotos') or []))
+        return [] if (tem_texto or tem_imagem) else ['resumo da operação do informante em texto ou imagem/print']
     if item == 13:
         return [] if list(dados.get('residencia_fotos') or []) else ['ao menos uma foto da residência/casa do líder']
     return []
@@ -52474,8 +52488,8 @@ async def _v116_auditoria_final(canal: discord.TextChannel, estado: Dict[str, An
         if len(rgs) > 1:
             nome_exemplo = next((p.get('nome') for _, p in pessoas if _v116_norm(p.get('nome')) == nome_norm), nome_norm)
             contradicoes.append(f'{nome_exemplo} aparece com RGs diferentes: ' + ', '.join(sorted(rgs)))
-    if len(list(dados.get('membros') or [])) != 7:
-        incompletos.append(f'Fotos dos membros: há {len(list(dados.get("membros") or []))}/7 membros.')
+    if not list(dados.get('membros') or []):
+        incompletos.append('Fotos dos membros: nenhum membro completo foi registrado.')
     if not list(dados.get('liderancas') or []):
         incompletos.append('Nenhuma liderança foi registrada.')
     linhas = [
@@ -52573,10 +52587,8 @@ def _v116_registrar_mensagem(estado: Dict[str, Any], msg_id: int) -> None:
 
 
 async def _v116_processar_pessoa(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, lideranca: bool=False, membro: bool=False, silencioso: bool=False) -> None:
-    if membro and len(list((estado.get('dados') or {}).get('membros') or [])) >= 7:
-        if not silencioso:
-            await _v116_responder(msg, '🟢 Os **7/7 membros** já foram registrados. Revise os dados e clique em **Finalizar tarefa** para confirmar o Item 3.')
-        return
+    # ITEM 3 não possui mais limite de 7 membros. O agente pode registrar quantos
+    # forem necessários e finaliza manualmente quando terminar.
     rasc = estado.setdefault('rascunho', {})
     p = rasc.get('pessoa') if isinstance(rasc.get('pessoa'), dict) else {}
     campos = _v116_extrair_pessoa(str(msg.content or ''))
@@ -52611,9 +52623,13 @@ async def _v116_processar_pessoa(canal: discord.TextChannel, estado: Dict[str, A
     estado['dados'] = dados
     estado['rascunho'] = {}
     _v116_gravar_estado(estado)
-    if membro and len(lista) >= 7:
+    if membro:
         if not silencioso:
-            await _v116_responder(msg, f'✅ Membro **7/7** registrado: {registro.get("nome")} — RG `{registro.get("rg")}`.\n🟢 ITEM 3 completo. Clique em **Finalizar tarefa** para confirmar e liberar o próximo item.')
+            await _v116_responder(
+                msg,
+                f'✅ Membro registrado: **{registro.get("nome")}** — RG `{registro.get("rg")}`.\n'
+                f'Total registrado nesta mesa: **{len(lista)}**. Envie o próximo membro ou use **Finalizar tarefa** quando terminar.'
+            )
         await _v116_atualizar_painel(canal, estado)
         await _v116_publicar_tarefa_atual(canal, estado)
         return
@@ -52825,13 +52841,26 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
             if not silencioso: await _v116_responder(msg, f'✅ Informante registrado: **{p.get("nome")}** — RG `{p.get("rg")}`.\n🟢 ETAPA 1/2 completa. Clique em **Finalizar tarefa** para confirmar esta etapa.')
             await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
             return
-        if not conteudo:
-            if not silencioso: await _v116_responder(msg, '⏳ Falta o resumo de como o informante realizou a operação.')
+        resumo_imgs = _v116_imagens(msg)
+        if resumo_imgs:
+            dados['informante_resumo_fotos'] = _v116_adicionar_unicos(
+                list(dados.get('informante_resumo_fotos') or []),
+                resumo_imgs,
+            )
+        if conteudo:
+            dados['informante_resumo'] = conteudo[:3500]
+        if not conteudo and not resumo_imgs:
+            if not silencioso:
+                await _v116_responder(msg, '⏳ Envie o resumo de como o informante realizou a operação em **texto ou imagem/print**.')
             return
-        dados['informante_resumo'] = conteudo[:3500]
         dados['informante_resumo_mensagem_id'] = int(msg.id)
         estado['dados'] = dados; _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, '✅ Resumo do informante registrado somente com as informações fornecidas. 🟢 ETAPA 2/2 completa. Clique em **Finalizar tarefa** para confirmar o ITEM 12.')
+        if not silencioso:
+            formato = 'imagem/print' if resumo_imgs and not conteudo else ('texto + imagem/print' if resumo_imgs else 'texto')
+            await _v116_responder(
+                msg,
+                f'✅ Resumo do informante registrado em **{formato}**. 🟢 ETAPA 2/2 completa. Clique em **Finalizar tarefa** para confirmar o ITEM 12.'
+            )
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -56294,6 +56323,7 @@ class V122TarefaGuiadaView(View):
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
 
         imagens_historicas: List[Dict[str, Any]] = []
+        imagens_informante_historicas: List[Dict[str, Any]] = []
         if int(item) == 1:
             try:
                 if _v117_faltando_item(estado, 1, 1):
@@ -56302,6 +56332,22 @@ class V122TarefaGuiadaView(View):
                         print(f'[INTERACTION] custom_id=dic_v122_tarefa_finalizar item=1 phase=evidence_recovered images={len(imagens_historicas)}', flush=True)
             except Exception as erro:
                 await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.finalizar.history_recovery')
+        elif int(item) == 12:
+            try:
+                etapa_atual = _v117_etapa_item(estado, 12)
+                if int(etapa_atual) == 2 and _v117_faltando_item(estado, 12, 2):
+                    # Reaproveita prints enviados ANTES desta atualização. Só roda em
+                    # mesas que já possuem o marcador V122, porque o contexto acima
+                    # rejeita qualquer mesa legada sem tarefas.
+                    imagens_informante_historicas = await _interaction_core_recuperar_imagens_painel_historico(interaction.channel)
+                    if imagens_informante_historicas:
+                        print(
+                            f'[INTERACTION] custom_id=dic_v122_tarefa_finalizar item=12 etapa=2 '
+                            f'phase=evidence_recovered images={len(imagens_informante_historicas)}',
+                            flush=True,
+                        )
+            except Exception as erro:
+                await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.finalizar.informante_history_recovery')
 
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.finalizar')
         if lock is None:
@@ -56318,6 +56364,14 @@ class V122TarefaGuiadaView(View):
                     imagens_historicas,
                 )
                 estado['dados'] = dados_item1
+                _v116_gravar_estado(estado)
+            if int(item) == 12 and imagens_informante_historicas:
+                dados_item12 = estado.setdefault('dados', {})
+                dados_item12['informante_resumo_fotos'] = _v116_adicionar_unicos(
+                    list(dados_item12.get('informante_resumo_fotos') or []),
+                    imagens_informante_historicas,
+                )
+                estado['dados'] = dados_item12
                 _v116_gravar_estado(estado)
             if str(item) in (estado.get('concluidos') or {}):
                 return await _v127_safe_send(interaction, '✅ Esta tarefa já foi concluída.', contexto='v122.finalizar')
@@ -56682,3 +56736,10 @@ async def _runtime_lifecycle_entrypoint() -> None:
 
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
+
+
+# DICOR interaction core — ajuste operacional (membros livres + resumo de informante por print)
+# IMPORTANTE: este bloco não chama _v118_marcar_mesa_nova/_v122_marcar_mesa_nova e
+# não percorre mesas antigas para criar tarefas. As novas regras valem para qualquer
+# mesa que JÁ possua tarefas_mesas_v122=True, inclusive mesas criadas antes deste deploy.
+print('✅ AJUSTE TAREFAS: membros com quantidade livre; Informante 2/2 aceita texto ou imagem/print; mesas legadas sem tarefas permanecem intocadas.', flush=True)
