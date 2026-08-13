@@ -55971,5 +55971,305 @@ async def b2storage_v126(interaction: discord.Interaction):
 print('✅ V126 carregada — B2 com health check, circuit breaker, pendências locais e anti-spam para NoSuchBucket/AccessDenied/rede.', flush=True)
 
 
+# =====================================================
+# V127 — Auditoria operacional e segurança global de interações
+# =====================================================
+_V127_SETUP_HOOK_ORIGINAL = bot.setup_hook
+_V127_VIEW_ON_ERROR_ORIGINAL = getattr(discord.ui.View, 'on_error', None)
+_V127_TREE_ON_ERROR_ORIGINAL = getattr(bot.tree, 'on_error', None)
+
+
+def _v127_interaction_meta(interaction: Optional[discord.Interaction], *, item: Any=None) -> Dict[str, Any]:
+    data = getattr(interaction, 'data', {}) or {}
+    return {
+        'interaction_id': int(getattr(interaction, 'id', 0) or 0) if interaction is not None else 0,
+        'custom_id': str(data.get('custom_id') or getattr(item, 'custom_id', '') or ''),
+        'command': str(data.get('name') or ''),
+        'user_id': int(getattr(getattr(interaction, 'user', None), 'id', 0) or 0) if interaction is not None else 0,
+        'channel_id': int(getattr(getattr(interaction, 'channel', None), 'id', 0) or 0) if interaction is not None else 0,
+        'guild_id': int(getattr(getattr(interaction, 'guild', None), 'id', 0) or 0) if interaction is not None else 0,
+        'view': type(getattr(item, 'view', None)).__name__ if item is not None else '',
+        'item': type(item).__name__ if item is not None else '',
+    }
+
+
+async def _v127_log_interaction_error(interaction: Optional[discord.Interaction], erro: BaseException, *, item: Any=None, contexto: str='callback') -> None:
+    meta = _v127_interaction_meta(interaction, item=item)
+    detalhe = (
+        f'❌ [INTERACTION] contexto={contexto} view={meta.get("view")} item={meta.get("item")} '
+        f'custom_id={meta.get("custom_id")} command={meta.get("command")} user={meta.get("user_id")} '
+        f'channel={meta.get("channel_id")} guild={meta.get("guild_id")} '
+        f'erro={type(erro).__name__}: {str(erro)[:700]}'
+    )
+    print(detalhe, flush=True)
+    try:
+        await enviar_log(detalhe)
+    except Exception:
+        pass
+
+
+def _v127_response_done(interaction: discord.Interaction) -> bool:
+    try:
+        return bool(interaction.response.is_done())
+    except Exception:
+        return True
+
+
+async def _v127_safe_defer(interaction: discord.Interaction, *, ephemeral: bool=True, thinking: bool=True, contexto: str='callback') -> bool:
+    if _v127_response_done(interaction):
+        return True
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+        return True
+    except discord.InteractionResponded:
+        return True
+    except Exception as erro:
+        await _v127_log_interaction_error(interaction, erro, contexto=f'{contexto}:defer')
+        return False
+
+
+async def _v127_safe_send(interaction: discord.Interaction, mensagem: str, *, ephemeral: bool=True, contexto: str='callback', **kwargs: Any) -> bool:
+    texto = str(mensagem or '')[:1900] or '⚠️ A interação foi processada, mas não gerou uma mensagem detalhada.'
+    try:
+        if not _v127_response_done(interaction):
+            await interaction.response.send_message(texto, ephemeral=ephemeral, **kwargs)
+        else:
+            await interaction.followup.send(texto, ephemeral=ephemeral, **kwargs)
+        return True
+    except discord.InteractionResponded:
+        try:
+            await interaction.followup.send(texto, ephemeral=ephemeral, **kwargs)
+            return True
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, contexto=f'{contexto}:followup_after_responded')
+            return False
+    except Exception as erro:
+        await _v127_log_interaction_error(interaction, erro, contexto=f'{contexto}:send')
+        return False
+
+
+async def _v127_safe_edit_original(interaction: discord.Interaction, *, contexto: str='callback', **kwargs: Any) -> bool:
+    try:
+        await interaction.edit_original_response(**kwargs)
+        return True
+    except Exception as erro:
+        await _v127_log_interaction_error(interaction, erro, contexto=f'{contexto}:edit_original')
+        return False
+
+
+async def _v127_safe_message_edit(message: Any, *, timeout: float=8.0, contexto: str='message_edit', **kwargs: Any) -> bool:
+    if message is None:
+        return False
+    try:
+        await asyncio.wait_for(message.edit(**kwargs), timeout=timeout)
+        return True
+    except Exception as erro:
+        print(f'⚠️ [INTERACTION] {contexto}: message.edit falhou/expirou: {type(erro).__name__}: {str(erro)[:500]}', flush=True)
+        return False
+
+
+async def _v127_view_on_error(self: discord.ui.View, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+    await _v127_log_interaction_error(interaction, error, item=item, contexto='view.on_error')
+    await _v127_safe_send(
+        interaction,
+        '❌ Este painel encontrou uma falha interna. A ação não foi aplicada parcialmente; tente novamente ou use o comando equivalente.',
+        ephemeral=True,
+        contexto='view.on_error',
+    )
+
+
+async def _v127_tree_on_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    await _v127_log_interaction_error(interaction, error, contexto='tree.on_error')
+    await _v127_safe_send(
+        interaction,
+        '❌ O comando encontrou uma falha interna. O diagnóstico foi registrado e nenhuma ação destrutiva foi executada sem confirmação.',
+        ephemeral=True,
+        contexto='tree.on_error',
+    )
+
+
+async def _v127_on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    try:
+        print(
+            f'❌ [COMMAND] prefixo comando={getattr(getattr(ctx, "command", None), "qualified_name", "")} '
+            f'user={getattr(getattr(ctx, "author", None), "id", 0)} channel={getattr(getattr(ctx, "channel", None), "id", 0)} '
+            f'erro={type(error).__name__}: {str(error)[:700]}',
+            flush=True,
+        )
+        if getattr(ctx, 'interaction', None) is not None:
+            await _v127_safe_send(ctx.interaction, '❌ O comando encontrou uma falha interna.', ephemeral=True, contexto='command_error')
+            return
+        try:
+            await ctx.reply('❌ O comando encontrou uma falha interna. Tente novamente ou use o painel correspondente.', mention_author=False)
+        except Exception:
+            pass
+    except Exception:
+        traceback.print_exc()
+
+
+async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
+    texto = _v122_texto_tarefa_guiada(canal, estado, item, etapa)
+    await _v127_safe_message_edit(
+        getattr(interaction, 'message', None),
+        content=texto,
+        view=V122TarefaGuiadaView(),
+        timeout=8.0,
+        contexto='v122.task_panel.update',
+    )
+
+
+class V122TarefaGuiadaView(View):
+    """Painel final ativo das tarefas guiadas V122, com ACK imediato e erro tratado."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _contexto_item(self, interaction: discord.Interaction) -> Tuple[Optional[discord.TextChannel], Optional[Dict[str, Any]], int]:
+        canal, _mesa = await _v116_resolver_contexto(interaction.channel)
+        if canal is None or not _v122_mesa_tarefas_habilitada(int(canal.id)):
+            return None, None, 0
+        estado = _v116_estado(canal.id, True)
+        if not isinstance(estado, dict):
+            return canal, None, 0
+        _v117_migrar_estado(estado)
+        item = _v117_item_do_topico(interaction.channel) if isinstance(interaction.channel, discord.Thread) else 0
+        if not item:
+            _v117_sincronizar_item_referencia(estado)
+            item = int(estado.get('item') or 1)
+        return canal, estado, item
+
+    async def _contexto_item_seguro(self, interaction: discord.Interaction) -> Tuple[Optional[discord.TextChannel], Optional[Dict[str, Any]], int]:
+        try:
+            return await asyncio.wait_for(self._contexto_item(interaction), timeout=8.0)
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, item=None, contexto='v122.contexto')
+            return None, None, 0
+
+    @discord.ui.button(label='Finalizar tarefa', emoji='✅', style=discord.ButtonStyle.green, custom_id='dic_v122_tarefa_finalizar', row=0)
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='v122.finalizar')
+        canal, estado, item = await self._contexto_item_seguro(interaction)
+        if canal is None or estado is None:
+            return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
+        try:
+            async with _v116_lock(canal.id):
+                estado = _v116_estado(canal.id, True)
+                if not isinstance(estado, dict):
+                    return await _v127_safe_send(interaction, '❌ Não consegui carregar o estado persistente desta mesa.', contexto='v122.finalizar')
+                _v117_migrar_estado(estado)
+                if str(item) in (estado.get('concluidos') or {}):
+                    return await _v127_safe_send(interaction, '✅ Esta tarefa já foi concluída.', contexto='v122.finalizar')
+                etapa = _v117_etapa_item(estado, item)
+                faltas = _v117_faltando_item(estado, item, etapa)
+                if faltas:
+                    return await _v127_safe_send(
+                        interaction,
+                        '❌ A tarefa ainda está incompleta.\n**Falta:** ' + '; '.join(faltas) + '.',
+                        contexto='v122.finalizar',
+                    )
+                tarefas = estado.setdefault('tarefas_guiadas', {})
+                chave = f'{int(item)}:{int(etapa)}'
+                registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+                if str(registro.get('status') or '').upper() == 'CONCLUIDA':
+                    return await _v127_safe_send(interaction, '✅ Esta tarefa já foi concluída.', contexto='v122.finalizar')
+                registro.update({
+                    'item': int(item),
+                    'etapa': int(etapa),
+                    'status': 'AGUARDANDO_CONCLUSAO',
+                    'finalizada_por_id': int(interaction.user.id),
+                    'finalizada_em': agora_br(),
+                    'versao_interacao': 127,
+                })
+                tarefas[chave] = registro
+                _v116_gravar_estado(estado)
+                await _v122_editar_painel_tarefa(interaction, canal, estado, item, etapa)
+            return await _v127_safe_send(interaction, '✅ Tarefa finalizada. Agora aguarda conclusão autorizada.', contexto='v122.finalizar')
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.finalizar')
+            return await _v127_safe_send(interaction, '❌ Não consegui finalizar esta tarefa agora. Nada foi apagado; tente novamente.', contexto='v122.finalizar')
+
+    @discord.ui.button(label='Concluir tarefa', emoji='🛡️', style=discord.ButtonStyle.primary, custom_id='dic_v122_tarefa_concluir', row=0)
+    async def concluir(self, interaction: discord.Interaction, button: Button):
+        await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='v122.concluir')
+        try:
+            if not usuario_e_administrador(interaction.user):
+                return await _v127_safe_send(interaction, '❌ Somente usuários autorizados podem concluir tarefas.', contexto='v122.concluir')
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.concluir.permissao')
+            return await _v127_safe_send(interaction, '❌ Não consegui validar sua permissão agora. Nenhuma conclusão foi aplicada.', contexto='v122.concluir')
+        canal, estado, item = await self._contexto_item_seguro(interaction)
+        if canal is None or estado is None:
+            return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.concluir')
+        try:
+            async with _v116_lock(canal.id):
+                estado = _v116_estado(canal.id, True)
+                if not isinstance(estado, dict):
+                    return await _v127_safe_send(interaction, '❌ Não consegui carregar o estado persistente desta mesa.', contexto='v122.concluir')
+                _v117_migrar_estado(estado)
+                if str(item) in (estado.get('concluidos') or {}):
+                    return await _v127_safe_send(interaction, '✅ Esta tarefa já foi concluída.', contexto='v122.concluir')
+                etapa = _v117_etapa_item(estado, item)
+                tarefas = estado.setdefault('tarefas_guiadas', {})
+                chave = f'{int(item)}:{int(etapa)}'
+                registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+                if str(registro.get('status') or '').upper() != 'AGUARDANDO_CONCLUSAO':
+                    return await _v127_safe_send(interaction, '⚠️ A tarefa precisa ser finalizada antes da conclusão.', contexto='v122.concluir')
+                ok, texto = await _v117_concluir_item(canal, estado, item)
+                if ok:
+                    estado = _v116_estado(canal.id, True) or estado
+                    _v117_migrar_estado(estado)
+                    await _v122_editar_painel_tarefa(interaction, canal, estado, item, etapa)
+            return await _v127_safe_send(interaction, texto, contexto='v122.concluir')
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.concluir')
+            return await _v127_safe_send(interaction, '❌ Não consegui concluir esta tarefa agora. Nenhuma etapa nova foi criada sem confirmação.', contexto='v122.concluir')
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _v127_view_on_error(self, interaction, error, item)
+
+
+async def _v127_setup_hook(self) -> None:
+    await _V127_SETUP_HOOK_ORIGINAL()
+    registradas: List[str] = []
+    falhas: List[str] = []
+    for view_factory in (V122TarefaGuiadaView, V116InvestigacaoGuiadaView, GerenciamentoTarefasView):
+        nome = getattr(view_factory, '__name__', str(view_factory))
+        try:
+            bot.add_view(view_factory())
+            registradas.append(nome)
+        except Exception as erro:
+            falhas.append(f'{nome}:{type(erro).__name__}')
+    try:
+        status = 'READY' if registradas else 'PARTIAL'
+        print(
+            f'✅ INTERACTION ACK {status} — Views críticas V127 registradas={registradas or []} falhas={falhas or []}.',
+            flush=True,
+        )
+    except Exception:
+        pass
+    try:
+        import interaction_audit as _dicor_interaction_audit
+        resumo = _dicor_interaction_audit.audit_file(BASE_DIR / 'bot.py').summary()
+        print(
+            '[INTERACTION AUDIT] '
+            f"commands={resumo.get('commands')} views={resumo.get('views')} "
+            f"persistent_views={resumo.get('persistent_views')} buttons={resumo.get('buttons')} "
+            f"selects={resumo.get('selects')} modals={resumo.get('modals')} "
+            f"custom_ids={resumo.get('custom_ids')}",
+            flush=True,
+        )
+    except Exception as erro:
+        print(f'⚠️ INTERACTION AUDIT startup indisponível: {type(erro).__name__}: {erro}', flush=True)
+
+
+discord.ui.View.on_error = _v127_view_on_error
+bot.tree.on_error = _v127_tree_on_error
+bot.on_command_error = _v127_on_command_error
+bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
+
+
+print('✅ V127 carregada — auditoria operacional de interações, ACK seguro e painel de tarefas V122 endurecido.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
