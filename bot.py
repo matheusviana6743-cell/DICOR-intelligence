@@ -50325,15 +50325,28 @@ class PainelProcuradosView(View):
 
     @discord.ui.button(label='Lista de Procurados',emoji='📋',style=discord.ButtonStyle.blurple,custom_id='dic_lista_procurados')
     async def lista(self,interaction:discord.Interaction,button:Button):
-        ativos=_v43_procurados_ativos()
-        if not ativos: return await interaction.response.send_message(f'📋 **Procurados ativos**\nNenhum registro localizado no canal <#{int(PROCURADOS_CHANNEL_ID)}>.',ephemeral=True)
-        paginas=[ativos[i:i+15] for i in range(0,len(ativos),15)]; primeira=True
-        for indice,pagina in enumerate(paginas,1):
-            embed=discord.Embed(title=f'📋 PROCURADOS ATIVOS — {indice}/{len(paginas)}',description=f'Total: **{len(ativos)}**',color=discord.Color.red())
-            for registro in pagina:
-                embed.add_field(name=f"👤 {registro.get('nome') or 'Nome não informado'}",value=f"**RG:** `{registro.get('rg') or 'N/I'}`\n**Último avistamento:** {str(registro.get('ultimo_avistamento') or 'Não informado')[:700]}",inline=False)
-            if primeira: await interaction.response.send_message(embed=embed,ephemeral=True); primeira=False
-            else: await interaction.followup.send(embed=embed,ephemeral=True)
+        if not await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='procurados.lista'):
+            return
+        try:
+            ativos = await asyncio.wait_for(asyncio.to_thread(_v43_procurados_ativos), timeout=12.0)
+            if not ativos:
+                return await _v127_safe_send(interaction, f'📋 **Procurados ativos**\nNenhum registro localizado no canal <#{int(PROCURADOS_CHANNEL_ID)}>.', contexto='procurados.lista')
+            paginas=[ativos[i:i+15] for i in range(0,len(ativos),15)]
+            primeira=True
+            for indice,pagina in enumerate(paginas,1):
+                embed=discord.Embed(title=f'📋 PROCURADOS ATIVOS — {indice}/{len(paginas)}',description=f'Total: **{len(ativos)}**',color=discord.Color.red())
+                for registro in pagina:
+                    embed.add_field(name=f"👤 {registro.get('nome') or 'Nome não informado'}",value=f"**RG:** `{registro.get('rg') or 'N/I'}`\n**Último avistamento:** {str(registro.get('ultimo_avistamento') or 'Não informado')[:700]}",inline=False)
+                if primeira:
+                    await interaction.edit_original_response(content=None, embed=embed)
+                    primeira=False
+                else:
+                    await interaction.followup.send(embed=embed,ephemeral=True)
+        except asyncio.TimeoutError:
+            return await _v127_safe_send(interaction, '⌛ A lista demorou além do limite para carregar. Tente novamente em instantes.', contexto='procurados.lista.timeout')
+        except Exception as erro:
+            await _v127_log_interaction_error(interaction, erro, item=button, contexto='procurados.lista')
+            return await _v127_safe_send(interaction, '❌ Não foi possível abrir a lista de procurados agora.', contexto='procurados.lista')
 
     @discord.ui.button(label='Registrar captura',emoji='🚔',style=discord.ButtonStyle.gray,custom_id='dic_retirar_procurado')
     async def retirar(self,interaction:discord.Interaction,button:Button): await interaction.response.send_modal(RetirarProcuradoModal())
@@ -52196,22 +52209,22 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
         faltas_atuais = ['pendente']
     if not faltas_atuais:
         if item == 2:
-            return f'ITEM 2 — FOTOS DOS LÍDERES\n\nLideranças registradas: **{len(list(dados.get("liderancas") or []))}**.\nSe ainda houver Líder, Vice-líder ou Gerente, envie a próxima pessoa. Caso tenha terminado, clique em **Concluir item**.'
+            return f'ITEM 2 — FOTOS DOS LÍDERES\n\nLideranças registradas: **{len(list(dados.get("liderancas") or []))}**.\nSe ainda houver Líder, Vice-líder ou Gerente, envie a próxima pessoa. Caso tenha terminado, clique em **Finalizar tarefa**.'
         if item == 6:
-            return f'ITEM 6 — CRIMES DA COMUNIDADE\n\nCrimes com prova registrados: **{len(list(dados.get("crimes") or []))}**.\nSe houver outro crime, envie-o com a respectiva prova. Caso tenha terminado, clique em **Concluir item**.'
+            return f'ITEM 6 — CRIMES DA COMUNIDADE\n\nCrimes com prova registrados: **{len(list(dados.get("crimes") or []))}**.\nSe houver outro crime, envie-o com a respectiva prova. Caso tenha terminado, clique em **Finalizar tarefa**.'
         if item == 13:
-            return f'ITEM 13 — RESIDÊNCIA DO LÍDER\n\nFotos registradas: **{len(list(dados.get("residencia_fotos") or []))}**.\nSe houver mais fotos, envie agora. Caso tenha terminado, clique em **Concluir item**.'
+            return f'ITEM 13 — RESIDÊNCIA DO LÍDER\n\nFotos registradas: **{len(list(dados.get("residencia_fotos") or []))}**.\nSe houver mais fotos, envie agora. Caso tenha terminado, clique em **Finalizar tarefa**.'
         if item in {5, 11, 12} and etapa == 1:
-            return f'ITEM {item} — {_v116_item_titulo(item)}\nETAPA 1/2\n\n🟢 Material obrigatório desta etapa completo. Revise e clique em **Concluir item** para confirmar.'
+            return f'ITEM {item} — {_v116_item_titulo(item)}\nETAPA 1/2\n\n🟢 Material obrigatório desta etapa completo. Revise e clique em **Finalizar tarefa** para confirmar.'
         if item in {5, 11, 12} and etapa == 2:
-            return f'ITEM {item} — {_v116_item_titulo(item)}\nETAPA 2/2\n\n🟢 Material obrigatório desta etapa completo. Revise e clique em **Concluir item** para confirmar.'
-        return f'ITEM {item} — {_v116_item_titulo(item)}\n\n🟢 Material obrigatório completo. Revise e clique em **Concluir item** para confirmar antes de avançar.'
+            return f'ITEM {item} — {_v116_item_titulo(item)}\nETAPA 2/2\n\n🟢 Material obrigatório desta etapa completo. Revise e clique em **Finalizar tarefa** para confirmar.'
+        return f'ITEM {item} — {_v116_item_titulo(item)}\n\n🟢 Material obrigatório completo. Revise e clique em **Finalizar tarefa** para confirmar antes de avançar.'
     if item == 1:
         return 'ITEM 1 — PAINEL\n\nEnvie o painel da organização em print/imagem ou texto.\nO bot vai transcrever e organizar o conteúdo para você copiar para o celular in-game.'
     if item == 2:
         total = len(list(dados.get('liderancas') or []))
         ordinal = 'primeira liderança' if total == 0 else 'próxima liderança'
-        return f'ITEM 2 — FOTOS DOS LÍDERES\n\nEnvie a {ordinal} com:\n- Foto\n- Cargo (Líder, Vice-líder ou Gerente)\n- Nome\n- RG\n\nEnvie uma pessoa por vez. Quando não houver mais lideranças, use **Concluir item**.'
+        return f'ITEM 2 — FOTOS DOS LÍDERES\n\nEnvie a {ordinal} com:\n- Foto\n- Cargo (Líder, Vice-líder ou Gerente)\n- Nome\n- RG\n\nEnvie uma pessoa por vez. Quando não houver mais lideranças, use **Finalizar tarefa**.'
     if item == 3:
         total = len(list(dados.get('membros') or []))
         return f'ITEM 3 — FOTOS DOS MEMBROS\n\nEnvie o membro {min(total + 1, 7)}/7 com:\n- Foto\n- Cargo\n- Nome\n- RG\n\nEnvie uma pessoa por vez.'
@@ -52222,7 +52235,7 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
     if item == 5 and etapa == 2:
         return 'ITEM 5 — LOCALIZAÇÃO\nETAPA 2/2\n\nEnvie 4 fotos aéreas da localização/organização.'
     if item == 6:
-        return 'ITEM 6 — CRIMES DA COMUNIDADE\n\nEnvie um crime por vez com:\n- Nome/descrição do crime;\n- Prova/evidência correspondente (imagem, arquivo ou link).\n\nQuando terminar todos os crimes, use **Concluir item**.'
+        return 'ITEM 6 — CRIMES DA COMUNIDADE\n\nEnvie um crime por vez com:\n- Nome/descrição do crime;\n- Prova/evidência correspondente (imagem, arquivo ou link).\n\nQuando terminar todos os crimes, use **Finalizar tarefa**.'
     if item == 7:
         return 'ITEM 7 — BAÚ DE LÍDER\n\nEnvie:\n- Foto do baú dos líderes;\n- Foto/localização da entrada do baú.'
     if item == 8:
@@ -52240,7 +52253,7 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
     if item == 12 and etapa == 2:
         return 'ITEM 12 — INFORMANTE\nETAPA 2/2\n\nEnvie um resumo explicando como o informante realizou a operação.\nO bot manterá somente as informações que você fornecer.'
     if item == 13:
-        return 'ITEM 13 — RESIDÊNCIA DO LÍDER\n\nEnvie as fotos da residência/casa do líder.\nQuando tiver enviado todas as fotos necessárias, use **Concluir item**.'
+        return 'ITEM 13 — RESIDÊNCIA DO LÍDER\n\nEnvie as fotos da residência/casa do líder.\nQuando tiver enviado todas as fotos necessárias, use **Finalizar tarefa**.'
     return '✅ INVESTIGAÇÃO GUIADA CONCLUÍDA. Faça a conferência final antes de fechar a mesa.'
 
 
@@ -52271,7 +52284,11 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
     etapa = int(estado.get('etapa') or 1)
     dados = estado.setdefault('dados', {})
     if item == 1:
-        return [] if str(dados.get('painel_transcricao') or '').strip() else ['painel transcrito']
+        # Regra operacional: o painel já transcrito no celular in-game é comprovado
+        # por uma ou mais imagens válidas. OCR é apenas enriquecimento para o dossiê.
+        if list(dados.get('painel_imagens') or []):
+            return []
+        return [] if str(dados.get('painel_transcricao') or '').strip() else ['imagem do painel transcrito no celular in-game']
     if item == 2:
         faltas = _v116_faltando_pessoa(estado, lideranca=True)
         if faltas and any((estado.get('rascunho') or {}).get('pessoa', {}).values()):
@@ -52558,7 +52575,7 @@ def _v116_registrar_mensagem(estado: Dict[str, Any], msg_id: int) -> None:
 async def _v116_processar_pessoa(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, lideranca: bool=False, membro: bool=False, silencioso: bool=False) -> None:
     if membro and len(list((estado.get('dados') or {}).get('membros') or [])) >= 7:
         if not silencioso:
-            await _v116_responder(msg, '🟢 Os **7/7 membros** já foram registrados. Revise os dados e clique em **Concluir item** para confirmar o Item 3.')
+            await _v116_responder(msg, '🟢 Os **7/7 membros** já foram registrados. Revise os dados e clique em **Finalizar tarefa** para confirmar o Item 3.')
         return
     rasc = estado.setdefault('rascunho', {})
     p = rasc.get('pessoa') if isinstance(rasc.get('pessoa'), dict) else {}
@@ -52596,13 +52613,13 @@ async def _v116_processar_pessoa(canal: discord.TextChannel, estado: Dict[str, A
     _v116_gravar_estado(estado)
     if membro and len(lista) >= 7:
         if not silencioso:
-            await _v116_responder(msg, f'✅ Membro **7/7** registrado: {registro.get("nome")} — RG `{registro.get("rg")}`.\n🟢 ITEM 3 completo. Clique em **Concluir item** para confirmar e liberar o próximo item.')
+            await _v116_responder(msg, f'✅ Membro **7/7** registrado: {registro.get("nome")} — RG `{registro.get("rg")}`.\n🟢 ITEM 3 completo. Clique em **Finalizar tarefa** para confirmar e liberar o próximo item.')
         await _v116_atualizar_painel(canal, estado)
         await _v116_publicar_tarefa_atual(canal, estado)
         return
     if not silencioso:
         if lideranca:
-            await _v116_responder(msg, f'✅ Liderança registrada: **{registro.get("nome")}** — {registro.get("cargo")} — RG `{registro.get("rg")}`.\nEnvie a próxima liderança ou use **Concluir item** quando tiver registrado todas.')
+            await _v116_responder(msg, f'✅ Liderança registrada: **{registro.get("nome")}** — {registro.get("cargo")} — RG `{registro.get("rg")}`.\nEnvie a próxima liderança ou use **Finalizar tarefa** quando tiver registrado todas.')
         else:
             await _v116_responder(msg, f'✅ Membro **{len(lista)}/7** registrado: **{registro.get("nome")}** — RG `{registro.get("rg")}`.\nEnvie o membro {len(lista)+1}/7.')
     await _v116_atualizar_painel(canal, estado)
@@ -52667,7 +52684,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         await _v116_atualizar_painel(canal, estado)
         await _v116_publicar_tarefa_atual(canal, estado)
         if not silencioso:
-            await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e clique em **Concluir item** para confirmar e liberar o próximo item.')
+            await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e clique em **Finalizar tarefa** para confirmar e liberar o próximo item.')
         return
 
     if item == 2:
@@ -52681,7 +52698,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         dados['radio'] = conteudo[:800]
         dados['radio_mensagem_id'] = int(msg.id)
         _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, '✅ Rádio registrada. 🟢 ITEM 4 completo. Clique em **Concluir item** para confirmar e liberar o próximo item.')
+        if not silencioso: await _v116_responder(msg, '✅ Rádio registrada. 🟢 ITEM 4 completo. Clique em **Finalizar tarefa** para confirmar e liberar o próximo item.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52694,7 +52711,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
             if faltas:
                 if not silencioso: await _v116_responder(msg, '⏳ Etapa 1 ainda incompleta.\n**Falta:** ' + '; '.join(faltas) + '.')
                 return
-            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
+            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Finalizar tarefa** para confirmar esta etapa.')
             await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
             return
         lista = _v116_adicionar_unicos(list(dados.get('localizacao_aereas') or []), imagens)
@@ -52704,7 +52721,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         if faltas:
             if not silencioso: await _v116_responder(msg, f'📸 Fotos aéreas registradas: **{len(lista)}/4**.\n**Falta:** {faltas[0]}.')
             return
-        if not silencioso: await _v116_responder(msg, '✅ 4 fotos aéreas registradas. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 5.')
+        if not silencioso: await _v116_responder(msg, '✅ 4 fotos aéreas registradas. 🟢 ETAPA 2/2 completa. Clique em **Finalizar tarefa** para confirmar o ITEM 5.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52738,7 +52755,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
             crimes.append(registro)
         dados['crimes'] = crimes; estado['dados'] = dados; estado['rascunho'] = {}
         _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, f'✅ Crime registrado com prova: **{registro.get("descricao")[:160]}**.\nTotal: **{len(crimes)}**. Envie o próximo crime ou use **Concluir item**.')
+        if not silencioso: await _v116_responder(msg, f'✅ Crime registrado com prova: **{registro.get("descricao")[:160]}**.\nTotal: **{len(crimes)}**. Envie o próximo crime ou use **Finalizar tarefa**.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52756,7 +52773,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         if faltas:
             if not silencioso: await _v116_responder(msg, f'📸 {nome}: **{len(lista)}/2** registro(s).\n**Falta:** ' + '; '.join(faltas) + '.')
             return
-        if not silencioso: await _v116_responder(msg, f'✅ {nome} com os 2 registros obrigatórios. 🟢 ITEM {item} completo. Clique em **Concluir item** para confirmar.')
+        if not silencioso: await _v116_responder(msg, f'✅ {nome} com os 2 registros obrigatórios. 🟢 ITEM {item} completo. Clique em **Finalizar tarefa** para confirmar.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52767,7 +52784,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
             if not dados['ingredientes_fotos']:
                 if not silencioso: await _v116_responder(msg, '⏳ Falta a foto dos ingredientes necessários para a produção.')
                 return
-            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
+            if not silencioso: await _v116_responder(msg, '🟢 ETAPA 1/2 completa. Clique em **Finalizar tarefa** para confirmar esta etapa.')
             await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
             return
         dados['produto_final_fotos'] = _v116_adicionar_unicos(list(dados.get('produto_final_fotos') or []), imagens)
@@ -52775,7 +52792,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         if not dados['produto_final_fotos']:
             if not silencioso: await _v116_responder(msg, '⏳ Falta a foto do produto final produzido pela organização.')
             return
-        if not silencioso: await _v116_responder(msg, '✅ Produto final registrado. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 11.')
+        if not silencioso: await _v116_responder(msg, '✅ Produto final registrado. 🟢 ETAPA 2/2 completa. Clique em **Finalizar tarefa** para confirmar o ITEM 11.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52784,7 +52801,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
             inf_salvo = dados.get('informante')
             if isinstance(inf_salvo, dict) and inf_salvo.get('foto') and inf_salvo.get('documento') and str(inf_salvo.get('nome') or '').strip() and str(inf_salvo.get('rg') or '').strip():
                 if not silencioso:
-                    await _v116_responder(msg, '🟢 O informante da ETAPA 1/2 já está completo. Revise e clique em **Concluir item** para confirmar esta etapa.')
+                    await _v116_responder(msg, '🟢 O informante da ETAPA 1/2 já está completo. Revise e clique em **Finalizar tarefa** para confirmar esta etapa.')
                 return
             rasc = estado.setdefault('rascunho', {})
             p = rasc.get('informante') if isinstance(rasc.get('informante'), dict) else {}
@@ -52805,7 +52822,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
                 return
             dados['informante'] = dict(p); estado['dados'] = dados; estado['rascunho'] = {}
             _v116_gravar_estado(estado)
-            if not silencioso: await _v116_responder(msg, f'✅ Informante registrado: **{p.get("nome")}** — RG `{p.get("rg")}`.\n🟢 ETAPA 1/2 completa. Clique em **Concluir item** para confirmar esta etapa.')
+            if not silencioso: await _v116_responder(msg, f'✅ Informante registrado: **{p.get("nome")}** — RG `{p.get("rg")}`.\n🟢 ETAPA 1/2 completa. Clique em **Finalizar tarefa** para confirmar esta etapa.')
             await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
             return
         if not conteudo:
@@ -52814,7 +52831,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         dados['informante_resumo'] = conteudo[:3500]
         dados['informante_resumo_mensagem_id'] = int(msg.id)
         estado['dados'] = dados; _v116_gravar_estado(estado)
-        if not silencioso: await _v116_responder(msg, '✅ Resumo do informante registrado somente com as informações fornecidas. 🟢 ETAPA 2/2 completa. Clique em **Concluir item** para confirmar o ITEM 12.')
+        if not silencioso: await _v116_responder(msg, '✅ Resumo do informante registrado somente com as informações fornecidas. 🟢 ETAPA 2/2 completa. Clique em **Finalizar tarefa** para confirmar o ITEM 12.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -52825,7 +52842,7 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         if not lista:
             if not silencioso: await _v116_responder(msg, '⏳ Falta ao menos uma foto da residência/casa do líder.')
             return
-        if not silencioso: await _v116_responder(msg, f'✅ Foto(s) da residência registrada(s): **{len(lista)}**.\nSe houver mais, envie agora. Quando terminar, use **Concluir item**.')
+        if not silencioso: await _v116_responder(msg, f'✅ Foto(s) da residência registrada(s): **{len(lista)}**.\nSe houver mais, envie agora. Quando terminar, use **Finalizar tarefa**.')
         await _v116_atualizar_painel(canal, estado); await _v116_publicar_tarefa_atual(canal, estado)
         return
 
@@ -55643,6 +55660,12 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         return await _V125_V116_PROCESSAR_ITEM_ANTES(canal, estado, msg, silencioso=silencioso)
     dados = estado.setdefault('dados', {})
     conteudo = str(getattr(msg, 'content', '') or '').strip()
+    imagens_recebidas = _v116_imagens(msg)
+    if imagens_recebidas:
+        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens_recebidas)
+        dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+        estado['dados'] = dados
+        _v116_gravar_estado(estado)
     try:
         canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
     except Exception as erro:
@@ -55650,11 +55673,17 @@ async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any
         if _v125_erro_ocr_indisponivel(erro):
             await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 painel mesa msg={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
             if not silencioso:
-                await _v116_responder(msg, '❌ O OCR do servidor está indisponível no momento. A imagem foi preservada; tente novamente após a correção técnica ou cole o texto do painel.')
+                await _v116_responder(msg, '✅ Imagem do painel registrada. O OCR está indisponível, mas isso não impede finalizar a tarefa; a imagem será preservada como evidência.')
+            if imagens_recebidas:
+                await _v116_atualizar_painel(canal, estado)
+                await _v116_publicar_tarefa_atual(canal, estado)
             return
         await enviar_log(f'⚠️ V125 OCR/transcrição do painel falhou na mensagem {getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
         if not silencioso:
-            await _v116_responder(msg, '❌ Não foi possível analisar este painel. A imagem foi preservada; envie um print mais nítido ou cole o texto.')
+            await _v116_responder(msg, '✅ Imagem do painel registrada. Não consegui extrair o texto automaticamente, mas a tarefa pode ser finalizada normalmente.')
+        if imagens_recebidas:
+            await _v116_atualizar_painel(canal, estado)
+            await _v116_publicar_tarefa_atual(canal, estado)
         return
     if pendencias:
         nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
@@ -56249,8 +56278,6 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
-        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
-            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Assim que a transcrição terminar, use **Finalizar tarefa** novamente.', contexto='v122.finalizar.panel_processing')
 
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.finalizar')
         if lock is None:
@@ -56303,8 +56330,6 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.concluir')
-        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
-            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Aguarde a transcrição terminar antes de concluir.', contexto='v122.concluir.panel_processing')
 
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.concluir')
         if lock is None:
@@ -56377,11 +56402,9 @@ async def _v128_task_component_fallback(interaction: discord.Interaction) -> Non
             await _v127_safe_send(interaction, '❌ Não consegui executar este botão agora. Tente novamente.', contexto='v128.task_fallback')
 
 def _v128_registrar_fallback_tarefas() -> None:
-    try:
-        bot.remove_listener(_v128_task_component_fallback, 'on_interaction')
-    except Exception:
-        pass
-    bot.add_listener(_v128_task_component_fallback, 'on_interaction')
+    # Rebuild: não há segundo roteador respondendo aos mesmos custom_ids.
+    return
+
 
 def _v128_custom_ids_persistentes() -> set:
     ids = set()
@@ -56405,9 +56428,44 @@ async def _v127_setup_hook(self) -> None:
         except Exception as erro:
             falhas.append(f'{nome}:{type(erro).__name__}')
 
-    # V14 limpa todos os listeners on_interaction durante o setup. Por isso este
-    # fallback precisa ser registrado somente DEPOIS de chamar o setup anterior.
-    _v128_registrar_fallback_tarefas()
+    # Rebuild estrutural: não registramos um segundo roteador para responder aos
+    # mesmos componentes. A ViewStore é a única dona dos callbacks persistentes.
+    # Reconciliamos explicitamente as Views críticas e removemos versões erradas
+    # que disputem os mesmos custom_ids.
+    canonical = {
+        'dic_v122_tarefa_finalizar': V122TarefaGuiadaView,
+        'dic_v122_tarefa_concluir': V122TarefaGuiadaView,
+        'dic_lista_procurados': PainelProcuradosView,
+        'dic_retirar_procurado': PainelProcuradosView,
+        'dic_modificar_procurado': PainelProcuradosView,
+        'dic_abrir_catalogo': PainelProcuradosView,
+    }
+    for view in list(getattr(bot, 'persistent_views', []) or []):
+        filhos = list(getattr(view, 'children', []) or [])
+        cids_view = {str(getattr(x, 'custom_id', '') or '') for x in filhos}
+        esperado = {canonical[cid] for cid in cids_view if cid in canonical}
+        if esperado and type(view) not in esperado:
+            try:
+                bot.remove_view(view)
+                print(f'[INTERACTION] persistent_view removida por conflito: {type(view).__name__} ids={sorted(cids_view & set(canonical))}', flush=True)
+            except Exception as erro:
+                falhas.append(f'remove:{type(view).__name__}:{type(erro).__name__}')
+    for factory in (V122TarefaGuiadaView, PainelProcuradosView):
+        try:
+            existentes = {
+                str(getattr(child, 'custom_id', '') or '')
+                for view in list(getattr(bot, 'persistent_views', []) or []) if type(view) is factory
+                for child in list(getattr(view, 'children', []) or [])
+            }
+            desejados = {
+                str(getattr(child, 'custom_id', '') or '')
+                for child in list(getattr(factory(), 'children', []) or [])
+            }
+            if not desejados.issubset(existentes):
+                bot.add_view(factory())
+                registradas.append(factory.__name__)
+        except Exception as erro:
+            falhas.append(f'{factory.__name__}:{type(erro).__name__}')
     ids = _v128_custom_ids_persistentes()
     faltando_ids = sorted(_V128_TASK_COMPONENT_IDS - ids)
     if faltando_ids:
@@ -56429,11 +56487,29 @@ async def _v127_setup_hook(self) -> None:
     except Exception:
         pass
     try:
+        views_runtime = list(getattr(bot, 'persistent_views', []) or [])
+        cid_owners = {}
+        buttons = selects = 0
+        for view in views_runtime:
+            for child in list(getattr(view, 'children', []) or []):
+                cid = str(getattr(child, 'custom_id', '') or '').strip()
+                if isinstance(child, discord.ui.Button):
+                    buttons += 1
+                elif isinstance(child, discord.ui.Select):
+                    selects += 1
+                if cid:
+                    cid_owners.setdefault(cid, []).append(type(view).__name__)
+        duplicates = {cid: donos for cid, donos in cid_owners.items() if len(set(donos)) > 1}
+        commands_total = len(list(bot.tree.get_commands()))
+        status_core = 'READY' if not duplicates and not faltando_ids and not falhas else 'FAILED'
         print(
-            '[RUNTIME] Startup de interações concluído sem auditoria pesada no setup_hook. '
-            'Use interaction_audit.py em testes/diagnóstico offline.',
+            f'[INTERACTIONS] commands={commands_total} persistent_views={len(views_runtime)} '
+            f'buttons={buttons} selects={selects} custom_ids={len(cid_owners)} duplicates={len(duplicates)} status={status_core}',
             flush=True,
         )
+        if duplicates:
+            print('[INTERACTIONS] DUPLICATES ' + json.dumps(duplicates, ensure_ascii=False)[:3000], flush=True)
+        print(f'INTERACTION SYSTEM {status_core}', flush=True)
     except Exception as erro:
         print(f'⚠️ [RUNTIME] Log de startup de interações falhou: {type(erro).__name__}: {erro}', flush=True)
 
@@ -56445,6 +56521,27 @@ bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
 
 
 print('✅ V128 carregada — hotfix de tarefas: fallback persistente, ACK/finalização segura e OCR sem bloquear o lock da mesa.', flush=True)
+
+
+async def _interaction_core_trace(interaction: discord.Interaction) -> None:
+    try:
+        if getattr(interaction, 'type', None) != discord.InteractionType.component:
+            return
+        data = dict(getattr(interaction, 'data', {}) or {})
+        cid = str(data.get('custom_id') or '')
+        print(
+            f'[INTERACTION] custom_id={cid} user={getattr(getattr(interaction, "user", None), "id", 0)} '
+            f'channel={getattr(interaction, "channel_id", 0)} message={getattr(getattr(interaction, "message", None), "id", 0)} phase=received',
+            flush=True,
+        )
+    except Exception as erro:
+        print(f'[INTERACTION] trace_failed={type(erro).__name__}: {erro}', flush=True)
+
+try:
+    bot.remove_listener(_interaction_core_trace, 'on_interaction')
+except Exception:
+    pass
+bot.add_listener(_interaction_core_trace, 'on_interaction')
 
 
 _RUNTIME_PROCESS_STARTED_AT = time.monotonic()
