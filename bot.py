@@ -55765,5 +55765,211 @@ bot.setup_hook = _v12_types.MethodType(_v125_setup_hook, bot)
 print('✅ V125 carregada — camada global de OCR/análise de imagens integrada a Banco de Dados e Painel da Mesa.', flush=True)
 
 
+# =====================================================
+# V126 — Backblaze B2 resiliente, com health check e anti-spam
+# =====================================================
+try:
+    import b2_storage as _dicor_b2_storage
+except Exception as _V126_B2_IMPORT_ERRO:
+    _dicor_b2_storage = None
+else:
+    _V126_B2_IMPORT_ERRO = None
+
+_V126_B2_MANAGER = None
+_V126_B2_MANAGER_LOCK = threading.RLock()
+_V126_B2_SETUP_HOOK_ORIGINAL = bot.setup_hook
+V126_B2_HEALTH_RETRY_SECONDS = max(300, env_int('B2_HEALTH_RETRY_SECONDS', env_int('B2_WRITE_PAUSE_SECONDS', 1800)))
+V126_B2_LOG_INTERVAL_SECONDS = max(300, env_int('B2_LOG_INTERVAL_SECONDS', V126_B2_HEALTH_RETRY_SECONDS))
+V126_B2_PENDING_SYNC_LIMIT = max(1, min(500, env_int('B2_PENDING_SYNC_LIMIT', 50)))
+V126_B2_STATE_JSON = DATA_DIR / 'b2_storage_health_v126.json'
+
+
+def _v126_b2_module():
+    if _dicor_b2_storage is None:
+        raise RuntimeError(f'b2_storage.py não pôde ser importado: {_V126_B2_IMPORT_ERRO}')
+    return _dicor_b2_storage
+
+
+def _v126_b2_config():
+    mod = _v126_b2_module()
+    return mod.B2Config(
+        enabled=bool(V79_B2_ENABLED),
+        endpoint_url=str(V79_B2_ENDPOINT_URL or '').strip().rstrip('/'),
+        region_name=str(V79_B2_REGION or '').strip(),
+        access_key_id=str(V79_B2_ACCESS_KEY_ID or '').strip(),
+        secret_access_key=str(V79_B2_SECRET_ACCESS_KEY or '').strip(),
+        bucket_name=str(V79_B2_BUCKET or '').strip(),
+        prefix='',
+    )
+
+
+def _v126_b2_log(mensagem: str) -> None:
+    print(str(mensagem), flush=True)
+
+
+def _v126_b2_client_factory():
+    return _v78_r2_client()
+
+
+def _v126_b2_manager():
+    global _V126_B2_MANAGER
+    with _V126_B2_MANAGER_LOCK:
+        if _V126_B2_MANAGER is None:
+            mod = _v126_b2_module()
+            _V126_B2_MANAGER = mod.B2StorageManager(
+                config=_v126_b2_config(),
+                client_factory=_v126_b2_client_factory,
+                state_path=V126_B2_STATE_JSON,
+                logger=_v126_b2_log,
+                retry_seconds=V126_B2_HEALTH_RETRY_SECONDS,
+                log_interval_seconds=V126_B2_LOG_INTERVAL_SECONDS,
+            )
+        return _V126_B2_MANAGER
+
+
+def _v126_b2_ready(*, force_health: bool=False) -> bool:
+    try:
+        return bool(_v126_b2_manager().can_use_remote(force_health=force_health))
+    except Exception as erro:
+        print(f'[B2] Backend UNAVAILABLE: {type(erro).__name__}. Arquivos locais permanecem preservados em /data.', flush=True)
+        return False
+
+
+def _v126_b2_status_dict(*, force: bool=False) -> Dict[str, Any]:
+    try:
+        manager = _v126_b2_manager()
+        status = manager.health_check(force=force) if force else manager.status()
+        resumo = manager.config.safe_summary()
+        resumo.update({
+            'status': status.status,
+            'reason': status.reason,
+            'detail': status.detail,
+            'retry_after_seconds': status.retry_after_seconds,
+            'pending_count': status.pending_count,
+        })
+        resumo['secret_configured'] = bool(manager.config.has_secret_key)
+        return resumo
+    except Exception as erro:
+        return {'status': 'UNAVAILABLE', 'reason': type(erro).__name__, 'detail': str(erro)[:500], 'pending_count': 0}
+
+
+_V126_V107_B2_CONFIGURADO_ANTERIOR = _v107_b2_configurado
+_V126_V86_B2_DIRETO_ATIVO_ANTERIOR = _v86_b2_direto_ativo
+_V126_V87_UPLOAD_ANTERIOR = _v87_upload_write_only_sync
+_V126_V107_UPLOAD_FILE_ANTERIOR = _v107_upload_file_estavel
+_V126_V107_UPLOAD_BYTES_ANTERIOR = _v107_upload_bytes
+_V126_V107_DOWNLOAD_JSON_ANTERIOR = _v107_download_json
+
+
+def _v107_b2_configurado() -> bool:
+    return _v126_b2_ready(force_health=False)
+
+
+def _v86_b2_direto_ativo() -> bool:
+    return bool(V86_B2_DIRECT_ENABLED and _v126_b2_ready(force_health=False))
+
+
+def _v87_b2_pausado() -> bool:
+    try:
+        status = _v126_b2_manager().status()
+        return bool(status.status == 'UNAVAILABLE' and status.retry_after_seconds > 0)
+    except Exception:
+        return True
+
+
+def _v87_upload_write_only_sync(caminho: Path, categoria: str) -> Dict[str, Any]:
+    global _V87_UPLOADS_OK
+    caminho = Path(caminho)
+    if not caminho.exists() or not caminho.is_file():
+        raise FileNotFoundError(str(caminho))
+    tamanho = int(caminho.stat().st_size)
+    if tamanho <= 0:
+        raise RuntimeError('Arquivo vazio.')
+    sha256 = _v78_hash_file(caminho)
+    mime = _v78_mimetypes.guess_type(caminho.name)[0] or 'application/octet-stream'
+    key = _v84_key_deterministica(categoria, caminho, sha256)
+    resultado = _v126_b2_manager().upload_file(caminho, key, category=categoria, content_type=mime)
+    if not resultado.uploaded:
+        motivo = resultado.reason or _v126_b2_manager().status().reason or 'B2_UNAVAILABLE'
+        raise RuntimeError(f'B2 STORAGE UNAVAILABLE: {motivo}; arquivo local preservado para fallback/sincronização.')
+    _v78_index_save(local_path=caminho, key=resultado.key, categoria=categoria, mime_type=mime, tamanho=tamanho, sha256=sha256)
+    _V87_UPLOADS_OK += 1
+    return {'key': resultado.key, 'pointer': _v78_pointer(resultado.key), 'size': tamanho, 'sha256': sha256, 'reutilizado': False, 'confirmado_por': 'UPLOAD_OK_V126'}
+
+
+def _v107_upload_bytes(chave: str, conteudo: bytes, content_type: str='application/octet-stream') -> bool:
+    key = _v107_remote_key(chave)
+    resultado = _v126_b2_manager().upload_bytes(bytes(conteudo or b''), key, content_type=content_type)
+    return bool(resultado.uploaded)
+
+
+def _v107_upload_file_estavel(caminho: Path, chave: str) -> bool:
+    caminho = Path(caminho)
+    key = _v107_remote_key(chave)
+    mime = _v78_mimetypes.guess_type(caminho.name)[0] or 'application/octet-stream'
+    resultado = _v126_b2_manager().upload_file(caminho, key, category='cofre-remoto-v107', content_type=mime)
+    return bool(resultado.uploaded)
+
+
+def _v107_download_json(chave: str) -> Optional[Dict[str, Any]]:
+    if not _v126_b2_ready(force_health=False):
+        return None
+    cli = _v78_r2_client()
+    if cli is None:
+        return None
+    try:
+        obj = cli.get_object(Bucket=V79_B2_BUCKET, Key=_v107_remote_key(chave))
+        raw = obj['Body'].read()
+        dado = json.loads(raw.decode('utf-8'))
+        return dado if isinstance(dado, dict) else None
+    except Exception as erro:
+        try:
+            _v126_b2_manager().mark_unavailable(erro)
+        except Exception:
+            pass
+        return None
+
+
+async def _v126_setup_hook(self) -> None:
+    await _V126_B2_SETUP_HOOK_ORIGINAL()
+    try:
+        status = await asyncio.to_thread(_v126_b2_manager().health_check, force=True)
+        if status.ready:
+            print(f'[B2] B2 STORAGE: READY bucket={V79_B2_BUCKET} pendentes={status.pending_count}', flush=True)
+            resumo = await asyncio.to_thread(_v126_b2_manager().sync_pending, limit=V126_B2_PENDING_SYNC_LIMIT)
+            if int(resumo.get('attempted') or 0):
+                print(f"[B2] Sincronização pendente: enviados={resumo.get('uploaded')} falhas={resumo.get('failed')} restantes={resumo.get('remaining')}", flush=True)
+        else:
+            print(f'[B2] B2 STORAGE: {status.status} reason={status.reason} bucket={V79_B2_BUCKET or "não configurado"} pendentes={status.pending_count}. Arquivos locais preservados em /data.', flush=True)
+    except Exception as erro:
+        print(f'[B2] B2 STORAGE: UNAVAILABLE reason={type(erro).__name__}. Arquivos locais preservados em /data.', flush=True)
+
+
+bot.setup_hook = _v12_types.MethodType(_v126_setup_hook, bot)
+
+
+@bot.tree.command(name='b2storage', description='Mostra o health check resiliente do armazenamento B2.')
+async def b2storage_v126(interaction: discord.Interaction):
+    if not usuario_e_administrador(interaction.user):
+        return await interaction.response.send_message('❌ Apenas a Diretoria pode consultar.', ephemeral=True)
+    status = await asyncio.to_thread(_v126_b2_status_dict, force=True)
+    await interaction.response.send_message(
+        '☁️ **B2 STORAGE — V126**\n'
+        f"**Status:** `{status.get('status')}`\n"
+        f"**Motivo:** `{status.get('reason') or 'OK'}`\n"
+        f"**Bucket:** `{status.get('bucket') or 'não configurado'}`\n"
+        f"**Endpoint configurado:** `{('SIM' if status.get('endpoint_configured') else 'NÃO')}`\n"
+        f"**Access key configurada:** `{('SIM' if status.get('access_key_configured') else 'NÃO')}`\n"
+        f"**Secret configurado:** `{('SIM' if status.get('secret_configured') else 'NÃO')}`\n"
+        f"**Pendentes locais:** `{status.get('pending_count', 0)}`\n"
+        f"**Retry em:** `{status.get('retry_after_seconds', 0)}s`\n"
+        'Arquivos locais em `/data` são preservados quando o B2 está indisponível.',
+        ephemeral=True,
+    )
+
+
+print('✅ V126 carregada — B2 com health check, circuit breaker, pendências locais e anti-spam para NoSuchBucket/AccessDenied/rede.', flush=True)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
