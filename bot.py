@@ -52220,7 +52220,7 @@ def _v116_prompt(estado: Dict[str, Any]) -> str:
             return f'ITEM {item} — {_v116_item_titulo(item)}\nETAPA 2/2\n\n🟢 Material obrigatório desta etapa completo. Revise e clique em **Finalizar tarefa** para confirmar.'
         return f'ITEM {item} — {_v116_item_titulo(item)}\n\n🟢 Material obrigatório completo. Revise e clique em **Finalizar tarefa** para confirmar antes de avançar.'
     if item == 1:
-        return 'ITEM 1 — PAINEL\n\nEnvie o painel da organização em print/imagem ou texto.\nO bot vai transcrever e organizar o conteúdo para você copiar para o celular in-game.'
+        return 'ITEM 1 — PAINEL\n\nEnvie uma ou mais imagens do painel **já transcrito no celular in-game**.\nA imagem é a prova obrigatória; OCR/transcrição automática é apenas complemento e nunca bloqueia a tarefa.'
     if item == 2:
         total = len(list(dados.get('liderancas') or []))
         ordinal = 'primeira liderança' if total == 0 else 'próxima liderança'
@@ -52288,7 +52288,7 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
         # por uma ou mais imagens válidas. OCR é apenas enriquecimento para o dossiê.
         if list(dados.get('painel_imagens') or []):
             return []
-        return [] if str(dados.get('painel_transcricao') or '').strip() else ['imagem do painel transcrito no celular in-game']
+        return [] if str(dados.get('painel_transcricao') or '').strip() else ['imagem do painel no celular in-game']
     if item == 2:
         faltas = _v116_faltando_pessoa(estado, lideranca=True)
         if faltas and any((estado.get('rascunho') or {}).get('pessoa', {}).values()):
@@ -56112,6 +56112,11 @@ async def _v127_safe_defer(interaction: discord.Interaction, *, ephemeral: bool=
     try:
         await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
         _V127_DEFERRED_INTERACTIONS.add(int(getattr(interaction, 'id', 0) or 0))
+        try:
+            data = getattr(interaction, 'data', {}) or {}
+            print(f'[INTERACTION] custom_id={str(data.get("custom_id") or "")} interaction={getattr(interaction, "id", 0)} phase=deferred contexto={contexto}', flush=True)
+        except Exception:
+            pass
         return True
     except discord.InteractionResponded:
         return True
@@ -56227,6 +56232,28 @@ async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: di
     )
 
 
+async def _interaction_core_recuperar_imagens_painel_historico(topico: Any, *, limite: int=150) -> List[Dict[str, Any]]:
+    """Recupera imagens já existentes no tópico Painel sem exigir reenvio nem OCR."""
+    if not isinstance(topico, discord.Thread):
+        return []
+    try:
+        async def _coletar() -> List[Dict[str, Any]]:
+            itens: List[Dict[str, Any]] = []
+            async for mensagem in topico.history(limit=max(20, min(int(limite or 150), 300)), oldest_first=False):
+                if getattr(getattr(mensagem, 'author', None), 'bot', False):
+                    continue
+                imgs = _v116_imagens(mensagem)
+                if imgs:
+                    itens = _v116_adicionar_unicos(itens, imgs)
+            return itens
+        return await asyncio.wait_for(_coletar(), timeout=7.0)
+    except asyncio.TimeoutError:
+        print(f'[INTERACTION] item1 history_recovery timeout channel={getattr(topico, "id", 0)}', flush=True)
+    except Exception as erro:
+        print(f'[INTERACTION] item1 history_recovery failed channel={getattr(topico, "id", 0)} erro={type(erro).__name__}: {erro}', flush=True)
+    return []
+
+
 class V122TarefaGuiadaView(View):
     """Painel final ativo das tarefas guiadas V122, com ACK imediato e timeout controlado."""
 
@@ -56279,6 +56306,16 @@ class V122TarefaGuiadaView(View):
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
 
+        imagens_historicas: List[Dict[str, Any]] = []
+        if int(item) == 1:
+            try:
+                if _v117_faltando_item(estado, 1, 1):
+                    imagens_historicas = await _interaction_core_recuperar_imagens_painel_historico(interaction.channel)
+                    if imagens_historicas:
+                        print(f'[INTERACTION] custom_id=dic_v122_tarefa_finalizar item=1 phase=evidence_recovered images={len(imagens_historicas)}', flush=True)
+            except Exception as erro:
+                await _v127_log_interaction_error(interaction, erro, item=button, contexto='v122.finalizar.history_recovery')
+
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.finalizar')
         if lock is None:
             return
@@ -56287,6 +56324,14 @@ class V122TarefaGuiadaView(View):
             if not isinstance(estado, dict):
                 return await _v127_safe_send(interaction, '❌ Não consegui carregar o estado persistente desta mesa.', contexto='v122.finalizar')
             _v117_migrar_estado(estado)
+            if int(item) == 1 and imagens_historicas:
+                dados_item1 = estado.setdefault('dados', {})
+                dados_item1['painel_imagens'] = _v116_adicionar_unicos(
+                    list(dados_item1.get('painel_imagens') or []),
+                    imagens_historicas,
+                )
+                estado['dados'] = dados_item1
+                _v116_gravar_estado(estado)
             if str(item) in (estado.get('concluidos') or {}):
                 return await _v127_safe_send(interaction, '✅ Esta tarefa já foi concluída.', contexto='v122.finalizar')
             etapa = _v117_etapa_item(estado, item)
@@ -56314,7 +56359,7 @@ class V122TarefaGuiadaView(View):
 
         # Editar a mensagem fora do lock evita travar outras ações da mesa por uma chamada HTTP do Discord.
         await _v122_editar_painel_tarefa(interaction, canal, estado, item, etapa)
-        return await _v127_safe_send(interaction, '✅ Tarefa finalizada. Agora aguarda conclusão autorizada.', contexto='v122.finalizar')
+        return await _v127_safe_send(interaction, '✅ Tarefa finalizada. Agora aguarda conclusão por Inspetor+.', contexto='v122.finalizar')
 
     @discord.ui.button(label='Concluir tarefa', emoji='🛡️', style=discord.ButtonStyle.primary, custom_id='dic_v122_tarefa_concluir', row=0)
     async def concluir(self, interaction: discord.Interaction, button: Button):
@@ -56416,8 +56461,48 @@ def _v128_custom_ids_persistentes() -> set:
     return ids
 
 
+async def _interaction_core_task_rescue(interaction: discord.Interaction) -> None:
+    """Resgata somente os dois botões V122 se a ViewStore não responder em 0,8 s."""
+    try:
+        if getattr(interaction, 'type', None) != discord.InteractionType.component:
+            return
+        data = getattr(interaction, 'data', {}) or {}
+        custom_id = str(data.get('custom_id') or '')
+        if custom_id not in _V128_TASK_COMPONENT_IDS:
+            return
+        await asyncio.sleep(0.8)
+        if _v127_response_done(interaction):
+            return
+        print(f'[INTERACTION] custom_id={custom_id} interaction={getattr(interaction, "id", 0)} phase=rescue_dispatch', flush=True)
+        view = V122TarefaGuiadaView()
+        alvo = next((child for child in list(view.children) if str(getattr(child, 'custom_id', '') or '') == custom_id), None)
+        callback = getattr(alvo, 'callback', None)
+        if not callable(callback):
+            return await _v127_safe_send(interaction, '❌ O botão perdeu o vínculo com a tarefa. Atualize o Discord e tente novamente.', contexto='interaction_core.rescue.no_callback')
+        await callback(interaction)
+    except discord.InteractionResponded:
+        return
+    except Exception as erro:
+        await _v127_log_interaction_error(interaction, erro, contexto='interaction_core.task_rescue')
+        if not _v127_response_done(interaction):
+            await _v127_safe_send(interaction, '❌ Não consegui executar este botão agora. O erro foi registrado.', contexto='interaction_core.task_rescue')
+
+
 async def _v127_setup_hook(self) -> None:
     await _V127_SETUP_HOOK_ORIGINAL()
+
+    # V14 limpa listeners antigos durante o setup. O trace e o rescue são
+    # registrados depois dessa limpeza para existirem de verdade no runtime.
+    for listener in (_interaction_core_trace, _interaction_core_task_rescue):
+        try:
+            bot.remove_listener(listener, 'on_interaction')
+        except Exception:
+            pass
+        try:
+            bot.add_listener(listener, 'on_interaction')
+        except Exception as erro:
+            print(f'⚠️ [INTERACTION] falha ao registrar {getattr(listener, "__name__", "listener")}: {type(erro).__name__}: {erro}', flush=True)
+
     registradas: List[str] = []
     falhas: List[str] = []
     for view_factory in (V122TarefaGuiadaView, V116InvestigacaoGuiadaView, GerenciamentoTarefasView):
@@ -56537,13 +56622,7 @@ async def _interaction_core_trace(interaction: discord.Interaction) -> None:
     except Exception as erro:
         print(f'[INTERACTION] trace_failed={type(erro).__name__}: {erro}', flush=True)
 
-try:
-    bot.remove_listener(_interaction_core_trace, 'on_interaction')
-except Exception:
-    pass
-bot.add_listener(_interaction_core_trace, 'on_interaction')
-
-
+# O trace/rescue é registrado no setup_hook final, depois da limpeza V14.
 _RUNTIME_PROCESS_STARTED_AT = time.monotonic()
 
 
