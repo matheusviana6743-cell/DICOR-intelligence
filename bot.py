@@ -52271,9 +52271,7 @@ def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
     etapa = int(estado.get('etapa') or 1)
     dados = estado.setdefault('dados', {})
     if item == 1:
-        tem_imagem = bool(list(dados.get('painel_imagens') or []))
-        tem_texto = bool(str(dados.get('painel_transcricao') or '').strip())
-        return [] if (tem_imagem or tem_texto) else ['print/imagem do painel transcrito para o celular in-game']
+        return [] if str(dados.get('painel_transcricao') or '').strip() else ['painel transcrito']
     if item == 2:
         faltas = _v116_faltando_pessoa(estado, lideranca=True)
         if faltas and any((estado.get('rascunho') or {}).get('pessoa', {}).values()):
@@ -52540,33 +52538,12 @@ async def _v116_mudar_etapa(canal: discord.TextChannel, estado: Dict[str, Any], 
     await _v116_publicar_tarefa_atual(canal, estado, nova=True)
 
 
-def _v129_ajustar_resposta_tarefa_v122(texto: str) -> str:
-    """Converte instruções legadas de 'Concluir item' para o fluxo real V122."""
-    t = str(texto or '')
-    t = t.replace('**Concluir item**', '**Finalizar tarefa**')
-    t = t.replace('para confirmar e liberar o próximo item', 'para enviar a tarefa para conclusão')
-    t = t.replace('para confirmar e liberar o próximo item.', 'para enviar a tarefa para conclusão.')
-    t = t.replace('para confirmar esta etapa', 'para enviar esta etapa para conclusão')
-    t = re.sub(r'para confirmar o ITEM\s*\d+', 'para enviar a tarefa para conclusão', t, flags=re.I)
-    t = t.replace('para confirmar o Item 3', 'para enviar a tarefa para conclusão')
-    # Se a mensagem orienta finalizar e ainda não explica a segunda ação, deixa o fluxo explícito.
-    if '**Finalizar tarefa**' in t and '**Concluir tarefa**' not in t:
-        t = t.rstrip() + '\nDepois, um Inspetor+ usa **Concluir tarefa** para concluir definitivamente.'
-    return t
-
-
 async def _v116_responder(msg: discord.Message, texto: str) -> None:
     try:
-        canal_mesa = msg.channel.parent if isinstance(getattr(msg, 'channel', None), discord.Thread) else None
-        if isinstance(canal_mesa, discord.TextChannel) and '_v122_mesa_tarefas_habilitada' in globals() and _v122_mesa_tarefas_habilitada(int(canal_mesa.id)):
-            texto = _v129_ajustar_resposta_tarefa_v122(texto)
-    except Exception:
-        pass
-    try:
-        await msg.reply(str(texto)[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        await msg.reply(texto[:1900], mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         try:
-            await msg.channel.send(str(texto)[:1900], allowed_mentions=discord.AllowedMentions.none())
+            await msg.channel.send(texto[:1900], allowed_mentions=discord.AllowedMentions.none())
         except Exception:
             pass
 
@@ -53307,15 +53284,10 @@ async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Opti
         dados['informantes'] = [{'nome': str(p.get('nome') or ''), 'rg': str(p.get('rg') or ''), 'cargo': 'Informante'}]
     textos = dados.get('textos_por_topico') if isinstance(dados.get('textos_por_topico'), dict) else {}
     resumos = dados.get('resumos') if isinstance(dados.get('resumos'), dict) else {}
-    painel_texto = str(guiado.get('painel_transcricao') or '').strip()
-    painel_imagens_guiadas = list(guiado.get('painel_imagens') or [])
-    if painel_texto:
-        textos['painel'] = list(dict.fromkeys(list(textos.get('painel') or []) + [painel_texto]))
-        resumos['painel'] = painel_texto[:3500]
-    elif painel_imagens_guiadas:
-        resumo_painel = 'Painel já transcrito/adaptado para o celular in-game, documentado pelas evidências visuais do tópico Painel.'
-        resumos['painel'] = resumo_painel
-        dados['painel_guiado_imagens'] = painel_imagens_guiadas
+    if str(guiado.get('painel_transcricao') or '').strip():
+        painel = str(guiado.get('painel_transcricao') or '').strip()
+        textos['painel'] = list(dict.fromkeys(list(textos.get('painel') or []) + [painel]))
+        resumos['painel'] = painel[:3500]
     if str(guiado.get('radio') or '').strip():
         radio = str(guiado.get('radio') or '').strip()
         textos['radio'] = list(dict.fromkeys(list(textos.get('radio') or []) + [radio]))
@@ -53710,45 +53682,6 @@ def _v122_status_tarefa_guiada(registro: Dict[str, Any]) -> str:
     }.get(status, status.title() if status else 'Pendente')
 
 
-def _v129_instrucao_tarefa_guiada(item: int, etapa: int) -> str:
-    """Descrição curta e fiel do que realmente valida cada tarefa V122."""
-    item = int(item or 0)
-    etapa = int(etapa or 1)
-    if item == 1:
-        return 'Envie uma ou mais imagens do painel JÁ transcrito/adaptado para o celular in-game. A própria imagem é a evidência; OCR não é obrigatório. Texto também é aceito como complemento.'
-    if item == 2:
-        return 'Registre todos os Líderes, Vice-líderes e Gerentes. Para cada pessoa: foto + cargo + nome + RG. Envie uma pessoa por vez.'
-    if item == 3:
-        return 'Registre 7 membros. Para cada pessoa: foto + cargo + nome + RG. Envie uma pessoa por vez até completar 7/7.'
-    if item == 4:
-        return 'Envie a numeração/frequência da rádio em texto.'
-    if item == 5 and etapa == 1:
-        return 'Envie 2 imagens: foto da organização/local + foto do GPS mostrando a localização.'
-    if item == 5 and etapa == 2:
-        return 'Envie 4 fotos aéreas da organização/localização.'
-    if item == 6:
-        return 'Registre os crimes da comunidade. Cada crime precisa de nome/descrição + prova/evidência. Envie um crime por vez.'
-    if item == 7:
-        return 'Envie 2 imagens: foto do baú de líder + foto/localização da entrada do baú.'
-    if item == 8:
-        return 'Envie 2 imagens: foto do baú de membros + foto/localização da entrada do baú.'
-    if item == 9:
-        return 'Envie 2 imagens: foto do NPC/gringo da rota de farm + foto do GPS.'
-    if item == 10:
-        return 'Envie 2 imagens: foto do NPC/gringo da rota de produção + foto do GPS.'
-    if item == 11 and etapa == 1:
-        return 'Envie uma ou mais fotos dos ingredientes necessários para a produção.'
-    if item == 11 and etapa == 2:
-        return 'Envie uma ou mais fotos do produto final da organização.'
-    if item == 12 and etapa == 1:
-        return 'Envie o informante com: foto + foto do RG/documento + nome + número do RG.'
-    if item == 12 and etapa == 2:
-        return 'Envie em texto um resumo de como o informante realizou a operação. O bot não inventará informações.'
-    if item == 13:
-        return 'Envie as fotos da residência/casa do líder. Uma foto é o mínimo; envie quantas forem necessárias para documentar bem.'
-    return 'Envie o material solicitado neste tópico.'
-
-
 def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> str:
     _v117_migrar_estado(estado)
     tarefas = estado.setdefault('tarefas_guiadas', {})
@@ -53756,24 +53689,12 @@ def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any]
     registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
     mesa = buscar_mesa_por_canal(int(canal.id)) or {}
     autor_id = int(mesa.get('autor_id') or 0) if isinstance(mesa, dict) else 0
-    criador = f'<@{autor_id}>' if autor_id else 'Não identificado'
+    criador = f'<@{autor_id}>' if autor_id else 'Nao identificado'
     etapa_txt = f'\n**ETAPA {int(etapa)}/2**' if int(item) in _V117_ITENS_DUAS_ETAPAS else ''
     responsavel_id = int((registro or {}).get('responsavel_id') or (registro or {}).get('finalizada_por_id') or 0)
-    responsavel_txt = f'\n**Responsável:** <@{responsavel_id}>' if responsavel_id else ''
+    responsavel_txt = f'\n**Responsavel:** <@{responsavel_id}>' if responsavel_id else ''
     faltas = _v117_faltando_item(estado, int(item), int(etapa))
-    status_registro = str((registro or {}).get('status') or 'ATIVA').upper()
-    if status_registro == 'AGUARDANDO_CONCLUSAO':
-        checklist = '✅ Finalizada pelo agente — aguardando **Concluir tarefa** por Inspetor+.'
-    elif faltas:
-        checklist = '⏳ Falta: ' + '; '.join(faltas[:4])
-    else:
-        checklist = '✅ Material mínimo completo — pronto para **Finalizar tarefa**.'
-    instrucao = _v129_instrucao_tarefa_guiada(int(item), int(etapa))
-    fluxo = (
-        '> Quando terminar o material, use **Finalizar tarefa**. '
-        'Depois, um Inspetor+ usa **Concluir tarefa** para concluir definitivamente'
-        + (' e liberar a próxima etapa.' if int(item) in _V117_ITENS_DUAS_ETAPAS and int(etapa) == 1 else '.')
-    )
+    checklist = '; '.join(faltas[:4]) if faltas else 'Material minimo completo; revise e finalize a tarefa.'
     return (
         f'🎯 **TAREFA GUIADA — ITEM {int(item)} — {_v116_item_titulo(int(item))}**\n\n'
         f'**Tarefa:** {_v116_item_titulo(int(item))}'
@@ -53781,10 +53702,10 @@ def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any]
         f'**Status:** {_v122_status_tarefa_guiada(registro)}'
         f'{responsavel_txt}\n'
         f'**Mesa criada por:** {criador}\n\n'
-        f'**O que enviar:** {instrucao}\n\n'
         f'**Checklist atual:** {checklist}\n'
-        f'{fluxo}'
+        '> Envie o material neste topico. Use **Finalizar tarefa** quando estiver pronto; a conclusao definitiva exige autorizacao interna.'
     )
+
 
 async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
     try:
@@ -54195,7 +54116,7 @@ class GerenciamentoTarefasView(View):
                 destino = topico.mention if topico else 'tópico não encontrado'
                 faltas = _v117_faltando_item(estado, item, etapa)
                 etapa_txt = f' • E{etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
-                situacao = ('Falta: ' + '; '.join(faltas[:2])) if faltas else 'Pronto para finalizar'
+                situacao = ('Falta: ' + '; '.join(faltas[:2])) if faltas else 'Pronto para concluir'
                 linhas.append(f'🎯 **{item}. {_v116_item_titulo(item)}{etapa_txt}** — {destino}\n{situacao}')
         tarefas = [t for t in _carregar_tarefas().values() if int(t.get('mesa_canal_id') or 0) == int(canal_mesa.id) and t.get('status') != 'CONCLUIDA']
         tarefas.sort(key=lambda t: int(t.get('numero') or 0))
@@ -55717,56 +55638,83 @@ async def _banco_v6_extrair_mensagem_painel(msg: discord.Message) -> Tuple[str, 
 
 
 async def _v116_processar_item(canal: discord.TextChannel, estado: Dict[str, Any], msg: discord.Message, *, silencioso: bool=False) -> None:
-    """V129: Item 1 é prova do painel já transcrito no celular in-game.
-
-    Uma imagem válida já cumpre o requisito. OCR pode continuar existindo para o
-    Banco de Dados, mas NÃO é requisito da tarefa de investigação.
-    """
     item = int(estado.get('item') or 1)
     if item != 1:
         return await _V125_V116_PROCESSAR_ITEM_ANTES(canal, estado, msg, silencioso=silencioso)
-
     dados = estado.setdefault('dados', {})
     conteudo = str(getattr(msg, 'content', '') or '').strip()
-    imagens = _v116_imagens(msg)
-
-    if imagens:
-        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens)
-        dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
-        dados['painel_recebido_em'] = agora_br()
-        dados['painel_tipo_comprovacao'] = 'imagem'
-        # Texto escrito pelo agente é complemento opcional; não fazemos OCR obrigatório.
-        if conteudo:
-            dados['painel_transcricao'] = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())[:6000]
+    try:
+        canonico, membros, pendencias, metricas = await _banco_v6_extrair_mensagem_painel(msg)
+    except Exception as erro:
+        _v116_gravar_estado(estado)
+        if _v125_erro_ocr_indisponivel(erro):
+            await enviar_log(f'❌ OCR_ENGINE_UNAVAILABLE V125 painel mesa msg={getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
+            if not silencioso:
+                await _v116_responder(msg, '❌ O OCR do servidor está indisponível no momento. A imagem foi preservada; tente novamente após a correção técnica ou cole o texto do painel.')
+            return
+        await enviar_log(f'⚠️ V125 OCR/transcrição do painel falhou na mensagem {getattr(msg, "id", 0)}: {type(erro).__name__}: {erro}')
+        if not silencioso:
+            await _v116_responder(msg, '❌ Não foi possível analisar este painel. A imagem foi preservada; envie um print mais nítido ou cole o texto.')
+        return
+    if pendencias:
+        nomes = [str(x.get('nome') or 'linha sem nome') for x in pendencias[:10]]
+        dados['painel_pendencias'] = pendencias
         estado['dados'] = dados
         _v116_gravar_estado(estado)
-        await _v116_atualizar_painel(canal, estado)
-        await _v116_publicar_tarefa_atual(canal, estado)
-        if not silencioso:
-            quantidade = len(list(dados.get('painel_imagens') or []))
-            await _v116_responder(
-                msg,
-                f'✅ Painel transcrito para o celular in-game registrado por imagem. Evidência(s): **{quantidade}**.\n'
-                'O OCR não é obrigatório nesta tarefa. Se o painel está completo, use **Finalizar tarefa**.'
-            )
-        return
-
-    if conteudo:
-        dados['painel_transcricao'] = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())[:6000]
-        dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
-        dados['painel_recebido_em'] = agora_br()
-        dados['painel_tipo_comprovacao'] = 'texto'
-        estado['dados'] = dados
+        # Não bloqueia todo o Item 1 quando parte do painel foi reconhecida.
+        # Se houver registros válidos, eles viram a transcrição e as linhas duvidosas
+        # ficam registradas para revisão. Só bloqueamos quando ZERO registro válido existe.
+        if not membros:
+            if not silencioso:
+                await _v116_responder(msg, '⚠️ O painel foi lido, mas nenhuma linha ficou completa com Nome + RG/Passaporte. Linhas para revisão: ' + ', '.join(nomes) + '.\nReenvie um print mais nítido ou envie essas linhas em texto.')
+            return
+    transcricao = ''
+    if membros:
+        registros_painel = [{'cargo': p.get('cargo') or 'MEMBRO', 'nome': p.get('nome') or '', 'passaporte': p.get('rg') or '', 'rg': p.get('rg') or ''} for p in membros]
+        try:
+            transcricao = _v125_image_analysis().build_panel_transcription(registros_painel)
+        except Exception:
+            linhas = []
+            for idx, p in enumerate(membros, 1):
+                linhas.append(f"{idx:02d}. Cargo: {p.get('cargo') or 'MEMBRO'} | Nome: {p.get('nome')} | Passaporte: {p.get('rg')}")
+            transcricao = '\n'.join(linhas)
+        dados['painel_membros'] = membros
+    elif conteudo:
+        transcricao = '\n'.join(l.strip() for l in conteudo.splitlines() if l.strip())
+    else:
+        prefixo = str(globals().get('_BANCO_V6_ORIGINAL_PREFIX') or '')
+        if prefixo and prefixo in str(canonico or ''):
+            bruto = str(canonico).split(prefixo, 1)[-1].strip()
+            bruto = re.sub(r'^\[OCR IMAGEM \d+\]\s*', '', bruto, flags=re.MULTILINE)
+            transcricao = bruto.strip()
+    if not transcricao:
         _v116_gravar_estado(estado)
-        await _v116_atualizar_painel(canal, estado)
-        await _v116_publicar_tarefa_atual(canal, estado)
         if not silencioso:
-            await _v116_responder(msg, '✅ Texto do painel registrado. Se o material está completo, use **Finalizar tarefa**.')
+            await _v116_responder(msg, '❌ Não consegui transcrever o painel com segurança. Envie um print mais nítido ou cole o texto do painel.')
         return
-
+    dados['painel_transcricao'] = transcricao
+    dados['painel_origem_mensagem_id'] = int(getattr(msg, 'id', 0) or 0)
+    dados['painel_metricas'] = metricas
+    dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), _v116_imagens(msg))
+    estado['dados'] = dados
     _v116_gravar_estado(estado)
     if not silencioso:
-        await _v116_responder(msg, '⏳ Esta tarefa precisa de ao menos uma **imagem do painel já transcrito para o celular in-game** (ou texto do painel como alternativa).')
+        cab = '📱 **TRANSCRIÇÃO DO PAINEL — PRONTA PARA O CELULAR IN-GAME**\n```\n'
+        rod = '\n```'
+        blocos = [transcricao[i:i + 1650] for i in range(0, len(transcricao), 1650)] or ['']
+        await _v116_responder(msg, cab + blocos[0] + rod)
+        for bloco in blocos[1:]:
+            try:
+                await msg.channel.send('```\n' + bloco + '\n```')
+            except Exception:
+                pass
+    await _v116_atualizar_painel(canal, estado)
+    await _v116_publicar_tarefa_atual(canal, estado)
+    if not silencioso:
+        if pendencias:
+            await _v116_responder(msg, f'⚠️ Transcrição criada com {len(membros)} registro(s) válido(s) e {len(pendencias)} linha(s) para revisão. As linhas válidas já contam como **painel transcrito**.')
+        await _v116_responder(msg, '🟢 ITEM 1 completo. Revise a transcrição e use **Finalizar tarefa**; depois um Inspetor+ pode concluir.')
+
 
 class BancoImportarPainelModal(Modal, title='Importar painel completo'):
 
@@ -56250,54 +56198,6 @@ async def _v122_editar_painel_tarefa(interaction: discord.Interaction, canal: di
     )
 
 
-async def _v129_recuperar_painel_visual_do_topico(canal: discord.TextChannel, estado: Dict[str, Any], topico_atual: Any) -> bool:
-    """Recupera imagens já enviadas no tópico Painel antes da V129.
-
-    Importante: isso NÃO faz OCR. O requisito do Item 1 é a evidência visual do
-    painel que já foi transcrito para o celular dentro do jogo.
-    """
-    dados = estado.setdefault('dados', {})
-    if list(dados.get('painel_imagens') or []) or str(dados.get('painel_transcricao') or '').strip():
-        return True
-    topico = topico_atual if isinstance(topico_atual, discord.Thread) else await _v116_topico_item(canal, 1)
-    if not isinstance(topico, discord.Thread):
-        return False
-    imagens: List[Any] = []
-    texto_alternativo = ''
-    origem_id = 0
-    try:
-        mensagens = [m async for m in topico.history(limit=150, oldest_first=True)]
-    except Exception:
-        return False
-    for mensagem in mensagens:
-        if getattr(getattr(mensagem, 'author', None), 'bot', False):
-            continue
-        imgs = _v116_imagens(mensagem)
-        if imgs:
-            imagens = _v116_adicionar_unicos(imagens, imgs)
-            origem_id = int(getattr(mensagem, 'id', 0) or origem_id)
-        elif not texto_alternativo:
-            bruto = str(getattr(mensagem, 'content', '') or '').strip()
-            if bruto:
-                texto_alternativo = bruto[:6000]
-                origem_id = int(getattr(mensagem, 'id', 0) or origem_id)
-    if imagens:
-        dados['painel_imagens'] = _v116_adicionar_unicos(list(dados.get('painel_imagens') or []), imagens)
-        dados['painel_origem_mensagem_id'] = origem_id
-        dados['painel_recebido_em'] = agora_br()
-        dados['painel_tipo_comprovacao'] = 'imagem_recuperada_historico'
-    elif texto_alternativo:
-        dados['painel_transcricao'] = texto_alternativo
-        dados['painel_origem_mensagem_id'] = origem_id
-        dados['painel_recebido_em'] = agora_br()
-        dados['painel_tipo_comprovacao'] = 'texto_recuperado_historico'
-    else:
-        return False
-    estado['dados'] = dados
-    _v116_gravar_estado(estado)
-    return True
-
-
 class V122TarefaGuiadaView(View):
     """Painel final ativo das tarefas guiadas V122, com ACK imediato e timeout controlado."""
 
@@ -56349,11 +56249,8 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.finalizar')
-        if int(item) == 1:
-            try:
-                await asyncio.wait_for(_v129_recuperar_painel_visual_do_topico(canal, estado, interaction.channel), timeout=8.0)
-            except Exception as erro:
-                await _v127_log_interaction_error(interaction, erro, item=button, contexto='v129.finalizar.recuperar_painel')
+        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
+            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Assim que a transcrição terminar, use **Finalizar tarefa** novamente.', contexto='v122.finalizar.panel_processing')
 
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.finalizar')
         if lock is None:
@@ -56406,6 +56303,9 @@ class V122TarefaGuiadaView(View):
         canal, estado, item = await self._contexto_item_seguro(interaction)
         if canal is None or estado is None:
             return await _v127_safe_send(interaction, '❌ Esta tarefa não está vinculada a uma mesa nova válida.', contexto='v122.concluir')
+        if int(item) == 1 and int(canal.id) in globals().get('_V128_PANEL_PROCESSING', set()):
+            return await _v127_safe_send(interaction, '⏳ Ainda estou lendo as imagens do painel. Aguarde a transcrição terminar antes de concluir.', contexto='v122.concluir.panel_processing')
+
         lock = await self._adquirir_lock_mesa(interaction, canal.id, 'v122.concluir')
         if lock is None:
             return
@@ -56546,569 +56446,6 @@ bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
 
 print('✅ V128 carregada — hotfix de tarefas: fallback persistente, ACK/finalização segura e OCR sem bloquear o lock da mesa.', flush=True)
 
-
-print(
-    '✅ V129 carregada — tarefas automáticas revisadas: Item 1 aceita imagem do painel já transcrito no celular in-game, '
-    'cards mostram requisitos reais, mensagens usam Finalizar tarefa/Concluir tarefa e o Dossiê aceita evidência visual do Painel.',
-    flush=True,
-)
-
-
-
-# =====================================================
-# V130 — DOSSIÊ HÍBRIDO + CHECKLIST EXTERNO DE CONFERÊNCIA
-# - Mesas antigas (sem tarefas V122): dossiê é montado pelos tópicos/evidências.
-# - Mesas novas (com tarefas V122): tarefas validam completude/etapas e os tópicos
-#   continuam sendo a fonte das provas, textos, imagens e anexos.
-# - As antigas páginas internas de indicadores/checklist deixam de fazer parte do
-#   PDF/DOCX final. A conferência passa a ser um painel separado no Discord.
-# - O encerramento definitivo só ocorre depois de confirmação humana no checklist.
-# =====================================================
-
-V130_DOSSIE_REVISOES_FILE = DATA_DIR / 'dossie_revisoes_v130.json'
-V130_REVIEW_APPROVE_ID = 'dic_v130_dossie_aprovar'
-V130_REVIEW_REJECT_ID = 'dic_v130_dossie_rejeitar'
-_V130_REVIEW_LOCK = asyncio.Lock()
-_V130_SECOES_INTERNAS_REMOVER = (
-    '16 indicadores e sintese de encerramento',
-    '17 checklist final de conformidade',
-    'checklist final atualizado',
-)
-
-
-def _v130_modo_dossie(canal_id: int) -> str:
-    try:
-        if _v122_mesa_tarefas_habilitada(int(canal_id)):
-            return 'GUIADO — TAREFAS + TÓPICOS'
-    except Exception:
-        pass
-    return 'LEGADO — TÓPICOS'
-
-
-def _v130_json_safe(valor: Any) -> Any:
-    if valor is None or isinstance(valor, (str, int, float, bool)):
-        return valor
-    if isinstance(valor, Path):
-        return str(valor)
-    if isinstance(valor, dict):
-        return {str(k): _v130_json_safe(v) for k, v in valor.items()}
-    if isinstance(valor, (list, tuple, set)):
-        return [_v130_json_safe(v) for v in valor]
-    return str(valor)
-
-
-def _v130_carregar_revisoes() -> Dict[str, Any]:
-    dados = carregar_json(V130_DOSSIE_REVISOES_FILE, {})
-    return dados if isinstance(dados, dict) else {}
-
-
-def _v130_salvar_revisoes(dados: Dict[str, Any]) -> None:
-    try:
-        V130_DOSSIE_REVISOES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    salvar_json(V130_DOSSIE_REVISOES_FILE, dados)
-
-
-async def _v130_registrar_revisao(canal_id: int, registro: Dict[str, Any]) -> None:
-    async with _V130_REVIEW_LOCK:
-        dados = await asyncio.to_thread(_v130_carregar_revisoes)
-        dados[str(int(canal_id))] = _v130_json_safe(registro)
-        await asyncio.to_thread(_v130_salvar_revisoes, dados)
-
-
-async def _v130_obter_revisao(canal_id: int) -> Dict[str, Any]:
-    async with _V130_REVIEW_LOCK:
-        dados = await asyncio.to_thread(_v130_carregar_revisoes)
-        reg = dados.get(str(int(canal_id)))
-        return dict(reg) if isinstance(reg, dict) else {}
-
-
-async def _v130_atualizar_revisao(canal_id: int, **campos: Any) -> Dict[str, Any]:
-    async with _V130_REVIEW_LOCK:
-        dados = await asyncio.to_thread(_v130_carregar_revisoes)
-        chave = str(int(canal_id))
-        reg = dict(dados.get(chave) or {})
-        reg.update(_v130_json_safe(campos))
-        dados[chave] = reg
-        await asyncio.to_thread(_v130_salvar_revisoes, dados)
-        return reg
-
-
-def _v130_normalizar_doc_texto(texto: Any) -> str:
-    try:
-        return normalizar_busca(str(texto or ''))
-    except Exception:
-        return re.sub(r'\s+', ' ', str(texto or '').lower()).strip()
-
-
-def _v130_pdf_remover_paginas_de_conferencia(caminho_pdf: Path) -> List[int]:
-    caminho_pdf = Path(caminho_pdf)
-    if not caminho_pdf.exists() or fitz is None:
-        return []
-    removidas: List[int] = []
-    doc = fitz.open(str(caminho_pdf))
-    try:
-        for idx, page in enumerate(doc):
-            n = _v130_normalizar_doc_texto(page.get_text('text'))
-            if any(alvo in n for alvo in _V130_SECOES_INTERNAS_REMOVER):
-                removidas.append(idx)
-        if removidas:
-            for idx in reversed(removidas):
-                doc.delete_page(idx)
-            temporario = caminho_pdf.with_suffix('.v130.tmp.pdf')
-            doc.save(str(temporario), garbage=4, deflate=True, clean=True)
-            doc.close()
-            os.replace(str(temporario), str(caminho_pdf))
-            doc = None
-    finally:
-        try:
-            if doc is not None:
-                doc.close()
-        except Exception:
-            pass
-    return [x + 1 for x in removidas]
-
-
-def _v130_docx_texto_elemento(elemento: Any) -> str:
-    try:
-        partes = []
-        for no in elemento.iter():
-            if str(getattr(no, 'tag', '')).endswith('}t') and getattr(no, 'text', None):
-                partes.append(str(no.text))
-        return ' '.join(partes)
-    except Exception:
-        return ''
-
-
-def _v130_docx_remover_secoes_de_conferencia(caminho_docx: Path) -> bool:
-    caminho_docx = Path(caminho_docx)
-    if not caminho_docx.exists() or Document is None:
-        return False
-    doc = Document(str(caminho_docx))
-    body = doc._element.body
-    remover = False
-    alterou = False
-    for elemento in list(body):
-        tag = str(getattr(elemento, 'tag', '')).split('}')[-1]
-        if tag == 'sectPr':
-            continue
-        texto = _v130_normalizar_doc_texto(_v130_docx_texto_elemento(elemento))
-        if not remover and any(alvo in texto for alvo in _V130_SECOES_INTERNAS_REMOVER):
-            remover = True
-        if remover:
-            try:
-                body.remove(elemento)
-                alterou = True
-            except Exception:
-                pass
-    if alterou:
-        temporario = caminho_docx.with_suffix('.v130.tmp.docx')
-        doc.save(str(temporario))
-        os.replace(str(temporario), str(caminho_docx))
-    return alterou
-
-
-def _v130_validar_sem_secoes_de_conferencia(caminho: Path, tipo: str) -> List[str]:
-    erros: List[str] = []
-    caminho = Path(caminho)
-    try:
-        if str(tipo).lower() == 'pdf' and fitz is not None and caminho.exists():
-            doc = fitz.open(str(caminho))
-            try:
-                texto = _v130_normalizar_doc_texto('\n'.join(p.get_text('text') for p in doc))
-            finally:
-                doc.close()
-            for alvo in _V130_SECOES_INTERNAS_REMOVER:
-                if alvo in texto:
-                    erros.append(f'Seção interna de conferência ainda presente no PDF: {alvo}.')
-        elif str(tipo).lower() == 'docx' and Document is not None and caminho.exists():
-            doc = Document(str(caminho))
-            texto_partes = [p.text for p in doc.paragraphs]
-            for tabela in doc.tables:
-                for linha in tabela.rows:
-                    texto_partes.extend(c.text for c in linha.cells)
-            texto = _v130_normalizar_doc_texto('\n'.join(texto_partes))
-            for alvo in _V130_SECOES_INTERNAS_REMOVER:
-                if alvo in texto:
-                    erros.append(f'Seção interna de conferência ainda presente no DOCX: {alvo}.')
-    except Exception as erro:
-        erros.append(f'Falha ao validar limpeza V130 do {tipo.upper()}: {type(erro).__name__}: {erro}')
-    return erros
-
-
-# A V123 já decide entre gerador guiado e legado. Esta camada deixa a decisão
-# explícita nos dados finais sem trocar a fonte de verdade: evidências continuam
-# vindo dos tópicos; tarefas apenas complementam/validam mesas novas.
-_V130_COLETAR_BASE = coletar_dados_operacionais_mesa
-async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
-    dados = await _V130_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
-    try:
-        modo = _v130_modo_dossie(int(canal.id))
-        dados['dossie_modo_v130'] = modo
-        dados['dossie_fontes_v130'] = {
-            'topicos': True,
-            'tarefas': modo.startswith('GUIADO'),
-            'regra': 'tarefas validam estrutura/etapas; tópicos fornecem conteúdo e evidências',
-        }
-    except Exception:
-        pass
-    return dados
-
-
-# Pós-processamento final: remove as duas páginas/seções internas que a chefia
-# decidiu transformar em checklist externo. Funciona tanto no gerador legado
-# quanto no V123, sem alterar o modelo visual das demais páginas.
-_V130_GERAR_PDF_BASE = gerar_pdf_dossie
-def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
-    retorno = _V130_GERAR_PDF_BASE(dados, caminho_pdf)
-    removidas = _v130_pdf_remover_paginas_de_conferencia(Path(caminho_pdf))
-    erros = _v130_validar_sem_secoes_de_conferencia(Path(caminho_pdf), 'pdf')
-    if erros:
-        raise RuntimeError('V130: PDF final ainda contém conteúdo de checklist interno: ' + ' | '.join(erros[:4]))
-    if removidas:
-        print(f'✅ V130 PDF: páginas internas de conferência removidas: {removidas}.', flush=True)
-    return retorno
-
-
-_V130_GERAR_DOCX_BASE = gerar_docx_dossie
-def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
-    retorno = _V130_GERAR_DOCX_BASE(dados, caminho_docx)
-    alterou = _v130_docx_remover_secoes_de_conferencia(Path(caminho_docx))
-    erros = _v130_validar_sem_secoes_de_conferencia(Path(caminho_docx), 'docx')
-    if erros:
-        raise RuntimeError('V130: DOCX final ainda contém conteúdo de checklist interno: ' + ' | '.join(erros[:4]))
-    if alterou:
-        print('✅ V130 DOCX: seções internas de conferência removidas.', flush=True)
-    return retorno
-
-
-def _v130_tem_texto_topico(dados: Dict[str, Any], chave: str) -> bool:
-    resumos = dados.get('resumos') if isinstance(dados.get('resumos'), dict) else {}
-    textos = dados.get('textos_por_topico') if isinstance(dados.get('textos_por_topico'), dict) else {}
-    if str(resumos.get(chave) or '').strip():
-        return True
-    return any(str(x or '').strip() for x in list(textos.get(chave) or []))
-
-
-def _v130_conteudo_item_ok(dados: Dict[str, Any], item: int) -> bool:
-    item = int(item)
-    if item == 1:
-        return bool(_v110_tem_midia(dados, 'painel') or _v130_tem_texto_topico(dados, 'painel'))
-    if item == 2:
-        return bool(list(dados.get('liderancas') or []))
-    if item == 3:
-        return bool(list(dados.get('integrantes') or []))
-    if item == 4:
-        return bool(_v130_tem_texto_topico(dados, 'radio'))
-    if item == 5:
-        return bool(_v110_tem_midia(dados, 'localizacao') or _v130_tem_texto_topico(dados, 'localizacao'))
-    if item == 6:
-        return bool(_v110_tem_midia(dados, 'crimes') or _v130_tem_texto_topico(dados, 'crimes'))
-    if item == 7:
-        return bool(_v110_tem_midia(dados, 'baus_lider'))
-    if item == 8:
-        return bool(_v110_tem_midia(dados, 'baus_membros'))
-    if item in {9, 10, 11}:
-        return bool(_v110_tem_midia(dados, 'producao') or _v130_tem_texto_topico(dados, 'producao'))
-    if item == 12:
-        return bool(list(dados.get('informantes') or []) or _v130_tem_texto_topico(dados, 'informantes'))
-    if item == 13:
-        return bool(_v110_tem_midia(dados, 'residencia') or _v130_tem_texto_topico(dados, 'residencia'))
-    return False
-
-
-def _v130_status_item(dados: Dict[str, Any], canal_id: int, item: int) -> Tuple[str, str]:
-    modo = _v130_modo_dossie(canal_id)
-    conteudo_ok = _v130_conteudo_item_ok(dados, item)
-    if not modo.startswith('GUIADO'):
-        return ('OK' if conteudo_ok else 'REVISAR', 'tópicos')
-    try:
-        estado = _v116_estado(int(canal_id), False) or {}
-        _v117_migrar_estado(estado)
-        concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
-        tarefa_ok = str(int(item)) in {str(k) for k in concluidos.keys()}
-    except Exception:
-        tarefa_ok = False
-    if tarefa_ok and conteudo_ok:
-        return ('OK', 'tarefa + tópico')
-    if tarefa_ok and not conteudo_ok:
-        return ('REVISAR', 'tarefa concluída, mas conteúdo do tópico precisa ser conferido')
-    if conteudo_ok and not tarefa_ok:
-        return ('REVISAR', 'conteúdo existe, mas tarefa não consta concluída')
-    return ('REVISAR', 'tarefa e conteúdo pendentes')
-
-
-def _v130_checklist_externo(dados: Dict[str, Any], canal_id: int, caminho_pdf: Optional[Path]=None) -> List[Tuple[str, str, str]]:
-    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
-    saida: List[Tuple[str, str, str]] = []
-    mand_ok = bool(_v110_texto_real(req.get('mandado_resumo')) and not _v110_requisitos_mandado_faltantes(req.get('mandado_resumo')))
-    plan_ok = bool(_v110_texto_real(req.get('planejamento_resumo')) and not _v110_requisitos_planejamento_faltantes(req.get('planejamento_resumo')))
-    motiv_ok = bool(_v102_valor_util(req.get('motivacao')))
-    saida.append(('Disposições do Mandado / Busca e Pacificação', 'OK' if mand_ok else 'REVISAR', 'conteúdo documental'))
-    saida.append(('Planejamento Operacional + Proteção da População', 'OK' if plan_ok else 'REVISAR', 'conteúdo documental'))
-    saida.append(('Fundamentação da Motivação do Pedido de Pacificação', 'OK' if motiv_ok else 'REVISAR', 'conteúdo documental'))
-
-    for item in range(1, 14):
-        status, origem = _v130_status_item(dados, canal_id, item)
-        saida.append((f'{item:02d}. {_v116_item_titulo(item)}', status, origem))
-
-    saida.append(('Assinaturas institucionais', 'OK' if _v110_assinaturas_ok(dados) else 'REVISAR', 'modelo institucional'))
-    saida.append(('Imagens/evidências carregadas', 'OK' if int((dados.get('estatisticas') or {}).get('evidencias', 0) or 0) > 0 else 'REVISAR', 'coleta da mesa'))
-    saida.append(('Páginas internas 19/20 removidas do documento', 'OK', 'checklist agora é externo'))
-    if caminho_pdf and fitz is not None and Path(caminho_pdf).exists():
-        try:
-            doc = fitz.open(str(caminho_pdf))
-            try:
-                paginas = len(doc)
-            finally:
-                doc.close()
-            saida.append(('PDF abre e possui páginas válidas', 'OK' if paginas > 0 else 'REVISAR', f'{paginas} página(s)'))
-        except Exception:
-            saida.append(('PDF abre e possui páginas válidas', 'REVISAR', 'falha na inspeção automática'))
-    return saida
-
-
-def _v130_texto_checklist(dados: Dict[str, Any], canal_id: int, caminho_pdf: Optional[Path]=None) -> str:
-    modo = _v130_modo_dossie(canal_id)
-    itens = _v130_checklist_externo(dados, canal_id, caminho_pdf)
-    linhas = [
-        '✅ **CONFERÊNCIA FINAL DO DOSSIÊ — DICOR**',
-        f'**Modo de montagem:** `{modo}`',
-        '',
-        'O PDF/DOCX de prévia já foi gerado. Confira o documento usando a lista abaixo antes do encerramento definitivo.',
-        '',
-    ]
-    pendentes = 0
-    for nome, status, origem in itens:
-        if status == 'OK':
-            icone = '✅'
-        elif status == 'NÃO SE APLICA':
-            icone = '➖'
-        else:
-            icone = '⚠️'
-            pendentes += 1
-        linhas.append(f'{icone} **{nome}** — {origem}')
-    linhas += [
-        '',
-        f'**Verificações automáticas para revisão humana:** {len(itens) - pendentes}/{len(itens)} OK.',
-        '👤 A decisão final continua humana: abra o PDF/DOCX, confira visualmente e use um dos botões abaixo.',
-        '',
-        '• **Conferi e encerrar mesa** → gera a cópia final e arquiva a investigação.',
-        '• **Manter mesa aberta** → não fecha nada; você pode corrigir e gerar uma nova prévia.',
-    ]
-    return cortar_discord('\n'.join(linhas), 1900)
-
-
-class V130DossieReviewView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label='Conferi e encerrar mesa', emoji='✅', style=discord.ButtonStyle.success, custom_id=V130_REVIEW_APPROVE_ID)
-    async def aprovar(self, interaction: discord.Interaction, button: Button):
-        canal = getattr(interaction, 'channel', None)
-        if not isinstance(canal, discord.TextChannel):
-            return await _v127_safe_send(interaction, '❌ Esta conferência só pode ser concluída dentro da mesa.', contexto='v130.review.aprovar')
-        if not usuario_pode_fechar_mesa(interaction.user):
-            return await _v127_safe_send(interaction, mensagem_sem_permissao_fechar_mesa(), contexto='v130.review.aprovar.permissao')
-        try:
-            await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='v130.review.aprovar')
-        except Exception:
-            pass
-        revisao = await _v130_obter_revisao(canal.id)
-        if not revisao:
-            return await _v127_safe_send(interaction, '❌ Não encontrei uma prévia válida para esta mesa. Gere o dossiê novamente.', contexto='v130.review.aprovar.sem_revisao')
-        if str(revisao.get('status') or '').upper() == 'ENCERRADA':
-            return await _v127_safe_send(interaction, '✅ Esta revisão já foi usada para encerrar a mesa.', contexto='v130.review.aprovar.ja_encerrada')
-        if _v130_modo_dossie(canal.id).startswith('GUIADO'):
-            try:
-                estado = _v116_estado(canal.id, False) or {}
-                if str(estado.get('status') or '').upper() != 'CONCLUIDA':
-                    return await _v127_safe_send(interaction, '❌ As tarefas guiadas deixaram de estar concluídas. Refaça a conferência antes de encerrar.', contexto='v130.review.aprovar.estado')
-            except Exception:
-                return await _v127_safe_send(interaction, '❌ Não consegui confirmar o estado atual das tarefas. Nada foi fechado.', contexto='v130.review.aprovar.estado_erro')
-        await _v130_atualizar_revisao(
-            canal.id,
-            status='APROVADA',
-            conferida_em=agora_br(),
-            conferida_por_id=int(interaction.user.id),
-            conferida_por_nome=str(interaction.user),
-        )
-        try:
-            if getattr(interaction, 'message', None):
-                await interaction.message.edit(content=(str(interaction.message.content or '') + f'\n\n✅ **Conferência humana aprovada por {interaction.user.mention}. Encerramento final iniciado.**')[:1950], view=None)
-        except Exception:
-            pass
-        try:
-            await _v127_safe_send(interaction, '✅ Conferência registrada. Gerando a cópia final e encerrando a mesa com segurança...', contexto='v130.review.aprovar.inicio')
-        except Exception:
-            pass
-        confirmacao = dict(revisao.get('dados_confirmacao') or {})
-        confirmacao['_v103_complementacao_validada'] = True
-        confirmacao['_v114_validado'] = True
-        confirmacao['_v130_human_review_ok'] = True
-        confirmacao['_v130_revisao_id'] = str(revisao.get('revisao_id') or '')
-        try:
-            await _V130_FECHAR_FINAL_BASE(interaction, str(revisao.get('motivo') or 'Fechada'), confirmacao)
-        except Exception as erro:
-            await _v130_atualizar_revisao(canal.id, status='ERRO_ENCERRAMENTO', erro=f'{type(erro).__name__}: {erro}')
-            await _v127_log_interaction_error(interaction, erro, item=button, contexto='v130.review.aprovar.encerramento')
-            return await _v127_safe_send(interaction, '❌ A conferência foi aceita, mas o encerramento final encontrou um erro. A mesa não deve ser considerada encerrada até nova tentativa.', contexto='v130.review.aprovar.encerramento_erro')
-        try:
-            mesa_atual = buscar_mesa_por_canal(canal.id) or {}
-            if str(mesa_atual.get('status') or '').upper() == 'FECHADA' or str(getattr(canal, 'name', '')).startswith('🔒'):
-                await _v130_atualizar_revisao(canal.id, status='ENCERRADA', encerrada_em=agora_br())
-        except Exception:
-            pass
-
-    @discord.ui.button(label='Manter mesa aberta', emoji='✏️', style=discord.ButtonStyle.secondary, custom_id=V130_REVIEW_REJECT_ID)
-    async def rejeitar(self, interaction: discord.Interaction, button: Button):
-        canal = getattr(interaction, 'channel', None)
-        if not isinstance(canal, discord.TextChannel):
-            return await _v127_safe_send(interaction, '❌ Esta conferência só funciona dentro da mesa.', contexto='v130.review.rejeitar')
-        if not usuario_pode_fechar_mesa(interaction.user):
-            return await _v127_safe_send(interaction, mensagem_sem_permissao_fechar_mesa(), contexto='v130.review.rejeitar.permissao')
-        await _v130_atualizar_revisao(canal.id, status='REJEITADA', rejeitada_em=agora_br(), rejeitada_por_id=int(interaction.user.id), rejeitada_por_nome=str(interaction.user))
-        try:
-            await interaction.response.edit_message(content=(str(interaction.message.content or '') + f'\n\n✏️ **Conferência interrompida por {interaction.user.mention}. A mesa permanece aberta.**')[:1950], view=None)
-        except Exception:
-            await _v127_safe_send(interaction, '✏️ Conferência interrompida. A mesa permanece aberta para ajustes.', contexto='v130.review.rejeitar')
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
-        await _v127_view_on_error(self, interaction, error, item)
-
-
-async def _v130_preparar_revisao_final(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
-    canal = getattr(interaction, 'channel', None)
-    if not isinstance(canal, discord.TextChannel):
-        return await _V130_FECHAR_FINAL_BASE(interaction, motivo, dados_confirmacao)
-    if not usuario_pode_fechar_mesa(interaction.user):
-        return await responder_interacao(interaction, mensagem_sem_permissao_fechar_mesa(), ephemeral=True)
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-
-    pasta_dossie: Optional[Path] = None
-    msg_aviso = None
-    try:
-        msg_aviso = await canal.send('🔎 **[DICOR] Gerando prévia para conferência humana.**\nA mesa permanecerá aberta até alguém autorizado revisar o checklist e aprovar o encerramento.')
-    except Exception:
-        pass
-    try:
-        mesa = buscar_mesa_por_canal(canal.id)
-        processo_base = str((dados_confirmacao or {}).get('processo') or f'PF-DICOR-{canal.id}').replace(' ', '-')
-        processo_limpo = slugify(processo_base).upper().replace('-', '_') or str(canal.id)
-        pasta_dossie = _v97_pasta_temporaria_dossie(f'{processo_limpo}-REVISAO')
-        await editar_progresso_dossie(msg_aviso, '🔎 **[DICOR] 1/4 — Coleta híbrida**\nMesas antigas usam os tópicos. Mesas com tarefas usam tarefas + tópicos, mantendo as provas reais como fonte documental.')
-        global _V99_DOSSIE_ATIVO
-        _V99_DOSSIE_ATIVO += 1
-        try:
-            dados_dossie = await coletar_dados_operacionais_mesa(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
-        finally:
-            _V99_DOSSIE_ATIVO = max(0, _V99_DOSSIE_ATIVO - 1)
-        dados_dossie['requisitos_pacificacao'] = _v110_preparar_requisitos(dados_dossie)
-        _v110_recalcular_estatisticas(dados_dossie)
-        pendencias = _v110_pdf_preflight_dados(dados_dossie)
-        if pendencias:
-            texto = '\n'.join(f'• {x}' for x in pendencias[:14])
-            await editar_progresso_dossie(msg_aviso, '⚠️ **Prévia não gerada.**\nAinda existem pendências reais na mesa:\n' + texto[:1500])
-            return await _v127_safe_send(interaction, '⚠️ Ainda existem pendências reais antes da prévia do dossiê. Corrija a mesa e use **Reanalisar Mesa**.\n' + texto[:1300], contexto='v130.review.preflight')
-
-        nome_pdf = f'DOSSIE_OPERACIONAL_{processo_limpo}_PREVIA.pdf'
-        nome_docx = f'DOSSIE_OPERACIONAL_{processo_limpo}_PREVIA.docx'
-        caminho_pdf = Path(pasta_dossie) / nome_pdf
-        caminho_docx = Path(pasta_dossie) / nome_docx
-        await editar_progresso_dossie(msg_aviso, '📄 **[DICOR] 2/4 — Gerando PDF/DOCX**\nAs páginas internas de checklist/indicadores serão retiradas; a conferência ficará no Discord.')
-        await asyncio.to_thread(gerar_pdf_dossie, dados_dossie, caminho_pdf)
-        await asyncio.to_thread(gerar_docx_dossie, dados_dossie, caminho_docx)
-        if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 0 or not caminho_docx.exists() or caminho_docx.stat().st_size <= 0:
-            raise RuntimeError('Prévia PDF/DOCX não foi criada corretamente.')
-        erros_pdf = _v110_pdf_preflight_arquivo(caminho_pdf)
-        erros_pdf.extend(_v130_validar_sem_secoes_de_conferencia(caminho_pdf, 'pdf'))
-        erros_docx = _v130_validar_sem_secoes_de_conferencia(caminho_docx, 'docx')
-        if erros_pdf or erros_docx:
-            raise RuntimeError('Prévia reprovada: ' + ' | '.join((erros_pdf + erros_docx)[:8]))
-
-        await editar_progresso_dossie(msg_aviso, '📎 **[DICOR] 3/4 — Publicando prévia na mesa**\nAbra os arquivos e faça a conferência humana antes de encerrar.')
-        arquivos = {'pdf': str(caminho_pdf), 'docx': str(caminho_docx)}
-        msg_arquivos = await enviar_arquivos_dossie_destino(
-            canal,
-            dados_dossie,
-            arquivos,
-            nome_pdf,
-            nome_docx,
-            canal,
-            interaction.user,
-            titulo='🔎 PRÉVIA DO DOSSIÊ — AGUARDANDO CONFERÊNCIA HUMANA',
-        )
-        revisao_id = f'{canal.id}-{int(time.time())}-{secrets.token_hex(3)}'
-        checklist = _v130_texto_checklist(dados_dossie, canal.id, caminho_pdf)
-        registro = {
-            'revisao_id': revisao_id,
-            'canal_id': int(canal.id),
-            'guild_id': int(getattr(getattr(canal, 'guild', None), 'id', 0) or 0),
-            'status': 'PENDENTE',
-            'modo': _v130_modo_dossie(canal.id),
-            'criada_em': agora_br(),
-            'criada_por_id': int(interaction.user.id),
-            'criada_por_nome': str(interaction.user),
-            'motivo': str(motivo or 'Fechada'),
-            'dados_confirmacao': _v130_json_safe(dict(dados_confirmacao or {})),
-            'processo': str(dados_dossie.get('processo') or processo_base),
-            'numero_investigacao': str(dados_dossie.get('numero_investigacao') or ''),
-            'preview_url': getattr(msg_arquivos, 'jump_url', '') if msg_arquivos else '',
-            'checklist': _v130_json_safe(_v130_checklist_externo(dados_dossie, canal.id, caminho_pdf)),
-        }
-        await _v130_registrar_revisao(canal.id, registro)
-        await canal.send(checklist, view=V130DossieReviewView(), allowed_mentions=discord.AllowedMentions.none())
-        await editar_progresso_dossie(msg_aviso, '✅ **[DICOR] 4/4 — Prévia pronta**\nA mesa continua aberta. Confira o PDF/DOCX e use **Conferi e encerrar mesa** somente depois da revisão humana.')
-        await _v127_safe_send(interaction, '✅ Prévia pronta. O dossiê NÃO foi arquivado ainda. Faça a conferência no checklist publicado na mesa.', contexto='v130.review.pronta')
-    except Exception as erro:
-        traceback.print_exc()
-        await enviar_log(f'❌ V130 revisão de dossiê falhou na mesa {getattr(canal, "id", 0)}: {type(erro).__name__}: {erro}')
-        await editar_progresso_dossie(msg_aviso, '❌ **[DICOR] A prévia falhou.**\nA mesa permaneceu aberta e nenhum encerramento foi aplicado.\n`' + cortar_discord(f'{type(erro).__name__}: {erro}', 900) + '`')
-        await _v127_safe_send(interaction, '❌ Não consegui preparar a prévia para conferência. A mesa permanece aberta.\n`' + cortar_discord(f'{type(erro).__name__}: {erro}', 1100) + '`', contexto='v130.review.erro')
-    finally:
-        if pasta_dossie is not None:
-            try:
-                await asyncio.to_thread(_v97_limpar_temp_dossie_sync, pasta_dossie)
-            except Exception:
-                pass
-
-
-# V114FechamentoView consulta este global em runtime. Ao substituir o alvo aqui,
-# o botão "Gerar Dossiê" passa a gerar uma prévia e checklist; somente o botão
-# V130 de aprovação chama o núcleo transacional antigo que realmente arquiva.
-_V130_FECHAR_FINAL_BASE = _V114_FECHAR_FINAL
-async def _v130_fechar_final_com_revisao(interaction: discord.Interaction, motivo: str='Fechada', dados_confirmacao: Optional[Dict[str, Any]]=None):
-    confirmacao = dict(dados_confirmacao or {})
-    if confirmacao.get('_v130_human_review_ok'):
-        return await _V130_FECHAR_FINAL_BASE(interaction, motivo, confirmacao)
-    return await _v130_preparar_revisao_final(interaction, motivo, confirmacao)
-
-_V114_FECHAR_FINAL = _v130_fechar_final_com_revisao
-
-
-# Registra a View do checklist após o setup atual (que já registra V122/V128).
-_V130_SETUP_HOOK_BASE = bot.setup_hook
-async def _v130_setup_hook(self) -> None:
-    await _V130_SETUP_HOOK_BASE()
-    try:
-        bot.add_view(V130DossieReviewView())
-        print('✅ V130 View persistente do checklist externo registrada.', flush=True)
-    except Exception as erro:
-        print(f'⚠️ V130 não registrou View persistente do checklist: {type(erro).__name__}: {erro}', flush=True)
-
-bot.setup_hook = _v12_types.MethodType(_v130_setup_hook, bot)
-
-
-print(
-    '✅ V130 carregada — dossiê híbrido ativo: mesas antigas usam tópicos; mesas V122 usam tarefas + tópicos; '
-    'páginas internas de indicadores/checklist removidas e encerramento depende de conferência humana externa.',
-    flush=True,
-)
 
 _RUNTIME_PROCESS_STARTED_AT = time.monotonic()
 
