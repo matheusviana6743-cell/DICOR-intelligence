@@ -57501,3 +57501,853 @@ if __name__ == '__main__':
 # não percorre mesas antigas para criar tarefas. As novas regras valem para qualquer
 # mesa que JÁ possua tarefas_mesas_v122=True, inclusive mesas criadas antes deste deploy.
 print('✅ AJUSTE TAREFAS: membros com quantidade livre; Informante 2/2 aceita texto ou imagem/print; mesas legadas sem tarefas permanecem intocadas.', flush=True)
+
+
+# =====================================================
+# V124 — DOSSIÊ GUIADO PROFISSIONAL
+# Corrige mistura de tópicos, vazamento de texto administrativo,
+# repetição de imagens e ausência de fotos nas seções guiadas.
+# =====================================================
+
+_V124_COLETAR_BASE = coletar_dados_operacionais_mesa
+
+
+def _v124_safe_int(valor: Any, padrao: int = 0) -> int:
+    try:
+        return int(valor)
+    except Exception:
+        return int(padrao)
+
+
+def _v124_clean_text(valor: Any, limite: int = 2200) -> str:
+    s = str(valor or '').replace('\r', '').strip()
+    if not s:
+        return ''
+    linhas: List[str] = []
+    vistos: set[str] = set()
+    bloqueios = (
+        'tarefa guiada', 'checklist atual', 'finalizar tarefa', 'concluir tarefa',
+        'mesa criada por', 'clique em finalizar tarefa', 'clique em concluir tarefa',
+        'etapa 1/2 completa', 'etapa 2/2 completa', 'status: concluida', 'status: pendente',
+        'envie o material neste topico', 'envie o material neste tópico', 'conclusao definitiva exige autorizacao',
+        'conclusão definitiva exige autorização', 'gerenciamento de tarefas', 'use finalizar tarefa',
+        'item 1 completo', 'item 5 completo', 'item 7 completo', 'item 8 completo', 'item 9 completo',
+        'item 10 completo', 'item 11', 'item 12', 'item 13 completo',
+    )
+    for linha in s.splitlines():
+        l = str(linha).strip().strip('•*-_#> ')
+        if not l:
+            continue
+        n = normalizar_busca(l)
+        if not n:
+            continue
+        if any(x in n for x in bloqueios):
+            continue
+        if n in vistos:
+            continue
+        vistos.add(n)
+        linhas.append(l)
+    texto = '\n'.join(linhas).strip()
+    return texto[:limite]
+
+
+def _v124_fmt_data(valor: Any) -> str:
+    s = str(valor or '').strip()
+    if not s:
+        return ''
+    return s.replace('T', ' ').replace('Z', '')[:19]
+
+
+def _v124_dedupe_media(lista: List[Dict[str, Any]], limite: int = 50) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    vistos: set[Tuple[str, str, str]] = set()
+    for item in list(lista or []):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get('url') or item.get('proxy_url') or '').strip()
+        local = str(item.get('local') or item.get('arquivo') or '').strip()
+        msg = str(item.get('mensagem_id') or '')
+        chave = (msg, url, local)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append(item)
+        if len(saida) >= max(1, int(limite or 50)):
+            break
+    return saida
+
+
+def _v124_imagens_estado(g: Dict[str, Any], chave: str, limite: int = 20) -> List[Dict[str, Any]]:
+    valor = g.get(chave)
+    if isinstance(valor, list):
+        return _v124_dedupe_media([x for x in valor if isinstance(x, dict)], limite)
+    if isinstance(valor, dict):
+        return _v124_dedupe_media([valor], limite)
+    return []
+
+
+def _v124_evidencias_secao(dados: Dict[str, Any], secao: str, limite: int = 20) -> List[Dict[str, Any]]:
+    try:
+        if '_v110_evidencias' in globals():
+            return _v124_dedupe_media(_v110_evidencias(dados, secao, limite, somente_imagem=True), limite)
+    except Exception:
+        pass
+    try:
+        return _v124_dedupe_media(filtrar_evidencias_por_topico(list(dados.get('evidencias') or []), [secao], limite), limite)
+    except Exception:
+        return []
+
+
+def _v124_img_pessoa(pessoa: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    foto = pessoa.get('foto')
+    return dict(foto) if isinstance(foto, dict) else None
+
+
+def _v124_bloco_pessoas(pessoas: List[Dict[str, Any]], titulo_padrao: str) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    for idx, p in enumerate(list(pessoas or []), start=1):
+        if not isinstance(p, dict):
+            continue
+        saida.append({
+            'ordem': idx,
+            'nome': str(p.get('nome') or 'Não identificado').strip() or 'Não identificado',
+            'rg': str(p.get('rg') or 'Não informado').strip() or 'Não informado',
+            'cargo': str(p.get('cargo') or titulo_padrao).strip() or titulo_padrao,
+            'foto': _v124_img_pessoa(p),
+        })
+    return saida
+
+
+def _v124_texto_secao(codigo: str, titulo: str, g: Dict[str, Any], dados: Dict[str, Any]) -> str:
+    if codigo == '01':
+        total = len(list(g.get('painel_membros') or []))
+        if total:
+            return f'Foi coletado o painel administrativo da organização, contendo {total} registro(s) identificados para conferência interna e uso operacional.'
+        return 'Foi coletado o painel administrativo da organização, preservando a referência visual utilizada no ambiente in-game e a transcrição consolidada para consulta.'
+    if codigo == '02':
+        total = len(list(g.get('liderancas') or []))
+        return f'As lideranças vinculadas à organização foram individualmente identificadas, com nome, RG, função/cargo e respectiva evidência visual. Total registrado: {total}.'
+    if codigo == '03':
+        total = len(list(g.get('membros') or []))
+        return f'Os membros mapeados nesta investigação foram organizados de forma individual, cada um com identificação funcional e evidência visual correspondente. Total registrado: {total}.'
+    if codigo == '04':
+        radio = str(g.get('radio') or '').strip()
+        return f'A frequência operacional associada à organização foi registrada como {radio}.' if radio else 'A frequência operacional associada à organização foi documentada nesta seção.'
+    if codigo == '05':
+        base = len(list(g.get('localizacao_etapa1') or []))
+        aereas = len(list(g.get('localizacao_aereas') or []))
+        return f'A localização da organização foi documentada com {base} registro(s) básicos de identificação e {aereas} vista(s) aérea(s), permitindo referência visual do ponto investigado.'
+    if codigo == '06':
+        total = len(list(g.get('crimes') or []))
+        return f'Os crimes atribuídos à organização foram catalogados individualmente, com descrição objetiva e provas vinculadas a cada ocorrência. Total de registros: {total}.'
+    if codigo == '07':
+        return 'O baú destinado à liderança foi documentado com evidências visuais do interior/armazenamento e do respectivo acesso, preservando o contexto operacional do local.'
+    if codigo == '08':
+        return 'O baú utilizado pelos membros foi documentado com evidências visuais do interior/armazenamento e do respectivo acesso, preservando o contexto operacional do local.'
+    if codigo == '09':
+        return 'A rota de farm da organização foi registrada com evidência visual do responsável/NPC e da localização correspondente, permitindo referência prática do ponto de coleta.'
+    if codigo == '10':
+        return 'A rota de produção da organização foi registrada com evidência visual do responsável/NPC e da localização correspondente, permitindo referência prática do ponto de fabricação.'
+    if codigo == '11':
+        qtd_ing = len(list(g.get('ingredientes_fotos') or []))
+        qtd_prod = len(list(g.get('produto_final_fotos') or []))
+        return f'Os insumos e o produto final da organização foram documentados separadamente, com {qtd_ing} evidência(s) de ingredientes e {qtd_prod} evidência(s) do produto final.'
+    if codigo == '12':
+        inf = g.get('informante') if isinstance(g.get('informante'), dict) else {}
+        nome = str(inf.get('nome') or 'informante').strip()
+        return f'Foi formalizado o registro do informante {nome}, com identificação individual e síntese objetiva da colaboração prestada à investigação.'
+    if codigo == '13':
+        total = len(list(g.get('residencia_fotos') or []))
+        return f'A residência vinculada ao líder da organização foi documentada visualmente, com {total} evidência(s) preservada(s) nesta seção.'
+    return f'Seção {titulo.lower()} consolidada a partir do material validado na investigação guiada.'
+
+
+def _v124_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    g = dict((estado or {}).get('dados') or {})
+    meta = {
+        'nome_operacao': str(dados.get('nome_operacao') or dados.get('nome') or f'OPERAÇÃO INVESTIGATIVA {canal_id}').strip(),
+        'numero': str(dados.get('numero') or f'INV-{str(canal_id)[-6:]}').strip(),
+        'processo': str(dados.get('processo') or f'PF-DICOR-{canal_id}').strip(),
+        'comunidade': str(dados.get('comunidade') or dados.get('faccao') or dados.get('organizacao') or 'Organização investigada').strip(),
+        'delegado': str(dados.get('delegado') or dados.get('autor_nome') or 'Superintendência DICOR').strip(),
+        'data_abertura': str(dados.get('data_abertura') or dados.get('criada_em') or agora_br()).strip(),
+        'mesa_canal_id': int(canal_id or 0),
+        'cidade': 'Capital Morada do Valley',
+    }
+
+    painel_imgs = _v124_imagens_estado(g, 'painel_imagens', 12) or _v124_evidencias_secao(dados, 'painel', 12)
+    liderancas = _v124_bloco_pessoas(list(g.get('liderancas') or []), 'Liderança')
+    membros = _v124_bloco_pessoas(list(g.get('membros') or []), 'Membro')
+    local_base = _v124_imagens_estado(g, 'localizacao_etapa1', 4)
+    local_aereas = _v124_imagens_estado(g, 'localizacao_aereas', 8)
+    crimes = []
+    for idx, c in enumerate(list(g.get('crimes') or []), start=1):
+        if not isinstance(c, dict):
+            continue
+        provas = _v124_dedupe_media([x for x in list(c.get('provas') or []) if isinstance(x, dict)], 12)
+        crimes.append({
+            'ordem': idx,
+            'descricao': _v124_clean_text(c.get('descricao'), 600) or f'Crime {idx}',
+            'provas': provas,
+        })
+    bau_lider = _v124_imagens_estado(g, 'bau_lider', 6)
+    bau_membros = _v124_imagens_estado(g, 'bau_membros', 6)
+    rota_farm = _v124_imagens_estado(g, 'rota_farm', 6)
+    rota_producao = _v124_imagens_estado(g, 'rota_producao', 6)
+    ingredientes = _v124_imagens_estado(g, 'ingredientes_fotos', 8)
+    produto_final = _v124_imagens_estado(g, 'produto_final_fotos', 8)
+    informante = g.get('informante') if isinstance(g.get('informante'), dict) else {}
+    informante_resumo = _v124_clean_text(g.get('informante_resumo'), 2000)
+    informante_resumo_fotos = _v124_imagens_estado(g, 'informante_resumo_fotos', 6)
+    residencia = _v124_imagens_estado(g, 'residencia_fotos', 8)
+
+    sections: List[Dict[str, Any]] = [
+        {
+            'code': '01', 'title': 'PAINEL', 'summary': _v124_texto_secao('01', 'PAINEL', g, dados),
+            'images': painel_imgs,
+            'extra_text': _v124_clean_text(g.get('painel_transcricao'), 3500),
+        },
+        {
+            'code': '02', 'title': 'FOTOS DOS LÍDERES', 'summary': _v124_texto_secao('02', 'FOTOS DOS LÍDERES', g, dados),
+            'people': liderancas,
+            'images': _v124_dedupe_media([p['foto'] for p in liderancas if isinstance(p.get('foto'), dict)], 40),
+        },
+        {
+            'code': '03', 'title': 'FOTOS DOS MEMBROS', 'summary': _v124_texto_secao('03', 'FOTOS DOS MEMBROS', g, dados),
+            'people': membros,
+            'images': _v124_dedupe_media([p['foto'] for p in membros if isinstance(p.get('foto'), dict)], 60),
+        },
+        {
+            'code': '04', 'title': 'RÁDIO', 'summary': _v124_texto_secao('04', 'RÁDIO', g, dados),
+            'field_lines': [('Frequência registrada', str(g.get('radio') or 'Não informada').strip() or 'Não informada')],
+            'images': [],
+        },
+        {
+            'code': '05', 'title': 'LOCALIZAÇÃO', 'summary': _v124_texto_secao('05', 'LOCALIZAÇÃO', g, dados),
+            'subgroups': [
+                {'label': 'Identificação do local / GPS', 'images': local_base},
+                {'label': 'Vistas aéreas da área', 'images': local_aereas},
+            ],
+            'images': _v124_dedupe_media(local_base + local_aereas, 20),
+        },
+        {
+            'code': '06', 'title': 'CRIMES DA COMUNIDADE', 'summary': _v124_texto_secao('06', 'CRIMES DA COMUNIDADE', g, dados),
+            'crimes': crimes,
+            'images': _v124_dedupe_media([p for crime in crimes for p in list(crime.get('provas') or [])], 80),
+        },
+        {
+            'code': '07', 'title': 'BAÚ DE LÍDER', 'summary': _v124_texto_secao('07', 'BAÚ DE LÍDER', g, dados),
+            'images': bau_lider,
+        },
+        {
+            'code': '08', 'title': 'BAÚ DE MEMBROS', 'summary': _v124_texto_secao('08', 'BAÚ DE MEMBROS', g, dados),
+            'images': bau_membros,
+        },
+        {
+            'code': '09', 'title': 'ROTA DE FARM', 'summary': _v124_texto_secao('09', 'ROTA DE FARM', g, dados),
+            'images': rota_farm,
+        },
+        {
+            'code': '10', 'title': 'ROTA DE PRODUÇÃO', 'summary': _v124_texto_secao('10', 'ROTA DE PRODUÇÃO', g, dados),
+            'images': rota_producao,
+        },
+        {
+            'code': '11', 'title': 'INGREDIENTES E PRODUTOS', 'summary': _v124_texto_secao('11', 'INGREDIENTES E PRODUTOS', g, dados),
+            'subgroups': [
+                {'label': 'Ingredientes base', 'images': ingredientes},
+                {'label': 'Produto final', 'images': produto_final},
+            ],
+            'images': _v124_dedupe_media(ingredientes + produto_final, 20),
+        },
+        {
+            'code': '12', 'title': 'INFORMANTE', 'summary': _v124_texto_secao('12', 'INFORMANTE', g, dados),
+            'informante': {
+                'nome': str(informante.get('nome') or 'Não informado').strip() or 'Não informado',
+                'rg': str(informante.get('rg') or 'Não informado').strip() or 'Não informado',
+                'cargo': 'Informante',
+                'foto': informante.get('foto') if isinstance(informante.get('foto'), dict) else None,
+                'documento': informante.get('documento') if isinstance(informante.get('documento'), dict) else None,
+            },
+            'extra_text': informante_resumo,
+            'images': _v124_dedupe_media([
+                x for x in [informante.get('foto'), informante.get('documento')] if isinstance(x, dict)
+            ] + informante_resumo_fotos, 12),
+        },
+        {
+            'code': '13', 'title': 'RESIDÊNCIA DO LÍDER', 'summary': _v124_texto_secao('13', 'RESIDÊNCIA DO LÍDER', g, dados),
+            'images': residencia,
+        },
+    ]
+
+    evidence_index: List[Dict[str, Any]] = []
+    for sec in sections:
+        base_images = list(sec.get('images') or [])
+        evidence_index.append({
+            'code': sec.get('code'),
+            'title': sec.get('title'),
+            'count': len(base_images),
+        })
+
+    return {
+        'meta': meta,
+        'sections': sections,
+        'evidence_index': evidence_index,
+        'status': str((estado or {}).get('status') or 'ATIVA'),
+        'concluidos': dict((estado or {}).get('concluidos') or {}),
+    }
+
+
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dados = await _V124_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        if isinstance(canal, discord.TextChannel) and _v122_mesa_tarefas_habilitada(int(canal.id)):
+            estado = _v116_estado(int(canal.id), False) or {}
+            if isinstance(estado, dict) and isinstance(estado.get('dados'), dict):
+                dados['dossie_v124'] = _v124_payload_profissional(dados, estado, int(canal.id))
+                dados['gerador_dossie'] = 'v124_profissional_guiado'
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'⚠️ V124: falha ao montar payload profissional da mesa {getattr(canal, "id", "?")}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+    return dados
+
+
+_V124_GERAR_PDF_BASE = gerar_pdf_dossie
+_V124_GERAR_DOCX_BASE = gerar_docx_dossie
+
+
+def _v124_materializar_midia(item: Dict[str, Any], pasta_cache: Path) -> Optional[Path]:
+    try:
+        pasta_cache = Path(pasta_cache)
+        pasta_cache.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    local = str(item.get('local') or item.get('arquivo') or '').strip()
+    if local and Path(local).exists():
+        return Path(local)
+    url = str(item.get('url') or item.get('proxy_url') or '').strip()
+    if not url.startswith(('http://', 'https://')):
+        return None
+    try:
+        import hashlib
+        import urllib.request
+        import urllib.parse
+        nome = Path(urllib.parse.urlparse(url).path).name or 'imagem'
+        ext = Path(nome).suffix.lower()
+        if ext not in {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}:
+            ext = '.png'
+        chave = hashlib.sha1(url.encode('utf-8', errors='ignore')).hexdigest()[:20]
+        destino = pasta_cache / f'{chave}{ext}'
+        if destino.exists() and destino.stat().st_size > 0:
+            return destino
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            dados = resp.read(12 * 1024 * 1024)
+        if not dados:
+            return None
+        destino.write_bytes(dados)
+        return destino if destino.exists() and destino.stat().st_size > 0 else None
+    except Exception:
+        return None
+
+
+def _v124_pdf_styles():
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    styles = getSampleStyleSheet()
+    estilos = {
+        'title': ParagraphStyle('v124_title', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=19, leading=23, textColor=colors.HexColor('#203646'), alignment=TA_CENTER, spaceAfter=8),
+        'subtitle': ParagraphStyle('v124_subtitle', parent=styles['Normal'], fontName='Helvetica', fontSize=10.5, leading=14, textColor=colors.HexColor('#4B5B63'), alignment=TA_CENTER, spaceAfter=6),
+        'section': ParagraphStyle('v124_section', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=16, leading=18, textColor=colors.HexColor('#203646'), spaceAfter=10, spaceBefore=4),
+        'heading2': ParagraphStyle('v124_heading2', parent=styles['Heading2'], fontName='Helvetica-Bold', fontSize=12, leading=14, textColor=colors.HexColor('#8A6500'), spaceBefore=8, spaceAfter=5),
+        'body': ParagraphStyle('v124_body', parent=styles['BodyText'], fontName='Helvetica', fontSize=10.4, leading=14.2, textColor=colors.black, alignment=TA_JUSTIFY, spaceAfter=7),
+        'small': ParagraphStyle('v124_small', parent=styles['BodyText'], fontName='Helvetica', fontSize=8.6, leading=10.6, textColor=colors.HexColor('#4B5B63'), alignment=TA_LEFT, spaceAfter=5),
+        'mono': ParagraphStyle('v124_mono', parent=styles['Code'], fontName='Courier', fontSize=8.8, leading=10.4, textColor=colors.black, backColor=colors.HexColor('#F4F0E8'), leftIndent=6, rightIndent=6, borderPadding=5, spaceAfter=6),
+        'card_title': ParagraphStyle('v124_card_title', parent=styles['BodyText'], fontName='Helvetica-Bold', fontSize=11.2, leading=13, textColor=colors.HexColor('#8A6500'), spaceAfter=4),
+    }
+    return estilos
+
+
+def _v124_pdf_header_footer(canvas_obj, doc):
+    try:
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        w, h = doc.pagesize
+        canvas_obj.saveState()
+        canvas_obj.setFillColor(colors.HexColor('#203646'))
+        canvas_obj.rect(1.2 * cm, h - 1.6 * cm, w - 2.4 * cm, 0.55 * cm, fill=1, stroke=0)
+        canvas_obj.setFillColor(colors.white)
+        canvas_obj.setFont('Helvetica-Bold', 9)
+        canvas_obj.drawString(1.45 * cm, h - 1.38 * cm, 'POLÍCIA FEDERAL • DICOR • DOSSIÊ OPERACIONAL')
+        canvas_obj.setFillColor(colors.HexColor('#4B5B63'))
+        canvas_obj.setFont('Helvetica', 8)
+        canvas_obj.drawRightString(w - 1.25 * cm, 1.0 * cm, f'Página {canvas_obj.getPageNumber()}')
+        canvas_obj.restoreState()
+    except Exception:
+        pass
+
+
+def _v124_pdf_image_flowables(imagens: List[Dict[str, Any]], pasta_cache: Path, estilos: Dict[str, Any], max_por_secao: int = 24):
+    from reportlab.platypus import Paragraph, Spacer, Image as RLImage, Table, TableStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    flow = []
+    itens = []
+    for idx, item in enumerate(_v124_dedupe_media(imagens, max_por_secao), start=1):
+        caminho = _v124_materializar_midia(item, pasta_cache)
+        if not caminho or not caminho.exists():
+            continue
+        try:
+            img = RLImage(str(caminho))
+            img._restrictSize(7.7 * cm, 8.8 * cm)
+            legenda_txt = f'Evidência visual {idx}'
+            data = _v124_fmt_data(item.get('data'))
+            if data:
+                legenda_txt += f' • {data}'
+            legenda = Paragraph(legenda_txt, estilos['small'])
+            card = Table([[img], [legenda]], colWidths=[8.1 * cm])
+            card.setStyle(TableStyle([
+                ('BOX', (0, 0), (-1, -1), 0.8, colors.HexColor('#8CA1AC')),
+                ('INNERPADDING', (0, 0), (-1, -1), 5),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FCFAF5')),
+            ]))
+            itens.append(card)
+        except Exception:
+            continue
+    for i in range(0, len(itens), 2):
+        linha = itens[i:i+2]
+        if len(linha) == 1:
+            linha.append(Spacer(8.1 * cm, 0.1 * cm))
+        tbl = Table([linha], colWidths=[8.25 * cm, 8.25 * cm])
+        tbl.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP')]))
+        flow.append(tbl)
+        flow.append(Spacer(1, 0.22 * cm))
+    return flow
+
+
+def _v124_pdf_people_cards(pessoas: List[Dict[str, Any]], pasta_cache: Path, estilos: Dict[str, Any], titulo_vazio: str = 'Sem registros'):
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    flow = []
+    if not pessoas:
+        flow.append(Paragraph(titulo_vazio, estilos['body']))
+        return flow
+    for pessoa in pessoas:
+        nome = str(pessoa.get('nome') or 'Não identificado')
+        rg = str(pessoa.get('rg') or 'Não informado')
+        cargo = str(pessoa.get('cargo') or 'Não informado')
+        foto = pessoa.get('foto') if isinstance(pessoa.get('foto'), dict) else None
+        bloco_texto = [
+            Paragraph(f'{int(pessoa.get("ordem") or 0)}. {nome}', estilos['card_title']),
+            Paragraph(f'RG: {rg}<br/>Função/Cargo: {cargo}', estilos['body']),
+        ]
+        foto_cell = ''
+        if foto:
+            caminho = _v124_materializar_midia(foto, pasta_cache)
+            if caminho and caminho.exists():
+                try:
+                    img = RLImage(str(caminho))
+                    img._restrictSize(4.1 * cm, 5.1 * cm)
+                    foto_cell = img
+                except Exception:
+                    foto_cell = ''
+        t = Table([[bloco_texto, foto_cell]], colWidths=[11.8 * cm, 4.7 * cm])
+        t.setStyle(TableStyle([
+            ('BOX', (0, 0), (-1, -1), 0.9, colors.HexColor('#8CA1AC')),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FCFAF5')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('INNERPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        flow.append(t)
+        flow.append(Spacer(1, 0.18 * cm))
+    return flow
+
+
+def _v124_generate_pdf(payload: Dict[str, Any], caminho_pdf: Path) -> None:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as RLImage
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    pasta_cache = caminho_pdf.parent / '_v124_media_cache_pdf'
+    pasta_cache.mkdir(parents=True, exist_ok=True)
+    estilos = _v124_pdf_styles()
+    doc = SimpleDocTemplate(str(caminho_pdf), pagesize=A4, leftMargin=1.35 * cm, rightMargin=1.35 * cm, topMargin=2.1 * cm, bottomMargin=1.5 * cm)
+    flow: List[Any] = []
+    meta = dict(payload.get('meta') or {})
+
+    # Capa
+    logos = []
+    for caminho_logo in (caminho_brasao_pf(), caminho_brasao_dicor()):
+        try:
+            if caminho_logo and Path(str(caminho_logo)).exists():
+                img = RLImage(str(caminho_logo))
+                img._restrictSize(2.6 * cm, 2.6 * cm)
+                logos.append(img)
+        except Exception:
+            pass
+    if logos:
+        tbl = Table([logos], colWidths=[2.8 * cm] * len(logos))
+        tbl.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'CENTER')]))
+        flow.append(tbl)
+        flow.append(Spacer(1, 0.35 * cm))
+    flow.append(Paragraph('DOSSIÊ OPERACIONAL — DICOR', estilos['title']))
+    flow.append(Paragraph('POLÍCIA FEDERAL • DIRETORIA DE INVESTIGAÇÃO E COMBATE AO CRIME ORGANIZADO', estilos['subtitle']))
+    flow.append(Spacer(1, 0.35 * cm))
+    operacao = str(meta.get('nome_operacao') or 'Operação sem título')
+    flow.append(Paragraph(operacao, estilos['section']))
+    dados_tabela = [
+        ['Comunidade / Base', str(meta.get('comunidade') or 'Não informada')],
+        ['Cidade operacional', str(meta.get('cidade') or 'Capital Morada do Valley')],
+        ['Número interno', str(meta.get('numero') or '-')],
+        ['Processo', str(meta.get('processo') or '-')],
+        ['Data de abertura', str(meta.get('data_abertura') or '-')],
+        ['Responsável institucional', str(meta.get('delegado') or '-')],
+    ]
+    tb = Table(dados_tabela, colWidths=[5.2 * cm, 11.0 * cm])
+    tb.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 0.9, colors.HexColor('#8CA1AC')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.6, colors.HexColor('#C7D2D8')),
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#F2E6C4')),
+        ('BACKGROUND', (1, 0), (1, -1), colors.HexColor('#FCFAF5')),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('LEADING', (0, 0), (-1, -1), 12),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    flow.append(tb)
+    flow.append(Spacer(1, 0.3 * cm))
+    flow.append(Paragraph('Documento consolidado a partir da investigação guiada, com estrutura fixa por seção, tratamento profissional do texto e associação estrita das evidências a seus respectivos tópicos.', estilos['body']))
+    flow.append(PageBreak())
+
+    # Índice e índice de evidências
+    flow.append(Paragraph('SUMÁRIO', estilos['section']))
+    sumario = []
+    for sec in list(payload.get('sections') or []):
+        sumario.append([f"{sec.get('code')}. {sec.get('title')}"])
+    tb_sum = Table(sumario, colWidths=[16.2 * cm])
+    tb_sum.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 0.8, colors.HexColor('#8CA1AC')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D2DADF')),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FCFAF5')),
+        ('FONTSIZE', (0, 0), (-1, -1), 10.2),
+        ('LEADING', (0, 0), (-1, -1), 12),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    flow.append(tb_sum)
+    flow.append(Spacer(1, 0.35 * cm))
+    flow.append(Paragraph('ÍNDICE DE EVIDÊNCIAS', estilos['section']))
+    idx_rows = [['Seção', 'Título', 'Qtd. de imagens']]
+    for item in list(payload.get('evidence_index') or []):
+        idx_rows.append([str(item.get('code') or ''), str(item.get('title') or ''), str(item.get('count') or 0)])
+    tb_idx = Table(idx_rows, colWidths=[1.8 * cm, 11.7 * cm, 2.7 * cm])
+    tb_idx.setStyle(TableStyle([
+        ('BOX', (0, 0), (-1, -1), 0.9, colors.HexColor('#8CA1AC')),
+        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D2DADF')),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#203646')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#FCFAF5')),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9.6),
+        ('LEADING', (0, 0), (-1, -1), 11),
+        ('TOPPADDING', (0, 0), (-1, -1), 5), ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    flow.append(tb_idx)
+    flow.append(PageBreak())
+
+    # Seções
+    for sec in list(payload.get('sections') or []):
+        flow.append(Paragraph(f"{sec.get('code')}. {sec.get('title')}", estilos['section']))
+        flow.append(Paragraph(str(sec.get('summary') or ''), estilos['body']))
+
+        field_lines = list(sec.get('field_lines') or [])
+        if field_lines:
+            tb_fields = Table(field_lines, colWidths=[5.1 * cm, 11.1 * cm])
+            tb_fields.setStyle(TableStyle([
+                ('BOX', (0, 0), (-1, -1), 0.8, colors.HexColor('#8CA1AC')),
+                ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D2DADF')),
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#F2E6C4')),
+                ('BACKGROUND', (1, 0), (1, -1), colors.HexColor('#FCFAF5')),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9.8),
+            ]))
+            flow.append(tb_fields)
+            flow.append(Spacer(1, 0.2 * cm))
+
+        if list(sec.get('people') or []):
+            flow.extend(_v124_pdf_people_cards(list(sec.get('people') or []), pasta_cache, estilos))
+
+        if isinstance(sec.get('informante'), dict):
+            info = sec['informante']
+            flow.append(Paragraph('Identificação do informante', estilos['heading2']))
+            flow.extend(_v124_pdf_people_cards([{
+                'ordem': 1,
+                'nome': info.get('nome'),
+                'rg': info.get('rg'),
+                'cargo': info.get('cargo'),
+                'foto': info.get('foto'),
+            }], pasta_cache, estilos))
+
+        extra_text = str(sec.get('extra_text') or '').strip()
+        if extra_text:
+            subtitulo = 'Transcrição consolidada' if sec.get('code') == '01' else 'Síntese complementar'
+            flow.append(Paragraph(subtitulo, estilos['heading2']))
+            estilo_txt = estilos['mono'] if sec.get('code') == '01' else estilos['body']
+            flow.append(Paragraph(extra_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br/>'), estilo_txt))
+
+        for grupo in list(sec.get('subgroups') or []):
+            imagens = list(grupo.get('images') or [])
+            if not imagens:
+                continue
+            flow.append(Paragraph(str(grupo.get('label') or 'Evidências'), estilos['heading2']))
+            flow.extend(_v124_pdf_image_flowables(imagens, pasta_cache, estilos))
+
+        if list(sec.get('crimes') or []):
+            flow.append(Paragraph('Crimes registrados', estilos['heading2']))
+            for crime in list(sec.get('crimes') or []):
+                flow.append(Paragraph(f"{int(crime.get('ordem') or 0)}. {str(crime.get('descricao') or '')}", estilos['body']))
+                if list(crime.get('provas') or []):
+                    flow.extend(_v124_pdf_image_flowables(list(crime.get('provas') or []), pasta_cache, estilos, max_por_secao=12))
+
+        if sec.get('code') not in {'02', '03', '05', '06', '11'}:
+            imagens = list(sec.get('images') or [])
+            if imagens:
+                flow.append(Paragraph('Evidências visuais', estilos['heading2']))
+                flow.extend(_v124_pdf_image_flowables(imagens, pasta_cache, estilos))
+
+        # Cada novo tópico começa em página própria.
+        if sec != list(payload.get('sections') or [])[-1]:
+            flow.append(PageBreak())
+
+    doc.build(flow, onFirstPage=_v124_pdf_header_footer, onLaterPages=_v124_pdf_header_footer)
+
+
+def _v124_generate_docx(payload: Dict[str, Any], caminho_docx: Path) -> None:
+    from docx import Document as _Doc
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.enum.section import WD_SECTION_START
+
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+    pasta_cache = caminho_docx.parent / '_v124_media_cache_docx'
+    pasta_cache.mkdir(parents=True, exist_ok=True)
+
+    doc = _Doc()
+    sec = doc.sections[0]
+    sec.top_margin = Inches(0.8)
+    sec.bottom_margin = Inches(0.6)
+    sec.left_margin = Inches(0.65)
+    sec.right_margin = Inches(0.65)
+
+    meta = dict(payload.get('meta') or {})
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for caminho_logo in (caminho_brasao_pf(), caminho_brasao_dicor()):
+        try:
+            if caminho_logo and Path(str(caminho_logo)).exists():
+                p.add_run().add_picture(str(caminho_logo), width=Inches(0.85))
+                p.add_run('  ')
+        except Exception:
+            pass
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run('DOSSIÊ OPERACIONAL — DICOR')
+    r.bold = True
+    r.font.size = Pt(17)
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run('POLÍCIA FEDERAL • DIRETORIA DE INVESTIGAÇÃO E COMBATE AO CRIME ORGANIZADO')
+    r.font.size = Pt(10)
+    r.italic = True
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run(str(meta.get('nome_operacao') or ''))
+    r.bold = True
+    r.font.size = Pt(14)
+
+    tabela = doc.add_table(rows=0, cols=2)
+    tabela.style = 'Table Grid'
+    for k, v in [
+        ('Comunidade / Base', meta.get('comunidade') or 'Não informada'),
+        ('Cidade operacional', meta.get('cidade') or 'Capital Morada do Valley'),
+        ('Número interno', meta.get('numero') or '-'),
+        ('Processo', meta.get('processo') or '-'),
+        ('Data de abertura', meta.get('data_abertura') or '-'),
+        ('Responsável institucional', meta.get('delegado') or '-'),
+    ]:
+        row = tabela.add_row().cells
+        row[0].text = str(k)
+        row[1].text = str(v)
+    doc.add_paragraph('Documento consolidado a partir da investigação guiada, com separação rígida por seção e associação profissional das evidências.', style=None)
+    doc.add_page_break()
+
+    p = doc.add_paragraph()
+    r = p.add_run('SUMÁRIO')
+    r.bold = True
+    r.font.size = Pt(14)
+    for secao in list(payload.get('sections') or []):
+        doc.add_paragraph(f"{secao.get('code')}. {secao.get('title')}", style='List Bullet')
+    p = doc.add_paragraph()
+    r = p.add_run('ÍNDICE DE EVIDÊNCIAS')
+    r.bold = True
+    r.font.size = Pt(14)
+    tabela_idx = doc.add_table(rows=1, cols=3)
+    tabela_idx.style = 'Table Grid'
+    hdr = tabela_idx.rows[0].cells
+    hdr[0].text = 'Seção'
+    hdr[1].text = 'Título'
+    hdr[2].text = 'Qtd. de imagens'
+    for item in list(payload.get('evidence_index') or []):
+        row = tabela_idx.add_row().cells
+        row[0].text = str(item.get('code') or '')
+        row[1].text = str(item.get('title') or '')
+        row[2].text = str(item.get('count') or 0)
+    doc.add_page_break()
+
+    for i, secao in enumerate(list(payload.get('sections') or []), start=1):
+        p = doc.add_paragraph()
+        r = p.add_run(f"{secao.get('code')}. {secao.get('title')}")
+        r.bold = True
+        r.font.size = Pt(14)
+        doc.add_paragraph(str(secao.get('summary') or ''))
+
+        for campo, valor in list(secao.get('field_lines') or []):
+            doc.add_paragraph(f'{campo}: {valor}')
+
+        pessoas = list(secao.get('people') or [])
+        if pessoas:
+            for pessoa in pessoas:
+                t = doc.add_table(rows=0, cols=2)
+                t.style = 'Table Grid'
+                row = t.add_row().cells
+                row[0].text = f"{int(pessoa.get('ordem') or 0)}. {pessoa.get('nome') or ''}\nRG: {pessoa.get('rg') or ''}\nFunção/Cargo: {pessoa.get('cargo') or ''}"
+                caminho = _v124_materializar_midia(pessoa.get('foto') or {}, pasta_cache) if isinstance(pessoa.get('foto'), dict) else None
+                if caminho and caminho.exists():
+                    try:
+                        par = row[1].paragraphs[0]
+                        par.add_run().add_picture(str(caminho), width=Inches(1.5))
+                    except Exception:
+                        row[1].text = 'Foto indisponível'
+                else:
+                    row[1].text = 'Sem foto'
+                doc.add_paragraph('')
+
+        if isinstance(secao.get('informante'), dict):
+            info = secao['informante']
+            p = doc.add_paragraph()
+            r = p.add_run('Identificação do informante')
+            r.bold = True
+            t = doc.add_table(rows=0, cols=2)
+            t.style = 'Table Grid'
+            row = t.add_row().cells
+            row[0].text = f"Nome: {info.get('nome') or ''}\nRG: {info.get('rg') or ''}\nFunção/Cargo: {info.get('cargo') or ''}"
+            caminho = _v124_materializar_midia(info.get('foto') or {}, pasta_cache) if isinstance(info.get('foto'), dict) else None
+            if caminho and caminho.exists():
+                try:
+                    row[1].paragraphs[0].add_run().add_picture(str(caminho), width=Inches(1.5))
+                except Exception:
+                    row[1].text = 'Foto indisponível'
+            else:
+                row[1].text = 'Sem foto'
+            doc.add_paragraph('')
+
+        extra_text = str(secao.get('extra_text') or '').strip()
+        if extra_text:
+            p = doc.add_paragraph()
+            r = p.add_run('Transcrição consolidada' if secao.get('code') == '01' else 'Síntese complementar')
+            r.bold = True
+            doc.add_paragraph(extra_text)
+
+        for grupo in list(secao.get('subgroups') or []):
+            imgs = list(grupo.get('images') or [])
+            if not imgs:
+                continue
+            p = doc.add_paragraph()
+            r = p.add_run(str(grupo.get('label') or 'Evidências'))
+            r.bold = True
+            for item in _v124_dedupe_media(imgs, 20):
+                caminho = _v124_materializar_midia(item, pasta_cache)
+                if caminho and caminho.exists():
+                    try:
+                        doc.add_picture(str(caminho), width=Inches(2.5))
+                    except Exception:
+                        pass
+
+        if list(secao.get('crimes') or []):
+            p = doc.add_paragraph()
+            r = p.add_run('Crimes registrados')
+            r.bold = True
+            for crime in list(secao.get('crimes') or []):
+                doc.add_paragraph(f"{int(crime.get('ordem') or 0)}. {str(crime.get('descricao') or '')}", style='List Bullet')
+                for item in _v124_dedupe_media(list(crime.get('provas') or []), 12):
+                    caminho = _v124_materializar_midia(item, pasta_cache)
+                    if caminho and caminho.exists():
+                        try:
+                            doc.add_picture(str(caminho), width=Inches(2.6))
+                        except Exception:
+                            pass
+
+        if secao.get('code') not in {'02', '03', '05', '06', '11'}:
+            imagens = list(secao.get('images') or [])
+            if imagens:
+                p = doc.add_paragraph()
+                r = p.add_run('Evidências visuais')
+                r.bold = True
+                for item in _v124_dedupe_media(imagens, 20):
+                    caminho = _v124_materializar_midia(item, pasta_cache)
+                    if caminho and caminho.exists():
+                        try:
+                            doc.add_picture(str(caminho), width=Inches(2.6))
+                        except Exception:
+                            pass
+
+        if i < len(list(payload.get('sections') or [])):
+            doc.add_page_break()
+
+    doc.save(str(caminho_docx))
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if isinstance(payload, dict):
+        try:
+            _v124_generate_pdf(payload, Path(caminho_pdf))
+            erros = _v123_preflight_arquivo(Path(caminho_pdf), 'pdf')
+            if erros:
+                raise RuntimeError('Preflight do PDF V124 reprovado: ' + ' | '.join(erros[:8]))
+            return
+        except Exception as erro:
+            print(f'⚠️ V124 PDF falhou, usando gerador anterior: {type(erro).__name__}: {erro}', flush=True)
+            traceback.print_exc()
+    return _V124_GERAR_PDF_BASE(dados, caminho_pdf)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if isinstance(payload, dict):
+        try:
+            _v124_generate_docx(payload, Path(caminho_docx))
+            erros = _v123_preflight_arquivo(Path(caminho_docx), 'docx')
+            if erros:
+                raise RuntimeError('Preflight do DOCX V124 reprovado: ' + ' | '.join(erros[:8]))
+            return
+        except Exception as erro:
+            print(f'⚠️ V124 DOCX falhou, usando gerador anterior: {type(erro).__name__}: {erro}', flush=True)
+            traceback.print_exc()
+    return _V124_GERAR_DOCX_BASE(dados, caminho_docx)
+
+
+print('✅ V124 carregada — dossiê guiado profissional: seções isoladas, textos curatoriais, fotos corretas, sem vazamento administrativo e sem repetição indevida.', flush=True)
