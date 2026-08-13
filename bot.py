@@ -40373,7 +40373,7 @@ async def _v74_heartbeat():
             await asyncio.sleep(V74_HEARTBEAT_INTERVAL)
             estado = 'READY' if bot.is_ready() else 'CONECTANDO'
             latencia = round(float(getattr(bot, 'latency', 0.0)) * 1000) if bot.is_ready() else -1
-            print(f"💓 V74 heartbeat: {estado} • latência={latencia}ms • guilds={len(getattr(bot, 'guilds', []) or [])}", flush=True)
+            print(f"[RUNTIME] Heartbeat interno: discord={estado} latência_ms={latencia} guilds={len(getattr(bot, 'guilds', []) or [])}", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as erro:
@@ -40402,6 +40402,7 @@ async def _v74_supervisionar_discord() -> None:
     """
     inicio = time.monotonic()
     try:
+        print('[RUNTIME] Inicializando Discord via bot.start(reconnect=True).', flush=True)
         await bot.start(DISCORD_TOKEN, reconnect=True)
     except asyncio.CancelledError:
         raise
@@ -40427,7 +40428,7 @@ async def main():
         print('❌ V74 DISCORD_TOKEN ausente. A Central permanecerá online para diagnóstico.', flush=True)
         await asyncio.Event().wait()
         return
-    print('✅ V74 supervisor ativo; conectando ao Discord.', flush=True)
+    print('✅ [RUNTIME] Supervisor ativo; conectando ao Discord.', flush=True)
     heartbeat = asyncio.create_task(_v74_heartbeat(), name='dicor-v74-heartbeat')
     try:
         await _v74_supervisionar_discord()
@@ -56248,18 +56249,13 @@ async def _v127_setup_hook(self) -> None:
     except Exception:
         pass
     try:
-        import interaction_audit as _dicor_interaction_audit
-        resumo = _dicor_interaction_audit.audit_file(BASE_DIR / 'bot.py').summary()
         print(
-            '[INTERACTION AUDIT] '
-            f"commands={resumo.get('commands')} views={resumo.get('views')} "
-            f"persistent_views={resumo.get('persistent_views')} buttons={resumo.get('buttons')} "
-            f"selects={resumo.get('selects')} modals={resumo.get('modals')} "
-            f"custom_ids={resumo.get('custom_ids')}",
+            '[RUNTIME] Startup de interações concluído sem auditoria pesada no setup_hook. '
+            'Use interaction_audit.py em testes/diagnóstico offline.',
             flush=True,
         )
     except Exception as erro:
-        print(f'⚠️ INTERACTION AUDIT startup indisponível: {type(erro).__name__}: {erro}', flush=True)
+        print(f'⚠️ [RUNTIME] Log de startup de interações falhou: {type(erro).__name__}: {erro}', flush=True)
 
 
 discord.ui.View.on_error = _v127_view_on_error
@@ -56271,5 +56267,64 @@ bot.setup_hook = _v12_types.MethodType(_v127_setup_hook, bot)
 print('✅ V127 carregada — auditoria operacional de interações, ACK seguro e painel de tarefas V122 endurecido.', flush=True)
 
 
+_RUNTIME_PROCESS_STARTED_AT = time.monotonic()
+
+
+@bot.listen('on_ready')
+async def _runtime_discord_ready_log() -> None:
+    try:
+        usuario = str(getattr(bot, 'user', '') or 'desconhecido')
+        guilds = len(list(getattr(bot, 'guilds', []) or []))
+        latencia = round(float(getattr(bot, 'latency', 0.0) or 0.0) * 1000)
+        print(f'[DISCORD] READY — usuário={usuario} guilds={guilds} latency_ms={latencia}', flush=True)
+        print('[RUNTIME] Bot READY — processo principal permanecendo ativo.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ [DISCORD] READY log falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+@bot.listen('on_disconnect')
+async def _runtime_discord_disconnect_log() -> None:
+    try:
+        print('[DISCORD] desconectado — discord.py deve reconectar automaticamente; supervisor continua ativo.', flush=True)
+    except Exception:
+        pass
+
+
+@bot.listen('on_resumed')
+async def _runtime_discord_resumed_log() -> None:
+    try:
+        print('[DISCORD] conexão resumida — gateway ativo novamente.', flush=True)
+    except Exception:
+        pass
+
+
+async def _runtime_lifecycle_entrypoint() -> None:
+    """Entrypoint real de produção: nunca permite saída normal silenciosa.
+
+    Um bot Discord long-running só deve encerrar por SIGTERM/SIGINT ou por falha
+    explícita. Se `main()` retornar, Railway marcaria o deploy como COMPLETED;
+    isso é tratado como erro fatal para acionar restart por ON_FAILURE.
+    """
+    print(f'[RUNTIME] Processo principal iniciado pid={os.getpid()} arquivo={Path(__file__).name}', flush=True)
+    print('[RUNTIME] Inicializando web server e supervisor Discord via main().', flush=True)
+    inicio = time.monotonic()
+    try:
+        await main()
+    except asyncio.CancelledError:
+        print('[RUNTIME] Shutdown solicitado por cancelamento do event loop.', flush=True)
+        raise
+    except KeyboardInterrupt:
+        print('[RUNTIME] Shutdown solicitado por KeyboardInterrupt.', flush=True)
+        raise
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'[RUNTIME] EXCEPTION no processo principal: {type(erro).__name__}: {erro}', flush=True)
+        raise
+    duracao = time.monotonic() - inicio
+    mensagem = f'[RUNTIME] MAIN LOOP EXITING — isto não deveria ocorrer. main() retornou após {duracao:.1f}s.'
+    print(mensagem, flush=True)
+    raise RuntimeError(mensagem)
+
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(_runtime_lifecycle_entrypoint())
