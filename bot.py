@@ -51950,6 +51950,14 @@ def _v118_marcar_mesa_nova(canal_id: int) -> bool:
     return alterou
 
 def _v122_mesa_tarefas_habilitada(canal_id: int) -> bool:
+    """Retorna True SOMENTE para mesas que já possuem o sistema de tarefas.
+
+    Regra de compatibilidade:
+    - marcador tarefas_mesas_v122=True continua sendo a fonte principal;
+    - se uma mesa já possui registros reais em tarefas_guiadas (cards com mensagem/tópico),
+      ela também é considerada habilitada. Isso permite aplicar correções em mesas já
+      abertas que JÁ TÊM tarefas, sem criar tarefas em mesas legadas antigas.
+    """
     alvo = int(canal_id or 0)
     if not alvo:
         return False
@@ -51959,7 +51967,26 @@ def _v122_mesa_tarefas_habilitada(canal_id: int) -> bool:
                 continue
             if int(mesa.get('canal_id') or 0) != alvo:
                 continue
-            return bool(mesa.get(_V122_TAREFAS_MESAS_MARCADOR) is True)
+            if mesa.get(_V122_TAREFAS_MESAS_MARCADOR) is True:
+                return True
+            break
+    except Exception:
+        traceback.print_exc()
+
+    # Fallback seguro: NÃO cria estado e NÃO publica tarefas. Só reconhece uma mesa
+    # que já tem cards persistidos no estado da investigação guiada.
+    try:
+        estado = _v116_estado(alvo, False)
+        if not isinstance(estado, dict):
+            return False
+        tarefas = estado.get('tarefas_guiadas')
+        if not isinstance(tarefas, dict) or not tarefas:
+            return False
+        for reg in tarefas.values():
+            if not isinstance(reg, dict):
+                continue
+            if int(reg.get('mensagem_id') or 0) and int(reg.get('topico_id') or 0):
+                return True
     except Exception:
         traceback.print_exc()
     return False
@@ -56733,6 +56760,219 @@ async def _runtime_lifecycle_entrypoint() -> None:
     print(mensagem, flush=True)
     raise RuntimeError(mensagem)
 
+
+
+
+# =====================================================
+# COMPAT — MESAS JÁ ABERTAS QUE JÁ POSSUEM TAREFAS
+# =====================================================
+# Este bloco NÃO marca mesas antigas, NÃO chama _v122_marcar_mesa_nova e NÃO cria
+# nenhum card novo. Ele só corrige/atualiza mesas em que tarefas_guiadas já existem.
+
+async def _compat_card_tarefa_existente(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> bool:
+    """Atualiza apenas um card que já existe; nunca cria tarefa nova."""
+    try:
+        tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+        reg = tarefas.get(f'{int(item)}:{int(etapa)}') if isinstance(tarefas, dict) else None
+        if not isinstance(reg, dict):
+            return False
+        mid = int(reg.get('mensagem_id') or 0)
+        tid = int(reg.get('topico_id') or 0)
+        if not mid or not tid:
+            return False
+        topico = canal.guild.get_thread(tid) if canal.guild else None
+        if topico is None and canal.guild:
+            try:
+                fetched = await canal.guild.fetch_channel(tid)
+                topico = fetched if isinstance(fetched, discord.Thread) else None
+            except Exception:
+                topico = None
+        if not isinstance(topico, discord.Thread):
+            return False
+        try:
+            mensagem = await topico.fetch_message(mid)
+        except Exception:
+            return False
+        texto = _v122_texto_tarefa_guiada(canal, estado, int(item), int(etapa))
+        await mensagem.edit(content=texto, view=V122TarefaGuiadaView())
+        return True
+    except Exception as erro:
+        print(f'⚠️ [COMPAT-TAREFAS] falha ao atualizar card existente mesa={getattr(canal, "id", 0)} item={item}: {type(erro).__name__}: {erro}', flush=True)
+        return False
+
+
+def _compat_registro_tarefa(estado: Dict[str, Any], item: int, etapa: int) -> Optional[Dict[str, Any]]:
+    tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+    reg = tarefas.get(f'{int(item)}:{int(etapa)}') if isinstance(tarefas, dict) else None
+    return reg if isinstance(reg, dict) else None
+
+
+async def _compat_recuperar_resumo_informante_pos_etapa2(canal: discord.TextChannel, estado: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str, int]:
+    """Recupera somente material enviado DEPOIS que a Etapa 2 do Informante foi liberada."""
+    reg = _compat_registro_tarefa(estado, 12, 2)
+    if not isinstance(reg, dict):
+        return [], '', 0
+    tid = int(reg.get('topico_id') or 0)
+    mid_etapa2 = int(reg.get('mensagem_id') or 0)
+    if not tid or not mid_etapa2:
+        return [], '', 0
+    topico = canal.guild.get_thread(tid) if canal.guild else None
+    if topico is None and canal.guild:
+        try:
+            fetched = await canal.guild.fetch_channel(tid)
+            topico = fetched if isinstance(fetched, discord.Thread) else None
+        except Exception:
+            topico = None
+    if not isinstance(topico, discord.Thread):
+        return [], '', 0
+
+    imagens: List[Dict[str, Any]] = []
+    texto = ''
+    ultima_msg = 0
+    try:
+        # IDs do Discord são cronológicos. Filtrar por ID impede que foto/documento da
+        # Etapa 1 seja confundido com o resumo da Etapa 2.
+        async for msg in topico.history(limit=200, oldest_first=True):
+            if int(getattr(msg, 'id', 0) or 0) <= mid_etapa2:
+                continue
+            if getattr(getattr(msg, 'author', None), 'bot', False):
+                continue
+            imgs = _v116_imagens(msg)
+            conteudo = str(getattr(msg, 'content', '') or '').strip()
+            if imgs:
+                imagens = _v116_adicionar_unicos(imagens, imgs)
+            if conteudo:
+                texto = conteudo[:3500]
+            if imgs or conteudo:
+                ultima_msg = int(getattr(msg, 'id', 0) or 0)
+    except Exception as erro:
+        print(f'⚠️ [COMPAT-TAREFAS] histórico Informante 2/2 falhou mesa={canal.id}: {type(erro).__name__}: {erro}', flush=True)
+    return imagens, texto, ultima_msg
+
+
+async def _compat_salvar_resumo_informante(canal: discord.TextChannel, estado: Dict[str, Any], *, imagens: List[Dict[str, Any]], texto: str='', mensagem_id: int=0) -> bool:
+    if not imagens and not str(texto or '').strip():
+        return False
+    dados = estado.setdefault('dados', {})
+    antes_imgs = len(list(dados.get('informante_resumo_fotos') or []))
+    antes_txt = str(dados.get('informante_resumo') or '')
+    if imagens:
+        dados['informante_resumo_fotos'] = _v116_adicionar_unicos(
+            list(dados.get('informante_resumo_fotos') or []), imagens
+        )
+    if str(texto or '').strip():
+        dados['informante_resumo'] = str(texto).strip()[:3500]
+    if mensagem_id:
+        dados['informante_resumo_mensagem_id'] = int(mensagem_id)
+    estado['dados'] = dados
+    _v116_gravar_estado(estado)
+    mudou = len(list(dados.get('informante_resumo_fotos') or [])) != antes_imgs or str(dados.get('informante_resumo') or '') != antes_txt
+    return mudou
+
+
+@bot.listen('on_message')
+async def _compat_informante_existente_listener(msg: discord.Message) -> None:
+    """Garante Informante 2/2 em mesas já abertas que JÁ possuem tarefas V122."""
+    try:
+        if getattr(getattr(msg, 'author', None), 'bot', False) or msg.guild is None:
+            return
+        if not isinstance(msg.channel, discord.Thread):
+            return
+        canal = msg.channel.parent
+        if not isinstance(canal, discord.TextChannel):
+            return
+        if not _v122_mesa_tarefas_habilitada(int(canal.id)):
+            return
+        estado = _v116_estado(int(canal.id), False)
+        if not isinstance(estado, dict):
+            return
+        _v117_migrar_estado(estado)
+        if _v117_item_do_topico(msg.channel) != 12 or int(_v117_etapa_item(estado, 12)) != 2:
+            return
+        if not _v116_imagens(msg) and not str(getattr(msg, 'content', '') or '').strip():
+            return
+
+        lock = _v116_lock(int(canal.id))
+        adquirido = False
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=4.0)
+            adquirido = True
+            estado = _v116_estado(int(canal.id), False)
+            if not isinstance(estado, dict):
+                return
+            _v117_migrar_estado(estado)
+            ids = {int(x) for x in list(estado.get('mensagens_processadas') or []) if str(x).isdigit()}
+            if int(msg.id) in ids:
+                return
+            imagens = _v116_imagens(msg)
+            conteudo = str(getattr(msg, 'content', '') or '').strip()
+            await _compat_salvar_resumo_informante(canal, estado, imagens=imagens, texto=conteudo, mensagem_id=int(msg.id))
+            _v116_registrar_mensagem(estado, int(msg.id))
+            _v116_gravar_estado(estado)
+        finally:
+            if adquirido and lock.locked():
+                lock.release()
+
+        await _compat_card_tarefa_existente(canal, estado, 12, 2)
+        formato = 'imagem/print' if _v116_imagens(msg) and not str(getattr(msg, 'content', '') or '').strip() else ('texto + imagem/print' if _v116_imagens(msg) else 'texto')
+        await _v116_responder(msg, f'✅ Resumo do informante registrado em **{formato}**. Use **Finalizar tarefa** para enviar à conclusão do Inspetor+.')
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'❌ COMPAT Informante 2/2 falhou: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+
+
+@bot.listen('on_ready')
+async def _compat_reconciliar_mesas_ja_com_tarefas() -> None:
+    """Aplica as novas regras apenas a mesas que já possuem cards de tarefa."""
+    await asyncio.sleep(2.0)
+    recuperadas = 0
+    atualizadas = 0
+    try:
+        for guild in list(getattr(bot, 'guilds', []) or []):
+            for mesa in carregar_mesas() or []:
+                if not isinstance(mesa, dict):
+                    continue
+                cid = int(mesa.get('canal_id') or 0)
+                if not cid or not _v122_mesa_tarefas_habilitada(cid):
+                    continue
+                estado = _v116_estado(cid, False)
+                if not isinstance(estado, dict):
+                    continue
+                tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+                if not tarefas:
+                    continue  # proteção absoluta: mesa legada sem tarefa fica intocada
+                canal = guild.get_channel(cid)
+                if not isinstance(canal, discord.TextChannel):
+                    continue
+                _v117_migrar_estado(estado)
+                if str(estado.get('status') or '').upper() != 'CONCLUIDA':
+                    estado['status'] = 'ATIVA'
+
+                # Regras visuais novas em cards existentes, sem criar qualquer card.
+                if _compat_registro_tarefa(estado, 3, _v117_etapa_item(estado, 3)):
+                    if await _compat_card_tarefa_existente(canal, estado, 3, _v117_etapa_item(estado, 3)):
+                        atualizadas += 1
+                etapa12 = int(_v117_etapa_item(estado, 12))
+                if _compat_registro_tarefa(estado, 12, etapa12):
+                    # Se Etapa 2 já estava aberta antes do deploy, recupera print/texto já enviado.
+                    if etapa12 == 2 and _v117_faltando_item(estado, 12, 2):
+                        imgs, txt, mid = await _compat_recuperar_resumo_informante_pos_etapa2(canal, estado)
+                        if imgs or txt:
+                            if await _compat_salvar_resumo_informante(canal, estado, imagens=imgs, texto=txt, mensagem_id=mid):
+                                recuperadas += 1
+                    if await _compat_card_tarefa_existente(canal, estado, 12, etapa12):
+                        atualizadas += 1
+                _v116_gravar_estado(estado)
+        print(f'✅ [COMPAT-TAREFAS] mesas já com tarefas reconciliadas: cards_atualizados={atualizadas} informantes_recuperados={recuperadas}; nenhuma mesa legada recebeu tarefa nova.', flush=True)
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'❌ [COMPAT-TAREFAS] reconciliação falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+print('✅ COMPAT TAREFAS EXISTENTES carregado — novas regras aplicadas a mesas que JÁ possuem tarefas; mesas legadas sem tarefas continuam intocadas.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
