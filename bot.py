@@ -62079,5 +62079,654 @@ print(
 )
 
 
+# =====================================================
+# V136 — RECONHECIMENTO PRISIONAL ROBUSTO
+# SOMENTE busca visual. Mesa/Dossiê V133 permanecem intocados.
+# Objetivo principal: se a foto consultada veio do histórico prisional,
+# localizar primeiro a própria referência (mesmo recortada/comprimida),
+# e só depois usar roupa/aparência como fallback.
+# =====================================================
+
+VISUAL_SEARCH_ENGINE_VERSION = 136
+VISUAL_SEARCH_ENGINE_LABEL = 'V136 prison-first + geometria local + roupa segmentada'
+VISUAL_SEARCH_TOP_K = max(1, min(3, env_int('VISUAL_SEARCH_TOP_K', 2)))
+VISUAL_SEARCH_MIN_SCORE_FULL = max(58.0, min(94.0, env_float('VISUAL_SEARCH_MIN_SCORE_FULL', 70.0)))
+VISUAL_SEARCH_MIN_SCORE_ROUPA = max(60.0, min(94.0, env_float('VISUAL_SEARCH_MIN_SCORE_ROUPA', 72.0)))
+VISUAL_SEARCH_STRICT = True
+V136_DIRECT_PRISON_THRESHOLD = max(68.0, min(98.0, env_float('VISUAL_DIRECT_PRISON_THRESHOLD', 78.0)))
+V136_DIRECT_UNIQUE_THRESHOLD = max(75.0, min(99.0, env_float('VISUAL_DIRECT_UNIQUE_THRESHOLD', 86.0)))
+
+
+def _v136_is_prison_source(entry: Dict[str, Any]) -> bool:
+    s=normalizar_busca(f"{entry.get('source','')} {entry.get('description','')} {entry.get('path','')}")
+    return any(k in s for k in ('historico prisao','historico_prisao','prisional','foto individuo','foto_individuo'))
+
+
+def _v136_core_region(region: Any, kind: str='upper'):
+    if region is None or getattr(region,'size',0)==0:
+        return region
+    if kind=='upper':
+        return _v134_crop(region,0.18,0.10,0.82,0.90)
+    if kind=='lower':
+        return _v134_crop(region,0.18,0.05,0.82,0.95)
+    if kind=='head':
+        return _v134_crop(region,0.10,0.02,0.90,0.92)
+    return _v134_crop(region,0.08,0.04,0.92,0.98)
+
+
+def _v136_norm_gray(region: Any):
+    if region is None or getattr(region,'size',0)==0 or _v134_np is None:
+        return None
+    try:
+        gray=_v134_gray(region)
+        if _v134_cv2 is not None:
+            gray=_v134_cv2.resize(gray,(96,144),interpolation=_v134_cv2.INTER_AREA)
+            clahe=_v134_cv2.createCLAHE(clipLimit=1.6,tileGridSize=(6,6))
+            gray=clahe.apply(gray)
+        else:
+            gray=gray[:144,:96]
+        return gray.astype(_v134_np.uint8,copy=False)
+    except Exception:
+        return None
+
+
+def _v136_ncc_similarity(a: Any,b: Any)->float:
+    if _v134_np is None or a is None or b is None:
+        return 0.0
+    try:
+        aa=_v134_np.asarray(a,dtype=_v134_np.float32); bb=_v134_np.asarray(b,dtype=_v134_np.float32)
+        if aa.shape!=bb.shape or aa.size<64:return 0.0
+        aa=aa-aa.mean(); bb=bb-bb.mean()
+        den=float(_v134_np.linalg.norm(aa)*_v134_np.linalg.norm(bb))
+        if den<=1e-9:return 0.0
+        corr=float((aa*bb).sum()/den)
+        return max(0.0,min(100.0,(corr+0.12)/1.12*100.0))
+    except Exception:return 0.0
+
+
+def _v136_akaze_signature(region: Any)->Dict[str,Any]:
+    if _v134_cv2 is None or _v134_np is None or region is None or getattr(region,'size',0)==0:
+        return {'points':None,'desc':None,'count':0}
+    try:
+        gray=_v134_gray(region)
+        h,w=gray.shape[:2]
+        scale=min(1.0,520.0/max(h,w))
+        if scale<0.999:
+            gray=_v134_cv2.resize(gray,(max(80,int(w*scale)),max(100,int(h*scale))),interpolation=_v134_cv2.INTER_AREA)
+        clahe=_v134_cv2.createCLAHE(clipLimit=1.8,tileGridSize=(8,8)); gray=clahe.apply(gray)
+        det=_v134_cv2.AKAZE_create(threshold=0.0009,nOctaves=4,nOctaveLayers=4)
+        kp,desc=det.detectAndCompute(gray,None)
+        if desc is None or not kp:return {'points':None,'desc':None,'count':0}
+        ordem=sorted(range(len(kp)),key=lambda i:float(kp[i].response),reverse=True)[:260]
+        pts=_v134_np.asarray([kp[i].pt for i in ordem],dtype=_v134_np.float32)
+        desc=_v134_np.asarray([desc[i] for i in ordem],dtype=_v134_np.uint8)
+        return {'points':pts,'desc':desc,'count':int(len(desc))}
+    except Exception:return {'points':None,'desc':None,'count':0}
+
+
+def _v136_geom_similarity(a:Dict[str,Any],b:Dict[str,Any])->Dict[str,float]:
+    if _v134_cv2 is None or _v134_np is None:return {'score':0.0,'matches':0.0,'inlier_ratio':0.0}
+    da=a.get('desc'); db=b.get('desc'); pa=a.get('points'); pb=b.get('points')
+    if da is None or db is None or pa is None or pb is None:return {'score':0.0,'matches':0.0,'inlier_ratio':0.0}
+    try:
+        da=_v134_np.asarray(da,dtype=_v134_np.uint8); db=_v134_np.asarray(db,dtype=_v134_np.uint8)
+        pa=_v134_np.asarray(pa,dtype=_v134_np.float32); pb=_v134_np.asarray(pb,dtype=_v134_np.float32)
+        if len(da)<6 or len(db)<6:return {'score':0.0,'matches':0.0,'inlier_ratio':0.0}
+        matcher=_v134_cv2.BFMatcher(_v134_cv2.NORM_HAMMING,crossCheck=False)
+        pares=matcher.knnMatch(da,db,k=2)
+        good=[]
+        for pair in pares:
+            if len(pair)>=2:
+                m,n=pair[:2]
+                if m.distance<0.76*n.distance and m.distance<92:
+                    good.append(m)
+        if len(good)<4:
+            return {'score':min(28.0,len(good)*5.0),'matches':float(len(good)),'inlier_ratio':0.0}
+        src=_v134_np.float32([pa[m.queryIdx] for m in good]).reshape(-1,1,2)
+        dst=_v134_np.float32([pb[m.trainIdx] for m in good]).reshape(-1,1,2)
+        mask=None
+        if len(good)>=5:
+            try:
+                _,mask=_v134_cv2.findHomography(src,dst,_v134_cv2.RANSAC,5.0)
+            except Exception:mask=None
+        inliers=int(mask.ravel().sum()) if mask is not None else 0
+        ratio=float(inliers/max(1,len(good))) if mask is not None else 0.0
+        count_score=min(1.0,len(good)/30.0)
+        inlier_score=min(1.0,inliers/20.0)
+        dist_quality=max(0.0,1.0-(sum(float(m.distance) for m in good)/len(good))/128.0)
+        score=(0.30*count_score+0.42*ratio+0.18*inlier_score+0.10*dist_quality)*100.0
+        if inliers>=12 and ratio>=0.42:score=max(score,82.0+min(12.0,(inliers-12)*0.7))
+        elif inliers>=8 and ratio>=0.36:score=max(score,70.0+min(10.0,(inliers-8)*1.1))
+        return {'score':float(max(0.0,min(100.0,score))),'matches':float(len(good)),'inlier_ratio':float(ratio*100.0),'inliers':float(inliers)}
+    except Exception:return {'score':0.0,'matches':0.0,'inlier_ratio':0.0}
+
+
+def _v136_feature_candidate(nome:str,crop:Any,qualidade:float)->Dict[str,Any]:
+    base=_v135_feature_candidate(nome,crop,qualidade)
+    full=_v134_region(crop,'full'); upper=_v134_region(crop,'upper'); lower=_v134_region(crop,'lower')
+    upper_core=_v136_core_region(upper,'upper'); lower_core=_v136_core_region(lower,'lower')
+    base.update({
+        'v136_upper_core':_v135_color_vector(upper_core,remove_skin=True),
+        'v136_lower_core':_v135_color_vector(lower_core,remove_skin=True),
+        'v136_upper_grid':_v134_grid_color(upper_core,gx=3,gy=3),
+        'v136_lower_grid':_v134_grid_color(lower_core,gx=3,gy=2),
+        'v136_norm_gray':_v136_norm_gray(full),
+        'v136_akaze':_v136_akaze_signature(full),
+    })
+    return base
+
+
+def _v136_features(img:Any)->Dict[str,Any]:
+    candidatos=[]
+    # detector real sempre primeiro; os demais só servem como fallback.
+    for nome,crop,qualidade in _v134_candidate_crops(img):
+        try:candidatos.append(_v136_feature_candidate(nome,crop,qualidade))
+        except Exception:continue
+    return {'candidates':candidatos,'shape':tuple(int(x) for x in img.shape[:2])}
+
+
+def _v136_direct_pair(q:Dict[str,Any],r:Dict[str,Any])->Dict[str,float]:
+    geom=_v136_geom_similarity(dict(q.get('v136_akaze') or {}),dict(r.get('v136_akaze') or {}))
+    ncc=_v136_ncc_similarity(q.get('v136_norm_gray'),r.get('v136_norm_gray'))
+    phash=_v135_hash_similarity(int(q.get('v135_phash') or 0),int(r.get('v135_phash') or 0))
+    up=_v135_color_similarity(dict(q.get('v136_upper_core') or {}),dict(r.get('v136_upper_core') or {}))
+    grid=_v134_grid_sim(q.get('v136_upper_grid'),r.get('v136_upper_grid'))
+    g=float(geom.get('score') or 0)
+    score=0.62*g+0.12*ncc+0.10*phash+0.10*up+0.06*grid
+    if g>=86 and float(geom.get('inlier_ratio') or 0)>=42:score=max(score,92.0)
+    elif g>=76 and up>=55:score=max(score,84.0)
+    elif phash>=92 and ncc>=72 and up>=65:score=max(score,86.0)
+    return {'score':float(max(0,min(100,score))),'geom':g,'ncc':float(ncc),'phash':float(phash),'upper':float(up),'grid':float(grid),'matches':float(geom.get('matches') or 0),'inlier_ratio':float(geom.get('inlier_ratio') or 0)}
+
+
+def _v136_direct_features(qf:Dict[str,Any],rf:Dict[str,Any])->Dict[str,float]:
+    best={'score':0.0,'geom':0.0,'ncc':0.0,'phash':0.0,'upper':0.0,'grid':0.0,'matches':0.0,'inlier_ratio':0.0}
+    for q in list(qf.get('candidates') or []):
+        for r in list(rf.get('candidates') or []):
+            d=_v136_direct_pair(q,r)
+            # evita um crop lateral ruim superar um detector real por acidente.
+            qual=min(float(q.get('quality') or 1.0),float(r.get('quality') or 1.0))
+            d['score']*=0.94+0.06*qual
+            if d['score']>best['score']:best=d
+    return best
+
+
+def _v136_color_family(name:str)->str:
+    n=str(name or '')
+    if n in {'preto'}:return 'dark'
+    if n in {'cinza'}:return 'gray'
+    if n in {'branco'}:return 'light'
+    if n in {'marrom/bege','laranja','amarelo'}:return 'warm'
+    if n in {'vermelho','rosa'}:return 'red'
+    if n in {'azul','ciano'}:return 'blue'
+    if n in {'verde'}:return 'green'
+    if n in {'roxo'}:return 'purple'
+    return n
+
+
+def _v136_compare_candidate(q:Dict[str,Any],r:Dict[str,Any],mode:str)->Dict[str,Any]:
+    qu=dict(q.get('v136_upper_core') or q.get('v135_upper_color') or {}); ru=dict(r.get('v136_upper_core') or r.get('v135_upper_color') or {})
+    ql=dict(q.get('v136_lower_core') or q.get('v135_lower_color') or {}); rl=dict(r.get('v136_lower_core') or r.get('v135_lower_color') or {})
+    up=_v135_color_similarity(qu,ru); low=_v135_color_similarity(ql,rl)
+    up_grid=_v134_grid_sim(q.get('v136_upper_grid'),r.get('v136_upper_grid'))
+    low_grid=_v134_grid_sim(q.get('v136_lower_grid'),r.get('v136_lower_grid'))
+    style=_v135_style_similarity(dict(q.get('v135_style') or {}),dict(r.get('v135_style') or {}))
+    texture=0.58*_v134_hist_intersection(q.get('upper_lbp'),r.get('upper_lbp'))+0.42*_v134_cos(q.get('upper_hog'),r.get('upper_hog'))
+    silhouette=_v134_cos(q.get('full_hog'),r.get('full_hog'))
+    hair=_v135_hair_similarity(dict(q.get('v135_hair') or {}),dict(r.get('v135_hair') or {}))
+    skin=_v135_skin_similarity(dict(q.get('v135_skin') or {}),dict(r.get('v135_skin') or {}))
+    head_texture=0.55*_v134_hist_intersection(q.get('head_lbp'),r.get('head_lbp'))+0.45*_v134_cos(q.get('head_hog'),r.get('head_hog'))
+    direct=_v136_direct_pair(q,r)
+    clothing=0.31*up+0.12*low+0.18*up_grid+0.08*low_grid+0.14*style+0.09*texture+0.08*silhouette
+    appearance=0.38*hair+0.18*skin+0.24*head_texture+0.20*silhouette
+    is_clothing=str(mode or '').lower() in {'roupa','clothing'}
+    score=(0.84*clothing+0.10*direct['score']+0.06*appearance) if is_clothing else (0.72*clothing+0.16*direct['score']+0.12*appearance)
+    hard_pass=True; penalties=[]
+    qconf=float(qu.get('confidence') or 0); rconf=float(ru.get('confidence') or 0)
+    qdom=str(qu.get('dominant') or ''); rdom=str(ru.get('dominant') or '')
+    if min(qconf,rconf)>=0.34:
+        fq,fr=_v136_color_family(qdom),_v136_color_family(rdom)
+        # preto x branco/cores claras deve eliminar; famílias vizinhas apenas penalizam.
+        incompatible={( 'dark','light'),('light','dark'),('dark','warm'),('warm','dark')}
+        if (fq,fr) in incompatible and up<54 and direct['score']<75:
+            hard_pass=False; penalties.append('cor principal da roupa incompatível')
+        elif fq!=fr and up<58:
+            score*=0.82; penalties.append('cor principal pouco compatível')
+    qstyle=dict(q.get('v135_style') or {}); rstyle=dict(r.get('v135_style') or {})
+    if str(qstyle.get('brightness') or '') and str(rstyle.get('brightness') or ''):
+        if {str(qstyle.get('brightness')),str(rstyle.get('brightness'))}=={'escura','clara'} and direct['score']<80:
+            score*=0.74; penalties.append('luminosidade da roupa oposta')
+    if str(qstyle.get('sleeves') or '')!=str(rstyle.get('sleeves') or '') and style<52:
+        score*=0.86; penalties.append('manga/cobertura diferente')
+    # correspondência geométrica forte da própria foto sempre vence filtros cosméticos.
+    if direct['score']>=V136_DIRECT_PRISON_THRESHOLD:
+        hard_pass=True; score=max(score,0.91*direct['score']+0.09*clothing)
+    quality=min(float(q.get('quality') or 1.0),float(r.get('quality') or 1.0)); score*=0.94+0.06*quality
+    return {
+        'score':float(max(0,min(100,score))),'clothing':float(clothing),'appearance':float(appearance),'accessory':float(direct['score']),
+        'upper_color':float(up),'lower_color':float(low),'upper_grid':float(up_grid),'lower_grid':float(low_grid),'style':float(style),'hair':float(hair),'skin':float(skin),
+        'texture':float(texture),'silhouette':float(silhouette),'phash':float(direct['phash']),'direct':float(direct['score']),'geom':float(direct['geom']),'ncc':float(direct['ncc']),
+        'local_matches':float(direct['matches']),'inlier_ratio':float(direct['inlier_ratio']),'hard_pass':bool(hard_pass),'penalties':penalties,
+        'query_profile':{'upper':qu,'lower':ql,'hair':dict(q.get('v135_hair') or {}),'skin':dict(q.get('v135_skin') or {}),'style':qstyle},
+        'ref_profile':{'upper':ru,'lower':rl,'hair':dict(r.get('v135_hair') or {}),'skin':dict(r.get('v135_skin') or {}),'style':rstyle},
+    }
+
+
+def _v136_compare_features(qf:Dict[str,Any],rf:Dict[str,Any],mode:str)->Dict[str,Any]:
+    best={'score':0.0,'hard_pass':False,'direct':0.0}
+    for q in list(qf.get('candidates') or []):
+        for r in list(rf.get('candidates') or []):
+            c=_v136_compare_candidate(q,r,mode)
+            if c['score']>float(best.get('score') or 0):best=c
+    return best
+
+
+def _v136_explanations(c:Dict[str,Any])->List[str]:
+    out=[]
+    if float(c.get('direct') or 0)>=86:out.append('forte correspondência com foto histórica/prisional')
+    elif float(c.get('geom') or 0)>=72:out.append('detalhes locais da imagem coincidem geometricamente')
+    if float(c.get('upper_color') or 0)>=78:out.append('cor principal da roupa superior muito próxima')
+    if float(c.get('upper_grid') or 0)>=76:out.append('distribuição de cores da roupa semelhante')
+    if float(c.get('style') or 0)>=78:out.append('tipo/cobertura da roupa semelhante')
+    if float(c.get('hair') or 0)>=76:out.append('cabelo/região da cabeça semelhante')
+    if float(c.get('silhouette') or 0)>=72:out.append('silhueta semelhante')
+    return out[:4] or ['combinação parcial de roupa/aparência']
+
+
+class _V136VisualSearchIndex:
+    def __init__(self,root:Any):
+        self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
+        self.path=self.root/'index_v136.pkl.gz'; self.lock=_v134_threading.RLock()
+        self.data={'version':VISUAL_SEARCH_ENGINE_VERSION,'entries':{},'built_at':'','engine':VISUAL_SEARCH_ENGINE_LABEL}; self._loaded=False
+    def load(self):
+        with self.lock:
+            if self._loaded:return self.data
+            if self.path.exists():
+                try:
+                    with _v134_gzip.open(self.path,'rb') as f:obj=_v134_pickle.load(f)
+                    if isinstance(obj,dict) and int(obj.get('version') or 0)==VISUAL_SEARCH_ENGINE_VERSION:self.data=obj
+                except Exception:pass
+            self._loaded=True;return self.data
+    def _save(self):
+        tmp=self.path.with_suffix('.tmp.gz'); self.data['version']=VISUAL_SEARCH_ENGINE_VERSION;self.data['engine']=VISUAL_SEARCH_ENGINE_LABEL
+        self.data['built_at']=_banco_agora_iso() if '_banco_agora_iso' in globals() else agora_br()
+        with _v134_gzip.open(tmp,'wb',compresslevel=5) as f:_v134_pickle.dump(self.data,f,protocol=_v134_pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp,self.path)
+    def _fingerprint(self,path:str)->str:
+        try:
+            p=Path(path);st=p.stat();h=_v134_hashlib.sha1();h.update(f'{st.st_size}:{st.st_mtime_ns}'.encode())
+            with p.open('rb') as f:
+                h.update(f.read(65536));
+                if st.st_size>131072:f.seek(max(0,st.st_size-65536));h.update(f.read(65536))
+            return h.hexdigest()
+        except Exception:return ''
+    def _raw_sha1(self,path:str)->str:
+        try:
+            h=_v134_hashlib.sha1()
+            with Path(path).open('rb') as f:
+                while True:
+                    b=f.read(1024*1024)
+                    if not b:break
+                    h.update(b)
+            return h.hexdigest()
+        except Exception:return ''
+    def _extract_record(self,record:Dict[str,Any]):
+        path=str(record.get('path') or '').strip()
+        if not path or not Path(path).exists():return None
+        img=_v134_load_path(path)
+        if img is None:return None
+        features=_v136_features(img)
+        if not features.get('candidates'):return None
+        out=dict(record);out['features']=features;out['fingerprint']=self._fingerprint(path);out['raw_sha1']=self._raw_sha1(path)
+        out['source_priority']=_v134_source_priority(record);out['engine_version']=VISUAL_SEARCH_ENGINE_VERSION
+        return out
+    def build_or_update(self,records:List[Dict[str,Any]],prune:bool=False,progress_callback:Optional[Callable[[Dict[str,Any]],None]]=None):
+        self.load()
+        with self.lock:
+            entries=dict(self.data.get('entries') or {});atuais=set();stats={'indexed_images':0,'added':0,'updated':0,'skipped':0,'invalid':0,'errors':[],'prison_indexed':0};total=len(list(records or []))
+            for idx,record in enumerate(list(records or []),start=1):
+                image_id=str(record.get('image_id') or '').strip()
+                if not image_id:stats['invalid']+=1;continue
+                atuais.add(image_id);path=str(record.get('path') or '').strip();fp=self._fingerprint(path) if path else '';anterior=entries.get(image_id)
+                if anterior and fp and str(anterior.get('fingerprint') or '')==fp and int(anterior.get('engine_version') or 0)==VISUAL_SEARCH_ENGINE_VERSION:
+                    for k in ('rg','nome','individuo_id','registro_id','url','source','mime_type','description','path'):
+                        if k in record:anterior[k]=record.get(k)
+                    entries[image_id]=anterior;stats['skipped']+=1
+                else:
+                    try:
+                        novo=self._extract_record(record)
+                        if novo is None:stats['invalid']+=1
+                        else:entries[image_id]=novo;stats['updated' if anterior else 'added']+=1
+                    except Exception as e:
+                        stats['invalid']+=1
+                        if len(stats['errors'])<20:stats['errors'].append(f'{image_id}: {type(e).__name__}: {e}')
+                if progress_callback:
+                    try:progress_callback({'phase':'indexing_v136','current':idx,'total':total,**stats})
+                    except Exception:pass
+            if prune:
+                for key in list(entries):
+                    if key not in atuais:entries.pop(key,None)
+            self.data['entries']=entries;self._save();stats['indexed_images']=len(entries);stats['prison_indexed']=sum(1 for e in entries.values() if _v136_is_prison_source(e));stats['summary']=self.summary();return stats
+    def summary(self):
+        self.load();entries=list((self.data.get('entries') or {}).values());regs={int(e.get('registro_id') or e.get('individuo_id') or 0) for e in entries if int(e.get('registro_id') or e.get('individuo_id') or 0)}
+        try:size=self.path.stat().st_size if self.path.exists() else 0
+        except Exception:size=0
+        return {'entries':len(entries),'records':len(regs),'prison_entries':sum(1 for e in entries if _v136_is_prison_source(e)),'index_bytes':int(size),'version':VISUAL_SEARCH_ENGINE_VERSION,'engine':VISUAL_SEARCH_ENGINE_LABEL}
+    def search_bytes(self,image_bytes:bytes,mode:str='full',top_k:int=2):
+        self.load();raw=bytes(image_bytes or b'');img=_v134_decode_bytes(raw)
+        if img is None:return {'results':[],'reason':'imagem de consulta inválida','summary':self.summary()}
+        qf=_v136_features(img)
+        if not qf.get('candidates'):return {'results':[],'reason':'não foi possível localizar o personagem','summary':self.summary()}
+        qsha=_v134_hashlib.sha1(raw).hexdigest() if raw else ''
+        entries=list((self.data.get('entries') or {}).values())
+
+        # ETAPA 1 — match direto, priorizando histórico prisional.
+        direct_hits=[]
+        for e in entries:
+            iid=int(e.get('registro_id') or e.get('individuo_id') or 0)
+            if not iid or not isinstance(e.get('features'),dict):continue
+            if qsha and qsha==str(e.get('raw_sha1') or ''):
+                d={'score':100.0,'geom':100.0,'ncc':100.0,'phash':100.0,'upper':100.0,'grid':100.0,'matches':999.0,'inlier_ratio':100.0}
+            else:d=_v136_direct_features(qf,e['features'])
+            if _v136_is_prison_source(e) and float(d.get('score') or 0)>=V136_DIRECT_PRISON_THRESHOLD:
+                direct_hits.append((float(d['score']),e,d))
+        direct_hits.sort(key=lambda x:x[0],reverse=True)
+        if direct_hits:
+            por_iid={}
+            for score,e,d in direct_hits:
+                iid=int(e.get('registro_id') or e.get('individuo_id') or 0)
+                if iid not in por_iid:por_iid[iid]=(score,e,d)
+            hits=sorted(por_iid.values(),key=lambda x:x[0],reverse=True)
+            # match prisional robusto: retorna só candidatos realmente fortes.
+            result=[]
+            for score,e,d in hits[:2]:
+                result.append({'registro_id':int(e.get('registro_id') or e.get('individuo_id') or 0),'individuo_id':int(e.get('registro_id') or e.get('individuo_id') or 0),'rg':str(e.get('rg') or ''),'nome':str(e.get('nome') or 'Ficha sem nome'),'score':score,
+                    'clothing_score':float(d.get('upper') or 0),'appearance_score':float(d.get('geom') or 0),'accessory_score':float(d.get('ncc') or 0),'upper_color_score':float(d.get('upper') or 0),'lower_color_score':0.0,'style_score':0.0,'hair_score':0.0,'skin_score':0.0,'texture_score':float(d.get('grid') or 0),'silhouette_score':float(d.get('ncc') or 0),'phash_score':float(d.get('phash') or 0),'direct_score':score,'geom_score':float(d.get('geom') or 0),'local_matches':int(d.get('matches') or 0),'inlier_ratio':float(d.get('inlier_ratio') or 0),'matches_count':1,'direct_prison':True,
+                    'explanations':['correspondência direta com foto do histórico prisional','geometria/local features conferidas'],'best_image':{k:e.get(k) for k in ('image_id','path','url','source','description')},'query_profile':_v135_query_profile(qf),'ref_profile':_v135_query_profile(e['features']),'penalties':[]})
+            if len(result)>1 and (result[0]['score']>=V136_DIRECT_UNIQUE_THRESHOLD and result[0]['score']-result[1]['score']>=7):result=result[:1]
+            return {'results':result,'reason':'','warning':'Correspondência prisional direta encontrada antes da busca por atributos.','summary':self.summary(),'threshold':V136_DIRECT_PRISON_THRESHOLD,'engine':VISUAL_SEARCH_ENGINE_LABEL,'query_profile':_v135_query_profile(qf),'direct_mode':True}
+
+        # ETAPA 2 — roupa/aparência estrita, somente quando não existe match prisional direto.
+        por={}
+        for e in entries:
+            iid=int(e.get('registro_id') or e.get('individuo_id') or 0)
+            if not iid or not isinstance(e.get('features'),dict):continue
+            c=_v136_compare_features(qf,e['features'],mode)
+            pri=float(e.get('source_priority') or _v134_source_priority(e));c['score']*=0.96+0.04*max(0.35,min(1.0,pri))
+            por.setdefault(iid,[]).append({'entry':e,'comp':c})
+        limiar=VISUAL_SEARCH_MIN_SCORE_ROUPA if str(mode or '').lower() in {'roupa','clothing'} else VISUAL_SEARCH_MIN_SCORE_FULL
+        resultados=[]
+        for iid,itens in por.items():
+            itens.sort(key=lambda x:float(x['comp'].get('score') or 0),reverse=True);best=itens[0];c=best['comp'];e=best['entry']
+            if not bool(c.get('hard_pass')):continue
+            score=float(c.get('score') or 0)
+            if score<limiar:continue
+            resultados.append({'registro_id':iid,'individuo_id':iid,'rg':str(e.get('rg') or ''),'nome':str(e.get('nome') or 'Ficha sem nome'),'score':score,
+                'clothing_score':float(c.get('clothing') or 0),'appearance_score':float(c.get('appearance') or 0),'accessory_score':float(c.get('direct') or 0),'upper_color_score':float(c.get('upper_color') or 0),'lower_color_score':float(c.get('lower_color') or 0),'style_score':float(c.get('style') or 0),'hair_score':float(c.get('hair') or 0),'skin_score':float(c.get('skin') or 0),'texture_score':float(c.get('texture') or 0),'silhouette_score':float(c.get('silhouette') or 0),'phash_score':float(c.get('phash') or 0),'direct_score':float(c.get('direct') or 0),'geom_score':float(c.get('geom') or 0),'local_matches':int(c.get('local_matches') or 0),'inlier_ratio':float(c.get('inlier_ratio') or 0),'matches_count':len(itens),'direct_prison':False,'explanations':_v136_explanations(c),'best_image':{k:e.get(k) for k in ('image_id','path','url','source','description')},'query_profile':dict(c.get('query_profile') or {}),'ref_profile':dict(c.get('ref_profile') or {}),'penalties':list(c.get('penalties') or [])})
+        resultados.sort(key=lambda x:float(x.get('score') or 0),reverse=True)
+        # Não mostrar resultados ambíguos/fracos só para preencher lista.
+        if resultados:
+            first=float(resultados[0]['score']);
+            if len(resultados)>1 and first>=82 and first-float(resultados[1]['score'])>=8:resultados=resultados[:1]
+            else:resultados=resultados[:max(1,min(2,int(top_k or 2)))]
+        qp=_v135_query_profile(qf);reason='' if resultados else f'nenhuma ficha passou pelos filtros estritos (mínimo {limiar:.0f}%) e nenhum histórico prisional teve correspondência direta'
+        return {'results':resultados,'reason':reason,'warning':'','summary':self.summary(),'threshold':limiar,'engine':VISUAL_SEARCH_ENGINE_LABEL,'query_profile':qp,'direct_mode':False}
+
+
+# módulo visual final V136
+_v136_mod=_v134_types.ModuleType('visual_search')
+_v136_mod.VisualSearchIndex=_V136VisualSearchIndex
+_v136_mod.is_supported_visual_file=_v134_visual_supported
+_v136_mod.format_index_size=_v134_visual_format_size
+_v136_mod.can_rebuild_visual_index=_v134_visual_can_rebuild
+_v134_sys.modules['visual_search']=_v136_mod
+
+
+def _v124_visual_embed_resultados(resultado:Dict[str,Any],modo_label:str)->discord.Embed:
+    resultados=list(resultado.get('results') or []);resumo=dict(resultado.get('summary') or {});qp=dict(resultado.get('query_profile') or {})
+    direct_mode=bool(resultado.get('direct_mode'))
+    titulo='🔒 BUSCA VISUAL — FOTO PRISIONAL LOCALIZADA' if direct_mode else '🔎 BUSCA VISUAL — ROUPA + APARÊNCIA V136'
+    descricao=(
+        f'**Modo:** {modo_label}\n'
+        + ('O motor encontrou primeiro uma **correspondência direta com imagem do histórico prisional**. Essa etapa usa pontos locais/geometria e tolera recorte, redimensionamento e compressão. ' if direct_mode else 'Nenhuma referência prisional direta foi forte o suficiente; o motor passou para a comparação estrita de roupa e aparência. ')
+        + '**O resultado é uma triagem visual e deve ser conferido pelo agente.**'
+    )
+    embed=discord.Embed(title=titulo,description=descricao,color=discord.Color.from_rgb(20,72,130))
+    embed.add_field(name='🎯 Perfil detectado na consulta',value=_v135_profile_text(qp),inline=False)
+    if not resultados:
+        embed.add_field(name='Resultado',value=f"Nenhuma ficha compatível foi encontrada.\n`{str(resultado.get('reason') or 'sem correspondência')[:650]}`",inline=False)
+    for pos,item in enumerate(resultados,start=1):
+        score=float(item.get('score') or 0);best=dict(item.get('best_image') or {});source=str(best.get('source') or 'imagem da ficha').replace('_',' ')
+        detalhes=[f"**RG:** `{str(item.get('rg') or 'N/I')}`",f"**Compatibilidade:** `{score:.1f}%`",f"**Referência:** `{source[:65]}`"]
+        if bool(item.get('direct_prison')):
+            detalhes += [f"**Match geométrico:** `{float(item.get('geom_score') or 0):.1f}%`",f"**Pontos locais válidos:** `{int(item.get('local_matches') or 0)}`",f"**Inliers/RANSAC:** `{float(item.get('inlier_ratio') or 0):.1f}%`",f"**Cor da roupa:** `{float(item.get('upper_color_score') or 0):.1f}%`"]
+        else:
+            detalhes += [f"**Roupa geral:** `{float(item.get('clothing_score') or 0):.1f}%`",f"**Cor superior:** `{float(item.get('upper_color_score') or 0):.1f}%`",f"**Cor inferior:** `{float(item.get('lower_color_score') or 0):.1f}%`",f"**Estilo/cobertura:** `{float(item.get('style_score') or 0):.1f}%`",f"**Cabelo:** `{float(item.get('hair_score') or 0):.1f}%`",f"**Pele visual:** `{float(item.get('skin_score') or 0):.1f}%`"]
+        detalhes.append('**Motivos:** '+'; '.join(list(item.get('explanations') or [])[:4]))
+        embed.add_field(name=f"{pos}. {str(item.get('nome') or 'Ficha sem nome')[:80]}",value='\n'.join(detalhes)[:1024],inline=False)
+    embed.add_field(name='Índice visual',value=f"Imagens: `{int(resumo.get('entries') or 0)}` • Prisionais/personagem: `{int(resumo.get('prison_entries') or 0)}` • Fichas: `{int(resumo.get('records') or 0)}` • Motor: `V136`",inline=False)
+    embed.set_footer(text='DICOR • Busca Visual V136 • prison-first • roupa segmentada • revisão humana')
+    return embed
+
+
+class V124VisualModoView(View):
+    def __init__(self,usuario_id:int,image_bytes:bytes,filename:str):
+        super().__init__(timeout=300);self.usuario_id=int(usuario_id);self.image_bytes=bytes(image_bytes);self.filename=str(filename or 'imagem')[:120];self.processando=False
+    async def interaction_check(self,interaction:discord.Interaction)->bool:
+        if int(interaction.user.id)==self.usuario_id:return True
+        await interaction.response.send_message('❌ Esta busca visual pertence a outro agente.',ephemeral=True);return False
+    async def _executar(self,interaction:discord.Interaction,modo:str,modo_label:str)->None:
+        if self.processando:return await interaction.response.send_message('⏳ Esta imagem já está sendo comparada.',ephemeral=True)
+        self.processando=True;await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            resultado=await asyncio.wait_for(asyncio.to_thread(_v124_visual_buscar_sync,self.image_bytes,modo),timeout=95)
+            embed=_v124_visual_embed_resultados(resultado,modo_label);view=V124VisualResultadosView(int(interaction.user.id),list(resultado.get('results') or []))
+            await interaction.edit_original_response(content=None,embed=embed,view=view if view.children else None)
+        except Exception as erro:
+            traceback.print_exc()
+            try:await enviar_log(f'❌ V136 busca visual falhou `{self.filename}` | {type(erro).__name__}: {erro}')
+            except Exception:pass
+            await interaction.edit_original_response(content=f'❌ Não foi possível processar a busca visual: `{type(erro).__name__}: {str(erro)[:180]}`',embed=None,view=None)
+        finally:self.processando=False
+    @discord.ui.button(label='Buscar pela foto',emoji='🔒',style=discord.ButtonStyle.primary,custom_id='v124_busca_visual_modo_completo')
+    async def completo(self,interaction:discord.Interaction,button:discord.ui.Button):await self._executar(interaction,'full','Foto prisional → roupa/aparência')
+    @discord.ui.button(label='Comparar roupa',emoji='👕',style=discord.ButtonStyle.secondary,custom_id='v124_busca_visual_modo_roupa')
+    async def roupa(self,interaction:discord.Interaction,button:discord.ui.Button):await self._executar(interaction,'roupa','Roupa estrita')
+
+
+_V136_REBUILD_LOCK=_v134_threading.Lock()
+def _v136_rebuild_se_necessario_sync()->Dict[str,Any]:
+    indice=_v124_visual_index();resumo=indice.summary()
+    if int(resumo.get('version') or 0)==136 and int(resumo.get('entries') or 0)>0:return {'skipped':True,'summary':resumo}
+    with _V136_REBUILD_LOCK:
+        indice=_v124_visual_index();resumo=indice.summary()
+        if int(resumo.get('version') or 0)==136 and int(resumo.get('entries') or 0)>0:return {'skipped':True,'summary':resumo}
+        return _v124_visual_rebuild_sync()
+
+@bot.listen('on_ready')
+async def _v136_visual_auto_rebuild_on_ready():
+    if not VISUAL_SEARCH_AUTO_REBUILD:return
+    await asyncio.sleep(16)
+    try:
+        r=await asyncio.to_thread(_v136_rebuild_se_necessario_sync);s=dict(r.get('summary') or {})
+        prison=int(s.get('prison_entries') or 0)
+        print(f"✅ V136 visual pronto: {int(s.get('entries') or 0)} imagem(ns), {prison} referência(s) prisionais/personagem, {int(s.get('records') or 0)} ficha(s).",flush=True)
+        if prison<=0:
+            print('⚠️ V136: nenhuma foto prisional/personagem entrou no índice. Nesse caso a busca só poderá usar atributos de roupa.',flush=True)
+    except Exception as erro:
+        print(f'⚠️ V136 visual rebuild falhou: {type(erro).__name__}: {erro}',flush=True)
+        try:await enviar_log(f'⚠️ V136 visual rebuild falhou | {type(erro).__name__}: {erro}')
+        except Exception:pass
+
+
+print('✅ V136 carregada — SOMENTE reconhecimento visual alterado. Match prisional direto por AKAZE+RANSAC, depois roupa segmentada/cabelo/pele. Mesa e dossiê V133 preservados.',flush=True)
+
+
+# =====================================================
+# V137 — HIERARQUIA SEMANAL REAL
+# SOMENTE hierarquia alterada. Mesa, dossiê e reconhecimento visual V136 preservados.
+# Regra: a cada 7 dias apaga a mensagem oficial anterior e PUBLICA uma nova.
+# Nunca edita/reaproveita a mensagem antiga como atualização semanal.
+# =====================================================
+
+HIERARQUIA_INTERVALO_DIAS = 7
+_V137_HIERARQUIA_INTERVALO = datetime.timedelta(days=7)
+_V137_HIERARQUIA_CHECK_HORAS = 1
+
+
+def _v137_e_hierarquia_oficial(msg: Any) -> bool:
+    try:
+        if bot.user is None or int(msg.author.id) != int(bot.user.id):
+            return False
+        texto = str(getattr(msg, 'content', '') or '').upper()
+        return 'HIERARQUIA OFICIAL' in texto and 'DICOR' in texto
+    except Exception:
+        return False
+
+
+async def _v137_buscar_hierarquias(canal: Any) -> List[discord.Message]:
+    encontradas: List[discord.Message] = []
+    try:
+        async for msg in canal.history(limit=500, oldest_first=False):
+            if _v137_e_hierarquia_oficial(msg):
+                encontradas.append(msg)
+    except Exception as erro:
+        await enviar_log(f'⚠️ V137 não conseguiu varrer o canal de hierarquia: {type(erro).__name__}: {erro}')
+    return encontradas
+
+
+def _v137_data_utc_msg(msg: discord.Message) -> datetime.datetime:
+    criado = getattr(msg, 'created_at', None)
+    if isinstance(criado, datetime.datetime):
+        if criado.tzinfo is None:
+            criado = criado.replace(tzinfo=datetime.timezone.utc)
+        return criado.astimezone(datetime.timezone.utc)
+    return datetime.datetime.now(datetime.timezone.utc) - _V137_HIERARQUIA_INTERVALO
+
+
+def _v137_proxima_atualizacao(criado: datetime.datetime) -> datetime.datetime:
+    return criado + _V137_HIERARQUIA_INTERVALO
+
+
+async def enviar_hierarquia_substituindo_anterior(*, forcar: bool=False) -> None:
+    """V137: renova a hierarquia por publicação nova a cada 7 dias.
+
+    - Se não existe mensagem oficial: publica imediatamente.
+    - Se a mensagem atual tem menos de 7 dias: mantém intacta.
+    - Se completou 7 dias: apaga TODAS as hierarquias oficiais antigas do bot e envia uma nova.
+    - Nunca edita a antiga para simular atualização.
+    """
+    if not HIERARQUIA_CHANNEL_ID or bot.user is None:
+        return
+
+    async with _HIERARQUIA_UNICA_LOCK:
+        canal = await _obter_canal_seguro(HIERARQUIA_CHANNEL_ID)
+        if canal is None or not hasattr(canal, 'history'):
+            await enviar_log(f'⚠️ V137: canal de hierarquia `{HIERARQUIA_CHANNEL_ID}` não encontrado.')
+            return
+
+        agora_utc = datetime.datetime.now(datetime.timezone.utc)
+        candidatas = await _v137_buscar_hierarquias(canal)
+
+        # Se há mais de uma, considera a mais nova como a oficial atual.
+        principal: Optional[discord.Message] = max(candidatas, key=lambda m: int(m.id)) if candidatas else None
+
+        if principal is not None and not forcar:
+            criada_utc = _v137_data_utc_msg(principal)
+            proxima = _v137_proxima_atualizacao(criada_utc)
+            if agora_utc < proxima:
+                # Apenas limpa duplicatas acidentais, sem editar/republicar a oficial.
+                for msg in candidatas:
+                    if int(msg.id) == int(principal.id):
+                        continue
+                    try:
+                        await msg.delete()
+                    except discord.NotFound:
+                        pass
+                    except Exception as erro:
+                        await enviar_log(f'⚠️ V137: não consegui apagar hierarquia duplicada `{msg.id}`: {erro}')
+                _salvar_dict(HIERARQUIA_MENSAGEM_JSON, {
+                    'mensagem_id': int(principal.id),
+                    'data': agora_br(),
+                    'publicada_em_utc': criada_utc.isoformat(),
+                    'proxima_atualizacao_utc': proxima.isoformat(),
+                    'intervalo_dias': 7,
+                })
+                return
+
+        # Chegou a semana: primeiro apaga TODAS as mensagens antigas.
+        falha_exclusao = False
+        ids_apagados: List[int] = []
+        for msg in candidatas:
+            try:
+                await msg.delete()
+                ids_apagados.append(int(msg.id))
+            except discord.NotFound:
+                ids_apagados.append(int(msg.id))
+            except Exception as erro:
+                falha_exclusao = True
+                await enviar_log(f'❌ V137: falha ao apagar hierarquia antiga `{msg.id}`: {type(erro).__name__}: {erro}')
+
+        # Não cria duplicata se não conseguiu remover a antiga.
+        if falha_exclusao:
+            await enviar_log('❌ V137: renovação semanal cancelada porque uma hierarquia antiga não pôde ser apagada.')
+            return
+
+        conteudo = montar_mensagem_hierarquia_dicor(canal.guild)
+        nova = await canal.send(
+            conteudo,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        criada_utc = _v137_data_utc_msg(nova)
+        proxima = _v137_proxima_atualizacao(criada_utc)
+        _salvar_dict(HIERARQUIA_MENSAGEM_JSON, {
+            'mensagem_id': int(nova.id),
+            'data': agora_br(),
+            'publicada_em_utc': criada_utc.isoformat(),
+            'proxima_atualizacao_utc': proxima.isoformat(),
+            'intervalo_dias': 7,
+        })
+        acao = 'criada' if not candidatas else 'renovada'
+        await enviar_log(
+            f'✅ V137: hierarquia semanal {acao}. Nova mensagem `{nova.id}`. '
+            f'Antigas removidas: `{len(ids_apagados)}`. Próxima renovação: `{proxima.isoformat()}`.'
+        )
+
+
+@tasks.loop(hours=_V137_HIERARQUIA_CHECK_HORAS)
+async def _v137_hierarquia_semanal_loop() -> None:
+    try:
+        await enviar_hierarquia_substituindo_anterior()
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'⚠️ V137: erro na verificação semanal da hierarquia: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+
+
+@_v137_hierarquia_semanal_loop.before_loop
+async def _v137_hierarquia_semanal_before() -> None:
+    await bot.wait_until_ready()
+    await asyncio.sleep(5)
+
+
+@bot.listen('on_ready')
+async def _v137_iniciar_hierarquia_semanal() -> None:
+    # A própria função usa created_at da mensagem; reiniciar o bot não reinicia os 7 dias.
+    try:
+        await enviar_hierarquia_substituindo_anterior()
+    except Exception as erro:
+        await enviar_log(f'⚠️ V137: falha na conferência da hierarquia ao iniciar: {type(erro).__name__}: {erro}')
+    if not _v137_hierarquia_semanal_loop.is_running():
+        _v137_hierarquia_semanal_loop.start()
+
+
+print(
+    '✅ V137 carregada — SOMENTE hierarquia alterada: renovação real a cada 7 dias, '
+    'apaga a publicação antiga e envia uma nova. Reinícios não resetam o prazo semanal.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
