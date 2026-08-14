@@ -58351,3 +58351,325 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 
 
 print('✅ V124 carregada — dossiê guiado profissional: seções isoladas, textos curatoriais, fotos corretas, sem vazamento administrativo e sem repetição indevida.', flush=True)
+
+
+# =========================
+# V125 — hardening do dossiê profissional
+# Corrige: fallback silencioso, fotos ausentes, materialização frágil e estilos PDF inválidos.
+# =========================
+
+
+def _v125_tem_conteudo_registrado(g: Dict[str, Any]) -> bool:
+    chaves = [
+        'painel_imagens', 'painel_membros', 'liderancas', 'membros', 'radio',
+        'localizacao_etapa1', 'localizacao_aereas', 'crimes', 'bau_lider',
+        'bau_membros', 'rota_farm', 'rota_producao', 'ingredientes_fotos',
+        'produto_final_fotos', 'informante', 'informante_resumo', 'residencia_fotos',
+    ]
+    for chave in chaves:
+        valor = g.get(chave)
+        if isinstance(valor, list) and valor:
+            return True
+        if isinstance(valor, dict) and valor:
+            return True
+        if isinstance(valor, str) and valor.strip():
+            return True
+    return False
+
+
+def _v124_normalizar_midia(item: Any) -> Optional[Dict[str, Any]]:
+    if item is None:
+        return None
+    if isinstance(item, dict):
+        saida = dict(item)
+    elif isinstance(item, (str, Path)):
+        texto = str(item).strip()
+        if not texto:
+            return None
+        saida = {
+            'local': texto if not texto.startswith(('http://', 'https://')) else '',
+            'url': texto if texto.startswith(('http://', 'https://')) else '',
+            'arquivo': Path(texto).name or 'imagem',
+        }
+    elif isinstance(item, list):
+        for sub in item:
+            normalizado = _v124_normalizar_midia(sub)
+            if normalizado:
+                return normalizado
+        return None
+    else:
+        return None
+
+    # Normalizações de aliases comuns.
+    if not str(saida.get('arquivo') or '').strip():
+        for chave in ('nome', 'filename', 'arquivo_nome'):
+            if str(saida.get(chave) or '').strip():
+                saida['arquivo'] = str(saida.get(chave)).strip()
+                break
+    if not str(saida.get('url') or '').strip():
+        for chave in ('proxy_url', 'download_url', 'link'):
+            if str(saida.get(chave) or '').strip():
+                saida['url'] = str(saida.get(chave)).strip()
+                break
+    if not str(saida.get('local') or '').strip():
+        for chave in ('path', 'caminho', 'file', 'src'):
+            if str(saida.get(chave) or '').strip():
+                saida['local'] = str(saida.get(chave)).strip()
+                break
+
+    local = str(saida.get('local') or '').strip()
+    url = str(saida.get('url') or '').strip()
+    if local.startswith(('http://', 'https://')) and not url:
+        saida['url'] = local
+        saida['local'] = ''
+    return saida if (str(saida.get('local') or '').strip() or str(saida.get('url') or '').strip()) else None
+
+
+def _v124_dedupe_media(lista: List[Dict[str, Any]], limite: int = 50) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    vistos: set[Tuple[str, str, str]] = set()
+    for bruto in list(lista or []):
+        item = _v124_normalizar_midia(bruto)
+        if not item:
+            continue
+        url = str(item.get('url') or item.get('proxy_url') or '').strip()
+        local = str(item.get('local') or item.get('arquivo') or '').strip()
+        msg = str(item.get('mensagem_id') or '')
+        chave = (msg, url, local)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        saida.append(item)
+        if len(saida) >= max(1, int(limite or 50)):
+            break
+    return saida
+
+
+def _v124_imagens_estado(g: Dict[str, Any], chave: str, limite: int = 20) -> List[Dict[str, Any]]:
+    valor = g.get(chave)
+    if isinstance(valor, list):
+        return _v124_dedupe_media(valor, limite)
+    if isinstance(valor, dict):
+        return _v124_dedupe_media([valor], limite)
+    if isinstance(valor, (str, Path)):
+        return _v124_dedupe_media([valor], limite)
+    return []
+
+
+def _v124_img_pessoa(pessoa: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(pessoa, dict):
+        return None
+    for chave in ('foto', 'imagem', 'anexo', 'arquivo', 'documento'):
+        midia = _v124_normalizar_midia(pessoa.get(chave))
+        if midia:
+            return midia
+    for chave in ('fotos', 'imagens', 'anexos'):
+        valor = pessoa.get(chave)
+        if isinstance(valor, list):
+            for item in valor:
+                midia = _v124_normalizar_midia(item)
+                if midia:
+                    return midia
+    return None
+
+
+def _v124_bloco_pessoas(pessoas: List[Dict[str, Any]], titulo_padrao: str) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    for idx, p in enumerate(list(pessoas or []), start=1):
+        if not isinstance(p, dict):
+            continue
+        saida.append({
+            'ordem': idx,
+            'nome': str(p.get('nome') or 'Não identificado').strip() or 'Não identificado',
+            'rg': str(p.get('rg') or 'Não informado').strip() or 'Não informado',
+            'cargo': str(p.get('cargo') or p.get('funcao') or titulo_padrao).strip() or titulo_padrao,
+            'foto': _v124_img_pessoa(p),
+        })
+    return saida
+
+
+def _v124_materializar_midia(item: Any, pasta_cache: Path) -> Optional[Path]:
+    item = _v124_normalizar_midia(item)
+    if not item:
+        return None
+    try:
+        pasta_cache = Path(pasta_cache)
+        pasta_cache.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+
+    local = str(item.get('local') or '').strip()
+    nome = str(item.get('arquivo') or Path(local).name or 'imagem').strip() or 'imagem'
+    if local:
+        try:
+            p = Path(local)
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            pass
+        # ponteiros ou caminhos indexados no storage do bot
+        try:
+            if 'materializar_sync' in globals():
+                mat = materializar_sync(local, nome)
+                if mat and Path(mat).exists():
+                    return Path(mat)
+        except Exception:
+            pass
+
+    url = str(item.get('url') or item.get('proxy_url') or '').strip()
+    if not url.startswith(('http://', 'https://')):
+        return None
+    try:
+        import hashlib
+        import urllib.request
+        import urllib.parse
+        nome_url = Path(urllib.parse.urlparse(url).path).name or nome or 'imagem'
+        ext = Path(nome_url).suffix.lower()
+        if ext not in {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}:
+            ext = '.png'
+        chave = hashlib.sha1(url.encode('utf-8', errors='ignore')).hexdigest()[:20]
+        destino = pasta_cache / f'{chave}{ext}'
+        if destino.exists() and destino.stat().st_size > 0:
+            return destino
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            dados = resp.read(18 * 1024 * 1024)
+        if not dados:
+            return None
+        destino.write_bytes(dados)
+        return destino if destino.exists() and destino.stat().st_size > 0 else None
+    except Exception:
+        return None
+
+
+def _v125_pdf_table_padding() -> List[Tuple[str, Tuple[int, int], Tuple[int, int], int]]:
+    return [
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]
+
+
+def _v124_pdf_image_flowables(imagens: List[Dict[str, Any]], pasta_cache: Path, estilos: Dict[str, Any], max_por_secao: int = 24):
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    flow = []
+    itens = []
+    for idx, item in enumerate(_v124_dedupe_media(imagens, max_por_secao), start=1):
+        caminho = _v124_materializar_midia(item, pasta_cache)
+        if not caminho or not caminho.exists():
+            continue
+        try:
+            img = RLImage(str(caminho))
+            img._restrictSize(7.7 * cm, 8.8 * cm)
+            legenda_txt = f'Evidência visual {idx}'
+            data = _v124_fmt_data(item.get('data'))
+            if data:
+                legenda_txt += f' • {data}'
+            if str(item.get('arquivo') or '').strip():
+                legenda_txt += f' • {str(item.get("arquivo"))[:60]}'
+            legenda = Paragraph(legenda_txt, estilos['small'])
+            card = Table([[img], [legenda]], colWidths=[8.1 * cm])
+            estilo_card = [
+                ('BOX', (0, 0), (-1, -1), 0.8, colors.HexColor('#8CA1AC')),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FCFAF5')),
+            ] + _v125_pdf_table_padding()
+            card.setStyle(TableStyle(estilo_card))
+            itens.append(card)
+        except Exception:
+            continue
+    for i in range(0, len(itens), 2):
+        linha = itens[i:i + 2]
+        if len(linha) == 1:
+            linha.append(Spacer(8.1 * cm, 0.1 * cm))
+        tbl = Table([linha], colWidths=[8.25 * cm, 8.25 * cm])
+        tbl.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP')]))
+        flow.append(tbl)
+        flow.append(Spacer(1, 0.22 * cm))
+    return flow
+
+
+def _v124_pdf_people_cards(pessoas: List[Dict[str, Any]], pasta_cache: Path, estilos: Dict[str, Any], titulo_vazio: str = 'Sem registros'):
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    flow = []
+    if not pessoas:
+        flow.append(Paragraph(titulo_vazio, estilos['body']))
+        return flow
+    for pessoa in pessoas:
+        nome = str(pessoa.get('nome') or 'Não identificado')
+        rg = str(pessoa.get('rg') or 'Não informado')
+        cargo = str(pessoa.get('cargo') or 'Não informado')
+        foto = _v124_normalizar_midia(pessoa.get('foto'))
+        bloco_texto = [
+            Paragraph(f'{int(pessoa.get("ordem") or 0)}. {nome}', estilos['card_title']),
+            Paragraph(f'RG: {rg}<br/>Função/Cargo: {cargo}', estilos['body']),
+        ]
+        foto_cell = Paragraph('Sem foto', estilos['small'])
+        if foto:
+            caminho = _v124_materializar_midia(foto, pasta_cache)
+            if caminho and caminho.exists():
+                try:
+                    img = RLImage(str(caminho))
+                    img._restrictSize(4.1 * cm, 5.1 * cm)
+                    foto_cell = img
+                except Exception:
+                    foto_cell = Paragraph('Foto indisponível', estilos['small'])
+        t = Table([[bloco_texto, foto_cell]], colWidths=[11.8 * cm, 4.7 * cm])
+        estilo_card = [
+            ('BOX', (0, 0), (-1, -1), 0.9, colors.HexColor('#8CA1AC')),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FCFAF5')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ] + _v125_pdf_table_padding()
+        t.setStyle(TableStyle(estilo_card))
+        flow.append(t)
+        flow.append(Spacer(1, 0.18 * cm))
+    return flow
+
+
+_V125_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dados = await _V125_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        if isinstance(canal, discord.TextChannel):
+            estado = _v116_estado(int(canal.id), False) or {}
+            dados_estado = dict(estado.get('dados') or {}) if isinstance(estado, dict) else {}
+            if isinstance(dados_estado, dict) and dados_estado and (_v122_mesa_tarefas_habilitada(int(canal.id)) or _v125_tem_conteudo_registrado(dados_estado)):
+                dados['dossie_v124'] = _v124_payload_profissional(dados, estado, int(canal.id))
+                dados['gerador_dossie'] = 'v125_profissional_guiado'
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'⚠️ V125: falha ao montar payload profissional da mesa {getattr(canal, "id", "?")}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+    return dados
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if isinstance(payload, dict):
+        _v124_generate_pdf(payload, Path(caminho_pdf))
+        erros = _v123_preflight_arquivo(Path(caminho_pdf), 'pdf')
+        if erros:
+            raise RuntimeError('Preflight do PDF V125 reprovado: ' + ' | '.join(erros[:8]))
+        return
+    return _V124_GERAR_PDF_BASE(dados, caminho_pdf)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if isinstance(payload, dict):
+        _v124_generate_docx(payload, Path(caminho_docx))
+        erros = _v123_preflight_arquivo(Path(caminho_docx), 'docx')
+        if erros:
+            raise RuntimeError('Preflight do DOCX V125 reprovado: ' + ' | '.join(erros[:8]))
+        return
+    return _V124_GERAR_DOCX_BASE(dados, caminho_docx)
+
+
+print('✅ V125 carregada — geração profissional blindada: V124 obrigatório quando disponível, fotos normalizadas/materializadas e PDF sem fallback silencioso.', flush=True)
