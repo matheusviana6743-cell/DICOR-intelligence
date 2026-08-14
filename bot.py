@@ -60229,5 +60229,386 @@ print(
 )
 
 
+# =============================================================
+# V132 — PÁGINA FINAL INSTITUCIONAL (SEM ALTERAR O MODELO V131)
+# Mantém 100% das páginas aprovadas da V131 e acrescenta SOMENTE:
+# conclusão, controle/autenticidade, QR de reabertura e 3 assinaturas.
+# =============================================================
+
+_V132_GERAR_PDF_BASE = gerar_pdf_dossie
+_V132_GERAR_DOCX_BASE = gerar_docx_dossie
+
+
+def _v132_codigo_autenticidade(dados: Dict[str, Any]) -> str:
+    import hashlib
+    base = '|'.join([
+        str(dados.get('processo') or ''),
+        str(dados.get('numero_investigacao') or dados.get('numero') or ''),
+        str(dados.get('canal_id') or ''),
+        str(dados.get('data_encerramento') or ''),
+    ])
+    dig = hashlib.sha256(base.encode('utf-8', errors='ignore')).hexdigest().upper()[:16]
+    return 'DICOR-' + '-'.join(dig[i:i+4] for i in range(0, 16, 4))
+
+
+def _v132_url_reabertura(dados: Dict[str, Any]) -> str:
+    url = str(dados.get('reabrir_url') or '').strip()
+    if url:
+        return url
+    guild = int(dados.get('guild_id') or globals().get('GUILD_ID') or 0)
+    canal = int(dados.get('canal_id') or 0)
+    if guild and canal:
+        return f'https://discord.com/channels/{guild}/{canal}'
+    return ''
+
+
+def _v132_conclusao(dados: Dict[str, Any]) -> str:
+    processo = str(dados.get('processo') or 'Não informado')
+    operacao = str(dados.get('nome_operacao') or dados.get('nome') or 'operação investigativa')
+    comunidade = str(dados.get('comunidade') or 'organização investigada')
+    return (
+        f'A investigação vinculada ao processo {processo}, referente à {operacao} e à organização '
+        f'{comunidade}, teve seu material consolidado neste dossiê após conferência das etapas '
+        'investigativas e das evidências registradas. O conteúdo permanece preservado para consulta '
+        'posterior, diligências futuras, cruzamento de informações e eventual reabertura da investigação. '
+        'O documento é arquivado como material reservado da DICOR, mantendo vínculo com o processo, '
+        'os responsáveis, as evidências e o histórico operacional da mesa.'
+    )
+
+
+def _v132_assinaturas(dados: Dict[str, Any]) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    regs: List[Dict[str, Any]] = []
+    try:
+        regs = list(obter_assinaturas_dossie(dados) or [])
+    except Exception:
+        regs = []
+
+    geral = regs[0] if len(regs) > 0 and isinstance(regs[0], dict) else {}
+    dicor = regs[1] if len(regs) > 1 and isinstance(regs[1], dict) else {}
+
+    saida.append({
+        'cargo': 'DELEGADO GERAL',
+        'nome': str(geral.get('nome') or ASSINATURA_DELEGADO_GERAL_NOME or 'Delegado Geral'),
+        'texto': str(geral.get('texto') or ASSINATURA_DELEGADO_GERAL_TEXTO or ''),
+        'imagem': geral.get('imagem') or geral.get('arquivo'),
+    })
+    saida.append({
+        'cargo': 'DELEGADO DICOR',
+        'nome': str(dicor.get('nome') or ASSINATURA_DELEGADO_DICOR_NOME or 'Delegado DICOR'),
+        'texto': str(dicor.get('texto') or ASSINATURA_DELEGADO_DICOR_TEXTO or ''),
+        'imagem': dicor.get('imagem') or dicor.get('arquivo'),
+    })
+
+    agente_img = None
+    try:
+        agente_img = caminho_arquivo_configurado(
+            ASSINATURA_AGENTE_RESPONSAVEL_IMAGEM,
+            ['assinatura_agente_responsavel.png', 'assinatura_agente_responsavel.jpg', 'assinatura_agente.png'],
+        )
+    except Exception:
+        agente_img = ASSINATURA_AGENTE_RESPONSAVEL_IMAGEM or None
+    saida.append({
+        'cargo': 'AGENTE RESPONSÁVEL',
+        'nome': str(dados.get('agente_encerramento') or dados.get('autor_nome') or 'Agente Responsável'),
+        'texto': str(ASSINATURA_AGENTE_RESPONSAVEL_TEXTO or ''),
+        'imagem': agente_img,
+    })
+    return saida
+
+
+def _v132_limpar_assinatura(caminho: Any) -> Optional[Path]:
+    if not caminho:
+        return None
+    try:
+        p = Path(str(caminho))
+        if not p.exists():
+            return None
+        limpa = limpar_imagem_assinatura_dossie(p)
+        return Path(limpa) if limpa and Path(limpa).exists() else p
+    except Exception:
+        return None
+
+
+def _v132_criar_pagina_final_pdf(dados: Dict[str, Any], destino: Path) -> None:
+    if canvas is None or A4 is None:
+        raise RuntimeError('ReportLab indisponível para a página final do dossiê.')
+
+    destino = Path(destino)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(destino), pagesize=A4)
+    largura, altura = A4
+    cores = _cores_documento_dicor()
+    margem_x = 1.35 * cm
+    largura_util = largura - 2 * margem_x
+    topo = altura - 4.35 * cm
+    base = 1.45 * cm
+
+    # MESMO FUNDO/MOLDURA/BRASÕES/MARCA D'ÁGUA DO MODELO V131.
+    _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=18.0)
+    c.saveState()
+    _alpha_pdf(c, 0.82, 1)
+    c.setFillColor(cores['painel'])
+    c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=1, stroke=0)
+    c.restoreState()
+    _desenhar_marca_dagua_visivel(c, largura, altura)
+    c.setStrokeColor(cores['linha'])
+    c.setLineWidth(0.75)
+    c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=0, stroke=1)
+
+    faixa_y = topo - 0.63 * cm
+    c.setFillColor(cores['azul'])
+    c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=1, stroke=0)
+    c.setStrokeColor(cores['dourado_claro'])
+    c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
+    c.setFillColor(cores['branco'])
+    c.setFont('Courier-Bold', 13.2)
+    c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, 'CONCLUSÃO E ASSINATURAS')
+    y = faixa_y - 0.42 * cm
+
+    def subtitulo(txt: str, yy: float) -> float:
+        c.setFillColor(cores['painel_sec'])
+        c.setStrokeColor(cores['dourado'])
+        c.roundRect(margem_x + 0.10 * cm, yy - 0.50 * cm, largura_util - 0.20 * cm, 0.50 * cm, 4, fill=1, stroke=1)
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 9.7)
+        c.drawString(margem_x + 0.25 * cm, yy - 0.33 * cm, txt.upper()[:96])
+        return yy - 0.82 * cm
+
+    def texto(txt: str, yy: float, tam: float=9.1, leading: float=0.37 * cm) -> float:
+        for linha in _linhas_pdf_seguras(c, str(txt or ''), 'Courier', tam, largura_util - 0.52 * cm):
+            if not linha:
+                yy -= leading * 0.55
+                continue
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', tam)
+            c.drawString(margem_x + 0.25 * cm, yy, linha[:165])
+            yy -= leading
+        return yy
+
+    def campo(rotulo: str, valor: Any, yy: float) -> float:
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 8.75)
+        c.drawString(margem_x + 0.24 * cm, yy, f'{rotulo}:')
+        c.setFillColor(cores['texto'])
+        c.setFont('Courier', 8.65)
+        valor_s = str(valor or 'Não informado').strip() or 'Não informado'
+        c.drawString(margem_x + 5.15 * cm, yy, valor_s[:112])
+        return yy - 0.34 * cm
+
+    y = subtitulo('Conclusão Operacional', y)
+    y = texto(_v132_conclusao(dados), y, tam=9.1, leading=0.37 * cm)
+    y -= 0.14 * cm
+
+    y = subtitulo('Controle, Emissão e Autenticidade', y)
+    stats = dados.get('estatisticas') if isinstance(dados.get('estatisticas'), dict) else {}
+    y = campo('Processo', dados.get('processo'), y)
+    y = campo('Investigação', dados.get('numero_investigacao') or dados.get('numero'), y)
+    y = campo('Cidade de emissão', dados.get('cidade_operacional') or 'Capital Morada do Valley', y)
+    y = campo('Data e horário de emissão', dados.get('data_encerramento') or agora_br(), y)
+    y = campo('Agente responsável', dados.get('agente_encerramento') or 'Não informado', y)
+    y = campo('Evidências consolidadas', stats.get('evidencias', 'Não informado'), y)
+    y = campo('Código de autenticidade', _v132_codigo_autenticidade(dados), y)
+    y -= 0.08 * cm
+
+    # QR + informação de reabertura/consulta.
+    url = _v132_url_reabertura(dados)
+    qr_path = None
+    if url:
+        try:
+            qr_path = gerar_qr_code_dossie(url, destino.parent, nome='qr_reabertura_v132.png')
+        except Exception:
+            qr_path = None
+    if qr_path and Path(qr_path).exists():
+        qr_size = 2.15 * cm
+        c.drawImage(str(qr_path), margem_x + 0.18 * cm, y - qr_size + 0.10 * cm, width=qr_size, height=qr_size, preserveAspectRatio=True, mask='auto')
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 8.7)
+        c.drawString(margem_x + 2.62 * cm, y - 0.28 * cm, 'QR CODE DE REABERTURA / CONSULTA')
+        c.setFillColor(cores['texto'])
+        c.setFont('Courier', 7.8)
+        for i, ln in enumerate(_linhas_pdf_seguras(c, url, 'Courier', 7.8, largura_util - 3.0 * cm)[:3]):
+            c.drawString(margem_x + 2.62 * cm, y - 0.68 * cm - i * 0.30 * cm, ln[:130])
+        y -= 2.35 * cm
+    else:
+        y = texto('QR Code indisponível. A investigação permanece vinculada ao processo e ao registro interno da DICOR.', y, tam=8.4)
+
+    y -= 0.05 * cm
+    y = subtitulo('Assinaturas Institucionais', y)
+    assinaturas = _v132_assinaturas(dados)
+    gap = 0.22 * cm
+    col_w = (largura_util - 2 * gap) / 3
+    x0 = margem_x + 0.10 * cm
+    card_y_top = y
+    card_h = 4.25 * cm
+    for idx, ass in enumerate(assinaturas[:3]):
+        x = x0 + idx * (col_w + gap)
+        c.setFillColor(colors.HexColor('#F7F3E9'))
+        c.setStrokeColor(cores['linha'])
+        c.roundRect(x, card_y_top - card_h, col_w, card_h, 4, fill=1, stroke=1)
+
+        img = _v132_limpar_assinatura(ass.get('imagem'))
+        if img:
+            try:
+                c.drawImage(str(img), x + 0.30 * cm, card_y_top - 2.00 * cm, width=col_w - 0.60 * cm, height=1.32 * cm, preserveAspectRatio=True, anchor='c', mask='auto')
+            except Exception:
+                pass
+        else:
+            c.setStrokeColor(cores['texto_suave'])
+            c.line(x + 0.42 * cm, card_y_top - 1.70 * cm, x + col_w - 0.42 * cm, card_y_top - 1.70 * cm)
+
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 8.15)
+        c.drawCentredString(x + col_w / 2, card_y_top - 2.37 * cm, str(ass.get('nome') or '')[:34])
+        c.setFillColor(cores['texto'])
+        c.setFont('Courier-Bold', 7.65)
+        c.drawCentredString(x + col_w / 2, card_y_top - 2.72 * cm, str(ass.get('cargo') or '')[:32])
+        c.setFont('Courier', 7.0)
+        c.drawCentredString(x + col_w / 2, card_y_top - 3.08 * cm, 'POLÍCIA FEDERAL - DICOR')
+        if str(ass.get('texto') or '').strip():
+            c.setFillColor(cores['texto_suave'])
+            c.setFont('Courier', 6.5)
+            c.drawCentredString(x + col_w / 2, card_y_top - 3.43 * cm, str(ass.get('texto'))[:42])
+        c.setFillColor(cores['texto_suave'])
+        c.setFont('Courier', 6.5)
+        c.drawCentredString(x + col_w / 2, card_y_top - 3.78 * cm, str(dados.get('data_encerramento') or agora_br())[:24])
+
+    # Rodapé reservado da página final.
+    c.setFillColor(cores['texto_suave'])
+    c.setFont('Courier', 6.9)
+    rodape = f"Documento reservado DICOR • Processo {dados.get('processo') or 'N/I'} • Autenticidade {_v132_codigo_autenticidade(dados)}"
+    c.drawCentredString(largura / 2, base + 0.18 * cm, rodape[:122])
+    c.save()
+
+
+def _v132_anexar_pagina_pdf(pdf_base: Path, pagina_final: Path) -> None:
+    pdf_base = Path(pdf_base)
+    pagina_final = Path(pagina_final)
+    if not pdf_base.exists() or not pagina_final.exists():
+        raise RuntimeError('Arquivos necessários para anexar a página final não foram encontrados.')
+    temporario = pdf_base.with_name(pdf_base.stem + '_v132_merge.pdf')
+    try:
+        if fitz is None:
+            raise RuntimeError('PyMuPDF indisponível para anexar a página final.')
+        doc = fitz.open(str(pdf_base))
+        fim = fitz.open(str(pagina_final))
+        try:
+            doc.insert_pdf(fim)
+            doc.save(str(temporario), garbage=4, deflate=True)
+        finally:
+            fim.close()
+            doc.close()
+        temporario.replace(pdf_base)
+    finally:
+        try:
+            temporario.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    # 1) Gera EXATAMENTE o V131 aprovado, sem tocar nas páginas anteriores.
+    _V132_GERAR_PDF_BASE(dados, caminho_pdf)
+    caminho_pdf = Path(caminho_pdf)
+    if not caminho_pdf.exists():
+        return
+
+    # 2) Acrescenta apenas a página institucional final.
+    pagina_final = caminho_pdf.with_name(caminho_pdf.stem + '_pagina_final_v132.pdf')
+    _v132_criar_pagina_final_pdf(dados, pagina_final)
+    _v132_anexar_pagina_pdf(caminho_pdf, pagina_final)
+    try:
+        pagina_final.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # 3) Verificação simples da página final sem revalidar o conteúdo já aprovado da V131.
+    if fitz is not None:
+        doc = fitz.open(str(caminho_pdf))
+        try:
+            if len(doc) < 16:
+                raise RuntimeError(f'V132: PDF final possui apenas {len(doc)} página(s); esperava-se o V131 + página final.')
+            txt_final = normalizar_busca(doc[-1].get_text('text'))
+            for termo in ('conclusao e assinaturas', 'codigo de autenticidade', 'delegado geral', 'delegado dicor', 'agente responsavel'):
+                if termo not in txt_final:
+                    raise RuntimeError(f'V132: elemento obrigatório ausente na página final: {termo}.')
+        finally:
+            doc.close()
+    print(f'✅ V132 PDF: página final de conclusão, QR, autenticidade e 3 assinaturas adicionada sem alterar o modelo V131: {caminho_pdf.name}', flush=True)
+
+
+def _v132_append_docx_final(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    if Document is None:
+        return
+    caminho_docx = Path(caminho_docx)
+    if not caminho_docx.exists():
+        return
+    try:
+        from docx import Document as _Doc
+        from docx.shared import Inches, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        doc = _Doc(str(caminho_docx))
+        doc.add_page_break()
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run('CONCLUSÃO E ASSINATURAS')
+        r.bold = True; r.font.size = Pt(15)
+        doc.add_paragraph(_v132_conclusao(dados))
+
+        p = doc.add_paragraph(); r = p.add_run('CONTROLE, EMISSÃO E AUTENTICIDADE'); r.bold = True
+        stats = dados.get('estatisticas') if isinstance(dados.get('estatisticas'), dict) else {}
+        tabela = doc.add_table(rows=0, cols=2); tabela.style = 'Table Grid'
+        for a, b in [
+            ('Processo', dados.get('processo') or 'Não informado'),
+            ('Investigação', dados.get('numero_investigacao') or dados.get('numero') or 'Não informado'),
+            ('Cidade de emissão', dados.get('cidade_operacional') or 'Capital Morada do Valley'),
+            ('Data e horário de emissão', dados.get('data_encerramento') or agora_br()),
+            ('Agente responsável', dados.get('agente_encerramento') or 'Não informado'),
+            ('Evidências consolidadas', stats.get('evidencias', 'Não informado')),
+            ('Código de autenticidade', _v132_codigo_autenticidade(dados)),
+        ]:
+            row = tabela.add_row().cells; row[0].text = str(a); row[1].text = str(b)
+
+        url = _v132_url_reabertura(dados)
+        if url:
+            qr = gerar_qr_code_dossie(url, caminho_docx.parent, nome='qr_reabertura_v132_docx.png')
+            if qr and Path(qr).exists():
+                p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.add_run().add_picture(str(qr), width=Inches(1.25))
+            p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run('QR Code de reabertura / consulta\n' + url)
+
+        p = doc.add_paragraph(); r = p.add_run('ASSINATURAS INSTITUCIONAIS'); r.bold = True
+        tabela_ass = doc.add_table(rows=1, cols=3); tabela_ass.style = 'Table Grid'
+        for i, ass in enumerate(_v132_assinaturas(dados)[:3]):
+            cell = tabela_ass.rows[0].cells[i]
+            img = _v132_limpar_assinatura(ass.get('imagem'))
+            if img:
+                try:
+                    cell.paragraphs[0].add_run().add_picture(str(img), width=Inches(1.45))
+                except Exception:
+                    pass
+            p2 = cell.add_paragraph(); p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p2.add_run(str(ass.get('nome') or '') + '\n').bold = True
+            p2.add_run(str(ass.get('cargo') or '') + '\n')
+            p2.add_run('POLÍCIA FEDERAL - DICOR\n')
+            p2.add_run(str(dados.get('data_encerramento') or agora_br()))
+        doc.save(str(caminho_docx))
+    except Exception as erro:
+        print(f'⚠️ V132 DOCX: não foi possível acrescentar a página final: {type(erro).__name__}: {erro}', flush=True)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    _V132_GERAR_DOCX_BASE(dados, caminho_docx)
+    _v132_append_docx_final(dados, caminho_docx)
+
+
+print(
+    '✅ V132 carregada — V131 preservada; adicionada última página com CONCLUSÃO, QR de reabertura, '
+    'código de autenticidade, cidade/data, controle do documento e 3 assinaturas institucionais.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
