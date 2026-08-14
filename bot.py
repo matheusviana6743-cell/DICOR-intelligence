@@ -60626,5 +60626,870 @@ print(
 )
 
 
+# =====================================================
+# V134 — RECONHECIMENTO VISUAL RP (ROUPA + APARÊNCIA)
+# IMPORTANTE: este bloco NÃO altera Mesa, tarefas, dossiê ou fechamento.
+# Ele substitui somente o motor de busca visual e os hooks de indexação.
+# =====================================================
+
+import sys as _v134_sys
+import types as _v134_types
+import gzip as _v134_gzip
+import pickle as _v134_pickle
+import hashlib as _v134_hashlib
+import threading as _v134_threading
+
+VISUAL_SEARCH_ENGINE_VERSION = 134
+VISUAL_SEARCH_ENGINE_LABEL = 'V134 multirregião roupa+aparência'
+VISUAL_SEARCH_AUTO_REBUILD = os.getenv('VISUAL_SEARCH_AUTO_REBUILD', '1').strip().lower() not in {'0', 'false', 'nao', 'não', 'off'}
+VISUAL_SEARCH_TOP_K = max(3, min(10, env_int('VISUAL_SEARCH_TOP_K', 5)))
+VISUAL_SEARCH_MIN_SCORE_FULL = max(20.0, min(80.0, env_float('VISUAL_SEARCH_MIN_SCORE_FULL', 34.0)))
+VISUAL_SEARCH_MIN_SCORE_ROUPA = max(20.0, min(80.0, env_float('VISUAL_SEARCH_MIN_SCORE_ROUPA', 31.0)))
+
+try:
+    import numpy as _v134_np
+except Exception:
+    _v134_np = None
+try:
+    import cv2 as _v134_cv2
+    try:
+        _v134_cv2.setNumThreads(1)
+    except Exception:
+        pass
+except Exception:
+    _v134_cv2 = None
+
+
+def _v134_visual_supported(nome: Any, mime_type: str='') -> bool:
+    n = str(nome or '').lower().split('?', 1)[0]
+    m = str(mime_type or '').lower()
+    return m.startswith('image/') or n.endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'))
+
+
+def _v134_visual_format_size(total: int) -> str:
+    valor = float(max(0, int(total or 0)))
+    unidades = ['B', 'KB', 'MB', 'GB']
+    for unidade in unidades:
+        if valor < 1024.0 or unidade == unidades[-1]:
+            return f'{valor:.1f} {unidade}' if unidade != 'B' else f'{int(valor)} B'
+        valor /= 1024.0
+    return f'{valor:.1f} GB'
+
+
+def _v134_visual_can_rebuild(*, is_inspector_plus: bool=False, is_admin: bool=False) -> bool:
+    return bool(is_inspector_plus or is_admin)
+
+
+def _v134_arr(v: Any, dtype='float32'):
+    if _v134_np is None:
+        return None
+    try:
+        return _v134_np.asarray(v, dtype=dtype)
+    except Exception:
+        return None
+
+
+def _v134_norm(v: Any):
+    a = _v134_arr(v)
+    if a is None or a.size == 0:
+        return a
+    n = float(_v134_np.linalg.norm(a))
+    return a / n if n > 1e-9 else a
+
+
+def _v134_cos(a: Any, b: Any) -> float:
+    aa, bb = _v134_norm(a), _v134_norm(b)
+    if aa is None or bb is None or aa.size == 0 or bb.size == 0 or aa.shape != bb.shape:
+        return 0.0
+    return float(max(0.0, min(1.0, float(_v134_np.dot(aa.ravel(), bb.ravel()))))) * 100.0
+
+
+def _v134_hist_intersection(a: Any, b: Any) -> float:
+    aa, bb = _v134_arr(a), _v134_arr(b)
+    if aa is None or bb is None or aa.size == 0 or bb.size == 0 or aa.shape != bb.shape:
+        return 0.0
+    sa = float(aa.sum()); sb = float(bb.sum())
+    if sa <= 1e-9 or sb <= 1e-9:
+        return 0.0
+    aa = aa / sa; bb = bb / sb
+    return float(max(0.0, min(1.0, float(_v134_np.minimum(aa, bb).sum())))) * 100.0
+
+
+def _v134_resize_rgb(img: Any, max_side: int=520):
+    if _v134_np is None:
+        return None
+    arr = _v134_np.asarray(img)
+    if arr.ndim == 2:
+        arr = _v134_np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim != 3:
+        return None
+    if arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+    arr = arr.astype(_v134_np.uint8, copy=False)
+    h, w = arr.shape[:2]
+    if min(h, w) < 8:
+        return None
+    scale = min(1.0, float(max_side) / float(max(h, w)))
+    if scale < 0.999 and _v134_cv2 is not None:
+        arr = _v134_cv2.resize(arr, (max(8, int(w * scale)), max(8, int(h * scale))), interpolation=_v134_cv2.INTER_AREA)
+    return arr
+
+
+def _v134_decode_bytes(dados: bytes):
+    if not dados or _v134_np is None:
+        return None
+    if _v134_cv2 is not None:
+        try:
+            buf = _v134_np.frombuffer(dados, dtype=_v134_np.uint8)
+            bgr = _v134_cv2.imdecode(buf, _v134_cv2.IMREAD_COLOR)
+            if bgr is not None:
+                return _v134_resize_rgb(_v134_cv2.cvtColor(bgr, _v134_cv2.COLOR_BGR2RGB))
+        except Exception:
+            pass
+    if PILImage is not None:
+        try:
+            with PILImage.open(io.BytesIO(dados)) as im:
+                return _v134_resize_rgb(_v134_np.asarray(im.convert('RGB')))
+        except Exception:
+            return None
+    return None
+
+
+def _v134_load_path(caminho: str):
+    p = Path(str(caminho or ''))
+    if not p.exists() or not p.is_file():
+        return None
+    try:
+        return _v134_decode_bytes(p.read_bytes())
+    except Exception:
+        return None
+
+
+def _v134_crop(img: Any, x1: float, y1: float, x2: float, y2: float):
+    h, w = img.shape[:2]
+    xa = max(0, min(w - 1, int(round(x1 * w))))
+    xb = max(xa + 1, min(w, int(round(x2 * w))))
+    ya = max(0, min(h - 1, int(round(y1 * h))))
+    yb = max(ya + 1, min(h, int(round(y2 * h))))
+    return img[ya:yb, xa:xb]
+
+
+def _v134_hog_person_bbox(img: Any) -> Optional[Tuple[int, int, int, int]]:
+    if _v134_cv2 is None or _v134_np is None:
+        return None
+    try:
+        h, w = img.shape[:2]
+        if h < 160 or w < 90:
+            return None
+        escala = min(1.0, 380.0 / max(h, w))
+        small = img
+        if escala < 0.999:
+            small = _v134_cv2.resize(img, (max(64, int(w * escala)), max(96, int(h * escala))), interpolation=_v134_cv2.INTER_AREA)
+        gray = _v134_cv2.cvtColor(small, _v134_cv2.COLOR_RGB2GRAY)
+        hog = _v134_cv2.HOGDescriptor()
+        hog.setSVMDetector(_v134_cv2.HOGDescriptor_getDefaultPeopleDetector())
+        rects, weights = hog.detectMultiScale(gray, winStride=(8, 8), padding=(8, 8), scale=1.06)
+        if len(rects) == 0:
+            return None
+        sh, sw = gray.shape[:2]
+        melhor = None; melhor_score = -1.0
+        for i, (x, y, rw, rh) in enumerate(rects):
+            area = float(rw * rh) / float(max(1, sw * sh))
+            cx = (x + rw / 2.0) / max(1.0, sw)
+            central = max(0.0, 1.0 - abs(cx - 0.5) * 1.3)
+            peso = float(weights[i]) if i < len(weights) else 0.0
+            score = area * 2.5 + central * 0.5 + min(1.0, max(0.0, peso)) * 0.25
+            if score > melhor_score:
+                melhor_score = score; melhor = (x, y, rw, rh)
+        if melhor is None:
+            return None
+        x, y, rw, rh = melhor
+        inv = 1.0 / escala
+        x = int(x * inv); y = int(y * inv); rw = int(rw * inv); rh = int(rh * inv)
+        # amplia para manter roupa inteira/acessórios
+        px = int(rw * 0.18); py = int(rh * 0.10)
+        return (max(0, x - px), max(0, y - py), min(w, x + rw + px), min(h, y + rh + py))
+    except Exception:
+        return None
+
+
+def _v134_candidate_crops(img: Any) -> List[Tuple[str, Any, float]]:
+    h, w = img.shape[:2]
+    saida: List[Tuple[str, Any, float]] = []
+    bbox = _v134_hog_person_bbox(img)
+    if bbox:
+        x1, y1, x2, y2 = bbox
+        crop = img[y1:y2, x1:x2]
+        if crop.size:
+            saida.append(('pessoa_detectada', crop, 1.00))
+    # crops múltiplos para GTA/RP: personagem pode estar central, à esquerda ou à direita.
+    specs = [
+        ('centro', (0.12, 0.02, 0.88, 0.98), 0.96),
+        ('esquerda', (0.00, 0.02, 0.68, 0.98), 0.89),
+        ('direita', (0.32, 0.02, 1.00, 0.98), 0.89),
+        ('centro_apertado', (0.22, 0.05, 0.78, 0.97), 0.93),
+    ]
+    for nome, box, q in specs:
+        c = _v134_crop(img, *box)
+        if c.size:
+            saida.append((nome, c, q))
+    return saida[:5]
+
+
+def _v134_region(crop: Any, nome: str):
+    if nome == 'head':
+        return _v134_crop(crop, 0.24, 0.02, 0.76, 0.34)
+    if nome == 'upper':
+        return _v134_crop(crop, 0.12, 0.20, 0.88, 0.62)
+    if nome == 'lower':
+        return _v134_crop(crop, 0.16, 0.52, 0.84, 0.96)
+    return _v134_crop(crop, 0.08, 0.04, 0.92, 0.98)
+
+
+def _v134_hsv_hist(region: Any):
+    if region is None or region.size == 0 or _v134_np is None:
+        return _v134_np.zeros(128, dtype=_v134_np.float32) if _v134_np is not None else []
+    if _v134_cv2 is None:
+        # fallback RGB quantizado
+        r = region.reshape(-1, 3).astype(_v134_np.int16)
+        bins = (r // 64).clip(0, 3)
+        idx = bins[:, 0] * 16 + bins[:, 1] * 4 + bins[:, 2]
+        hist = _v134_np.bincount(idx, minlength=64).astype(_v134_np.float32)
+        return hist / max(1.0, float(hist.sum()))
+    hsv = _v134_cv2.cvtColor(region, _v134_cv2.COLOR_RGB2HSV)
+    hist = _v134_cv2.calcHist([hsv], [0, 1], None, [24, 8], [0, 180, 0, 256]).astype(_v134_np.float32).ravel()
+    s = float(hist.sum())
+    return hist / s if s > 0 else hist
+
+
+def _v134_lab_hist(region: Any):
+    if region is None or region.size == 0 or _v134_np is None:
+        return _v134_np.zeros(96, dtype=_v134_np.float32) if _v134_np is not None else []
+    if _v134_cv2 is None:
+        return _v134_hsv_hist(region)
+    lab = _v134_cv2.cvtColor(region, _v134_cv2.COLOR_RGB2LAB)
+    a = lab[:, :, 1].reshape(-1)
+    b = lab[:, :, 2].reshape(-1)
+    ha = _v134_np.histogram(a, bins=16, range=(0, 256))[0].astype(_v134_np.float32)
+    hb = _v134_np.histogram(b, bins=16, range=(0, 256))[0].astype(_v134_np.float32)
+    out = _v134_np.concatenate([ha, hb])
+    s = float(out.sum())
+    return out / s if s > 0 else out
+
+
+def _v134_gray(region: Any):
+    if _v134_cv2 is not None:
+        return _v134_cv2.cvtColor(region, _v134_cv2.COLOR_RGB2GRAY)
+    return (_v134_np.dot(region[:, :, :3], [0.299, 0.587, 0.114])).astype(_v134_np.uint8)
+
+
+def _v134_lbp_hist(region: Any):
+    if region is None or region.size == 0 or _v134_np is None:
+        return _v134_np.zeros(256, dtype=_v134_np.float32) if _v134_np is not None else []
+    gray = _v134_gray(region)
+    if _v134_cv2 is not None:
+        gray = _v134_cv2.resize(gray, (96, 96), interpolation=_v134_cv2.INTER_AREA)
+    else:
+        gray = gray[:96, :96]
+    if min(gray.shape[:2]) < 3:
+        return _v134_np.zeros(256, dtype=_v134_np.float32)
+    c = gray[1:-1, 1:-1]
+    viz = [gray[:-2, :-2], gray[:-2, 1:-1], gray[:-2, 2:], gray[1:-1, 2:], gray[2:, 2:], gray[2:, 1:-1], gray[2:, :-2], gray[1:-1, :-2]]
+    code = _v134_np.zeros_like(c, dtype=_v134_np.uint8)
+    for bit, v in enumerate(viz):
+        code |= ((v >= c).astype(_v134_np.uint8) << bit)
+    hist = _v134_np.bincount(code.ravel(), minlength=256).astype(_v134_np.float32)
+    s = float(hist.sum())
+    return hist / s if s > 0 else hist
+
+
+def _v134_hog(region: Any, cells_x: int=3, cells_y: int=4):
+    if region is None or region.size == 0 or _v134_np is None:
+        return _v134_np.zeros(cells_x * cells_y * 9, dtype=_v134_np.float32) if _v134_np is not None else []
+    gray = _v134_gray(region).astype(_v134_np.float32)
+    if _v134_cv2 is not None:
+        gray = _v134_cv2.resize(gray, (96, 128), interpolation=_v134_cv2.INTER_AREA)
+        gx = _v134_cv2.Sobel(gray, _v134_cv2.CV_32F, 1, 0, ksize=3)
+        gy = _v134_cv2.Sobel(gray, _v134_cv2.CV_32F, 0, 1, ksize=3)
+    else:
+        gy, gx = _v134_np.gradient(gray)
+    mag = _v134_np.sqrt(gx * gx + gy * gy)
+    ang = (_v134_np.degrees(_v134_np.arctan2(gy, gx)) % 180.0)
+    h, w = gray.shape[:2]
+    vec = []
+    for cy in range(cells_y):
+        ya, yb = int(cy * h / cells_y), int((cy + 1) * h / cells_y)
+        for cx in range(cells_x):
+            xa, xb = int(cx * w / cells_x), int((cx + 1) * w / cells_x)
+            hist = _v134_np.zeros(9, dtype=_v134_np.float32)
+            a = ang[ya:yb, xa:xb].ravel(); m = mag[ya:yb, xa:xb].ravel()
+            bins = _v134_np.floor(a / 20.0).astype(_v134_np.int32).clip(0, 8)
+            for b in range(9):
+                hist[b] = float(m[bins == b].sum())
+            n = float(_v134_np.linalg.norm(hist))
+            if n > 1e-9:
+                hist /= n
+            vec.extend(hist.tolist())
+    return _v134_np.asarray(vec, dtype=_v134_np.float32)
+
+
+def _v134_grid_color(region: Any, gx: int=3, gy: int=4):
+    if region is None or region.size == 0 or _v134_np is None:
+        return _v134_np.zeros(gx * gy * 6, dtype=_v134_np.float32) if _v134_np is not None else []
+    if _v134_cv2 is not None:
+        hsv = _v134_cv2.cvtColor(region, _v134_cv2.COLOR_RGB2HSV).astype(_v134_np.float32)
+        lab = _v134_cv2.cvtColor(region, _v134_cv2.COLOR_RGB2LAB).astype(_v134_np.float32)
+        src = _v134_np.concatenate([hsv / _v134_np.array([180.0, 255.0, 255.0]), lab / 255.0], axis=2)
+    else:
+        rgb = region.astype(_v134_np.float32) / 255.0
+        src = _v134_np.concatenate([rgb, rgb], axis=2)
+    h, w = src.shape[:2]; vals = []
+    for yy in range(gy):
+        ya, yb = int(yy * h / gy), max(int((yy + 1) * h / gy), int(yy * h / gy) + 1)
+        for xx in range(gx):
+            xa, xb = int(xx * w / gx), max(int((xx + 1) * w / gx), int(xx * w / gx) + 1)
+            bloco = src[ya:yb, xa:xb]
+            vals.extend(bloco.reshape(-1, bloco.shape[2]).mean(axis=0).tolist())
+    return _v134_np.asarray(vals, dtype=_v134_np.float32)
+
+
+def _v134_grid_sim(a: Any, b: Any) -> float:
+    aa, bb = _v134_arr(a), _v134_arr(b)
+    if aa is None or bb is None or aa.size == 0 or bb.size == 0 or aa.shape != bb.shape or aa.size % 6 != 0:
+        return 0.0
+    aa = aa.reshape(-1, 6); bb = bb.reshape(-1, 6)
+    # HSV: matiz é circular; LAB ajuda a separar roupas com brilho parecido.
+    dh = _v134_np.abs(aa[:, 0] - bb[:, 0]); dh = _v134_np.minimum(dh, 1.0 - dh)
+    ds = _v134_np.abs(aa[:, 1] - bb[:, 1]); dv = _v134_np.abs(aa[:, 2] - bb[:, 2])
+    dlab = _v134_np.abs(aa[:, 3:6] - bb[:, 3:6]).mean(axis=1)
+    dist = 0.42 * dh + 0.18 * ds + 0.12 * dv + 0.28 * dlab
+    sim = 1.0 - float(_v134_np.clip(dist.mean() / 0.46, 0.0, 1.0))
+    return max(0.0, min(100.0, sim * 100.0))
+
+
+def _v134_dhash(region: Any) -> int:
+    if region is None or region.size == 0 or _v134_np is None:
+        return 0
+    gray = _v134_gray(region)
+    if _v134_cv2 is not None:
+        small = _v134_cv2.resize(gray, (9, 8), interpolation=_v134_cv2.INTER_AREA)
+    else:
+        small = gray[:8, :9]
+        if small.shape != (8, 9):
+            return 0
+    bits = small[:, 1:] > small[:, :-1]
+    valor = 0
+    for bit in bits.ravel().tolist():
+        valor = (valor << 1) | int(bool(bit))
+    return int(valor)
+
+
+def _v134_orb(region: Any):
+    if _v134_cv2 is None or region is None or region.size == 0:
+        return None
+    try:
+        gray = _v134_gray(region)
+        gray = _v134_cv2.resize(gray, (220, 300), interpolation=_v134_cv2.INTER_AREA)
+        orb = _v134_cv2.ORB_create(nfeatures=260, scaleFactor=1.2, nlevels=6, edgeThreshold=15, fastThreshold=12)
+        _, desc = orb.detectAndCompute(gray, None)
+        if desc is None:
+            return None
+        return desc[:180].astype('uint8', copy=False)
+    except Exception:
+        return None
+
+
+def _v134_feature_candidate(nome: str, crop: Any, qualidade: float) -> Dict[str, Any]:
+    full = _v134_region(crop, 'full'); head = _v134_region(crop, 'head'); upper = _v134_region(crop, 'upper'); lower = _v134_region(crop, 'lower')
+    return {
+        'name': nome,
+        'quality': float(qualidade),
+        'full_hsv': _v134_hsv_hist(full),
+        'full_lab': _v134_lab_hist(full),
+        'full_hog': _v134_hog(full),
+        'full_hash': _v134_dhash(full),
+        'upper_hsv': _v134_hsv_hist(upper),
+        'upper_lab': _v134_lab_hist(upper),
+        'upper_lbp': _v134_lbp_hist(upper),
+        'upper_hog': _v134_hog(upper),
+        'upper_grid': _v134_grid_color(upper),
+        'lower_hsv': _v134_hsv_hist(lower),
+        'lower_hog': _v134_hog(lower),
+        'lower_grid': _v134_grid_color(lower),
+        'head_hsv': _v134_hsv_hist(head),
+        'head_lab': _v134_lab_hist(head),
+        'head_lbp': _v134_lbp_hist(head),
+        'head_hog': _v134_hog(head),
+        'orb': _v134_orb(full),
+    }
+
+
+def _v134_features(img: Any) -> Dict[str, Any]:
+    candidatos = []
+    for nome, crop, qualidade in _v134_candidate_crops(img):
+        try:
+            candidatos.append(_v134_feature_candidate(nome, crop, qualidade))
+        except Exception:
+            continue
+    return {'candidates': candidatos, 'shape': tuple(int(x) for x in img.shape[:2])}
+
+
+def _v134_hash_sim(a: int, b: int) -> float:
+    try:
+        dist = int(int(a) ^ int(b)).bit_count()
+    except Exception:
+        dist = bin(int(a) ^ int(b)).count('1')
+    return max(0.0, 100.0 * (1.0 - dist / 64.0))
+
+
+def _v134_orb_sim(a: Any, b: Any) -> float:
+    if _v134_cv2 is None or a is None or b is None:
+        return 0.0
+    try:
+        aa = _v134_np.asarray(a, dtype=_v134_np.uint8); bb = _v134_np.asarray(b, dtype=_v134_np.uint8)
+        if len(aa) < 4 or len(bb) < 4:
+            return 0.0
+        matcher = _v134_cv2.BFMatcher(_v134_cv2.NORM_HAMMING, crossCheck=False)
+        pares = matcher.knnMatch(aa, bb, k=2)
+        bons = [m for pair in pares if len(pair) >= 2 for m, n in [pair[:2]] if m.distance < 0.78 * n.distance]
+        if not bons:
+            return 0.0
+        frac = min(1.0, len(bons) / max(10.0, min(len(aa), len(bb)) * 0.24))
+        qualidade = max(0.0, 1.0 - (sum(float(m.distance) for m in bons) / len(bons)) / 128.0)
+        return (0.68 * frac + 0.32 * qualidade) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _v134_compare_candidate(q: Dict[str, Any], r: Dict[str, Any], mode: str) -> Dict[str, float]:
+    up_hsv = 0.72 * _v134_hist_intersection(q.get('upper_hsv'), r.get('upper_hsv')) + 0.28 * _v134_hist_intersection(q.get('upper_lab'), r.get('upper_lab'))
+    low_hsv = _v134_hist_intersection(q.get('lower_hsv'), r.get('lower_hsv'))
+    full_color = 0.7 * _v134_hist_intersection(q.get('full_hsv'), r.get('full_hsv')) + 0.3 * _v134_hist_intersection(q.get('full_lab'), r.get('full_lab'))
+    up_texture = 0.58 * _v134_hist_intersection(q.get('upper_lbp'), r.get('upper_lbp')) + 0.42 * _v134_cos(q.get('upper_hog'), r.get('upper_hog'))
+    up_grid = _v134_grid_sim(q.get('upper_grid'), r.get('upper_grid'))
+    low_grid = _v134_grid_sim(q.get('lower_grid'), r.get('lower_grid'))
+    orb = _v134_orb_sim(q.get('orb'), r.get('orb'))
+    clothing = 0.38 * up_hsv + 0.15 * low_hsv + 0.07 * full_color + 0.10 * up_texture + 0.18 * up_grid + 0.08 * low_grid + 0.04 * orb
+
+    head_color = 0.65 * _v134_hist_intersection(q.get('head_hsv'), r.get('head_hsv')) + 0.35 * _v134_hist_intersection(q.get('head_lab'), r.get('head_lab'))
+    head_texture = 0.55 * _v134_hist_intersection(q.get('head_lbp'), r.get('head_lbp')) + 0.45 * _v134_cos(q.get('head_hog'), r.get('head_hog'))
+    full_hog = _v134_cos(q.get('full_hog'), r.get('full_hog'))
+    dh = _v134_hash_sim(int(q.get('full_hash') or 0), int(r.get('full_hash') or 0))
+    appearance = 0.34 * head_color + 0.24 * head_texture + 0.18 * full_hog + 0.12 * dh + 0.12 * orb
+    accessory = 0.38 * orb + 0.30 * full_hog + 0.18 * _v134_cos(q.get('upper_hog'), r.get('upper_hog')) + 0.14 * dh
+    if str(mode or '').lower() in {'roupa', 'clothing'}:
+        score = 0.84 * clothing + 0.10 * accessory + 0.06 * appearance
+    else:
+        score = 0.62 * clothing + 0.24 * appearance + 0.14 * accessory
+    qualidade = min(float(q.get('quality') or 1.0), float(r.get('quality') or 1.0))
+    score *= (0.90 + 0.10 * qualidade)
+    return {'score': float(score), 'clothing': float(clothing), 'appearance': float(appearance), 'accessory': float(accessory), 'orb': float(orb), 'head': float(head_color), 'texture': float(up_texture), 'color': float(up_hsv), 'shape': float(full_hog)}
+
+
+def _v134_compare_features(qf: Dict[str, Any], rf: Dict[str, Any], mode: str) -> Dict[str, float]:
+    melhor = {'score': 0.0, 'clothing': 0.0, 'appearance': 0.0, 'accessory': 0.0, 'orb': 0.0, 'head': 0.0, 'texture': 0.0, 'color': 0.0, 'shape': 0.0}
+    for q in list(qf.get('candidates') or []):
+        for r in list(rf.get('candidates') or []):
+            atual = _v134_compare_candidate(q, r, mode)
+            if atual['score'] > melhor['score']:
+                melhor = atual
+    return melhor
+
+
+def _v134_explanations(comp: Dict[str, float]) -> List[str]:
+    candidatos = []
+    if comp.get('color', 0) >= 58: candidatos.append((comp['color'], 'cores da roupa muito próximas'))
+    if comp.get('texture', 0) >= 52: candidatos.append((comp['texture'], 'textura/padrão da roupa semelhante'))
+    if comp.get('orb', 0) >= 40: candidatos.append((comp['orb'], 'detalhes e acessórios locais semelhantes'))
+    if comp.get('shape', 0) >= 58: candidatos.append((comp['shape'], 'silhueta/estrutura visual semelhante'))
+    if comp.get('head', 0) >= 55: candidatos.append((comp['head'], 'aparência da região da cabeça semelhante'))
+    if not candidatos:
+        candidatos.append((comp.get('clothing', 0), 'combinação geral de roupa e aparência próxima'))
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    return [texto for _, texto in candidatos[:3]]
+
+
+def _v134_source_priority(record: Dict[str, Any]) -> float:
+    s = normalizar_busca(f"{record.get('source','')} {record.get('description','')} {record.get('path','')}")
+    # documentos/mochila/veículos não devem dominar busca de personagem.
+    if any(k in s for k in ('foto rg', 'foto_rg', 'documento', 'passaporte', 'mochila', 'placa', 'veiculo', 'veículo', 'mapa', 'gps')):
+        return 0.35
+    if any(k in s for k in ('historico prisao', 'historico_prisao', 'prisional', 'foto individuo', 'foto_individuo', 'rosto', 'personagem', 'roupa')):
+        return 1.0
+    if 'arquivo ficha geral' in s or 'arquivo_ficha_geral' in s:
+        return 0.88
+    return 0.92
+
+
+class _V134VisualSearchIndex:
+    def __init__(self, root: Any):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / 'index_v134.pkl.gz'
+        self.lock = _v134_threading.RLock()
+        self.data: Dict[str, Any] = {'version': VISUAL_SEARCH_ENGINE_VERSION, 'entries': {}, 'built_at': '', 'engine': VISUAL_SEARCH_ENGINE_LABEL}
+        self._loaded = False
+
+    def load(self) -> Dict[str, Any]:
+        with self.lock:
+            if self._loaded:
+                return self.data
+            if self.path.exists():
+                try:
+                    with _v134_gzip.open(self.path, 'rb') as f:
+                        obj = _v134_pickle.load(f)
+                    if isinstance(obj, dict) and int(obj.get('version') or 0) == VISUAL_SEARCH_ENGINE_VERSION:
+                        self.data = obj
+                except Exception:
+                    self.data = {'version': VISUAL_SEARCH_ENGINE_VERSION, 'entries': {}, 'built_at': '', 'engine': VISUAL_SEARCH_ENGINE_LABEL}
+            self._loaded = True
+            return self.data
+
+    def _save(self) -> None:
+        tmp = self.path.with_suffix('.tmp.gz')
+        self.data['version'] = VISUAL_SEARCH_ENGINE_VERSION
+        self.data['engine'] = VISUAL_SEARCH_ENGINE_LABEL
+        self.data['built_at'] = _banco_agora_iso() if '_banco_agora_iso' in globals() else agora_br()
+        with _v134_gzip.open(tmp, 'wb', compresslevel=5) as f:
+            _v134_pickle.dump(self.data, f, protocol=_v134_pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, self.path)
+
+    def _fingerprint(self, path: str) -> str:
+        try:
+            p = Path(path); st = p.stat()
+            h = _v134_hashlib.sha1()
+            h.update(f'{st.st_size}:{st.st_mtime_ns}'.encode())
+            with p.open('rb') as f:
+                h.update(f.read(32768))
+                if st.st_size > 65536:
+                    f.seek(max(0, st.st_size - 32768)); h.update(f.read(32768))
+            return h.hexdigest()
+        except Exception:
+            return ''
+
+    def _extract_record(self, record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        path = str(record.get('path') or '').strip()
+        if not path or not Path(path).exists():
+            return None
+        img = _v134_load_path(path)
+        if img is None:
+            return None
+        features = _v134_features(img)
+        if not features.get('candidates'):
+            return None
+        out = dict(record)
+        out['features'] = features
+        out['fingerprint'] = self._fingerprint(path)
+        out['source_priority'] = _v134_source_priority(record)
+        out['engine_version'] = VISUAL_SEARCH_ENGINE_VERSION
+        return out
+
+    def build_or_update(self, records: List[Dict[str, Any]], prune: bool=False, progress_callback: Optional[Callable[[Dict[str, Any]], None]]=None) -> Dict[str, Any]:
+        self.load()
+        with self.lock:
+            entries = dict(self.data.get('entries') or {})
+            atuais = set()
+            stats = {'indexed_images': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'invalid': 0, 'errors': []}
+            total = len(list(records or []))
+            for idx, record in enumerate(list(records or []), start=1):
+                image_id = str(record.get('image_id') or '').strip()
+                if not image_id:
+                    stats['invalid'] += 1; continue
+                atuais.add(image_id)
+                path = str(record.get('path') or '').strip()
+                fp = self._fingerprint(path) if path else ''
+                anterior = entries.get(image_id)
+                if anterior and fp and str(anterior.get('fingerprint') or '') == fp and int(anterior.get('engine_version') or 0) == VISUAL_SEARCH_ENGINE_VERSION:
+                    # metadados podem mudar sem recalcular features
+                    for k in ('rg', 'nome', 'individuo_id', 'registro_id', 'url', 'source', 'mime_type', 'description', 'path'):
+                        if k in record:
+                            anterior[k] = record.get(k)
+                    entries[image_id] = anterior
+                    stats['skipped'] += 1
+                else:
+                    try:
+                        novo = self._extract_record(record)
+                        if novo is None:
+                            stats['invalid'] += 1
+                        else:
+                            entries[image_id] = novo
+                            if anterior: stats['updated'] += 1
+                            else: stats['added'] += 1
+                    except Exception as e:
+                        stats['invalid'] += 1
+                        if len(stats['errors']) < 20:
+                            stats['errors'].append(f'{image_id}: {type(e).__name__}: {e}')
+                if progress_callback:
+                    try:
+                        progress_callback({'phase': 'indexing_v134', 'current': idx, 'total': total, **stats})
+                    except Exception:
+                        pass
+            if prune:
+                for key in list(entries):
+                    if key not in atuais:
+                        entries.pop(key, None)
+            self.data['entries'] = entries
+            self._save()
+            stats['indexed_images'] = len(entries)
+            stats['summary'] = self.summary()
+            return stats
+
+    def summary(self) -> Dict[str, Any]:
+        self.load()
+        entries = list((self.data.get('entries') or {}).values())
+        registros = {int(e.get('registro_id') or e.get('individuo_id') or 0) for e in entries if int(e.get('registro_id') or e.get('individuo_id') or 0)}
+        try: tamanho = self.path.stat().st_size if self.path.exists() else 0
+        except Exception: tamanho = 0
+        return {'entries': len(entries), 'records': len(registros), 'index_bytes': int(tamanho), 'version': VISUAL_SEARCH_ENGINE_VERSION, 'engine': VISUAL_SEARCH_ENGINE_LABEL}
+
+    def search_bytes(self, image_bytes: bytes, mode: str='full', top_k: int=5) -> Dict[str, Any]:
+        self.load()
+        img = _v134_decode_bytes(bytes(image_bytes or b''))
+        if img is None:
+            return {'results': [], 'reason': 'imagem de consulta inválida', 'summary': self.summary()}
+        qf = _v134_features(img)
+        if not qf.get('candidates'):
+            return {'results': [], 'reason': 'não foi possível extrair características visuais', 'summary': self.summary()}
+        por_pessoa: Dict[int, List[Dict[str, Any]]] = {}
+        for entry in list((self.data.get('entries') or {}).values()):
+            iid = int(entry.get('registro_id') or entry.get('individuo_id') or 0)
+            if not iid or not isinstance(entry.get('features'), dict):
+                continue
+            comp = _v134_compare_features(qf, entry['features'], mode)
+            prioridade = float(entry.get('source_priority') or _v134_source_priority(entry))
+            comp['score'] *= (0.90 + 0.10 * prioridade)
+            por_pessoa.setdefault(iid, []).append({'entry': entry, 'comp': comp})
+        resultados = []
+        for iid, itens in por_pessoa.items():
+            itens.sort(key=lambda x: x['comp']['score'], reverse=True)
+            best = itens[0]
+            top = itens[:3]
+            pesos = [0.76, 0.17, 0.07]
+            agregado = 0.0; peso_total = 0.0
+            for pos, item in enumerate(top):
+                w = pesos[pos]
+                agregado += w * float(item['comp']['score']); peso_total += w
+            agregado = agregado / max(peso_total, 1e-9)
+            # Não esconda um bom match único por falta de várias fotos.
+            agregado = max(agregado, float(best['comp']['score']) * 0.96)
+            e = best['entry']; c = best['comp']
+            resultados.append({
+                'registro_id': iid, 'individuo_id': iid,
+                'rg': str(e.get('rg') or ''), 'nome': str(e.get('nome') or 'Ficha sem nome'),
+                'score': float(agregado),
+                'clothing_score': float(c.get('clothing') or 0),
+                'appearance_score': float(c.get('appearance') or 0),
+                'accessory_score': float(c.get('accessory') or 0),
+                'matches_count': len(itens),
+                'explanations': _v134_explanations(c),
+                'best_image': {k: e.get(k) for k in ('image_id', 'path', 'url', 'source', 'description')},
+            })
+        resultados.sort(key=lambda x: float(x.get('score') or 0), reverse=True)
+        limiar = VISUAL_SEARCH_MIN_SCORE_ROUPA if str(mode or '').lower() in {'roupa', 'clothing'} else VISUAL_SEARCH_MIN_SCORE_FULL
+        acima = [x for x in resultados if float(x.get('score') or 0) >= limiar]
+        warning = ''
+        if not acima and resultados:
+            # Em triagem é melhor mostrar candidatos fracos do que esconder a ficha inteira.
+            acima = resultados[:min(int(top_k or 5), 3)]
+            warning = f'Nenhum candidato superou o limiar de {limiar:.0f}%; exibindo os mais próximos para revisão humana.'
+        else:
+            acima = acima[:max(1, int(top_k or 5))]
+        return {'results': acima, 'reason': '' if acima else 'índice sem candidatos comparáveis', 'warning': warning, 'summary': self.summary(), 'threshold': limiar, 'engine': VISUAL_SEARCH_ENGINE_LABEL}
+
+
+# Publica um módulo visual_search compatível com a interface V124, mas usando o motor V134.
+_v134_mod = _v134_types.ModuleType('visual_search')
+_v134_mod.VisualSearchIndex = _V134VisualSearchIndex
+_v134_mod.is_supported_visual_file = _v134_visual_supported
+_v134_mod.format_index_size = _v134_visual_format_size
+_v134_mod.can_rebuild_visual_index = _v134_visual_can_rebuild
+_v134_sys.modules['visual_search'] = _v134_mod
+
+
+# V134: inclui fotos históricas de prisões no índice e evita que RG/mochila domine a busca.
+def _v124_visual_coletar_records(individuo_id: Optional[int]=None) -> List[Dict[str, Any]]:
+    inicializar_banco_dicor()
+    records: List[Dict[str, Any]] = []
+    with _banco_conexao() as db:
+        if individuo_id:
+            linhas_individuos = db.execute('SELECT * FROM individuos WHERE id=?', (int(individuo_id),)).fetchall()
+        else:
+            linhas_individuos = db.execute('SELECT * FROM individuos').fetchall()
+        individuos = [_v124_visual_row_dict(row) for row in linhas_individuos]
+        individuos = [ind for ind in individuos if _v124_visual_registro_valido(ind)]
+        por_id = {int(ind.get('id') or 0): ind for ind in individuos}
+        for ind in individuos:
+            iid = int(ind.get('id') or 0)
+            # Foto principal é a referência mais valiosa para roupa/aparência.
+            for path_key, url_key, source in (
+                ('foto_individuo_path', 'foto_individuo_url', 'foto_individuo'),
+                ('foto_ficha_path', 'foto_ficha_url', 'foto_ficha'),
+            ):
+                valor = str(ind.get(path_key) or '').strip()
+                if valor:
+                    _v124_visual_adicionar_record(records, image_id=f'individuo:{iid}:{source}', individuo=ind, caminho_original=valor, url=ind.get(url_key), source=source, mime_type='image/jpeg', description='Foto principal do personagem para busca visual')
+        # Fotos extras da ficha: mantidas, mas documentos/mochilas são rebaixados pelo motor.
+        try:
+            if individuo_id:
+                linhas_arquivos = db.execute('''SELECT a.*, i.rg AS rg, i.nome AS nome, i.status AS status FROM arquivos_ficha_geral a LEFT JOIN individuos i ON i.id=a.individuo_id WHERE a.individuo_id=?''', (int(individuo_id),)).fetchall()
+            else:
+                linhas_arquivos = db.execute('''SELECT a.*, i.rg AS rg, i.nome AS nome, i.status AS status FROM arquivos_ficha_geral a LEFT JOIN individuos i ON i.id=a.individuo_id WHERE a.individuo_id>0''').fetchall()
+        except Exception:
+            linhas_arquivos = []
+        for row in linhas_arquivos:
+            arq = _v124_visual_row_dict(row); iid = int(arq.get('individuo_id') or 0)
+            ind = dict(por_id.get(iid) or {'id': iid, 'rg': arq.get('rg'), 'nome': arq.get('nome'), 'status': arq.get('status')})
+            if not _v124_visual_registro_valido(ind):
+                continue
+            _v124_visual_adicionar_record(records, image_id=f'arquivo_ficha_geral:{int(arq.get("id") or 0)}', individuo=ind, caminho_original=arq.get('caminho'), url=arq.get('url_original'), source='arquivo_ficha_geral', mime_type=str(arq.get('mime_type') or ''), description=str(arq.get('descricao') or arq.get('nome_arquivo') or 'Foto adicional da ficha'))
+        # CRÍTICO: cada foto do indivíduo salva em prisional passa a fazer parte do histórico visual.
+        try:
+            if individuo_id:
+                prisoes = db.execute('''SELECT p.*, i.rg AS rg, i.nome AS nome, i.status AS status, i.foto_individuo_url AS foto_atual_url FROM historico_prisoes p LEFT JOIN individuos i ON i.id=p.individuo_id WHERE p.individuo_id=? AND TRIM(COALESCE(p.foto_individuo_path,''))<>'' ORDER BY p.id DESC''', (int(individuo_id),)).fetchall()
+            else:
+                prisoes = db.execute('''SELECT p.*, i.rg AS rg, i.nome AS nome, i.status AS status, i.foto_individuo_url AS foto_atual_url FROM historico_prisoes p LEFT JOIN individuos i ON i.id=p.individuo_id WHERE p.individuo_id>0 AND TRIM(COALESCE(p.foto_individuo_path,''))<>'' ORDER BY p.id DESC''').fetchall()
+        except Exception:
+            prisoes = []
+        for row in prisoes:
+            p = _v124_visual_row_dict(row); iid = int(p.get('individuo_id') or 0)
+            ind = dict(por_id.get(iid) or {'id': iid, 'rg': p.get('rg'), 'nome': p.get('nome'), 'status': p.get('status')})
+            if not _v124_visual_registro_valido(ind):
+                continue
+            url = str(p.get('foto_atual_url') or '') if str(ind.get('foto_individuo_path') or '') == str(p.get('foto_individuo_path') or '') else ''
+            _v124_visual_adicionar_record(records, image_id=f'historico_prisao:{int(p.get("id") or p.get("mensagem_id") or 0)}:individuo', individuo=ind, caminho_original=p.get('foto_individuo_path'), url=url, source='historico_prisao', mime_type='image/jpeg', description=f"Foto do personagem no prisional • {str(p.get('data_prisao') or 'data N/I')}")
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        dedup[str(record.get('image_id') or '')] = record
+    return list(dedup.values())
+
+
+# Atualiza o índice visual automaticamente quando uma foto prisional é salva.
+_V134_PRISAO_SALVAR_BASE = _prisao_salvar_registro_sync
+def _prisao_salvar_registro_sync(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    resultado = _V134_PRISAO_SALVAR_BASE(*args, **kwargs)
+    try:
+        ind = dict(resultado.get('individuo') or {}) if isinstance(resultado, dict) else {}
+        iid = int(ind.get('id') or 0)
+        if iid:
+            _v124_visual_indexar_individuo_sync(iid)
+            print(f'✅ V134 visual: foto prisional indexada imediatamente para ficha {iid} / RG {ind.get("rg") or "N/I"}.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V134 visual: prisão salva, mas índice visual não atualizou: {type(erro).__name__}: {erro}', flush=True)
+    return resultado
+
+
+# Resultado mais claro: mostra roupa, aparência e a origem da foto de referência.
+def _v124_visual_embed_resultados(resultado: Dict[str, Any], modo_label: str) -> discord.Embed:
+    resultados = list(resultado.get('results') or [])
+    resumo = dict(resultado.get('summary') or {})
+    warning = str(resultado.get('warning') or '').strip()
+    embed = discord.Embed(
+        title='🔎 BUSCA VISUAL — ROUPA + APARÊNCIA',
+        description=(
+            f'**Modo:** {modo_label}\n'
+            'A comparação prioriza **roupa**, cores, padrões, silhueta/acessórios e usa a aparência do personagem como apoio. '
+            '**É triagem por semelhança, não confirmação de identidade.**'
+        ),
+        color=discord.Color.from_rgb(20, 72, 130),
+    )
+    if warning:
+        embed.add_field(name='⚠️ Observação', value=warning[:1024], inline=False)
+    if not resultados:
+        motivo = str(resultado.get('reason') or 'nenhum candidato comparável')
+        embed.add_field(name='Resultado', value=f'Nenhuma ficha comparável foi encontrada.\nMotivo: `{motivo}`', inline=False)
+    for pos, item in enumerate(resultados, start=1):
+        score = float(item.get('score') or 0)
+        confianca = 'ALTA' if score >= 72 else ('BOA' if score >= 58 else ('MÉDIA' if score >= 44 else 'BAIXA'))
+        explicacoes = list(item.get('explanations') or [])
+        best = dict(item.get('best_image') or {})
+        source = str(best.get('source') or 'imagem da ficha').replace('_', ' ')
+        detalhes = [
+            f'**RG:** `{str(item.get("rg") or "N/I")}`',
+            f'**Compatibilidade geral:** `{score:.1f}%` • **{confianca}**',
+            f'**Roupa/vestimenta:** `{float(item.get("clothing_score") or 0):.1f}%`',
+            f'**Aparência:** `{float(item.get("appearance_score") or 0):.1f}%`',
+            f'**Acessórios/silhueta:** `{float(item.get("accessory_score") or 0):.1f}%`',
+            f'**Referência que mais bateu:** `{source[:65]}`',
+            f'**Fotos da ficha comparadas:** `{int(item.get("matches_count") or 1)}`',
+            '**Semelhanças:** ' + '; '.join(explicacoes[:3]),
+        ]
+        embed.add_field(name=f'{pos}. {str(item.get("nome") or "Ficha sem nome")[:80]}', value='\n'.join(detalhes)[:1024], inline=False)
+    melhor = dict((resultados[0].get('best_image') if resultados else {}) or {})
+    thumb = str(melhor.get('url') or '').strip()
+    if thumb.startswith('http'):
+        embed.set_thumbnail(url=thumb)
+    embed.add_field(name='Índice visual', value=f'Imagens: `{int(resumo.get("entries") or 0)}` • Fichas: `{int(resumo.get("records") or 0)}` • Motor: `V{int(resumo.get("version") or VISUAL_SEARCH_ENGINE_VERSION)}` • Tamanho: `{_v124_visual_formatar_tamanho(int(resumo.get("index_bytes") or 0))}`', inline=False)
+    embed.set_footer(text='DICOR • Busca Visual V134 • roupa priorizada + aparência auxiliar • revisão humana obrigatória')
+    return embed
+
+
+# Mantém os mesmos custom_ids, mas deixa o modo principal explícito.
+class V124VisualModoView(View):
+    def __init__(self, usuario_id: int, image_bytes: bytes, filename: str):
+        super().__init__(timeout=300)
+        self.usuario_id = int(usuario_id); self.image_bytes = bytes(image_bytes); self.filename = str(filename or 'imagem')[:120]; self.processando = False
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.usuario_id: return True
+        await interaction.response.send_message('❌ Esta busca visual pertence a outro agente.', ephemeral=True); return False
+    async def _executar(self, interaction: discord.Interaction, modo: str, modo_label: str) -> None:
+        if self.processando:
+            return await interaction.response.send_message('⏳ Esta imagem já está sendo comparada.', ephemeral=True)
+        self.processando = True
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            resultado = await asyncio.wait_for(asyncio.to_thread(_v124_visual_buscar_sync, self.image_bytes, modo), timeout=60)
+            embed = _v124_visual_embed_resultados(resultado, modo_label)
+            view = V124VisualResultadosView(int(interaction.user.id), list(resultado.get('results') or []))
+            await interaction.edit_original_response(content=None, embed=embed, view=view if view.children else None)
+        except Exception as erro:
+            traceback.print_exc()
+            try: await enviar_log(f'❌ V134 busca visual falhou `{self.filename}` | {type(erro).__name__}: {erro}')
+            except Exception: pass
+            await interaction.edit_original_response(content=f'❌ Não foi possível processar a busca visual: `{type(erro).__name__}: {str(erro)[:160]}`', embed=None, view=None)
+        finally:
+            self.processando = False
+    @discord.ui.button(label='Roupa + aparência', emoji='🔎', style=discord.ButtonStyle.primary, custom_id='v124_busca_visual_modo_completo')
+    async def completo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._executar(interaction, 'full', 'Roupa + aparência')
+    @discord.ui.button(label='Só roupa', emoji='👕', style=discord.ButtonStyle.secondary, custom_id='v124_busca_visual_modo_roupa')
+    async def roupa(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._executar(interaction, 'roupa', 'Roupa/vestimenta')
+
+
+# Primeiro deploy do V134: índice antigo não é reaproveitado; reconstrói sozinho em background.
+_V134_REBUILD_LOCK = _v134_threading.Lock()
+def _v134_rebuild_se_necessario_sync() -> Dict[str, Any]:
+    indice = _v124_visual_index()
+    resumo = indice.summary()
+    if int(resumo.get('version') or 0) == VISUAL_SEARCH_ENGINE_VERSION and int(resumo.get('entries') or 0) > 0:
+        return {'skipped': True, 'summary': resumo}
+    with _V134_REBUILD_LOCK:
+        indice = _v124_visual_index(); resumo = indice.summary()
+        if int(resumo.get('entries') or 0) > 0:
+            return {'skipped': True, 'summary': resumo}
+        return _v124_visual_rebuild_sync()
+
+@bot.listen('on_ready')
+async def _v134_visual_auto_rebuild_on_ready():
+    if not VISUAL_SEARCH_AUTO_REBUILD:
+        return
+    await asyncio.sleep(12)
+    try:
+        resultado = await asyncio.to_thread(_v134_rebuild_se_necessario_sync)
+        resumo = dict(resultado.get('summary') or {})
+        print(f'✅ V134 visual pronto: {int(resumo.get("entries") or 0)} imagem(ns) em {int(resumo.get("records") or 0)} ficha(s).', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V134 visual: rebuild automático falhou: {type(erro).__name__}: {erro}', flush=True)
+        try: await enviar_log(f'⚠️ V134 visual rebuild automático falhou | {type(erro).__name__}: {erro}')
+        except Exception: pass
+
+
+print(
+    '✅ V134 carregada — reconhecimento visual reconstruído: roupa priorizada, aparência auxiliar, múltiplos recortes, '
+    'cores/texturas/silhueta/acessórios, fotos prisionais históricas indexadas e auto-rebuild do índice. Mesa/dossiê V133 não alterados.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
