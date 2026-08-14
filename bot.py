@@ -59440,5 +59440,380 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 print('✅ V129 carregada — preflight corrigido, payload V128 forçado, cartões sem foto bloqueados e duplicações entre seções eliminadas.', flush=True)
 print('✅ V129: títulos com ponto (ex.: “02. FOTOS DOS LÍDERES”) agora passam corretamente no preflight.', flush=True)
 
+
+
+# =============================================================
+# V130 — ENTREGA FINAL DO DOSSIÊ + COMPACTAÇÃO PROFISSIONAL
+# Resolve o caso em que PDF/DOCX são gerados corretamente, mas excedem
+# o limite de upload do Discord e não existe DOSSIE_PUBLIC_URL explícita.
+# =============================================================
+
+# Railway já fornece o domínio público do serviço. Se a URL configurada ainda
+# apontar para localhost, usamos automaticamente o domínio real do deploy.
+def _v130_public_base() -> str:
+    dominio = str(os.getenv('RAILWAY_PUBLIC_DOMAIN', '') or '').strip().strip('/')
+    if dominio:
+        return f'https://{dominio}'
+    for valor in (globals().get('DOSSIE_PUBLIC_URL', ''), globals().get('CATALOG_PUBLIC_URL', '')):
+        base = normalizar_url_publica_base(str(valor or ''))
+        try:
+            parsed = urlparse(base)
+            if base and parsed.hostname not in {'127.0.0.1', 'localhost'}:
+                return base.rstrip('/')
+        except Exception:
+            continue
+    return ''
+
+_V130_PUBLIC_BASE = _v130_public_base()
+if _V130_PUBLIC_BASE:
+    DOSSIE_PUBLIC_URL = _V130_PUBLIC_BASE
+    # Mantém catálogo coerente apenas quando ele ainda estava apontando localmente.
+    try:
+        _cat = normalizar_url_publica_base(CATALOG_PUBLIC_URL)
+        _cat_host = urlparse(_cat).hostname if _cat else ''
+        if _cat_host in {'127.0.0.1', 'localhost', ''}:
+            CATALOG_PUBLIC_URL = _V130_PUBLIC_BASE + '/'
+    except Exception:
+        pass
+
+
+# --- Otimização real das imagens EMBUTIDAS no PDF/DOCX ---
+# O V129 redimensionava a imagem apenas visualmente no documento, mas ainda
+# incorporava o arquivo original inteiro. Aqui materializamos e regravamos uma
+# cópia JPEG compactada antes de inserir no PDF/DOCX.
+_V130_MATERIALIZAR_ORIGINAL = _v124_materializar_midia
+_V130_MEDIA_CACHE_LOCK = threading.RLock()
+
+
+def _v130_hash_path(caminho: Path) -> str:
+    try:
+        h = hashlib.sha1()
+        with open(caminho, 'rb') as f:
+            while True:
+                b = f.read(1024 * 1024)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()[:24]
+    except Exception:
+        return hashlib.sha1(str(caminho).encode('utf-8', errors='ignore')).hexdigest()[:24]
+
+
+def _v130_otimizar_imagem_documento(origem: Path, pasta_cache: Path) -> Path:
+    if PILImage is None:
+        return origem
+    origem = Path(origem)
+    if not origem.exists() or not origem.is_file():
+        return origem
+    pasta = Path(pasta_cache) / '_v130_otimizadas'
+    pasta.mkdir(parents=True, exist_ok=True)
+    chave = _v130_hash_path(origem)
+    destino = pasta / f'{chave}.jpg'
+    try:
+        if destino.exists() and destino.stat().st_size > 0:
+            return destino
+    except Exception:
+        pass
+    try:
+        from PIL import ImageOps as _ImageOps
+        with _V130_MEDIA_CACHE_LOCK:
+            if destino.exists() and destino.stat().st_size > 0:
+                return destino
+            with PILImage.open(origem) as img:
+                img = _ImageOps.exif_transpose(img)
+                # 1350 px mantém screenshots de celular legíveis e reduz PNGs enormes.
+                img.thumbnail((1350, 1350), PILImage.Resampling.LANCZOS)
+                if img.mode in {'RGBA', 'LA'} or 'transparency' in img.info:
+                    rgba = img.convert('RGBA')
+                    fundo = PILImage.new('RGB', rgba.size, (248, 246, 239))
+                    fundo.paste(rgba, mask=rgba.getchannel('A'))
+                    img = fundo
+                else:
+                    img = img.convert('RGB')
+                img.save(destino, 'JPEG', quality=78, optimize=True, progressive=True, subsampling='4:2:0')
+            if destino.exists() and destino.stat().st_size > 0:
+                return destino
+    except Exception:
+        pass
+    return origem
+
+
+def _v124_materializar_midia(item: Any, pasta_cache: Path) -> Optional[Path]:
+    original = _V130_MATERIALIZAR_ORIGINAL(item, pasta_cache)
+    if not original:
+        return None
+    try:
+        original = Path(original)
+        if not original.exists() or not original.is_file():
+            return None
+        return _v130_otimizar_imagem_documento(original, Path(pasta_cache))
+    except Exception:
+        return original
+
+
+# --- Fallback compacto para PDF quando nem Discord, nem link, nem B2 estiverem disponíveis ---
+def _v130_pdf_raster_compacto(origem: Path, destino: Path, alvo_bytes: int) -> Optional[Path]:
+    if fitz is None or PILImage is None:
+        return None
+    origem = Path(origem); destino = Path(destino)
+    if not origem.exists():
+        return None
+    tentativas = [
+        (1.20, 68),
+        (1.00, 60),
+        (0.86, 52),
+    ]
+    for escala, qualidade in tentativas:
+        temp = destino.with_suffix(f'.q{qualidade}.pdf')
+        try:
+            src = fitz.open(str(origem))
+            out = fitz.open()
+            try:
+                for pagina in src:
+                    pix = pagina.get_pixmap(matrix=fitz.Matrix(escala, escala), alpha=False)
+                    modo = 'RGB' if pix.n >= 3 else 'L'
+                    img = PILImage.frombytes(modo, (pix.width, pix.height), pix.samples)
+                    if modo != 'RGB':
+                        img = img.convert('RGB')
+                    bio = io.BytesIO()
+                    img.save(bio, 'JPEG', quality=qualidade, optimize=True, progressive=True, subsampling='4:2:0')
+                    nova = out.new_page(width=pagina.rect.width, height=pagina.rect.height)
+                    nova.insert_image(nova.rect, stream=bio.getvalue(), keep_proportion=False)
+                out.save(str(temp), garbage=4, deflate=True, clean=True)
+            finally:
+                out.close(); src.close()
+            if temp.exists() and temp.stat().st_size > 0:
+                if not destino.exists() or temp.stat().st_size < destino.stat().st_size:
+                    temp.replace(destino)
+                else:
+                    temp.unlink(missing_ok=True)
+                if destino.stat().st_size <= alvo_bytes:
+                    return destino
+        except Exception:
+            try:
+                temp.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return destino if destino.exists() and destino.stat().st_size > 0 else None
+
+
+# --- Compactação interna do DOCX mantendo os nomes/extensões esperados pelo Word ---
+def _v130_docx_compacto(origem: Path, destino: Path, alvo_bytes: int) -> Optional[Path]:
+    import zipfile
+    origem = Path(origem); destino = Path(destino)
+    if not origem.exists() or PILImage is None:
+        return None
+    def montar(max_px: int, jpg_q: int, png_colors: int) -> bool:
+        tmp = destino.with_suffix('.tmp.docx')
+        try:
+            with zipfile.ZipFile(origem, 'r') as zin, zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+                for info in zin.infolist():
+                    data = zin.read(info.filename)
+                    nome = info.filename.lower()
+                    if nome.startswith('word/media/'):
+                        ext = Path(nome).suffix.lower()
+                        try:
+                            with PILImage.open(io.BytesIO(data)) as img:
+                                img.thumbnail((max_px, max_px), PILImage.Resampling.LANCZOS)
+                                bio = io.BytesIO()
+                                if ext in {'.jpg', '.jpeg'}:
+                                    img.convert('RGB').save(bio, 'JPEG', quality=jpg_q, optimize=True, progressive=True, subsampling='4:2:0')
+                                    data = bio.getvalue()
+                                elif ext == '.png':
+                                    # Para prints/UI, paleta reduz muito o tamanho sem trocar extensão.
+                                    if img.mode not in {'RGB', 'RGBA'}:
+                                        img = img.convert('RGBA' if 'A' in img.getbands() else 'RGB')
+                                    if img.mode == 'RGBA':
+                                        fundo = PILImage.new('RGB', img.size, (248, 246, 239))
+                                        fundo.paste(img, mask=img.getchannel('A'))
+                                        img = fundo
+                                    img = img.convert('P', palette=PILImage.Palette.ADAPTIVE, colors=png_colors)
+                                    img.save(bio, 'PNG', optimize=True, compress_level=9)
+                                    data = bio.getvalue()
+                                elif ext in {'.bmp', '.gif'}:
+                                    img.save(bio, format='PNG', optimize=True)
+                                    data = bio.getvalue()
+                        except Exception:
+                            pass
+                    zout.writestr(info, data)
+            if tmp.exists() and tmp.stat().st_size > 0:
+                tmp.replace(destino)
+                return True
+        except Exception:
+            pass
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return False
+    for max_px, jpg_q, png_colors in [(1200, 72, 192), (950, 64, 128), (760, 56, 96)]:
+        if montar(max_px, jpg_q, png_colors):
+            if destino.stat().st_size <= alvo_bytes:
+                return destino
+    return destino if destino.exists() and destino.stat().st_size > 0 else None
+
+
+def _v130_persistir_para_download(caminho: Path, nome: str, dados_dossie: Dict[str, Any], canal_mesa: Any) -> Tuple[Optional[Path], str]:
+    """Copia o arquivo para DOSSIES_DIR antes do envio e monta URL do web server do bot."""
+    try:
+        processo = slugify(str(dados_dossie.get('processo') or f'MESA-{getattr(canal_mesa, "id", 0)}')).upper().replace('-', '_') or f'MESA_{getattr(canal_mesa, "id", 0)}'
+        pasta = DOSSIES_DIR / processo / 'downloads'
+        pasta.mkdir(parents=True, exist_ok=True)
+        destino = pasta / nome
+        shutil.copy2(str(caminho), str(destino))
+        base = _v130_public_base()
+        if not base:
+            return destino, ''
+        rel = destino.resolve().relative_to(DOSSIES_DIR.resolve())
+        url = f"{base}/dossies/{'/'.join(quote(p) for p in rel.parts)}?download=1&nome={quote(nome)}"
+        return destino, url if url_discord_valida(url) else ''
+    except Exception:
+        return None, ''
+
+
+def _v130_b2_link(caminho: Path, categoria: str = 'dossies') -> Tuple[str, str]:
+    """Retorna (url, erro). Usa Backblaze já configurado pelo próprio bot."""
+    try:
+        if '_v78_r2_configurado' not in globals() or not _v78_r2_configurado():
+            return '', 'B2 não configurado'
+        resultado = _v78_upload_sync(Path(caminho), categoria)
+        pointer = str(resultado.get('pointer') or '')
+        url = _v78_presign_sync(pointer)
+        if url and url_discord_valida(url):
+            return url, ''
+        return '', 'B2 confirmou upload, mas não gerou URL válida'
+    except Exception as erro:
+        return '', f'{type(erro).__name__}: {erro}'
+
+
+# Substitui a entrega antiga. Ordem:
+# 1) Discord direto; 2) link permanente do Railway; 3) B2 presign;
+# 4) cópia compacta para Discord. O fechamento só avança se houver confirmação.
+async def enviar_arquivos_dossie_destino(destino, dados_dossie: Dict[str, Any], arquivos: Dict[str, str], nome_pdf: str, nome_docx: str, canal_mesa: discord.TextChannel, usuario: discord.abc.User, titulo: str='🏛️ DOSSIÊ OPERACIONAL AUTOMÁTICO DICOR') -> Optional[discord.Message]:
+    if not destino or not hasattr(destino, 'send'):
+        return None
+
+    limite_real = int(getattr(getattr(destino, 'guild', None), 'filesize_limit', 10 * 1024 * 1024) or 10 * 1024 * 1024)
+    # margem para evitar rejeição por overhead/limite reportado incorretamente
+    limite = max(1024 * 1024, limite_real - 256 * 1024)
+    itens = []
+    if arquivos.get('pdf'):
+        itens.append((Path(arquivos['pdf']), nome_pdf, 'PDF'))
+    if arquivos.get('docx'):
+        itens.append((Path(arquivos['docx']), nome_docx, 'DOCX'))
+
+    embed = discord.Embed(
+        title=titulo,
+        description='Documento oficial gerado e validado. Arquivos preservados antes do encerramento da mesa.',
+        color=discord.Color.from_rgb(0, 43, 91),
+    )
+    embed.add_field(name='Processo', value=f"`{dados_dossie.get('processo', 'Não informado')}`", inline=True)
+    embed.add_field(name='Investigação', value=f"`{dados_dossie.get('numero_investigacao', 'Não informado')}`", inline=True)
+    embed.add_field(name='Encerrada por', value=getattr(usuario, 'mention', str(usuario)), inline=False)
+
+    primeiro: Optional[discord.Message] = None
+    sucessos = 0
+    falhas: List[str] = []
+    links: List[Tuple[str, str, int, str]] = []
+
+    for caminho, nome, rotulo in itens:
+        if not caminho.exists() or caminho.stat().st_size <= 0:
+            falhas.append(f'{rotulo}: arquivo inexistente ou vazio')
+            continue
+        tamanho = int(caminho.stat().st_size)
+
+        # 1) envio direto
+        if tamanho <= limite:
+            try:
+                msg = await destino.send(
+                    content=f'📄 **Dossiê DICOR em {rotulo} — {tamanho / 1024 / 1024:.1f} MB**',
+                    embed=embed if primeiro is None else None,
+                    file=discord.File(str(caminho), filename=nome),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                primeiro = primeiro or msg
+                sucessos += 1
+                continue
+            except Exception as erro:
+                falhas.append(f'{rotulo} upload direto: {type(erro).__name__}: {erro}')
+
+        # 2) URL permanente pelo próprio Railway. Copiamos antes para DOSSIES_DIR,
+        # evitando o bug anterior em que a URL era montada a partir da pasta temporária.
+        persistido, url_web = await asyncio.to_thread(_v130_persistir_para_download, caminho, nome, dados_dossie, canal_mesa)
+        if url_web:
+            links.append((rotulo, url_web, tamanho, 'link permanente'))
+            sucessos += 1
+            continue
+
+        # 3) B2 privado com link temporário, caso Railway não tenha domínio público.
+        url_b2, erro_b2 = await asyncio.to_thread(_v130_b2_link, persistido or caminho, f'dossies/{slugify(str(dados_dossie.get("processo") or "mesa"))}')
+        if url_b2:
+            links.append((rotulo, url_b2, tamanho, 'Backblaze B2'))
+            sucessos += 1
+            continue
+
+        # 4) último recurso: compactar uma cópia e anexar ao Discord.
+        compacto_dir = Path(caminho.parent) / '_v130_compactos'
+        compacto_dir.mkdir(parents=True, exist_ok=True)
+        if rotulo == 'PDF':
+            compacto = compacto_dir / (Path(nome).stem + '_LEVE.pdf')
+            gerado = await asyncio.to_thread(_v130_pdf_raster_compacto, caminho, compacto, limite)
+        else:
+            compacto = compacto_dir / (Path(nome).stem + '_LEVE.docx')
+            gerado = await asyncio.to_thread(_v130_docx_compacto, caminho, compacto, limite)
+        if gerado and Path(gerado).exists() and Path(gerado).stat().st_size <= limite:
+            try:
+                tam2 = int(Path(gerado).stat().st_size)
+                msg = await destino.send(
+                    content=f'📦 **{rotulo} compactado para envio — {tam2 / 1024 / 1024:.1f} MB**\nO original integral foi preservado no armazenamento do dossiê.',
+                    embed=embed if primeiro is None else None,
+                    file=discord.File(str(gerado), filename=Path(gerado).name),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                primeiro = primeiro or msg
+                sucessos += 1
+                continue
+            except Exception as erro:
+                falhas.append(f'{rotulo} compacto: {type(erro).__name__}: {erro}')
+        else:
+            falhas.append(f'{rotulo}: {tamanho / 1024 / 1024:.1f} MB; sem URL Railway; B2={erro_b2}; compactação não atingiu o limite de {limite_real / 1024 / 1024:.1f} MB')
+
+    if links:
+        view = discord.ui.View(timeout=None)
+        linhas = []
+        for rotulo, url, tamanho, origem in links:
+            try:
+                view.add_item(discord.ui.Button(label=f'Baixar {rotulo} ({tamanho / 1024 / 1024:.1f} MB)', emoji='⬇️', style=discord.ButtonStyle.link, url=url))
+                linhas.append(f'• **{rotulo}:** {tamanho / 1024 / 1024:.1f} MB — {origem}')
+            except Exception as erro:
+                falhas.append(f'{rotulo} botão de download: {erro}')
+        if linhas:
+            msg = await destino.send(
+                content='📦 **Arquivos do dossiê disponíveis para download:**\n' + '\n'.join(linhas),
+                embed=embed if primeiro is None else None,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            primeiro = primeiro or msg
+
+    if falhas:
+        try:
+            await destino.send('⚠️ **Diagnóstico de entrega do dossiê:**\n' + '\n'.join(f'• {x}' for x in falhas)[:1800])
+        except Exception:
+            pass
+
+    if sucessos <= 0 or primeiro is None:
+        raise RuntimeError('Nenhum arquivo do dossiê pôde ser entregue. ' + (' | '.join(falhas[:8]) if falhas else 'Sem destino disponível.'))
+    return primeiro
+
+
+print(
+    f'✅ V130 carregada — entrega de dossiê robusta | URL pública={_V130_PUBLIC_BASE or "não detectada"} | '
+    f'B2={"ativo" if ("_v78_r2_configurado" in globals() and _v78_r2_configurado()) else "fallback"} | '
+    'imagens serão compactadas antes de entrar no PDF/DOCX.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
