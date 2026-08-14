@@ -58673,3 +58673,262 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 
 
 print('✅ V125 carregada — geração profissional blindada: V124 obrigatório quando disponível, fotos normalizadas/materializadas e PDF sem fallback silencioso.', flush=True)
+
+
+# =========================
+# V126 — rebuild do payload profissional
+# Foco: isolar seções, usar textos curatoriais, impedir mistura entre tópicos e priorizar fotos corretas.
+# =========================
+
+
+def _v126_aliases_secao(codigo: str) -> List[str]:
+    mapa = {
+        '01': ['painel'],
+        '02': ['fotos lideres', 'fotos líderes', 'liderancas', 'liderança', 'lideres', 'líderes'],
+        '03': ['fotos dos membros', 'fotos membros', 'integrantes', 'membros'],
+        '04': ['radio', 'rádio'],
+        '05': ['localizacao', 'localização'],
+        '06': ['crimes da comunidade', 'crimes', 'crime'],
+        '07': ['bau de lider', 'baú de líder', 'bau lider', 'baú líder'],
+        '08': ['bau de membros', 'baú de membros'],
+        '09': ['rota de farm', 'farm'],
+        '10': ['rota de producao', 'rota de produção', 'producao', 'produção'],
+        '11': ['ingredientes base e produtos', 'ingredientes', 'produto final', 'produtos'],
+        '12': ['informante'],
+        '13': ['residencia do lider', 'residência do líder', 'residencia', 'residência'],
+    }
+    return list(mapa.get(str(codigo), []))
+
+
+def _v126_secao_imagens(dados: Dict[str, Any], g: Dict[str, Any], codigo: str, guided_keys: List[str], limite: int = 24) -> List[Dict[str, Any]]:
+    combinadas: List[Dict[str, Any]] = []
+    # 1) histórico/evidências do tópico correto
+    aliases = _v126_aliases_secao(codigo)
+    if aliases:
+        for alias in aliases:
+            combinadas.extend(_v124_evidencias_secao(dados, alias, limite))
+    # 2) estrutura guiada da mesa
+    for chave in guided_keys:
+        combinadas.extend(_v124_imagens_estado(g, chave, limite))
+    return _v124_dedupe_media(combinadas, limite)
+
+
+def _v126_resumo_informante(g: Dict[str, Any]) -> str:
+    resumo = _v124_clean_text(g.get('informante_resumo'), 900)
+    if resumo:
+        return resumo
+    if isinstance(g.get('informante'), dict) and str(g['informante'].get('nome') or '').strip():
+        return 'A colaboração do informante foi registrada internamente e vinculada a esta investigação, com preservação de sua identificação básica e do contexto operacional.'
+    return ''
+
+
+def _v126_texto_secao(codigo: str, titulo: str, g: Dict[str, Any], dados: Dict[str, Any], imagens: List[Dict[str, Any]]) -> str:
+    if codigo == '01':
+        total = len(list(g.get('painel_membros') or []))
+        return (
+            f'O painel estrutural da organização foi consolidado para conferência operacional, contendo {total} registro(s) individuais extraídos do material anexado.'
+            if total else
+            'O painel estrutural da organização foi consolidado para conferência operacional, preservando a referência visual e a identificação básica dos integrantes exibidos.'
+        )
+    if codigo == '02':
+        total = len(list(g.get('liderancas') or []))
+        return f'As lideranças identificadas foram organizadas em fichas individuais com nome, RG, função/cargo e evidência fotográfica. Total cadastrado: {total}.'
+    if codigo == '03':
+        total = len(list(g.get('membros') or []))
+        return f'Os membros mapeados foram organizados em fichas individuais com identificação funcional e evidência visual correspondente. Total cadastrado: {total}.'
+    if codigo == '04':
+        radio = str(g.get('radio') or '').strip()
+        return f'A frequência operacional vinculada à organização foi registrada como {radio}.' if radio else 'A frequência operacional vinculada à organização foi registrada nesta seção.'
+    if codigo == '05':
+        return f'A localização operacional da organização foi documentada por meio de registros visuais do ponto-base, GPS e vistas aéreas, com {len(imagens)} evidência(s) aproveitada(s) nesta seção.'
+    if codigo == '06':
+        total = len(list(g.get('crimes') or []))
+        return f'Os crimes atribuídos à comunidade foram catalogados com descrição objetiva e, quando existentes, com as respectivas provas vinculadas. Total de registros: {total}.'
+    if codigo == '07':
+        return 'O baú de liderança foi documentado com registro visual do ambiente e do respectivo ponto de acesso, preservando o contexto do armazenamento utilizado pela chefia da organização.'
+    if codigo == '08':
+        return 'O baú dos membros foi documentado com registro visual do ambiente e do respectivo ponto de acesso, preservando o contexto do armazenamento utilizado pelos integrantes da organização.'
+    if codigo == '09':
+        return 'A rota de farm foi documentada com registros visuais do ponto operacional e do trajeto correspondente, permitindo localização e conferência do procedimento de coleta.'
+    if codigo == '10':
+        return 'A rota de produção foi documentada com registros visuais do ponto operacional e do trajeto correspondente, permitindo localização e conferência do procedimento de fabricação.'
+    if codigo == '11':
+        return 'Os ingredientes-base e o produto final foram consolidados nesta seção, com organização separada das evidências para demonstrar os insumos e o resultado final do processo produtivo.'
+    if codigo == '12':
+        inf = g.get('informante') if isinstance(g.get('informante'), dict) else {}
+        nome = str(inf.get('nome') or 'não identificado').strip() or 'não identificado'
+        return f'O informante {nome} foi registrado com identificação individual e referência visual, acompanhado de síntese da colaboração prestada à investigação.'
+    if codigo == '13':
+        return 'A residência vinculada ao líder da organização foi documentada visualmente, preservando o ponto de interesse e os registros necessários para consulta operacional.'
+    return f'Seção {titulo.lower()} consolidada a partir do material validado nesta mesa investigativa.'
+
+
+def _v126_ajustar_pessoas(pessoas: List[Dict[str, Any]], imagens_secao: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    fotos = list(_v124_dedupe_media(imagens_secao, 80))
+    idx_foto = 0
+    saida = []
+    for idx, bruto in enumerate(list(pessoas or []), start=1):
+        p = dict(bruto or {})
+        foto = _v124_img_pessoa(p)
+        if not foto and idx_foto < len(fotos):
+            foto = fotos[idx_foto]
+            idx_foto += 1
+        saida.append({
+            'ordem': idx,
+            'nome': str(p.get('nome') or 'Não identificado').strip() or 'Não identificado',
+            'rg': str(p.get('rg') or 'Não informado').strip() or 'Não informado',
+            'cargo': str(p.get('cargo') or p.get('funcao') or 'Não informado').strip() or 'Não informado',
+            'foto': foto,
+        })
+    return saida
+
+
+def _v126_dividir_localizacao(g: Dict[str, Any], imagens_local: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    base = _v124_dedupe_media(_v124_imagens_estado(g, 'localizacao_etapa1', 4), 4)
+    aereas = _v124_dedupe_media(_v124_imagens_estado(g, 'localizacao_aereas', 8), 8)
+    if base or aereas:
+        usadas = _v124_dedupe_media(base + aereas, 20)
+        # complementa pelas evidências do tópico se faltar alguma
+        for item in list(imagens_local or []):
+            ident = (str(item.get('mensagem_id') or ''), str(item.get('url') or ''), str(item.get('local') or item.get('arquivo') or ''))
+            usados_ids = {(str(x.get('mensagem_id') or ''), str(x.get('url') or ''), str(x.get('local') or x.get('arquivo') or '')) for x in usadas}
+            if ident in usados_ids:
+                continue
+            if len(base) < 2:
+                base.append(item)
+            elif len(aereas) < 4:
+                aereas.append(item)
+            else:
+                break
+        return _v124_dedupe_media(base, 2), _v124_dedupe_media(aereas, 6)
+    todas = list(_v124_dedupe_media(imagens_local, 10))
+    return todas[:2], todas[2:6]
+
+
+def _v126_dividir_ingredientes(g: Dict[str, Any], imagens_secao: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    base = _v124_dedupe_media(_v124_imagens_estado(g, 'ingredientes_fotos', 8), 8)
+    produto = _v124_dedupe_media(_v124_imagens_estado(g, 'produto_final_fotos', 8), 8)
+    if base or produto:
+        return base, produto
+    todas = list(_v124_dedupe_media(imagens_secao, 12))
+    if len(todas) <= 1:
+        return todas, []
+    return todas[:1], todas[1:]
+
+
+def _v126_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    g = dict((estado or {}).get('dados') or {})
+    meta = {
+        'nome_operacao': str(dados.get('nome_operacao') or dados.get('nome') or f'OPERAÇÃO INVESTIGATIVA {canal_id}').strip(),
+        'numero': str(dados.get('numero') or f'INV-{str(canal_id)[-6:]}').strip(),
+        'processo': str(dados.get('processo') or f'PF-DICOR-{canal_id}').strip(),
+        'comunidade': str(dados.get('comunidade') or dados.get('faccao') or dados.get('organizacao') or 'Organização investigada').strip(),
+        'delegado': str(dados.get('delegado') or dados.get('autor_nome') or 'Superintendência DICOR').strip(),
+        'data_abertura': str(dados.get('data_abertura') or dados.get('criada_em') or agora_br()).strip(),
+        'mesa_canal_id': int(canal_id or 0),
+        'cidade': 'Capital Morada do Valley',
+    }
+
+    painel_imgs = _v126_secao_imagens(dados, g, '01', ['painel_imagens'], 12)
+    lider_imgs = _v126_secao_imagens(dados, g, '02', [], 30)
+    membro_imgs = _v126_secao_imagens(dados, g, '03', [], 50)
+    local_imgs = _v126_secao_imagens(dados, g, '05', ['localizacao_etapa1', 'localizacao_aereas'], 12)
+    crimes_imgs = _v126_secao_imagens(dados, g, '06', [], 50)
+    bau_lider_imgs = _v126_secao_imagens(dados, g, '07', ['bau_lider'], 8)
+    bau_membros_imgs = _v126_secao_imagens(dados, g, '08', ['bau_membros'], 8)
+    rota_farm_imgs = _v126_secao_imagens(dados, g, '09', ['rota_farm'], 8)
+    rota_producao_imgs = _v126_secao_imagens(dados, g, '10', ['rota_producao'], 8)
+    ingred_imgs = _v126_secao_imagens(dados, g, '11', ['ingredientes_fotos', 'produto_final_fotos'], 12)
+    informante_imgs = _v126_secao_imagens(dados, g, '12', ['informante_resumo_fotos'], 8)
+    residencia_imgs = _v126_secao_imagens(dados, g, '13', ['residencia_fotos'], 12)
+
+    liderancas = _v126_ajustar_pessoas(list(g.get('liderancas') or []), lider_imgs)
+    membros = _v126_ajustar_pessoas(list(g.get('membros') or []), membro_imgs)
+    local_base, local_aereas = _v126_dividir_localizacao(g, local_imgs)
+    ingredientes_base, produto_final = _v126_dividir_ingredientes(g, ingred_imgs)
+
+    crimes = []
+    provas_gerais = list(crimes_imgs)
+    for idx, c in enumerate(list(g.get('crimes') or []), start=1):
+        if not isinstance(c, dict):
+            continue
+        provas = _v124_dedupe_media(list(c.get('provas') or []), 12)
+        if not provas and provas_gerais:
+            provas = provas_gerais[:2]
+            provas_gerais = provas_gerais[2:]
+        crimes.append({
+            'ordem': idx,
+            'descricao': _v124_clean_text(c.get('descricao'), 500) or f'Crime {idx}',
+            'provas': provas,
+        })
+
+    informante_bruto = g.get('informante') if isinstance(g.get('informante'), dict) else {}
+    informante_foto = _v124_img_pessoa(informante_bruto)
+    if not informante_foto and informante_imgs:
+        informante_foto = informante_imgs[0]
+    informante_doc = _v124_normalizar_midia(informante_bruto.get('documento')) if isinstance(informante_bruto, dict) else None
+    if not informante_doc and len(informante_imgs) > 1:
+        informante_doc = informante_imgs[1]
+
+    sections: List[Dict[str, Any]] = []
+    def add_sec(code: str, title: str, **extra: Any) -> None:
+        imagens_base = list(extra.get('images') or [])
+        sec = {
+            'code': code,
+            'title': title,
+            'summary': _v126_texto_secao(code, title, g, dados, imagens_base),
+        }
+        sec.update(extra)
+        sections.append(sec)
+
+    add_sec('01', 'PAINEL', images=painel_imgs)
+    add_sec('02', 'FOTOS DOS LÍDERES', people=liderancas, images=_v124_dedupe_media([p.get('foto') for p in liderancas if isinstance(p.get('foto'), dict)], 40))
+    add_sec('03', 'FOTOS DOS MEMBROS', people=membros, images=_v124_dedupe_media([p.get('foto') for p in membros if isinstance(p.get('foto'), dict)], 60))
+    add_sec('04', 'RÁDIO', field_lines=[('Frequência registrada', str(g.get('radio') or 'Não informada').strip() or 'Não informada')], images=[])
+    add_sec('05', 'LOCALIZAÇÃO', subgroups=[{'label': 'Ponto de referência e GPS', 'images': local_base}, {'label': 'Vistas aéreas', 'images': local_aereas}], images=_v124_dedupe_media(local_base + local_aereas, 12))
+    add_sec('06', 'CRIMES DA COMUNIDADE', crimes=crimes, images=_v124_dedupe_media([p for crime in crimes for p in list(crime.get('provas') or [])], 40))
+    add_sec('07', 'BAÚ DE LÍDER', images=bau_lider_imgs)
+    add_sec('08', 'BAÚ DE MEMBROS', images=bau_membros_imgs)
+    add_sec('09', 'ROTA DE FARM', images=rota_farm_imgs)
+    add_sec('10', 'ROTA DE PRODUÇÃO', images=rota_producao_imgs)
+    add_sec('11', 'INGREDIENTES E PRODUTOS', subgroups=[{'label': 'Ingredientes base', 'images': ingredientes_base}, {'label': 'Produto final', 'images': produto_final}], images=_v124_dedupe_media(ingredientes_base + produto_final, 12))
+    add_sec('12', 'INFORMANTE', informante={'nome': str(informante_bruto.get('nome') or 'Não informado').strip() or 'Não informado', 'rg': str(informante_bruto.get('rg') or 'Não informado').strip() or 'Não informado', 'cargo': 'Informante', 'foto': informante_foto, 'documento': informante_doc}, extra_text=_v126_resumo_informante(g), images=_v124_dedupe_media([x for x in [informante_foto, informante_doc] if isinstance(x, dict)], 8))
+    add_sec('13', 'RESIDÊNCIA DO LÍDER', images=residencia_imgs)
+
+    evidence_index = [{'code': sec.get('code'), 'title': sec.get('title'), 'count': len(list(sec.get('images') or []))} for sec in sections]
+    return {
+        'meta': meta,
+        'sections': sections,
+        'evidence_index': evidence_index,
+        'status': str((estado or {}).get('status') or 'ATIVA'),
+        'concluidos': dict((estado or {}).get('concluidos') or {}),
+        'geracao': 'v126_payload_profissional',
+    }
+
+
+_V126_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dados = await _V126_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        if isinstance(canal, discord.TextChannel):
+            estado = _v116_estado(int(canal.id), False) or {}
+            dados_estado = dict(estado.get('dados') or {}) if isinstance(estado, dict) else {}
+            if isinstance(dados_estado, dict) and dados_estado and (_v122_mesa_tarefas_habilitada(int(canal.id)) or _v125_tem_conteudo_registrado(dados_estado)):
+                payload = _v126_payload_profissional(dados, estado, int(canal.id))
+                dados['dossie_v124'] = payload
+                dados['gerador_dossie'] = 'v126_profissional_rebuild'
+                try:
+                    resumo = ', '.join(f"{s['code']}={len(list(s.get('images') or []))}" for s in payload.get('sections', []))
+                    await enviar_log(f'✅ V126 payload montado para mesa {int(canal.id)} | seções/imagens: {resumo}')
+                except Exception:
+                    pass
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'⚠️ V126: falha ao montar payload profissional da mesa {getattr(canal, "id", "?")}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+    return dados
+
+
+print('✅ V126 carregada — payload profissional reconstruído com isolamento rígido por seção, textos curatoriais e prioridade para fotos corretas.', flush=True)
