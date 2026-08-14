@@ -59815,5 +59815,419 @@ print(
     flush=True,
 )
 
+
+
+# =============================================================
+# V131 — RESTAURAÇÃO DO MODELO VISUAL APROVADO
+# REGRA: o visual do dossiê volta a usar a moldura/apresentação aprovada
+# (fundo, moldura, brasões, marca d'água, painel bege e faixa azul).
+# O CONTEÚDO permanece exatamente nos 13 itens da investigação guiada.
+# =============================================================
+
+
+def _v131_media_id(item: Any) -> str:
+    try:
+        if '_v129_midia_id' in globals():
+            return str(_v129_midia_id(item) or '')
+    except Exception:
+        pass
+    try:
+        m = _v124_normalizar_midia(item)
+    except Exception:
+        m = item if isinstance(item, dict) else None
+    if not isinstance(m, dict):
+        return ''
+    return '|'.join([
+        str(m.get('mensagem_id') or ''),
+        str(m.get('indice') if m.get('indice') is not None else ''),
+        str(m.get('url') or m.get('proxy_url') or ''),
+        str(m.get('local') or m.get('arquivo') or ''),
+    ])
+
+
+def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) -> None:
+    """Gera o PDF nos MESMOS elementos visuais do modelo DICOR aprovado.
+
+    Não usa a capa branca/Flowables da V124. Cada item da investigação começa
+    em página própria; continuação do mesmo item mantém o mesmo cabeçalho.
+    """
+    if canvas is None or A4 is None:
+        raise RuntimeError('Dependência ausente: instale reportlab.')
+
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    pasta_cache = caminho_pdf.parent / '_v131_media_cache'
+    pasta_cache.mkdir(parents=True, exist_ok=True)
+
+    c = canvas.Canvas(str(caminho_pdf), pagesize=A4)
+    largura, altura = A4
+    cores = _cores_documento_dicor()
+    margem_x = 1.35 * cm
+    largura_util = largura - 2 * margem_x
+    topo = altura - 4.35 * cm
+    base = 1.45 * cm
+    meta = dict(payload.get('meta') or {})
+    secoes = [s for s in list(payload.get('sections') or []) if isinstance(s, dict)]
+    usados_globais: set[str] = set()
+
+    def seguro(v: Any, padrao: str='Não informado') -> str:
+        s = str(v if v is not None else '').replace('\r', '').strip()
+        return s or padrao
+
+    def iniciar_pagina(titulo: str, continuacao: bool=False) -> float:
+        # EXATAMENTE a base visual já aprovada no bot.
+        _desenhar_fundo_moldura_dicor(c, largura, altura, titulo_tam=23.0, subtitulo_tam=18.0)
+        c.saveState()
+        _alpha_pdf(c, 0.82, 1)
+        c.setFillColor(cores['painel'])
+        c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=1, stroke=0)
+        c.restoreState()
+        _desenhar_marca_dagua_visivel(c, largura, altura)
+        c.setStrokeColor(cores['linha'])
+        c.setLineWidth(0.75)
+        c.roundRect(margem_x - 0.12 * cm, base, largura_util + 0.24 * cm, topo - base + 0.3 * cm, 6, fill=0, stroke=1)
+
+        faixa_y = topo - 0.63 * cm
+        c.setFillColor(cores['azul'])
+        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=1, stroke=0)
+        c.setStrokeColor(cores['dourado_claro'])
+        c.rect(margem_x, faixa_y, largura_util, 0.62 * cm, fill=0, stroke=1)
+        c.setFillColor(cores['branco'])
+        c.setFont('Courier-Bold', 13.2)
+        tt = titulo + (' - CONTINUAÇÃO' if continuacao else '')
+        c.drawString(margem_x + 0.18 * cm, faixa_y + 0.20 * cm, tt[:88])
+        return faixa_y - 0.35 * cm
+
+    titulo_atual = 'DOSSIÊ OPERACIONAL DICOR'
+
+    def quebra(y: float, espaco: float) -> float:
+        nonlocal titulo_atual
+        if y - espaco < base + 0.35 * cm:
+            c.showPage()
+            return iniciar_pagina(titulo_atual, True)
+        return y
+
+    def nova_secao(titulo: str) -> float:
+        nonlocal titulo_atual
+        titulo_atual = titulo
+        c.showPage()
+        return iniciar_pagina(titulo)
+
+    def subtitulo(txt: str, y: float) -> float:
+        y = quebra(y, 0.75 * cm)
+        c.setFillColor(cores['painel_sec'])
+        c.setStrokeColor(cores['dourado'])
+        c.roundRect(margem_x + 0.10 * cm, y - 0.50 * cm, largura_util - 0.20 * cm, 0.50 * cm, 4, fill=1, stroke=1)
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 9.7)
+        c.drawString(margem_x + 0.25 * cm, y - 0.33 * cm, seguro(txt).upper()[:96])
+        return y - 0.84 * cm
+
+    def texto(txt: Any, y: float, tam: float=9.20, leading: float=0.38 * cm) -> float:
+        valor = str(txt or '').strip()
+        if not valor:
+            return y
+        for linha in _linhas_pdf_seguras(c, valor, 'Courier', tam, largura_util - 0.48 * cm):
+            y = quebra(y, leading)
+            if not linha:
+                y -= leading * 0.58
+                continue
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', tam)
+            c.drawString(margem_x + 0.24 * cm, y, linha[:166])
+            y -= leading
+        return y
+
+    def campo(label: str, valor: Any, y: float, label_w: float=5.1 * cm) -> float:
+        label = str(label or '').strip()
+        valor = seguro(valor)
+        try:
+            largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05)
+        except Exception:
+            largura_rotulo = 0
+        empilhar = bool(len(label) >= 20 or largura_rotulo > 5.05 * cm)
+        if empilhar:
+            linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_util - 0.72 * cm) or ['—']
+            h = 0.46 * cm + max(1, len(linhas[:8])) * 0.34 * cm + 0.10 * cm
+            y = quebra(y, h)
+            c.setFillColor(cores['dourado'])
+            c.setFont('Courier-Bold', 9.05)
+            c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', 9.0)
+            yy = y - 0.36 * cm
+            for ln in linhas[:8]:
+                c.drawString(margem_x + 0.54 * cm, yy, ln[:154])
+                yy -= 0.33 * cm
+            return y - h
+        label_w_real = max(label_w, largura_rotulo + 0.45 * cm)
+        linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, max(4.0 * cm, largura_util - label_w_real - 0.45 * cm)) or ['—']
+        h = max(0.45 * cm, len(linhas) * 0.34 * cm + 0.08 * cm)
+        y = quebra(y, h)
+        c.setFillColor(cores['dourado'])
+        c.setFont('Courier-Bold', 9.05)
+        c.drawString(margem_x + 0.23 * cm, y, f'{label}:')
+        c.setFillColor(cores['texto'])
+        c.setFont('Courier', 9.0)
+        xx = margem_x + label_w_real
+        for i, ln in enumerate(linhas[:8]):
+            c.drawString(xx, y - i * 0.33 * cm, ln[:148])
+        return y - h
+
+    def campos(itens: List[Tuple[Any, Any]], y: float) -> float:
+        for rotulo, valor in itens:
+            y = campo(str(rotulo), valor, y)
+        return y - 0.10 * cm
+
+    def media_path(item: Any) -> Optional[Path]:
+        try:
+            p = _v124_materializar_midia(item, pasta_cache)
+            if p and Path(p).exists() and Path(p).stat().st_size > 0:
+                return Path(p)
+        except Exception:
+            return None
+        return None
+
+    def reservar_midia(item: Any) -> bool:
+        ident = _v131_media_id(item)
+        if not ident:
+            return True
+        if ident in usados_globais:
+            return False
+        usados_globais.add(ident)
+        return True
+
+    def desenhar_imagem(item: Any, x: float, y: float, w: float, h: float, *, reservar: bool=True) -> bool:
+        if reservar and not reservar_midia(item):
+            return False
+        p = media_path(item)
+        if not p:
+            return False
+        try:
+            c.drawImage(str(p), x, y, width=w, height=h, preserveAspectRatio=True, anchor='c', mask='auto')
+            return True
+        except Exception:
+            return False
+
+    def imagens(lista: List[Dict[str, Any]], y: float, rotulo: str, exigir_uma: bool=False) -> float:
+        midias = []
+        vistos_local = set()
+        for item in list(lista or []):
+            ident = _v131_media_id(item) or repr(item)
+            if ident in vistos_local:
+                continue
+            vistos_local.add(ident)
+            midias.append(item)
+        if not midias:
+            if exigir_uma:
+                raise RuntimeError(f'{titulo_atual}: nenhuma evidência visual vinculada ao item.')
+            return y
+
+        col_w = (largura_util - 0.42 * cm) / 2
+        card_h = 6.55 * cm
+        img_h = 5.40 * cm
+        xs = [margem_x + 0.10 * cm, margem_x + 0.10 * cm + col_w + 0.22 * cm]
+        renderizadas = 0
+        pendentes = []
+        for item in midias:
+            ident = _v131_media_id(item)
+            if ident and ident in usados_globais:
+                continue
+            p = media_path(item)
+            if p:
+                pendentes.append((item, p))
+        for i in range(0, len(pendentes), 2):
+            y = quebra(y, card_h + 0.22 * cm)
+            for j, x in enumerate(xs):
+                if i + j >= len(pendentes):
+                    continue
+                item, p = pendentes[i + j]
+                if not reservar_midia(item):
+                    continue
+                c.setFillColor(colors.HexColor('#F7F3E9'))
+                c.setStrokeColor(cores['linha'])
+                c.roundRect(x, y - card_h, col_w, card_h, 4, fill=1, stroke=1)
+                try:
+                    c.drawImage(str(p), x + 0.12 * cm, y - img_h - 0.15 * cm, width=col_w - 0.24 * cm, height=img_h, preserveAspectRatio=True, anchor='c', mask='auto')
+                    renderizadas += 1
+                except Exception:
+                    continue
+                c.setFillColor(cores['texto_suave'])
+                c.setFont('Courier', 7.2)
+                nome = str((item or {}).get('nome') or (item or {}).get('arquivo') or '').strip()
+                legenda = f'{rotulo} - Evidência {renderizadas:02d}' + (f' - {nome[:52]}' if nome else '')
+                c.drawString(x + 0.14 * cm, y - card_h + 0.28 * cm, legenda[:93])
+            y -= card_h + 0.22 * cm
+        if exigir_uma and renderizadas == 0:
+            raise RuntimeError(f'{titulo_atual}: evidências existem no estado, mas nenhuma imagem pôde ser carregada/materializada.')
+        return y
+
+    def pessoas(lista: List[Dict[str, Any]], y: float, rotulo: str) -> float:
+        if not lista:
+            return texto(f'Nenhum registro de {rotulo.lower()} foi encontrado.', y, tam=8.95)
+        for idx, pessoa in enumerate(lista, 1):
+            h = 3.25 * cm
+            y = quebra(y, h + 0.17 * cm)
+            foto = pessoa.get('foto')
+            p = media_path(foto)
+            if not p:
+                raise RuntimeError(f'{titulo_atual}: foto não pôde ser carregada para {pessoa.get("nome") or "pessoa não identificada"}.')
+            if not reservar_midia(foto):
+                raise RuntimeError(f'{titulo_atual}: foto duplicada detectada para {pessoa.get("nome") or "pessoa não identificada"}.')
+            c.setFillColor(colors.HexColor('#F7F3E9'))
+            c.setStrokeColor(cores['linha'])
+            c.roundRect(margem_x + 0.12 * cm, y - h, largura_util - 0.24 * cm, h, 4, fill=1, stroke=1)
+            c.drawImage(str(p), margem_x + 0.22 * cm, y - 2.92 * cm, width=2.55 * cm, height=2.55 * cm, preserveAspectRatio=True, anchor='c', mask='auto')
+            tx = margem_x + 3.15 * cm
+            c.setFillColor(cores['dourado'])
+            c.setFont('Courier-Bold', 9.5)
+            c.drawString(tx, y - 0.42 * cm, f'{idx}. {seguro(pessoa.get("nome"))[:62]}')
+            c.setFillColor(cores['texto'])
+            c.setFont('Courier', 8.9)
+            detalhes = [
+                f'RG: {seguro(pessoa.get("rg"))}',
+                f'Função/Cargo: {seguro(pessoa.get("cargo") or pessoa.get("funcao"))}',
+            ]
+            ly = y - 0.90 * cm
+            for det in detalhes:
+                for ln in _linhas_pdf_seguras(c, det, 'Courier', 8.9, largura_util - 3.65 * cm)[:2]:
+                    c.drawString(tx, ly, ln[:135])
+                    ly -= 0.31 * cm
+            y -= h + 0.18 * cm
+        return y
+
+    def informante_card(info: Dict[str, Any], y: float) -> float:
+        return pessoas([{
+            'nome': info.get('nome'),
+            'rg': info.get('rg'),
+            'cargo': info.get('cargo') or 'Informante',
+            'foto': info.get('foto'),
+        }], y, 'Informante')
+
+    # CAPA/IDENTIFICAÇÃO - no modelo aprovado, sem a capa branca nova.
+    y = iniciar_pagina('DOSSIÊ OPERACIONAL DICOR')
+    y = subtitulo('Identificação do Procedimento', y)
+    y = campos([
+        ('Processo Nº', meta.get('processo')),
+        ('Investigação Nº', meta.get('numero')),
+        ('Nome da Operação', meta.get('nome_operacao')),
+        ('Organização / Família', meta.get('comunidade')),
+        ('Cidade Operacional', meta.get('cidade') or 'Capital Morada do Valley'),
+        ('Data de Abertura', meta.get('data_abertura')),
+        ('Responsável Institucional', meta.get('delegado')),
+    ], y)
+    y = subtitulo('Objeto do Dossiê', y)
+    y = texto(
+        'Consolidação técnica das evidências validadas na mesa de investigação. '
+        'O documento mantém cada item em seção própria e utiliza somente os dados estruturados '
+        'do roteiro investigativo, sem copiar mensagens administrativas dos tópicos.',
+        y,
+        tam=9.35,
+    )
+
+    # ÍNDICE - necessário para conferência e para o preflight final.
+    y = nova_secao('ÍNDICE DE EVIDÊNCIAS')
+    y = texto('Relação das 13 seções oficiais da investigação:', y, tam=9.3)
+    for sec in secoes:
+        code = str(sec.get('code') or '').zfill(2)
+        title = str(sec.get('title') or '').strip().upper()
+        qtd = len(list(sec.get('images') or []))
+        y = campo(f'{code}. {title}', f'{qtd} evidência(s) visual(is) vinculada(s)', y, label_w=9.8 * cm)
+
+    # 13 ITENS - mesma ordem do roteiro guiado.
+    for sec in secoes:
+        code = str(sec.get('code') or '').zfill(2)
+        title = str(sec.get('title') or '').strip().upper()
+        titulo_secao = f'{code}. {title}'
+        y = nova_secao(titulo_secao)
+        resumo = str(sec.get('summary') or '').strip()
+        if resumo:
+            y = texto(resumo, y, tam=9.35, leading=0.40 * cm)
+            y -= 0.10 * cm
+
+        if code in {'02', '03'}:
+            y = pessoas(list(sec.get('people') or []), y, 'Lideranças' if code == '02' else 'Membros')
+            continue
+
+        if code == '04':
+            linhas = list(sec.get('field_lines') or [])
+            if linhas:
+                y = subtitulo('Registro da Rádio', y)
+                y = campos([(str(a), b) for a, b in linhas], y)
+            continue
+
+        if code == '05':
+            grupos = list(sec.get('subgroups') or [])
+            for grupo in grupos:
+                imgs = list((grupo or {}).get('images') or [])
+                y = subtitulo(str((grupo or {}).get('label') or 'Evidências de localização'), y)
+                y = imagens(imgs, y, str((grupo or {}).get('label') or 'Localização'), exigir_uma=True)
+            continue
+
+        if code == '06':
+            crimes = list(sec.get('crimes') or [])
+            for idx, crime in enumerate(crimes, 1):
+                y = subtitulo(f'Crime {idx}', y)
+                y = texto(str((crime or {}).get('descricao') or 'Crime sem descrição.'), y, tam=9.35)
+                provas = list((crime or {}).get('provas') or [])
+                if provas:
+                    y = imagens(provas, y, f'Crime {idx}', exigir_uma=True)
+            continue
+
+        if code == '11':
+            grupos = list(sec.get('subgroups') or [])
+            for grupo in grupos:
+                label = str((grupo or {}).get('label') or 'Evidências')
+                y = subtitulo(label, y)
+                y = imagens(list((grupo or {}).get('images') or []), y, label, exigir_uma=True)
+            continue
+
+        if code == '12':
+            info = sec.get('informante') if isinstance(sec.get('informante'), dict) else {}
+            y = subtitulo('Identificação do Informante', y)
+            y = informante_card(info, y)
+            extra = str(sec.get('extra_text') or '').strip()
+            if extra:
+                y = subtitulo('Resumo da Operação do Informante', y)
+                y = texto(extra, y, tam=9.25, leading=0.40 * cm)
+            auxiliares = list(sec.get('images') or [])
+            if auxiliares:
+                y = subtitulo('Documentação e Registros Complementares', y)
+                y = imagens(auxiliares, y, 'Informante', exigir_uma=True)
+            continue
+
+        # Painel, baús, rotas e residência usam somente as imagens do próprio item.
+        imgs = list(sec.get('images') or [])
+        if imgs:
+            y = subtitulo('Evidências Visuais', y)
+            y = imagens(imgs, y, title, exigir_uma=True)
+
+    c.save()
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if not isinstance(payload, dict):
+        # Mesas legadas sem roteiro guiado continuam no gerador anterior.
+        return _V129_GERAR_PDF_LEGADO(dados, caminho_pdf)
+
+    problemas = _v129_validar_payload(payload)
+    if problemas:
+        raise RuntimeError('Dossiê V131 não será gerado com conteúdo incompleto: ' + ' | '.join(problemas[:25]))
+
+    _v131_gerar_pdf_modelo_aprovado(payload, Path(caminho_pdf))
+    erros = _v123_preflight_arquivo(Path(caminho_pdf), 'pdf')
+    if erros:
+        raise RuntimeError('Preflight V131 reprovado: ' + ' | '.join(erros[:12]))
+    print(f'✅ V131 PDF aprovado no MODELO VISUAL OFICIAL: {Path(caminho_pdf).name}', flush=True)
+
+
+print(
+    '✅ V131 carregada — MODELO VISUAL APROVADO RESTAURADO. '
+    'Moldura, brasões, marca d\'água, painel bege e faixa azul preservados; conteúdo = 13 itens guiados.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
