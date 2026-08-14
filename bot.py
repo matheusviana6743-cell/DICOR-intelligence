@@ -57492,8 +57492,8 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 
 print('✅ DOSSIE FIX carregado — falso negativo do preflight V123 agora aciona fallback seguro somente em mesas guiadas 13/13 concluídas.', flush=True)
 
-if __name__ == '__main__':
-    asyncio.run(_runtime_lifecycle_entrypoint())
+# V127: o runtime NÃO inicia aqui. As correções V124/V125/V126 abaixo precisam
+# ser carregadas primeiro; o entrypoint real foi movido para o final do arquivo.
 
 
 # DICOR interaction core — ajuste operacional (membros livres + resumo de informante por print)
@@ -58932,3 +58932,191 @@ async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Opti
 
 
 print('✅ V126 carregada — payload profissional reconstruído com isolamento rígido por seção, textos curatoriais e prioridade para fotos corretas.', flush=True)
+
+
+# =====================================================
+# V127 — ENTRYPOINT ÚNICO E FINAL
+# IMPORTANTE: todas as redefinições/correções acima são carregadas ANTES do Discord iniciar.
+# =====================================================
+
+def _v127_diagnostico_boot() -> None:
+    try:
+        import inspect as _v127_inspect
+        print('✅ V127 carregada — entrypoint movido para o FINAL do arquivo.', flush=True)
+        print('✅ V127 dossiê ativo — payload V126 + gerador profissional V125/V124 carregados antes do runtime.', flush=True)
+        try:
+            print(f'✅ V127 coletor final: {coletar_dados_operacionais_mesa.__name__} linha {_v127_inspect.getsourcelines(coletar_dados_operacionais_mesa)[1]}', flush=True)
+            print(f'✅ V127 gerador PDF final: {gerar_pdf_dossie.__name__} linha {_v127_inspect.getsourcelines(gerar_pdf_dossie)[1]}', flush=True)
+            print(f'✅ V127 gerador DOCX final: {gerar_docx_dossie.__name__} linha {_v127_inspect.getsourcelines(gerar_docx_dossie)[1]}', flush=True)
+        except Exception:
+            pass
+    except Exception:
+        traceback.print_exc()
+
+
+_v127_diagnostico_boot()
+
+# V128: entrypoint movido novamente para o final, após o rebuild state-only do dossiê.
+
+
+# =====================================================
+# V128 — DOSSIÊ FINAL BASEADO SOMENTE NO ESTADO GUIADO
+# Nenhum texto bruto de tópico e nenhuma evidência de outro tópico entra no documento.
+# =====================================================
+
+
+def _v128_fotos_pessoas(pessoas: List[Dict[str, Any]], titulo_padrao: str) -> List[Dict[str, Any]]:
+    saida = []
+    for idx, p in enumerate(list(pessoas or []), start=1):
+        if not isinstance(p, dict):
+            continue
+        saida.append({
+            'ordem': idx,
+            'nome': str(p.get('nome') or 'Não identificado').strip() or 'Não identificado',
+            'rg': str(p.get('rg') or 'Não informado').strip() or 'Não informado',
+            'cargo': str(p.get('cargo') or p.get('funcao') or titulo_padrao).strip() or titulo_padrao,
+            'foto': _v124_img_pessoa(p),
+        })
+    return saida
+
+
+def _v128_profissional_text(codigo: str, g: Dict[str, Any]) -> str:
+    textos = {
+        '01': 'O painel administrativo da organização foi registrado para consolidar a estrutura observada durante a investigação. As imagens anexadas nesta seção correspondem exclusivamente ao painel utilizado como referência operacional.',
+        '02': 'As lideranças identificadas foram organizadas individualmente para facilitar a conferência de nome, RG e função exercida dentro da organização. Cada ficha utiliza somente a fotografia vinculada ao respectivo registro.',
+        '03': 'Os membros identificados foram organizados em fichas individuais, preservando a identificação funcional de cada integrante e sua respectiva evidência visual.',
+        '04': 'A frequência de rádio utilizada pela organização foi registrada como dado operacional da investigação.',
+        '05': 'A localização da organização foi documentada em duas etapas: identificação do ponto e GPS, seguida das vistas aéreas utilizadas para contextualizar a área investigada.',
+        '06': 'Os crimes atribuídos à organização foram consolidados a partir dos registros estruturados da investigação. Cada ocorrência permanece vinculada somente às provas registradas para aquele crime.',
+        '07': 'O baú destinado à liderança foi documentado com as evidências visuais registradas especificamente para este ponto, incluindo o armazenamento e o acesso correspondente.',
+        '08': 'O baú utilizado pelos membros foi documentado com as evidências visuais registradas especificamente para este ponto, incluindo o armazenamento e o acesso correspondente.',
+        '09': 'A rota de farm foi documentada exclusivamente com os registros coletados para essa rota, incluindo o ponto operacional e a referência de localização.',
+        '10': 'A rota de produção foi documentada exclusivamente com os registros coletados para essa rota, incluindo o ponto operacional e a referência de localização.',
+        '11': 'Os ingredientes necessários à produção e o produto final foram separados em grupos próprios para evitar mistura entre insumos e resultado final.',
+        '12': 'O informante foi registrado de forma individual, preservando seus dados básicos e as evidências fornecidas durante a operação.',
+        '13': 'A residência vinculada ao líder foi documentada exclusivamente com as imagens registradas para esse item da investigação.',
+    }
+    base = textos.get(str(codigo), 'Conteúdo consolidado a partir dos registros validados da investigação guiada.')
+    if codigo == '04':
+        radio = str(g.get('radio') or '').strip()
+        if radio:
+            base += f' Frequência registrada: {radio}.'
+    if codigo == '02':
+        base += f' Total de lideranças cadastradas: {len(list(g.get("liderancas") or []))}.'
+    if codigo == '03':
+        base += f' Total de membros cadastrados: {len(list(g.get("membros") or []))}.'
+    if codigo == '06':
+        base += f' Total de crimes estruturados: {len(list(g.get("crimes") or []))}.'
+    return base
+
+
+def _v128_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    g = dict((estado or {}).get('dados') or {})
+    meta = {
+        'nome_operacao': str(dados.get('nome_operacao') or dados.get('nome') or f'OPERAÇÃO INVESTIGATIVA {canal_id}').strip(),
+        'numero': str(dados.get('numero') or f'INV-{str(canal_id)[-6:]}').strip(),
+        'processo': str(dados.get('processo') or f'PF-DICOR-{canal_id}').strip(),
+        'comunidade': str(dados.get('comunidade') or dados.get('faccao') or dados.get('organizacao') or 'Organização investigada').strip(),
+        'delegado': str(dados.get('delegado') or dados.get('autor_nome') or 'Superintendência DICOR').strip(),
+        'data_abertura': str(dados.get('data_abertura') or dados.get('criada_em') or agora_br()).strip(),
+        'mesa_canal_id': int(canal_id or 0),
+        'cidade': 'Capital Morada do Valley',
+    }
+
+    painel = _v124_dedupe_media(_v124_imagens_estado(g, 'painel_imagens', 12), 12)
+    liderancas = _v128_fotos_pessoas(list(g.get('liderancas') or []), 'Liderança')
+    membros = _v128_fotos_pessoas(list(g.get('membros') or []), 'Membro')
+    local_base = _v124_dedupe_media(_v124_imagens_estado(g, 'localizacao_etapa1', 2), 2)
+    local_aereas = _v124_dedupe_media(_v124_imagens_estado(g, 'localizacao_aereas', 4), 4)
+    bau_lider = _v124_dedupe_media(_v124_imagens_estado(g, 'bau_lider', 2), 2)
+    bau_membros = _v124_dedupe_media(_v124_imagens_estado(g, 'bau_membros', 2), 2)
+    rota_farm = _v124_dedupe_media(_v124_imagens_estado(g, 'rota_farm', 2), 2)
+    rota_producao = _v124_dedupe_media(_v124_imagens_estado(g, 'rota_producao', 2), 2)
+    ingredientes = _v124_dedupe_media(_v124_imagens_estado(g, 'ingredientes_fotos', 8), 8)
+    produto_final = _v124_dedupe_media(_v124_imagens_estado(g, 'produto_final_fotos', 8), 8)
+    residencia = _v124_dedupe_media(_v124_imagens_estado(g, 'residencia_fotos', 12), 12)
+
+    crimes = []
+    for idx, crime in enumerate(list(g.get('crimes') or []), start=1):
+        if not isinstance(crime, dict):
+            continue
+        descricao = _v124_clean_text(crime.get('descricao'), 550) or f'Crime {idx}'
+        provas = _v124_dedupe_media(list(crime.get('provas') or []), 12)
+        crimes.append({'ordem': idx, 'descricao': descricao, 'provas': provas})
+
+    inf = g.get('informante') if isinstance(g.get('informante'), dict) else {}
+    inf_foto = _v124_img_pessoa(inf)
+    inf_doc = _v124_normalizar_midia(inf.get('documento')) if isinstance(inf, dict) else None
+    inf_resumo_fotos = _v124_dedupe_media(_v124_imagens_estado(g, 'informante_resumo_fotos', 6), 6)
+    inf_imgs = _v124_dedupe_media([x for x in [inf_foto, inf_doc] if isinstance(x, dict)] + inf_resumo_fotos, 8)
+    resumo_informante = _v124_clean_text(g.get('informante_resumo'), 1200)
+
+    sections: List[Dict[str, Any]] = [
+        {'code':'01','title':'PAINEL','summary':_v128_profissional_text('01',g),'images':painel},
+        {'code':'02','title':'FOTOS DOS LÍDERES','summary':_v128_profissional_text('02',g),'people':liderancas,'images':_v124_dedupe_media([p['foto'] for p in liderancas if isinstance(p.get('foto'),dict)],40)},
+        {'code':'03','title':'FOTOS DOS MEMBROS','summary':_v128_profissional_text('03',g),'people':membros,'images':_v124_dedupe_media([p['foto'] for p in membros if isinstance(p.get('foto'),dict)],60)},
+        {'code':'04','title':'RÁDIO','summary':_v128_profissional_text('04',g),'field_lines':[('Frequência registrada',str(g.get('radio') or 'Não informada').strip() or 'Não informada')],'images':[]},
+        {'code':'05','title':'LOCALIZAÇÃO','summary':_v128_profissional_text('05',g),'subgroups':[{'label':'Identificação do local e GPS','images':local_base},{'label':'Vistas aéreas da localização','images':local_aereas}],'images':_v124_dedupe_media(local_base+local_aereas,8)},
+        {'code':'06','title':'CRIMES DA COMUNIDADE','summary':_v128_profissional_text('06',g),'crimes':crimes,'images':_v124_dedupe_media([p for c in crimes for p in list(c.get('provas') or [])],80)},
+        {'code':'07','title':'BAÚ DE LÍDER','summary':_v128_profissional_text('07',g),'images':bau_lider},
+        {'code':'08','title':'BAÚ DE MEMBROS','summary':_v128_profissional_text('08',g),'images':bau_membros},
+        {'code':'09','title':'ROTA DE FARM','summary':_v128_profissional_text('09',g),'images':rota_farm},
+        {'code':'10','title':'ROTA DE PRODUÇÃO','summary':_v128_profissional_text('10',g),'images':rota_producao},
+        {'code':'11','title':'INGREDIENTES E PRODUTOS','summary':_v128_profissional_text('11',g),'subgroups':[{'label':'Ingredientes necessários','images':ingredientes},{'label':'Produto final','images':produto_final}],'images':_v124_dedupe_media(ingredientes+produto_final,16)},
+        {'code':'12','title':'INFORMANTE','summary':_v128_profissional_text('12',g),'informante':{'nome':str(inf.get('nome') or 'Não informado').strip() or 'Não informado','rg':str(inf.get('rg') or 'Não informado').strip() or 'Não informado','cargo':'Informante','foto':inf_foto,'documento':inf_doc},'extra_text':resumo_informante,'images':inf_imgs},
+        {'code':'13','title':'RESIDÊNCIA DO LÍDER','summary':_v128_profissional_text('13',g),'images':residencia},
+    ]
+
+    evidence_index = [{'code':s['code'],'title':s['title'],'count':len(list(s.get('images') or []))} for s in sections]
+    return {'meta':meta,'sections':sections,'evidence_index':evidence_index,'status':str((estado or {}).get('status') or 'ATIVA'),'concluidos':dict((estado or {}).get('concluidos') or {}),'geracao':'V128_STATE_ONLY'}
+
+
+# Substitui o construtor usado pelo coletor V126. O coletor chama esta função por nome em runtime.
+def _v126_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    return _v128_payload_profissional(dados, estado, canal_id)
+
+
+def _v128_validar_payload_estado(payload: Dict[str, Any]) -> List[str]:
+    erros = []
+    secoes = {str(s.get('code')):s for s in list(payload.get('sections') or []) if isinstance(s,dict)}
+    for codigo in [f'{i:02d}' for i in range(1,14)]:
+        if codigo not in secoes:
+            erros.append(f'seção {codigo} ausente')
+    # Se houver pessoas com foto no payload, nenhuma pode aparecer sem a mídia associada no registro.
+    for codigo in ('02','03'):
+        for p in list(secoes.get(codigo,{}).get('people') or []):
+            if not isinstance(p,dict):
+                continue
+            if not p.get('foto'):
+                erros.append(f'{codigo}: {p.get("nome") or "pessoa"} sem foto vinculada no estado guiado')
+    inf=secoes.get('12',{}).get('informante') if isinstance(secoes.get('12',{}),dict) else None
+    if isinstance(inf,dict) and not inf.get('foto'):
+        erros.append('12: informante sem foto vinculada no estado guiado')
+    return erros
+
+
+# Rewrap final collector apenas para validar e logar exatamente o que vai ao PDF.
+_V128_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dados = await _V128_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    payload = dados.get('dossie_v124') if isinstance(dados,dict) else None
+    if isinstance(payload,dict):
+        erros = _v128_validar_payload_estado(payload)
+        try:
+            resumo=[]
+            for s in list(payload.get('sections') or []):
+                resumo.append(f"{s.get('code')}:{len(list(s.get('images') or []))}img")
+            print(f"✅ V128 PAYLOAD mesa={getattr(canal,'id','?')} | {' | '.join(resumo)}", flush=True)
+            if erros:
+                print('⚠️ V128 PAYLOAD pendências: ' + ' | '.join(erros[:30]), flush=True)
+        except Exception:
+            pass
+        dados['gerador_dossie']='V128_STATE_ONLY'
+    return dados
+
+
+print('✅ V128 carregada — dossiê usa SOMENTE o estado guiado de cada item; textos brutos dos tópicos e mídia de outros tópicos foram excluídos do payload final.', flush=True)
+print('✅ V128 prova visual: o PDF novo deve exibir “02. FOTOS DOS LÍDERES”; se aparecer “4. LIDERANÇAS IDENTIFICADAS”, o deploy ainda está executando o gerador antigo.', flush=True)
+
+if __name__ == '__main__':
+    asyncio.run(_runtime_lifecycle_entrypoint())
