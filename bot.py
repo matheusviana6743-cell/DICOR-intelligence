@@ -59945,7 +59945,9 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
             largura_rotulo = c.stringWidth(f'{label}:', 'Courier-Bold', 9.05)
         except Exception:
             largura_rotulo = 0
-        empilhar = bool(len(label) >= 20 or largura_rotulo > 5.05 * cm)
+        # V133: manter rótulo e valor na mesma linha sempre que possível.
+        # O valor pode quebrar dentro da própria coluna, mas nunca é jogado para baixo do rótulo.
+        empilhar = False
         if empilhar:
             linhas = _linhas_pdf_seguras(c, valor, 'Courier', 9.0, largura_util - 0.72 * cm) or ['—']
             h = 0.46 * cm + max(1, len(linhas[:8])) * 0.34 * cm + 0.10 * cm
@@ -60118,11 +60120,34 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
     ], y)
     y = subtitulo('Objeto do Dossiê', y)
     y = texto(
-        'Consolidação técnica das evidências validadas na mesa de investigação. '
-        'O documento mantém cada item em seção própria e utiliza somente os dados estruturados '
-        'do roteiro investigativo, sem copiar mensagens administrativas dos tópicos.',
+        'Este dossiê tem por finalidade consolidar, em documento único e reservado, o material '
+        'validado ao longo da investigação. A apresentação foi estruturada para facilitar a consulta '
+        'operacional, a conferência das evidências e a identificação objetiva das informações '
+        'registradas durante o procedimento.',
         y,
-        tam=9.35,
+        tam=9.55,
+        leading=0.42 * cm,
+    )
+    y -= 0.10 * cm
+    y = subtitulo('Critérios de Organização', y)
+    y = texto(
+        'Os treze itens oficiais permanecem separados em seções próprias e independentes. Cada '
+        'imagem, identificação, registro ou prova é apresentada exclusivamente no tópico ao qual '
+        'foi vinculada, preservando a ordem do roteiro investigativo e evitando mistura entre '
+        'localização, rotas, baús, integrantes, produtos e demais conteúdos.',
+        y,
+        tam=9.45,
+        leading=0.41 * cm,
+    )
+    y -= 0.10 * cm
+    y = subtitulo('Integridade Documental', y)
+    y = texto(
+        'A composição prioriza informações estruturadas e evidências efetivamente validadas. '
+        'Mensagens administrativas do Discord não integram o corpo do documento, e mídias repetidas '
+        'são suprimidas para manter o dossiê limpo, coerente e adequado à consulta institucional.',
+        y,
+        tam=9.45,
+        leading=0.41 * cm,
     )
 
     # ÍNDICE - necessário para conferência e para o preflight final.
@@ -60230,9 +60255,9 @@ print(
 
 
 # =============================================================
-# V132 — PÁGINA FINAL INSTITUCIONAL (SEM ALTERAR O MODELO V131)
+# V133 — AJUSTES FINAIS DE LAYOUT (MODELO V131 PRESERVADO)
 # Mantém 100% das páginas aprovadas da V131 e acrescenta SOMENTE:
-# conclusão, controle/autenticidade, QR de reabertura e 3 assinaturas.
+# conclusão, controle/autenticidade, QR de reabertura e 2 assinaturas institucionais.
 # =============================================================
 
 _V132_GERAR_PDF_BASE = gerar_pdf_dossie
@@ -60277,7 +60302,7 @@ def _v132_conclusao(dados: Dict[str, Any]) -> str:
 
 
 def _v132_assinaturas(dados: Dict[str, Any]) -> List[Dict[str, Any]]:
-    saida: List[Dict[str, Any]] = []
+    # V133: página final possui somente as duas assinaturas institucionais oficiais.
     regs: List[Dict[str, Any]] = []
     try:
         regs = list(obter_assinaturas_dossie(dados) or [])
@@ -60287,34 +60312,20 @@ def _v132_assinaturas(dados: Dict[str, Any]) -> List[Dict[str, Any]]:
     geral = regs[0] if len(regs) > 0 and isinstance(regs[0], dict) else {}
     dicor = regs[1] if len(regs) > 1 and isinstance(regs[1], dict) else {}
 
-    saida.append({
-        'cargo': 'DELEGADO GERAL',
-        'nome': str(geral.get('nome') or ASSINATURA_DELEGADO_GERAL_NOME or 'Delegado Geral'),
-        'texto': str(geral.get('texto') or ASSINATURA_DELEGADO_GERAL_TEXTO or ''),
-        'imagem': geral.get('imagem') or geral.get('arquivo'),
-    })
-    saida.append({
-        'cargo': 'DELEGADO DICOR',
-        'nome': str(dicor.get('nome') or ASSINATURA_DELEGADO_DICOR_NOME or 'Delegado DICOR'),
-        'texto': str(dicor.get('texto') or ASSINATURA_DELEGADO_DICOR_TEXTO or ''),
-        'imagem': dicor.get('imagem') or dicor.get('arquivo'),
-    })
-
-    agente_img = None
-    try:
-        agente_img = caminho_arquivo_configurado(
-            ASSINATURA_AGENTE_RESPONSAVEL_IMAGEM,
-            ['assinatura_agente_responsavel.png', 'assinatura_agente_responsavel.jpg', 'assinatura_agente.png'],
-        )
-    except Exception:
-        agente_img = ASSINATURA_AGENTE_RESPONSAVEL_IMAGEM or None
-    saida.append({
-        'cargo': 'AGENTE RESPONSÁVEL',
-        'nome': str(dados.get('agente_encerramento') or dados.get('autor_nome') or 'Agente Responsável'),
-        'texto': str(ASSINATURA_AGENTE_RESPONSAVEL_TEXTO or ''),
-        'imagem': agente_img,
-    })
-    return saida
+    return [
+        {
+            'cargo': 'DELEGADO GERAL',
+            'nome': 'Buiu Gomes',
+            'texto': '',
+            'imagem': geral.get('imagem') or geral.get('arquivo'),
+        },
+        {
+            'cargo': 'DELEGADO DICOR',
+            'nome': 'Arthur Fleker',
+            'texto': '',
+            'imagem': dicor.get('imagem') or dicor.get('arquivo'),
+        },
+    ]
 
 
 def _v132_limpar_assinatura(caminho: Any) -> Optional[Path]:
@@ -60436,12 +60447,12 @@ def _v132_criar_pagina_final_pdf(dados: Dict[str, Any], destino: Path) -> None:
     y -= 0.05 * cm
     y = subtitulo('Assinaturas Institucionais', y)
     assinaturas = _v132_assinaturas(dados)
-    gap = 0.22 * cm
-    col_w = (largura_util - 2 * gap) / 3
+    gap = 0.45 * cm
+    col_w = (largura_util - gap - 0.20 * cm) / 2
     x0 = margem_x + 0.10 * cm
     card_y_top = y
-    card_h = 4.25 * cm
-    for idx, ass in enumerate(assinaturas[:3]):
+    card_h = 4.45 * cm
+    for idx, ass in enumerate(assinaturas[:2]):
         x = x0 + idx * (col_w + gap)
         c.setFillColor(colors.HexColor('#F7F3E9'))
         c.setStrokeColor(cores['linha'])
@@ -60450,28 +60461,33 @@ def _v132_criar_pagina_final_pdf(dados: Dict[str, Any], destino: Path) -> None:
         img = _v132_limpar_assinatura(ass.get('imagem'))
         if img:
             try:
-                c.drawImage(str(img), x + 0.30 * cm, card_y_top - 2.00 * cm, width=col_w - 0.60 * cm, height=1.32 * cm, preserveAspectRatio=True, anchor='c', mask='auto')
+                c.drawImage(
+                    str(img),
+                    x + 0.50 * cm,
+                    card_y_top - 2.10 * cm,
+                    width=col_w - 1.00 * cm,
+                    height=1.48 * cm,
+                    preserveAspectRatio=True,
+                    anchor='c',
+                    mask='auto',
+                )
             except Exception:
                 pass
         else:
             c.setStrokeColor(cores['texto_suave'])
-            c.line(x + 0.42 * cm, card_y_top - 1.70 * cm, x + col_w - 0.42 * cm, card_y_top - 1.70 * cm)
+            c.line(x + 0.70 * cm, card_y_top - 1.78 * cm, x + col_w - 0.70 * cm, card_y_top - 1.78 * cm)
 
         c.setFillColor(cores['dourado'])
-        c.setFont('Courier-Bold', 8.15)
-        c.drawCentredString(x + col_w / 2, card_y_top - 2.37 * cm, str(ass.get('nome') or '')[:34])
+        c.setFont('Courier-Bold', 9.15)
+        c.drawCentredString(x + col_w / 2, card_y_top - 2.48 * cm, str(ass.get('nome') or '')[:40])
         c.setFillColor(cores['texto'])
-        c.setFont('Courier-Bold', 7.65)
-        c.drawCentredString(x + col_w / 2, card_y_top - 2.72 * cm, str(ass.get('cargo') or '')[:32])
-        c.setFont('Courier', 7.0)
-        c.drawCentredString(x + col_w / 2, card_y_top - 3.08 * cm, 'POLÍCIA FEDERAL - DICOR')
-        if str(ass.get('texto') or '').strip():
-            c.setFillColor(cores['texto_suave'])
-            c.setFont('Courier', 6.5)
-            c.drawCentredString(x + col_w / 2, card_y_top - 3.43 * cm, str(ass.get('texto'))[:42])
+        c.setFont('Courier-Bold', 8.10)
+        c.drawCentredString(x + col_w / 2, card_y_top - 2.88 * cm, str(ass.get('cargo') or '')[:38])
+        c.setFont('Courier', 7.35)
+        c.drawCentredString(x + col_w / 2, card_y_top - 3.28 * cm, 'POLÍCIA FEDERAL - DICOR')
         c.setFillColor(cores['texto_suave'])
-        c.setFont('Courier', 6.5)
-        c.drawCentredString(x + col_w / 2, card_y_top - 3.78 * cm, str(dados.get('data_encerramento') or agora_br())[:24])
+        c.setFont('Courier', 6.9)
+        c.drawCentredString(x + col_w / 2, card_y_top - 3.76 * cm, str(dados.get('data_encerramento') or agora_br())[:24])
 
     # Rodapé reservado da página final.
     c.setFillColor(cores['texto_suave'])
@@ -60529,12 +60545,12 @@ def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
             if len(doc) < 16:
                 raise RuntimeError(f'V132: PDF final possui apenas {len(doc)} página(s); esperava-se o V131 + página final.')
             txt_final = normalizar_busca(doc[-1].get_text('text'))
-            for termo in ('conclusao e assinaturas', 'codigo de autenticidade', 'delegado geral', 'delegado dicor', 'agente responsavel'):
+            for termo in ('conclusao e assinaturas', 'codigo de autenticidade', 'delegado geral', 'delegado dicor', 'buiu gomes', 'arthur fleker'):
                 if termo not in txt_final:
                     raise RuntimeError(f'V132: elemento obrigatório ausente na página final: {termo}.')
         finally:
             doc.close()
-    print(f'✅ V132 PDF: página final de conclusão, QR, autenticidade e 3 assinaturas adicionada sem alterar o modelo V131: {caminho_pdf.name}', flush=True)
+    print(f'✅ V133 PDF: página final ajustada com 2 assinaturas institucionais, layout alinhado e modelo V131 preservado: {caminho_pdf.name}', flush=True)
 
 
 def _v132_append_docx_final(dados: Dict[str, Any], caminho_docx: Path) -> None:
@@ -60579,13 +60595,13 @@ def _v132_append_docx_final(dados: Dict[str, Any], caminho_docx: Path) -> None:
             p.add_run('QR Code de reabertura / consulta\n' + url)
 
         p = doc.add_paragraph(); r = p.add_run('ASSINATURAS INSTITUCIONAIS'); r.bold = True
-        tabela_ass = doc.add_table(rows=1, cols=3); tabela_ass.style = 'Table Grid'
-        for i, ass in enumerate(_v132_assinaturas(dados)[:3]):
+        tabela_ass = doc.add_table(rows=1, cols=2); tabela_ass.style = 'Table Grid'
+        for i, ass in enumerate(_v132_assinaturas(dados)[:2]):
             cell = tabela_ass.rows[0].cells[i]
             img = _v132_limpar_assinatura(ass.get('imagem'))
             if img:
                 try:
-                    cell.paragraphs[0].add_run().add_picture(str(img), width=Inches(1.45))
+                    cell.paragraphs[0].add_run().add_picture(str(img), width=Inches(2.05))
                 except Exception:
                     pass
             p2 = cell.add_paragraph(); p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -60604,8 +60620,8 @@ def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
 
 
 print(
-    '✅ V132 carregada — V131 preservada; adicionada última página com CONCLUSÃO, QR de reabertura, '
-    'código de autenticidade, cidade/data, controle do documento e 3 assinaturas institucionais.',
+    '✅ V133 carregada — V131 preservada; capa/índice alinhados, objeto do dossiê ampliado e página final com '
+    'Buiu Gomes + Arthur Fleker como as 2 assinaturas institucionais.',
     flush=True,
 )
 
