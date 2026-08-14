@@ -61491,5 +61491,593 @@ print(
 )
 
 
+# =====================================================
+# V135 — RECONHECIMENTO VISUAL ESTRITO POR ATRIBUTOS
+# NÃO ALTERA: mesa, tarefas, dossiê, fechamento ou fichas.
+# Alterações somente no motor de busca visual.
+#
+# Objetivo:
+# - impedir top-5 irrelevante;
+# - separar cor da roupa superior/inferior;
+# - comparar cobertura/estilo da roupa;
+# - comparar padrão/textura;
+# - usar cabelo e tom VISUAL de pele como apoio;
+# - priorizar fotos prisionais e detectar imagem idêntica/near-duplicate;
+# - retornar somente candidatos que passam por filtros mínimos.
+# =====================================================
+
+VISUAL_SEARCH_ENGINE_VERSION = 135
+VISUAL_SEARCH_ENGINE_LABEL = 'V135 atributos estritos roupa+cabelo+pele+silhueta'
+VISUAL_SEARCH_TOP_K = max(1, min(5, env_int('VISUAL_SEARCH_TOP_K', 3)))
+VISUAL_SEARCH_MIN_SCORE_FULL = max(45.0, min(90.0, env_float('VISUAL_SEARCH_MIN_SCORE_FULL', 58.0)))
+VISUAL_SEARCH_MIN_SCORE_ROUPA = max(45.0, min(90.0, env_float('VISUAL_SEARCH_MIN_SCORE_ROUPA', 60.0)))
+VISUAL_SEARCH_STRICT = os.getenv('VISUAL_SEARCH_STRICT', '1').strip().lower() not in {'0','false','nao','não','off'}
+
+_V135_COLOR_NAMES = [
+    'preto','branco','cinza','vermelho','laranja','amarelo','verde','ciano','azul','roxo','rosa','marrom/bege'
+]
+
+
+def _v135_center_weight(h: int, w: int):
+    if _v134_np is None:
+        return None
+    yy = _v134_np.linspace(-1.0, 1.0, max(1,h), dtype=_v134_np.float32)[:,None]
+    xx = _v134_np.linspace(-1.0, 1.0, max(1,w), dtype=_v134_np.float32)[None,:]
+    d = xx*xx + 0.65*yy*yy
+    return (0.35 + 0.65*_v134_np.exp(-1.8*d)).astype(_v134_np.float32)
+
+
+def _v135_skin_mask(region: Any):
+    if _v134_np is None or region is None or getattr(region,'size',0)==0:
+        return None
+    arr=_v134_np.asarray(region,dtype=_v134_np.uint8)
+    if _v134_cv2 is None:
+        r,g,b=[arr[:,:,i].astype(_v134_np.int16) for i in range(3)]
+        return ((r>70)&(g>35)&(b>20)&(r>g)&(r>b)&((r-_v134_np.minimum(g,b))>12))
+    try:
+        ycrcb=_v134_cv2.cvtColor(arr,_v134_cv2.COLOR_RGB2YCrCb)
+        y,cr,cb=ycrcb[:,:,0],ycrcb[:,:,1],ycrcb[:,:,2]
+        hsv=_v134_cv2.cvtColor(arr,_v134_cv2.COLOR_RGB2HSV)
+        h,s,v=hsv[:,:,0],hsv[:,:,1],hsv[:,:,2]
+        m1=(y>45)&(cr>=130)&(cr<=185)&(cb>=72)&(cb<=142)
+        m2=(v>45)&(s>=18)&(s<=190)&(((h<=25)|(h>=170)))
+        return (m1 & m2)
+    except Exception:
+        return _v134_np.zeros(arr.shape[:2],dtype=bool)
+
+
+def _v135_color_vector(region: Any, remove_skin: bool=False):
+    if _v134_np is None or region is None or getattr(region,'size',0)==0:
+        return {'vector':[0.0]*len(_V135_COLOR_NAMES),'dominant':'indefinida','confidence':0.0,'brightness':0.0,'saturation':0.0}
+    arr=_v134_np.asarray(region,dtype=_v134_np.uint8)
+    if _v134_cv2 is not None:
+        hsv=_v134_cv2.cvtColor(arr,_v134_cv2.COLOR_RGB2HSV)
+        H=hsv[:,:,0].astype(_v134_np.float32)*2.0
+        S=hsv[:,:,1].astype(_v134_np.float32)/255.0
+        V=hsv[:,:,2].astype(_v134_np.float32)/255.0
+    else:
+        # fallback aproximado via colorsys em amostra reduzida seria caro; usa RGB simples.
+        mx=arr.max(axis=2).astype(_v134_np.float32); mn=arr.min(axis=2).astype(_v134_np.float32)
+        V=mx/255.0; S=(mx-mn)/_v134_np.maximum(mx,1.0); H=_v134_np.zeros_like(V)
+    mask=_v134_np.ones(arr.shape[:2],dtype=bool)
+    if remove_skin:
+        sm=_v135_skin_mask(arr)
+        if sm is not None:
+            mask &= ~sm
+    # evita bordas muito escuras/transparentes sem eliminar roupa preta.
+    weight=_v135_center_weight(arr.shape[0],arr.shape[1])
+    weight=weight*mask.astype(_v134_np.float32)
+    idx=_v134_np.full(arr.shape[:2],2,dtype=_v134_np.int16)  # cinza default
+    idx[V<0.18]=0
+    idx[(S<0.13)&(V>=0.82)]=1
+    idx[(S<0.13)&(V>=0.18)&(V<0.82)]=2
+    chrom=(S>=0.13)&(V>=0.18)
+    # vermelho
+    idx[chrom & ((H<15)|(H>=345))]=3
+    idx[chrom & (H>=15)&(H<38) & ~((V<0.62)&(S>0.28))]=4
+    idx[chrom & (H>=38)&(H<70)]=5
+    idx[chrom & (H>=70)&(H<165)]=6
+    idx[chrom & (H>=165)&(H<195)]=7
+    idx[chrom & (H>=195)&(H<255)]=8
+    idx[chrom & (H>=255)&(H<290)]=9
+    idx[chrom & (H>=290)&(H<345)]=10
+    brown=chrom & (H>=12)&(H<45)&(V<0.62)&(S>0.22)
+    beige=chrom & (H>=20)&(H<55)&(V>=0.55)&(S<0.48)
+    idx[brown|beige]=11
+    hist=_v134_np.zeros(len(_V135_COLOR_NAMES),dtype=_v134_np.float32)
+    for k in range(len(_V135_COLOR_NAMES)):
+        hist[k]=float(weight[idx==k].sum())
+    total=float(hist.sum())
+    if total>1e-9:
+        hist/=total
+    ordem=_v134_np.argsort(hist)[::-1]
+    dom=int(ordem[0]) if len(ordem) else 2
+    conf=float(hist[dom]) if len(hist) else 0.0
+    # se duas cores empatam, confiança deve cair.
+    if len(ordem)>1:
+        conf=max(0.0,min(1.0,conf-float(hist[int(ordem[1])])*0.35))
+    valid=weight>0
+    brightness=float((V[valid]*weight[valid]).sum()/max(1e-9,float(weight[valid].sum()))) if valid.any() else 0.0
+    saturation=float((S[valid]*weight[valid]).sum()/max(1e-9,float(weight[valid].sum()))) if valid.any() else 0.0
+    return {'vector':hist.tolist(),'dominant':_V135_COLOR_NAMES[dom],'confidence':conf,'brightness':brightness,'saturation':saturation}
+
+
+def _v135_color_similarity(a: Dict[str,Any], b: Dict[str,Any]) -> float:
+    va=_v134_arr(a.get('vector')); vb=_v134_arr(b.get('vector'))
+    if va is None or vb is None or va.shape!=vb.shape:
+        return 0.0
+    inter=float(_v134_np.minimum(va,vb).sum())*100.0
+    da=str(a.get('dominant') or ''); db=str(b.get('dominant') or '')
+    ca=float(a.get('confidence') or 0); cb=float(b.get('confidence') or 0)
+    if da and da==db and min(ca,cb)>=0.22:
+        inter=min(100.0,inter+8.0*min(ca,cb))
+    return max(0.0,min(100.0,inter))
+
+
+def _v135_skin_profile(region: Any) -> Dict[str,Any]:
+    if _v134_np is None or region is None or getattr(region,'size',0)==0:
+        return {'tone':'indefinido','l':0.0,'ratio':0.0}
+    arr=_v134_np.asarray(region,dtype=_v134_np.uint8)
+    mask=_v135_skin_mask(arr)
+    if mask is None or int(mask.sum())<10:
+        return {'tone':'indefinido','l':0.0,'ratio':0.0}
+    ratio=float(mask.mean())
+    if _v134_cv2 is not None:
+        lab=_v134_cv2.cvtColor(arr,_v134_cv2.COLOR_RGB2LAB)
+        L=float(_v134_np.median(lab[:,:,0][mask]))/255.0
+    else:
+        rgb=arr[mask].astype(_v134_np.float32)/255.0
+        L=float(rgb.mean())
+    tone='claro' if L>=0.68 else ('médio-claro' if L>=0.55 else ('médio' if L>=0.42 else ('médio-escuro' if L>=0.30 else 'escuro')))
+    return {'tone':tone,'l':L,'ratio':ratio}
+
+
+def _v135_skin_similarity(a:Dict[str,Any],b:Dict[str,Any])->float:
+    ra=float(a.get('ratio') or 0); rb=float(b.get('ratio') or 0)
+    if min(ra,rb)<0.015:
+        return 50.0  # neutro: não penaliza quando pele não está visível
+    d=abs(float(a.get('l') or 0)-float(b.get('l') or 0))
+    return max(0.0,100.0*(1.0-min(1.0,d/0.34)))
+
+
+def _v135_hair_profile(head: Any) -> Dict[str,Any]:
+    if _v134_np is None or head is None or getattr(head,'size',0)==0:
+        return {'color':'indefinido','confidence':0.0,'vector':[0.0]*len(_V135_COLOR_NAMES)}
+    # cabelo tende a ficar na parte superior/laterais da cabeça; exclui pixels classificados como pele.
+    hair=_v134_crop(head,0.08,0.00,0.92,0.62)
+    prof=_v135_color_vector(hair,remove_skin=True)
+    raw=str(prof.get('dominant') or 'indefinida')
+    mapa={'preto':'preto','marrom/bege':'castanho','amarelo':'loiro','laranja':'ruivo','vermelho':'ruivo','branco':'branco/cinza','cinza':'branco/cinza'}
+    color=mapa.get(raw,'colorido' if raw in {'azul','verde','ciano','roxo','rosa'} else raw)
+    return {'color':color,'confidence':float(prof.get('confidence') or 0),'vector':prof.get('vector') or []}
+
+
+def _v135_hair_similarity(a:Dict[str,Any],b:Dict[str,Any])->float:
+    va={'vector':a.get('vector') or [],'dominant':'','confidence':a.get('confidence',0)}
+    vb={'vector':b.get('vector') or [],'dominant':'','confidence':b.get('confidence',0)}
+    base=_v135_color_similarity(va,vb)
+    ca=str(a.get('color') or ''); cb=str(b.get('color') or '')
+    if ca and cb and ca!='indefinido' and cb!='indefinido':
+        if ca==cb: base=min(100.0,base+14.0)
+        elif min(float(a.get('confidence') or 0),float(b.get('confidence') or 0))>0.34: base*=0.72
+    return base
+
+
+def _v135_edge_density(region:Any)->float:
+    if region is None or getattr(region,'size',0)==0 or _v134_np is None:
+        return 0.0
+    gray=_v134_gray(region)
+    if _v134_cv2 is not None:
+        try:
+            g=_v134_cv2.resize(gray,(120,120),interpolation=_v134_cv2.INTER_AREA)
+            edges=_v134_cv2.Canny(g,60,130)
+            return float((edges>0).mean())
+        except Exception:
+            return 0.0
+    gy,gx=_v134_np.gradient(gray.astype(_v134_np.float32)); mag=_v134_np.sqrt(gx*gx+gy*gy)
+    return float((mag>32).mean())
+
+
+def _v135_style_profile(upper:Any,lower:Any,full:Any)->Dict[str,Any]:
+    smu=_v135_skin_mask(upper) if upper is not None else None
+    sml=_v135_skin_mask(lower) if lower is not None else None
+    arm_ratio=0.0
+    if smu is not None and smu.size:
+        w=smu.shape[1]
+        side=_v134_np.concatenate([smu[:, :max(1,int(w*.26))].ravel(),smu[:, min(w-1,int(w*.74)):].ravel()])
+        arm_ratio=float(side.mean()) if side.size else 0.0
+    leg_ratio=0.0
+    if sml is not None and sml.size:
+        h=sml.shape[0]; bottom=sml[min(h-1,int(h*.42)):,:]
+        leg_ratio=float(bottom.mean()) if bottom.size else 0.0
+    sleeves='sem manga/curta' if arm_ratio>=0.20 else ('manga longa' if arm_ratio<=0.07 else 'manga média')
+    legs='pernas expostas' if leg_ratio>=0.20 else ('pernas cobertas' if leg_ratio<=0.07 else 'cobertura parcial')
+    edge=_v135_edge_density(upper)
+    pattern='estampada/detalhada' if edge>=0.17 else ('texturizada' if edge>=0.10 else 'lisa')
+    upc=_v135_color_vector(upper,remove_skin=True)
+    br=float(upc.get('brightness') or 0)
+    brightness='clara' if br>=0.72 else ('escura' if br<=0.34 else 'média')
+    aspect=float(full.shape[1])/max(1.0,float(full.shape[0])) if full is not None and getattr(full,'size',0) else 0.0
+    return {'sleeves':sleeves,'legs':legs,'pattern':pattern,'brightness':brightness,'arm_skin':arm_ratio,'leg_skin':leg_ratio,'edge':edge,'aspect':aspect}
+
+
+def _v135_cat_sim(a:str,b:str,groups:List[str])->float:
+    if not a or not b: return 60.0
+    if a==b: return 100.0
+    try: ia=groups.index(a); ib=groups.index(b)
+    except ValueError: return 50.0
+    d=abs(ia-ib)
+    return 72.0 if d==1 else 34.0
+
+
+def _v135_style_similarity(a:Dict[str,Any],b:Dict[str,Any])->float:
+    sleeve=_v135_cat_sim(str(a.get('sleeves') or ''),str(b.get('sleeves') or ''),['manga longa','manga média','sem manga/curta'])
+    legs=_v135_cat_sim(str(a.get('legs') or ''),str(b.get('legs') or ''),['pernas cobertas','cobertura parcial','pernas expostas'])
+    pattern=_v135_cat_sim(str(a.get('pattern') or ''),str(b.get('pattern') or ''),['lisa','texturizada','estampada/detalhada'])
+    bright=_v135_cat_sim(str(a.get('brightness') or ''),str(b.get('brightness') or ''),['escura','média','clara'])
+    aspect=max(0.0,100.0*(1.0-min(1.0,abs(float(a.get('aspect') or 0)-float(b.get('aspect') or 0))/0.45)))
+    return 0.30*sleeve+0.24*legs+0.20*pattern+0.12*bright+0.14*aspect
+
+
+def _v135_phash(region:Any)->int:
+    if region is None or getattr(region,'size',0)==0 or _v134_np is None:
+        return 0
+    gray=_v134_gray(region).astype(_v134_np.float32)
+    if _v134_cv2 is not None:
+        small=_v134_cv2.resize(gray,(32,32),interpolation=_v134_cv2.INTER_AREA)
+        dct=_v134_cv2.dct(small)
+    else:
+        # fallback dHash já existente
+        return int(_v134_dhash(region))
+    low=dct[:8,:8].copy(); vals=low.ravel()[1:]
+    med=float(_v134_np.median(vals)) if vals.size else 0.0
+    bits=(low>med).ravel(); out=0
+    for bit in bits.tolist(): out=(out<<1)|int(bool(bit))
+    return int(out)
+
+
+def _v135_hash_similarity(a:int,b:int)->float:
+    if not a or not b: return 0.0
+    try: d=(int(a)^int(b)).bit_count()
+    except Exception: d=bin(int(a)^int(b)).count('1')
+    return max(0.0,100.0*(1.0-d/64.0))
+
+
+def _v135_feature_candidate(nome:str,crop:Any,qualidade:float)->Dict[str,Any]:
+    base=_v134_feature_candidate(nome,crop,qualidade)
+    full=_v134_region(crop,'full'); head=_v134_region(crop,'head'); upper=_v134_region(crop,'upper'); lower=_v134_region(crop,'lower')
+    base.update({
+        'v135_upper_color':_v135_color_vector(upper,remove_skin=True),
+        'v135_lower_color':_v135_color_vector(lower,remove_skin=True),
+        'v135_hair':_v135_hair_profile(head),
+        'v135_skin':_v135_skin_profile(head),
+        'v135_style':_v135_style_profile(upper,lower,full),
+        'v135_phash':_v135_phash(full),
+    })
+    return base
+
+
+def _v135_features(img:Any)->Dict[str,Any]:
+    candidatos=[]
+    for nome,crop,qualidade in _v134_candidate_crops(img):
+        try: candidatos.append(_v135_feature_candidate(nome,crop,qualidade))
+        except Exception: continue
+    return {'candidates':candidatos,'shape':tuple(int(x) for x in img.shape[:2])}
+
+
+def _v135_compare_candidate(q:Dict[str,Any],r:Dict[str,Any],mode:str)->Dict[str,Any]:
+    up_color=_v135_color_similarity(dict(q.get('v135_upper_color') or {}),dict(r.get('v135_upper_color') or {}))
+    low_color=_v135_color_similarity(dict(q.get('v135_lower_color') or {}),dict(r.get('v135_lower_color') or {}))
+    style=_v135_style_similarity(dict(q.get('v135_style') or {}),dict(r.get('v135_style') or {}))
+    hair=_v135_hair_similarity(dict(q.get('v135_hair') or {}),dict(r.get('v135_hair') or {}))
+    skin=_v135_skin_similarity(dict(q.get('v135_skin') or {}),dict(r.get('v135_skin') or {}))
+    texture=0.58*_v134_hist_intersection(q.get('upper_lbp'),r.get('upper_lbp'))+0.42*_v134_cos(q.get('upper_hog'),r.get('upper_hog'))
+    silhouette=0.62*_v134_cos(q.get('full_hog'),r.get('full_hog'))+0.38*_v135_cat_sim(str((q.get('v135_style') or {}).get('brightness') or ''),str((r.get('v135_style') or {}).get('brightness') or ''),['escura','média','clara'])
+    orb=_v134_orb_sim(q.get('orb'),r.get('orb'))
+    phash=_v135_hash_similarity(int(q.get('v135_phash') or 0),int(r.get('v135_phash') or 0))
+    head_texture=0.55*_v134_hist_intersection(q.get('head_lbp'),r.get('head_lbp'))+0.45*_v134_cos(q.get('head_hog'),r.get('head_hog'))
+    clothing=0.36*up_color+0.14*low_color+0.24*style+0.14*texture+0.08*silhouette+0.04*orb
+    appearance=0.34*hair+0.30*skin+0.20*head_texture+0.16*silhouette
+    accessory=0.45*orb+0.35*silhouette+0.20*texture
+    is_clothing=str(mode or '').lower() in {'roupa','clothing'}
+    score=(0.76*clothing+0.10*accessory+0.08*appearance+0.06*phash) if is_clothing else (0.57*clothing+0.23*appearance+0.10*accessory+0.10*phash)
+    # Regras duras: a cor do tronco e o estilo são os sinais mais importantes em fotos prisionais.
+    qu=dict(q.get('v135_upper_color') or {}); ru=dict(r.get('v135_upper_color') or {})
+    qconf=float(qu.get('confidence') or 0); rconf=float(ru.get('confidence') or 0)
+    hard_pass=True; penalties=[]
+    if min(qconf,rconf)>=0.30 and up_color<38.0:
+        hard_pass=False; penalties.append('cor superior incompatível')
+    elif min(qconf,rconf)>=0.30 and up_color<52.0:
+        score*=0.78; penalties.append('cor superior pouco compatível')
+    qs=dict(q.get('v135_style') or {}); rs=dict(r.get('v135_style') or {})
+    if qs.get('sleeves') and rs.get('sleeves') and qs.get('sleeves')!=rs.get('sleeves') and style<52:
+        score*=0.82; penalties.append('estilo de manga diferente')
+    if qs.get('legs') and rs.get('legs') and qs.get('legs')!=rs.get('legs') and low_color<48:
+        score*=0.88; penalties.append('parte inferior pouco compatível')
+    # Near-duplicate/screenshot da própria ficha recebe prioridade muito alta, mas só se roupa também fizer sentido.
+    if phash>=91 and up_color>=55:
+        score=max(score,86.0+0.12*(phash-91.0)); hard_pass=True
+    elif phash>=84 and up_color>=60:
+        score=max(score,78.0+0.18*(phash-84.0))
+    qualidade=min(float(q.get('quality') or 1.0),float(r.get('quality') or 1.0))
+    score*=0.92+0.08*qualidade
+    return {
+        'score':float(max(0,min(100,score))), 'clothing':float(clothing), 'appearance':float(appearance), 'accessory':float(accessory),
+        'upper_color':float(up_color), 'lower_color':float(low_color), 'style':float(style), 'hair':float(hair), 'skin':float(skin),
+        'texture':float(texture), 'silhouette':float(silhouette), 'orb':float(orb), 'phash':float(phash), 'hard_pass':bool(hard_pass),
+        'penalties':penalties,
+        'query_profile':{'upper':qu,'lower':dict(q.get('v135_lower_color') or {}),'hair':dict(q.get('v135_hair') or {}),'skin':dict(q.get('v135_skin') or {}),'style':qs},
+        'ref_profile':{'upper':ru,'lower':dict(r.get('v135_lower_color') or {}),'hair':dict(r.get('v135_hair') or {}),'skin':dict(r.get('v135_skin') or {}),'style':rs},
+    }
+
+
+def _v135_compare_features(qf:Dict[str,Any],rf:Dict[str,Any],mode:str)->Dict[str,Any]:
+    melhor={'score':0.0,'hard_pass':False}
+    for q in list(qf.get('candidates') or []):
+        for r in list(rf.get('candidates') or []):
+            atual=_v135_compare_candidate(q,r,mode)
+            if float(atual.get('score') or 0)>float(melhor.get('score') or 0): melhor=atual
+    return melhor
+
+
+def _v135_query_profile(qf:Dict[str,Any])->Dict[str,Any]:
+    candidatos=list(qf.get('candidates') or [])
+    if not candidatos: return {}
+    # prefere detector real, depois crop de maior qualidade
+    best=max(candidatos,key=lambda x:(1 if x.get('name')=='pessoa_detectada' else 0,float(x.get('quality') or 0)))
+    return {'upper':dict(best.get('v135_upper_color') or {}),'lower':dict(best.get('v135_lower_color') or {}),'hair':dict(best.get('v135_hair') or {}),'skin':dict(best.get('v135_skin') or {}),'style':dict(best.get('v135_style') or {})}
+
+
+def _v135_explanations(c:Dict[str,Any])->List[str]:
+    out=[]
+    if float(c.get('upper_color') or 0)>=72: out.append('cor da roupa superior muito próxima')
+    if float(c.get('lower_color') or 0)>=68: out.append('cor da parte inferior próxima')
+    if float(c.get('style') or 0)>=76: out.append('estilo/cobertura da roupa semelhante')
+    if float(c.get('texture') or 0)>=62: out.append('padrão/textura semelhante')
+    if float(c.get('hair') or 0)>=70: out.append('cabelo/região superior semelhante')
+    if float(c.get('skin') or 0)>=72: out.append('tom visual de pele semelhante')
+    if float(c.get('phash') or 0)>=84: out.append('imagem visualmente muito próxima da referência')
+    if float(c.get('silhouette') or 0)>=68: out.append('silhueta corporal semelhante')
+    return out[:4] or ['combinação parcial de atributos visuais']
+
+
+class _V135VisualSearchIndex:
+    def __init__(self,root:Any):
+        self.root=Path(root); self.root.mkdir(parents=True,exist_ok=True)
+        self.path=self.root/'index_v135.pkl.gz'; self.lock=_v134_threading.RLock()
+        self.data={'version':VISUAL_SEARCH_ENGINE_VERSION,'entries':{},'built_at':'','engine':VISUAL_SEARCH_ENGINE_LABEL}; self._loaded=False
+    def load(self):
+        with self.lock:
+            if self._loaded: return self.data
+            if self.path.exists():
+                try:
+                    with _v134_gzip.open(self.path,'rb') as f: obj=_v134_pickle.load(f)
+                    if isinstance(obj,dict) and int(obj.get('version') or 0)==VISUAL_SEARCH_ENGINE_VERSION: self.data=obj
+                except Exception: pass
+            self._loaded=True; return self.data
+    def _save(self):
+        tmp=self.path.with_suffix('.tmp.gz'); self.data['version']=VISUAL_SEARCH_ENGINE_VERSION; self.data['engine']=VISUAL_SEARCH_ENGINE_LABEL
+        self.data['built_at']=_banco_agora_iso() if '_banco_agora_iso' in globals() else agora_br()
+        with _v134_gzip.open(tmp,'wb',compresslevel=5) as f: _v134_pickle.dump(self.data,f,protocol=_v134_pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp,self.path)
+    def _fingerprint(self,path:str)->str:
+        try:
+            p=Path(path); st=p.stat(); h=_v134_hashlib.sha1(); h.update(f'{st.st_size}:{st.st_mtime_ns}'.encode())
+            with p.open('rb') as f:
+                h.update(f.read(65536))
+                if st.st_size>131072: f.seek(max(0,st.st_size-65536)); h.update(f.read(65536))
+            return h.hexdigest()
+        except Exception:return ''
+    def _raw_sha1(self,path:str)->str:
+        try:
+            h=_v134_hashlib.sha1()
+            with Path(path).open('rb') as f:
+                while True:
+                    b=f.read(1024*1024)
+                    if not b:break
+                    h.update(b)
+            return h.hexdigest()
+        except Exception:return ''
+    def _extract_record(self,record:Dict[str,Any]):
+        path=str(record.get('path') or '').strip()
+        if not path or not Path(path).exists(): return None
+        img=_v134_load_path(path)
+        if img is None:return None
+        features=_v135_features(img)
+        if not features.get('candidates'):return None
+        out=dict(record); out['features']=features; out['fingerprint']=self._fingerprint(path); out['raw_sha1']=self._raw_sha1(path)
+        out['source_priority']=_v134_source_priority(record); out['engine_version']=VISUAL_SEARCH_ENGINE_VERSION
+        return out
+    def build_or_update(self,records:List[Dict[str,Any]],prune:bool=False,progress_callback:Optional[Callable[[Dict[str,Any]],None]]=None):
+        self.load()
+        with self.lock:
+            entries=dict(self.data.get('entries') or {}); atuais=set(); stats={'indexed_images':0,'added':0,'updated':0,'skipped':0,'invalid':0,'errors':[]}; total=len(list(records or []))
+            for idx,record in enumerate(list(records or []),start=1):
+                image_id=str(record.get('image_id') or '').strip()
+                if not image_id: stats['invalid']+=1; continue
+                atuais.add(image_id); path=str(record.get('path') or '').strip(); fp=self._fingerprint(path) if path else ''; anterior=entries.get(image_id)
+                if anterior and fp and str(anterior.get('fingerprint') or '')==fp and int(anterior.get('engine_version') or 0)==VISUAL_SEARCH_ENGINE_VERSION:
+                    for k in ('rg','nome','individuo_id','registro_id','url','source','mime_type','description','path'):
+                        if k in record: anterior[k]=record.get(k)
+                    entries[image_id]=anterior; stats['skipped']+=1
+                else:
+                    try:
+                        novo=self._extract_record(record)
+                        if novo is None: stats['invalid']+=1
+                        else:
+                            entries[image_id]=novo; stats['updated' if anterior else 'added']+=1
+                    except Exception as e:
+                        stats['invalid']+=1
+                        if len(stats['errors'])<20:stats['errors'].append(f'{image_id}: {type(e).__name__}: {e}')
+                if progress_callback:
+                    try:progress_callback({'phase':'indexing_v135','current':idx,'total':total,**stats})
+                    except Exception:pass
+            if prune:
+                for key in list(entries):
+                    if key not in atuais:entries.pop(key,None)
+            self.data['entries']=entries; self._save(); stats['indexed_images']=len(entries); stats['summary']=self.summary(); return stats
+    def summary(self):
+        self.load(); entries=list((self.data.get('entries') or {}).values()); regs={int(e.get('registro_id') or e.get('individuo_id') or 0) for e in entries if int(e.get('registro_id') or e.get('individuo_id') or 0)}
+        try:size=self.path.stat().st_size if self.path.exists() else 0
+        except Exception:size=0
+        return {'entries':len(entries),'records':len(regs),'index_bytes':int(size),'version':VISUAL_SEARCH_ENGINE_VERSION,'engine':VISUAL_SEARCH_ENGINE_LABEL}
+    def search_bytes(self,image_bytes:bytes,mode:str='full',top_k:int=3):
+        self.load(); raw=bytes(image_bytes or b''); img=_v134_decode_bytes(raw)
+        if img is None:return {'results':[],'reason':'imagem de consulta inválida','summary':self.summary()}
+        qf=_v135_features(img)
+        if not qf.get('candidates'):return {'results':[],'reason':'não foi possível localizar/comparar o personagem','summary':self.summary()}
+        qsha=_v134_hashlib.sha1(raw).hexdigest() if raw else ''
+        por={}
+        for entry in list((self.data.get('entries') or {}).values()):
+            iid=int(entry.get('registro_id') or entry.get('individuo_id') or 0)
+            if not iid or not isinstance(entry.get('features'),dict):continue
+            if qsha and qsha==str(entry.get('raw_sha1') or ''):
+                comp={'score':100.0,'clothing':100.0,'appearance':100.0,'accessory':100.0,'upper_color':100.0,'lower_color':100.0,'style':100.0,'hair':100.0,'skin':100.0,'texture':100.0,'silhouette':100.0,'orb':100.0,'phash':100.0,'hard_pass':True,'penalties':[],'query_profile':_v135_query_profile(qf),'ref_profile':_v135_query_profile(entry['features'])}
+            else:
+                comp=_v135_compare_features(qf,entry['features'],mode)
+            pri=float(entry.get('source_priority') or _v134_source_priority(entry))
+            # prisional / foto indivíduo recebem preferência moderada; nunca salvam candidato ruim.
+            comp['score']*=0.94+0.06*max(0.35,min(1.0,pri))
+            por.setdefault(iid,[]).append({'entry':entry,'comp':comp})
+        resultados=[]
+        limiar=VISUAL_SEARCH_MIN_SCORE_ROUPA if str(mode or '').lower() in {'roupa','clothing'} else VISUAL_SEARCH_MIN_SCORE_FULL
+        for iid,itens in por.items():
+            itens.sort(key=lambda x:float(x['comp'].get('score') or 0),reverse=True); best=itens[0]; c=best['comp']; e=best['entry']
+            if VISUAL_SEARCH_STRICT and not bool(c.get('hard_pass')):continue
+            best_score=float(c.get('score') or 0)
+            if best_score<limiar:continue
+            # apoio de múltiplas fotos só acrescenta poucos pontos; não deixa 3 fotos ruins vencer 1 foto correta.
+            support=[float(x['comp'].get('score') or 0) for x in itens[1:3] if bool(x['comp'].get('hard_pass')) and float(x['comp'].get('score') or 0)>=limiar-8]
+            agregado=best_score
+            if support: agregado=min(100.0,0.90*best_score+0.10*max(support))
+            resultados.append({
+                'registro_id':iid,'individuo_id':iid,'rg':str(e.get('rg') or ''),'nome':str(e.get('nome') or 'Ficha sem nome'),'score':float(agregado),
+                'clothing_score':float(c.get('clothing') or 0),'appearance_score':float(c.get('appearance') or 0),'accessory_score':float(c.get('accessory') or 0),
+                'upper_color_score':float(c.get('upper_color') or 0),'lower_color_score':float(c.get('lower_color') or 0),'style_score':float(c.get('style') or 0),
+                'hair_score':float(c.get('hair') or 0),'skin_score':float(c.get('skin') or 0),'texture_score':float(c.get('texture') or 0),'silhouette_score':float(c.get('silhouette') or 0),'phash_score':float(c.get('phash') or 0),
+                'matches_count':len(itens),'explanations':_v135_explanations(c),'best_image':{k:e.get(k) for k in ('image_id','path','url','source','description')},
+                'query_profile':dict(c.get('query_profile') or {}),'ref_profile':dict(c.get('ref_profile') or {}),'penalties':list(c.get('penalties') or []),
+            })
+        resultados.sort(key=lambda x:float(x.get('score') or 0),reverse=True)
+        # Não poluir: no máximo 3; se o primeiro estiver bem isolado, mostra só ele.
+        maxret=min(3,max(1,int(top_k or VISUAL_SEARCH_TOP_K)))
+        if resultados and len(resultados)>1 and float(resultados[0]['score'])>=82 and float(resultados[0]['score'])-float(resultados[1]['score'])>=9:
+            resultados=resultados[:1]
+        else:resultados=resultados[:maxret]
+        qp=_v135_query_profile(qf)
+        reason='' if resultados else f'nenhuma ficha passou pelos filtros de cor/estilo e pelo limiar de {limiar:.0f}%'
+        return {'results':resultados,'reason':reason,'warning':'','summary':self.summary(),'threshold':limiar,'engine':VISUAL_SEARCH_ENGINE_LABEL,'query_profile':qp}
+
+
+# Substitui apenas o módulo de busca visual; todo o restante do bot permanece intacto.
+_v135_mod=_v134_types.ModuleType('visual_search')
+_v135_mod.VisualSearchIndex=_V135VisualSearchIndex
+_v135_mod.is_supported_visual_file=_v134_visual_supported
+_v135_mod.format_index_size=_v134_visual_format_size
+_v135_mod.can_rebuild_visual_index=_v134_visual_can_rebuild
+_v134_sys.modules['visual_search']=_v135_mod
+
+
+def _v135_profile_text(p:Dict[str,Any])->str:
+    if not isinstance(p,dict):return 'não determinado'
+    up=dict(p.get('upper') or {}); low=dict(p.get('lower') or {}); hair=dict(p.get('hair') or {}); skin=dict(p.get('skin') or {}); st=dict(p.get('style') or {})
+    parts=[]
+    if up.get('dominant'):parts.append(f"superior **{up.get('dominant')}**")
+    if low.get('dominant'):parts.append(f"inferior **{low.get('dominant')}**")
+    if st.get('sleeves'):parts.append(str(st.get('sleeves')))
+    if st.get('legs'):parts.append(str(st.get('legs')))
+    if st.get('pattern'):parts.append(str(st.get('pattern')))
+    if hair.get('color') and hair.get('color')!='indefinido':parts.append(f"cabelo **{hair.get('color')}**")
+    if skin.get('tone') and skin.get('tone')!='indefinido':parts.append(f"pele visual **{skin.get('tone')}**")
+    return ' • '.join(parts)[:950] or 'não determinado'
+
+
+def _v124_visual_embed_resultados(resultado:Dict[str,Any],modo_label:str)->discord.Embed:
+    resultados=list(resultado.get('results') or []); resumo=dict(resultado.get('summary') or {}); qp=dict(resultado.get('query_profile') or {})
+    embed=discord.Embed(title='🔎 BUSCA VISUAL — COMPARAÇÃO ESTRITA',description=(
+        f'**Modo:** {modo_label}\n'
+        'O motor separa **cor da roupa superior**, **cor da parte inferior**, **cobertura/estilo**, **padrão/textura**, **cabelo**, **tom visual de pele**, **silhueta** e detalhes locais. '
+        'Resultados fracos são descartados em vez de preencher uma lista com fichas sem relação. **É triagem por semelhança, não confirmação de identidade.**'
+    ),color=discord.Color.from_rgb(20,72,130))
+    embed.add_field(name='🎯 Atributos detectados na imagem enviada',value=_v135_profile_text(qp),inline=False)
+    if not resultados:
+        embed.add_field(name='Resultado',value=f"Nenhuma ficha passou pelos filtros mínimos.\nMotivo: `{str(resultado.get('reason') or 'sem candidato compatível')[:400]}`\nIsso é preferível a exibir pessoas sem relação visual.",inline=False)
+    for pos,item in enumerate(resultados,start=1):
+        score=float(item.get('score') or 0); conf='MUITO FORTE' if score>=86 else ('FORTE' if score>=74 else ('BOA' if score>=64 else 'POSSÍVEL'))
+        best=dict(item.get('best_image') or {}); source=str(best.get('source') or 'imagem da ficha').replace('_',' '); ref=dict(item.get('ref_profile') or {})
+        detalhes=[
+            f"**RG:** `{str(item.get('rg') or 'N/I')}`",
+            f"**Compatibilidade geral:** `{score:.1f}%` • **{conf}**",
+            f"**Cor roupa superior:** `{float(item.get('upper_color_score') or 0):.1f}%`",
+            f"**Cor parte inferior:** `{float(item.get('lower_color_score') or 0):.1f}%`",
+            f"**Estilo/cobertura:** `{float(item.get('style_score') or 0):.1f}%`",
+            f"**Padrão/textura:** `{float(item.get('texture_score') or 0):.1f}%`",
+            f"**Cabelo:** `{float(item.get('hair_score') or 0):.1f}%`",
+            f"**Tom visual de pele:** `{float(item.get('skin_score') or 0):.1f}%`",
+            f"**Silhueta:** `{float(item.get('silhouette_score') or 0):.1f}%`",
+            f"**Referência mais próxima:** `{source[:55]}`",
+            f"**Perfil da referência:** {_v135_profile_text(ref)}",
+            '**Pontos que bateram:** '+'; '.join(list(item.get('explanations') or [])[:4]),
+        ]
+        embed.add_field(name=f"{pos}. {str(item.get('nome') or 'Ficha sem nome')[:80]}",value='\n'.join(detalhes)[:1024],inline=False)
+    embed.add_field(name='Índice visual',value=f"Imagens: `{int(resumo.get('entries') or 0)}` • Fichas: `{int(resumo.get('records') or 0)}` • Motor: `V{int(resumo.get('version') or VISUAL_SEARCH_ENGINE_VERSION)}` • Limiar: `{float(resultado.get('threshold') or 0):.0f}%`",inline=False)
+    embed.set_footer(text='DICOR • Busca Visual V135 • filtros estritos por atributos • revisão humana obrigatória')
+    return embed
+
+
+class V124VisualModoView(View):
+    def __init__(self,usuario_id:int,image_bytes:bytes,filename:str):
+        super().__init__(timeout=300); self.usuario_id=int(usuario_id); self.image_bytes=bytes(image_bytes); self.filename=str(filename or 'imagem')[:120]; self.processando=False
+    async def interaction_check(self,interaction:discord.Interaction)->bool:
+        if int(interaction.user.id)==self.usuario_id:return True
+        await interaction.response.send_message('❌ Esta busca visual pertence a outro agente.',ephemeral=True);return False
+    async def _executar(self,interaction:discord.Interaction,modo:str,modo_label:str)->None:
+        if self.processando:return await interaction.response.send_message('⏳ Esta imagem já está sendo comparada.',ephemeral=True)
+        self.processando=True; await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            resultado=await asyncio.wait_for(asyncio.to_thread(_v124_visual_buscar_sync,self.image_bytes,modo),timeout=75)
+            embed=_v124_visual_embed_resultados(resultado,modo_label); view=V124VisualResultadosView(int(interaction.user.id),list(resultado.get('results') or []))
+            await interaction.edit_original_response(content=None,embed=embed,view=view if view.children else None)
+        except Exception as erro:
+            traceback.print_exc()
+            try:await enviar_log(f'❌ V135 busca visual falhou `{self.filename}` | {type(erro).__name__}: {erro}')
+            except Exception:pass
+            await interaction.edit_original_response(content=f'❌ Não foi possível processar a busca visual: `{type(erro).__name__}: {str(erro)[:160]}`',embed=None,view=None)
+        finally:self.processando=False
+    @discord.ui.button(label='Roupa + aparência detalhada',emoji='🔎',style=discord.ButtonStyle.primary,custom_id='v124_busca_visual_modo_completo')
+    async def completo(self,interaction:discord.Interaction,button:discord.ui.Button):await self._executar(interaction,'full','Roupa + aparência detalhada')
+    @discord.ui.button(label='Priorizar roupa',emoji='👕',style=discord.ButtonStyle.secondary,custom_id='v124_busca_visual_modo_roupa')
+    async def roupa(self,interaction:discord.Interaction,button:discord.ui.Button):await self._executar(interaction,'roupa','Priorizar roupa')
+
+
+# Força rebuild porque os atributos V135 não existem no índice V134.
+_V135_REBUILD_LOCK=_v134_threading.Lock()
+def _v135_rebuild_se_necessario_sync()->Dict[str,Any]:
+    indice=_v124_visual_index(); resumo=indice.summary()
+    if int(resumo.get('version') or 0)==135 and int(resumo.get('entries') or 0)>0:return {'skipped':True,'summary':resumo}
+    with _V135_REBUILD_LOCK:
+        indice=_v124_visual_index(); resumo=indice.summary()
+        if int(resumo.get('version') or 0)==135 and int(resumo.get('entries') or 0)>0:return {'skipped':True,'summary':resumo}
+        return _v124_visual_rebuild_sync()
+
+@bot.listen('on_ready')
+async def _v135_visual_auto_rebuild_on_ready():
+    if not VISUAL_SEARCH_AUTO_REBUILD:return
+    await asyncio.sleep(16)
+    try:
+        r=await asyncio.to_thread(_v135_rebuild_se_necessario_sync); s=dict(r.get('summary') or {})
+        print(f"✅ V135 visual pronto: {int(s.get('entries') or 0)} imagem(ns) em {int(s.get('records') or 0)} ficha(s). Filtros estritos ativos.",flush=True)
+    except Exception as erro:
+        print(f'⚠️ V135 visual rebuild falhou: {type(erro).__name__}: {erro}',flush=True)
+        try:await enviar_log(f'⚠️ V135 visual rebuild falhou | {type(erro).__name__}: {erro}')
+        except Exception:pass
+
+
+print(
+    '✅ V135 carregada — SOMENTE busca visual alterada. Cor superior/inferior, estilo/cobertura, padrão, cabelo, tom visual de pele, silhueta, near-duplicate e filtros estritos. Mesa/dossiê V133 preservados.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
