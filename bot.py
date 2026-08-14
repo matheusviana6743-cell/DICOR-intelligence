@@ -59118,5 +59118,327 @@ async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Opti
 print('✅ V128 carregada — dossiê usa SOMENTE o estado guiado de cada item; textos brutos dos tópicos e mídia de outros tópicos foram excluídos do payload final.', flush=True)
 print('✅ V128 prova visual: o PDF novo deve exibir “02. FOTOS DOS LÍDERES”; se aparecer “4. LIDERANÇAS IDENTIFICADAS”, o deploy ainda está executando o gerador antigo.', flush=True)
 
+
+# =====================================================
+# V129 — FECHAMENTO PROFISSIONAL DEFINITIVO
+# Corrige o preflight V123/V125, força o payload state-only V128,
+# bloqueia cartões sem foto e elimina repetição do informante.
+# =====================================================
+
+
+def _v129_norm_preflight(valor: Any) -> str:
+    texto = normalizar_busca(valor)
+    texto = re.sub(r'[^a-z0-9]+', ' ', texto)
+    return re.sub(r'\s+', ' ', texto).strip()
+
+
+def _v123_preflight_arquivo(caminho: Path, tipo: str) -> List[str]:
+    """Preflight final compatível com títulos como `02. FOTOS DOS LÍDERES`.
+
+    O preflight antigo normalizava acentos, mas não removia pontuação. Por isso
+    procurava `02 fotos dos lideres` dentro de `02. fotos dos lideres` e reprovava
+    TODAS as seções mesmo quando elas estavam presentes.
+    """
+    erros: List[str] = []
+    try:
+        caminho = Path(caminho)
+        tipo_norm = str(tipo or '').lower()
+        minimo = 6000 if tipo_norm == 'pdf' else 3500
+        if not caminho.exists() or caminho.stat().st_size < minimo:
+            return [f'{tipo_norm.upper()} V129 não foi gerado corretamente ou está vazio.']
+
+        if tipo_norm == 'pdf' and fitz is not None:
+            doc = fitz.open(str(caminho))
+            try:
+                if len(doc) < 15:
+                    erros.append(
+                        f'PDF V129 gerou apenas {len(doc)} página(s); esperado: capa, sumário/índice e 13 seções isoladas.'
+                    )
+                texto_pdf = '\n'.join(page.get_text('text') for page in doc)
+                normalizado = _v129_norm_preflight(texto_pdf)
+                obrigatorios = [
+                    '01 painel', '02 fotos dos lideres', '03 fotos dos membros', '04 radio',
+                    '05 localizacao', '06 crimes da comunidade', '07 bau de lider',
+                    '08 bau de membros', '09 rota de farm', '10 rota de producao',
+                    '11 ingredientes e produtos', '12 informante', '13 residencia do lider',
+                    'indice de evidencias',
+                ]
+                for termo in obrigatorios:
+                    if _v129_norm_preflight(termo) not in normalizado:
+                        erros.append(f'Seção obrigatória ausente no PDF V129: {termo}.')
+                proibidos = (
+                    'tarefa guiada', 'gerenciamento de tarefas', 'checklist atual',
+                    'finalizar tarefa', 'concluir tarefa', 'mesa criada por',
+                )
+                for termo in proibidos:
+                    if _v129_norm_preflight(termo) in normalizado:
+                        erros.append(f'Mensagem administrativa vazou para o PDF V129: {termo}.')
+            finally:
+                doc.close()
+    except Exception as erro:
+        erros.append(f'Falha no preflight {str(tipo).upper()} V129: {type(erro).__name__}: {erro}')
+    return erros
+
+
+def _v129_midia_id(item: Any) -> str:
+    midia = _v124_normalizar_midia(item)
+    if not midia:
+        return ''
+    url = str(midia.get('url') or midia.get('proxy_url') or '').strip()
+    local = str(midia.get('local') or '').strip()
+    msg = str(midia.get('mensagem_id') or '')
+    indice = str(midia.get('indice') if midia.get('indice') is not None else '')
+    return '|'.join((msg, indice, url, local))
+
+
+def _v129_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    # Base totalmente state-only criada na V128.
+    payload = _v128_payload_profissional(dados, estado, canal_id)
+    secoes = {str(s.get('code')): s for s in list(payload.get('sections') or []) if isinstance(s, dict)}
+
+    # O informante já tem a foto exibida no cartão. Não repete essa mesma foto na
+    # galeria da seção. A galeria fica apenas para documento e resumo em imagem.
+    sec12 = secoes.get('12')
+    if isinstance(sec12, dict):
+        info = sec12.get('informante') if isinstance(sec12.get('informante'), dict) else {}
+        foto_id = _v129_midia_id(info.get('foto'))
+        auxiliares = []
+        for item in list(sec12.get('images') or []):
+            ident = _v129_midia_id(item)
+            if ident and ident == foto_id:
+                continue
+            auxiliares.append(item)
+        sec12['images'] = _v124_dedupe_media(auxiliares, 8)
+
+    # Deduplicação GLOBAL. Uma evidência física não pode ser exibida em dois
+    # tópicos diferentes. A primeira associação estruturada vence.
+    usados: set[str] = set()
+    for codigo in [f'{i:02d}' for i in range(1, 14)]:
+        sec = secoes.get(codigo)
+        if not isinstance(sec, dict):
+            continue
+
+        if codigo in ('02', '03'):
+            for pessoa in list(sec.get('people') or []):
+                if not isinstance(pessoa, dict):
+                    continue
+                ident = _v129_midia_id(pessoa.get('foto'))
+                if ident:
+                    # Fotos individuais pertencem ao próprio registro e são
+                    # reservadas antes de qualquer galeria.
+                    if ident in usados:
+                        pessoa['foto'] = None
+                    else:
+                        usados.add(ident)
+            sec['images'] = [
+                p.get('foto') for p in list(sec.get('people') or [])
+                if isinstance(p, dict) and isinstance(p.get('foto'), dict)
+            ]
+            continue
+
+        if codigo == '12':
+            info = sec.get('informante') if isinstance(sec.get('informante'), dict) else {}
+            for chave in ('foto', 'documento'):
+                ident = _v129_midia_id(info.get(chave))
+                if not ident:
+                    continue
+                if ident in usados:
+                    info[chave] = None
+                else:
+                    usados.add(ident)
+
+        # Subgrupos são a fonte visual principal de 05 e 11.
+        if codigo in ('05', '11'):
+            novos_grupos = []
+            for grupo in list(sec.get('subgroups') or []):
+                if not isinstance(grupo, dict):
+                    continue
+                novas = []
+                for item in list(grupo.get('images') or []):
+                    ident = _v129_midia_id(item)
+                    if not ident or ident in usados:
+                        continue
+                    usados.add(ident)
+                    novas.append(item)
+                novo = dict(grupo)
+                novo['images'] = _v124_dedupe_media(novas, 20)
+                novos_grupos.append(novo)
+            sec['subgroups'] = novos_grupos
+            sec['images'] = _v124_dedupe_media(
+                [item for g in novos_grupos for item in list(g.get('images') or [])], 30
+            )
+            continue
+
+        # Crimes: deduplica cada prova sem atravessar outras seções.
+        if codigo == '06':
+            crimes_novos = []
+            for crime in list(sec.get('crimes') or []):
+                if not isinstance(crime, dict):
+                    continue
+                provas = []
+                for item in list(crime.get('provas') or []):
+                    ident = _v129_midia_id(item)
+                    if not ident or ident in usados:
+                        continue
+                    usados.add(ident)
+                    provas.append(item)
+                novo = dict(crime)
+                novo['provas'] = _v124_dedupe_media(provas, 12)
+                crimes_novos.append(novo)
+            sec['crimes'] = crimes_novos
+            sec['images'] = _v124_dedupe_media(
+                [p for c in crimes_novos for p in list(c.get('provas') or [])], 80
+            )
+            continue
+
+        novas = []
+        for item in list(sec.get('images') or []):
+            ident = _v129_midia_id(item)
+            if not ident or ident in usados:
+                continue
+            usados.add(ident)
+            novas.append(item)
+        sec['images'] = _v124_dedupe_media(novas, 30)
+
+    payload['sections'] = [secoes[f'{i:02d}'] for i in range(1, 14) if f'{i:02d}' in secoes]
+    payload['evidence_index'] = [
+        {'code': s.get('code'), 'title': s.get('title'), 'count': len(list(s.get('images') or []))}
+        for s in payload['sections']
+    ]
+    payload['geracao'] = 'V129_STATE_ONLY_PROFISSIONAL'
+    return payload
+
+
+# O coletor V126 procura esta função por nome em runtime. Forçamos o payload V129.
+def _v126_payload_profissional(dados: Dict[str, Any], estado: Dict[str, Any], canal_id: int = 0) -> Dict[str, Any]:
+    return _v129_payload_profissional(dados, estado, canal_id)
+
+
+def _v129_validar_payload(payload: Dict[str, Any]) -> List[str]:
+    erros: List[str] = []
+    secoes = {str(s.get('code')): s for s in list(payload.get('sections') or []) if isinstance(s, dict)}
+    esperadas = [f'{i:02d}' for i in range(1, 14)]
+    for codigo in esperadas:
+        if codigo not in secoes:
+            erros.append(f'seção {codigo} ausente')
+
+    # Lideranças e membros: NUNCA gerar cartão vazio de foto.
+    for codigo, rotulo in (('02', 'liderança'), ('03', 'membro')):
+        for pessoa in list(secoes.get(codigo, {}).get('people') or []):
+            if not isinstance(pessoa, dict):
+                continue
+            if not _v129_midia_id(pessoa.get('foto')):
+                erros.append(f'{rotulo} sem foto vinculada: {pessoa.get("nome") or "não identificado"}')
+
+    # Quantidades mínimas definidas pelo próprio roteiro guiado.
+    minimos = {
+        '01': 1,
+        '05': 6,   # 2 identificação/GPS + 4 aéreas
+        '07': 2,
+        '08': 2,
+        '09': 2,
+        '10': 2,
+        '13': 1,
+    }
+    for codigo, minimo in minimos.items():
+        qtd = len(list(secoes.get(codigo, {}).get('images') or []))
+        if qtd < minimo:
+            erros.append(f'{codigo}: {qtd}/{minimo} evidência(s) visual(is) disponível(is) no estado guiado')
+
+    sec11 = secoes.get('11', {})
+    grupos11 = list(sec11.get('subgroups') or []) if isinstance(sec11, dict) else []
+    if len(grupos11) < 2 or not list(grupos11[0].get('images') or []):
+        erros.append('11: foto dos ingredientes não vinculada')
+    if len(grupos11) < 2 or not list(grupos11[1].get('images') or []):
+        erros.append('11: foto do produto final não vinculada')
+
+    sec12 = secoes.get('12', {})
+    inf = sec12.get('informante') if isinstance(sec12, dict) and isinstance(sec12.get('informante'), dict) else {}
+    if not _v129_midia_id(inf.get('foto')):
+        erros.append('12: foto do informante não vinculada')
+    if not _v129_midia_id(inf.get('documento')):
+        erros.append('12: documento/RG do informante não vinculado')
+    if not str(sec12.get('extra_text') or '').strip() and not list(sec12.get('images') or []):
+        erros.append('12: resumo da operação do informante ausente')
+
+    # Cada crime precisa manter pelo menos uma prova.
+    for crime in list(secoes.get('06', {}).get('crimes') or []):
+        if isinstance(crime, dict) and not list(crime.get('provas') or []):
+            erros.append(f'06: crime sem prova vinculada: {str(crime.get("descricao") or "crime")[:80]}')
+
+    return erros
+
+
+_V129_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    dados = await _V129_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        if isinstance(canal, discord.TextChannel):
+            estado = _v116_estado(int(canal.id), False) or {}
+            estado_dados = dict(estado.get('dados') or {}) if isinstance(estado, dict) else {}
+            if estado_dados and (_v122_mesa_tarefas_habilitada(int(canal.id)) or _v125_tem_conteudo_registrado(estado_dados)):
+                payload = _v129_payload_profissional(dados, estado, int(canal.id))
+                dados['dossie_v124'] = payload
+                dados['gerador_dossie'] = 'V129_STATE_ONLY_PROFISSIONAL'
+                problemas = _v129_validar_payload(payload)
+                resumo = ' | '.join(
+                    f"{s.get('code')}:{len(list(s.get('images') or []))}img"
+                    for s in list(payload.get('sections') or [])
+                )
+                print(f'✅ V129 PAYLOAD mesa={int(canal.id)} | {resumo}', flush=True)
+                if problemas:
+                    print('⚠️ V129 PAYLOAD pendências: ' + ' | '.join(problemas[:40]), flush=True)
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'⚠️ V129: falha ao reconstruir payload da mesa {getattr(canal, "id", "?")}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+    return dados
+
+
+# Captura o gerador V125 apenas para mesas legadas sem payload guiado.
+_V129_GERAR_PDF_LEGADO = gerar_pdf_dossie
+_V129_GERAR_DOCX_LEGADO = gerar_docx_dossie
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if not isinstance(payload, dict):
+        return _V129_GERAR_PDF_LEGADO(dados, caminho_pdf)
+
+    problemas = _v129_validar_payload(payload)
+    if problemas:
+        raise RuntimeError(
+            'Dossiê V129 não será gerado com conteúdo incompleto: ' + ' | '.join(problemas[:25])
+        )
+
+    _v124_generate_pdf(payload, Path(caminho_pdf))
+    erros = _v123_preflight_arquivo(Path(caminho_pdf), 'pdf')
+    if erros:
+        raise RuntimeError('Preflight profissional V129 reprovado: ' + ' | '.join(erros[:12]))
+    print(f'✅ V129 PDF aprovado: {Path(caminho_pdf).name}', flush=True)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    if not isinstance(payload, dict):
+        return _V129_GERAR_DOCX_LEGADO(dados, caminho_docx)
+
+    problemas = _v129_validar_payload(payload)
+    if problemas:
+        raise RuntimeError(
+            'DOCX V129 não será gerado com conteúdo incompleto: ' + ' | '.join(problemas[:25])
+        )
+    _v124_generate_docx(payload, Path(caminho_docx))
+    erros = _v123_preflight_arquivo(Path(caminho_docx), 'docx')
+    if erros:
+        raise RuntimeError('Preflight profissional DOCX V129 reprovado: ' + ' | '.join(erros[:12]))
+    print(f'✅ V129 DOCX aprovado: {Path(caminho_docx).name}', flush=True)
+
+
+print('✅ V129 carregada — preflight corrigido, payload V128 forçado, cartões sem foto bloqueados e duplicações entre seções eliminadas.', flush=True)
+print('✅ V129: títulos com ponto (ex.: “02. FOTOS DOS LÍDERES”) agora passam corretamente no preflight.', flush=True)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
