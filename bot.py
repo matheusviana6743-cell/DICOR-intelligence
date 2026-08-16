@@ -63254,5 +63254,94 @@ print(
     flush=True,
 )
 
+
+
+# =========================
+# V142 — STARTUP NÃO PODE TRAVAR NO SYNC DO DISCORD
+# Corrige o cenário em que o Railway fica Online, mas o bot nunca chega ao READY
+# porque bot.tree.sync() fica preso dentro do setup_hook antes do gateway.
+# NÃO altera mesa, dossiê, reconhecimento visual, hierarquia ou gestão DICOR.
+# =========================
+
+_V142_SYNC_RETRY_TASK = None
+_V142_SYNC_LOCK = asyncio.Lock()
+
+async def _v142_sync_direto(*, timeout: float = 12.0) -> int:
+    """Sincroniza slash commands com limite rígido de tempo.
+
+    O gateway do Discord nunca pode ficar bloqueado indefinidamente por um sync HTTP.
+    """
+    async with _V142_SYNC_LOCK:
+        async def _executar():
+            if int(GUILD_ID or 0) > 0:
+                guild_obj = discord.Object(id=int(GUILD_ID))
+                bot.tree.copy_global_to(guild=guild_obj)
+                return await bot.tree.sync(guild=guild_obj)
+            return await bot.tree.sync()
+        try:
+            comandos = await asyncio.wait_for(_executar(), timeout=max(4.0, float(timeout)))
+            print(f'✅ V142 sync Discord concluído: {len(comandos)} comando(s).', flush=True)
+            return len(comandos)
+        except asyncio.TimeoutError:
+            print(
+                f'⚠️ V142 sync Discord excedeu {float(timeout):.0f}s. '
+                'Startup continuará para conectar o gateway; nova tentativa será feita após READY.',
+                flush=True,
+            )
+            return -1
+        except asyncio.CancelledError:
+            raise
+        except Exception as erro:
+            traceback.print_exc()
+            print(f'⚠️ V142 sync Discord falhou: {type(erro).__name__}: {erro}. Startup continuará.', flush=True)
+            return 0
+
+async def _v142_sync_depois_ready() -> None:
+    try:
+        await bot.wait_until_ready()
+        await asyncio.sleep(4.0)
+        resultado = await _v142_sync_direto(timeout=25.0)
+        if resultado >= 0:
+            print(f'✅ V142 sync pós-READY finalizado: resultado={resultado}.', flush=True)
+        else:
+            print('⚠️ V142 sync pós-READY também excedeu o limite; bot permanece online com comandos já existentes.', flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as erro:
+        print(f'⚠️ V142 retry de sync pós-READY: {type(erro).__name__}: {erro}', flush=True)
+
+# _v13_setup_hook consulta este nome global em runtime. Substituímos SOMENTE o sync,
+# preservando toda a cadeia de setup-hooks e Views das versões anteriores.
+async def _v13_sincronizar_comandos() -> int:
+    global _V142_SYNC_RETRY_TASK
+    resultado = await _v142_sync_direto(timeout=10.0)
+    if resultado == -1:
+        try:
+            if _V142_SYNC_RETRY_TASK is None or _V142_SYNC_RETRY_TASK.done():
+                _V142_SYNC_RETRY_TASK = asyncio.create_task(
+                    _v142_sync_depois_ready(), name='v142-sync-pos-ready'
+                )
+        except Exception as erro:
+            print(f'⚠️ V142 não conseguiu agendar retry de sync: {type(erro).__name__}: {erro}', flush=True)
+        return 0
+    return max(0, int(resultado or 0))
+
+@bot.listen('on_ready')
+async def _v142_confirmar_ready() -> None:
+    try:
+        print(
+            f'✅ V142 DISCORD READY — bot={bot.user} guilds={len(list(bot.guilds or []))} '
+            f'latencia_ms={round(float(getattr(bot, "latency", 0.0) or 0.0) * 1000)}',
+            flush=True,
+        )
+    except Exception:
+        print('✅ V142 DISCORD READY.', flush=True)
+
+print(
+    '✅ V142 carregada — sync de comandos possui timeout; Railway Online não ficará preso antes do gateway/READY.',
+    flush=True,
+)
+
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
