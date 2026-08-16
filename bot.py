@@ -39667,8 +39667,21 @@ def _v72_validar_hierarquia(interaction: discord.Interaction, alvo: discord.Memb
         raise ValueError('Você não pode alterar um membro com cargo igual ou superior ao seu.')
     if guild.me is None or alvo.top_role >= guild.me.top_role:
         raise ValueError('O cargo do bot precisa ficar acima do cargo do membro selecionado.')
-    if para_expulsao and (not alvo.kickable):
-        raise ValueError('O bot não consegue expulsar esse membro. Verifique a hierarquia de cargos.')
+    if para_expulsao:
+        # discord.py não possui a propriedade Member.kickable.
+        # A possibilidade de expulsão é validada pelas permissões do bot
+        # e pela hierarquia de cargos, que já foi conferida acima.
+        bot_member = guild.me
+        if bot_member is None:
+            raise ValueError('Não foi possível localizar o membro do bot no servidor.')
+        try:
+            pode_expulsar = bool(bot_member.guild_permissions.kick_members)
+        except Exception:
+            pode_expulsar = False
+        if not pode_expulsar:
+            raise ValueError('O bot não possui a permissão **Expulsar membros** no servidor.')
+        if alvo.top_role >= bot_member.top_role:
+            raise ValueError('O cargo do bot precisa ficar acima do cargo do membro selecionado para expulsá-lo.')
 
 async def _v138_publicar_desligamento(
     guild: discord.Guild,
@@ -39823,7 +39836,7 @@ async def _v72_aplicar_acao(interaction: discord.Interaction, alvo: discord.Memb
 class V72GestaoModal(discord.ui.Modal):
 
     def __init__(self, alvo: discord.Member, acao: str):
-        titulos = {'subir': 'Subir para Investigador', 'descer': 'Descer para Estagiário', 'retirar': 'Retirar da DICOR'}
+        titulos = {'subir': 'Subir para Investigador', 'descer': 'Descer para Estagiário', 'retirar': 'Retirar da DICOR • V140'}
         super().__init__(title=titulos.get(acao, 'Gestão DICOR'))
         self.alvo = alvo
         self.acao = acao
@@ -39898,7 +39911,7 @@ class V72PainelGestaoView(discord.ui.View):
 
     @discord.ui.button(label='Retirar da DICOR', emoji='🚫', style=discord.ButtonStyle.danger, custom_id='dicor:gestao:retirar:v72', row=1)
     async def retirar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message('Selecione o membro que será **retirado e expulso do servidor**:', view=V72SelecionarMembroView('retirar'), ephemeral=True)
+        await interaction.response.send_message('Selecione o membro que será **retirado e expulso do servidor**.\n`Fluxo ativo: V140`', view=V72SelecionarMembroView('retirar'), ephemeral=True)
 
 @bot.tree.command(name='painelgestaodicor', description='Envia o painel de promoção, rebaixamento e retirada da DICOR.')
 async def painelgestaodicor(interaction: discord.Interaction) -> None:
@@ -62834,6 +62847,66 @@ print(
     'no canal 1490200494885306498, mencionando o oficial e o responsável.',
     flush=True,
 )
+
+
+
+# =========================
+# V140 — RETIRAR DICOR: override final e verificável
+# =========================
+def _v140_validar_hierarquia_retirada(interaction: discord.Interaction, alvo: discord.Member, *, para_expulsao: bool=False) -> None:
+    guild = interaction.guild
+    executor = interaction.user
+    if guild is None or not isinstance(executor, discord.Member):
+        raise ValueError('Esta ação precisa ser executada dentro do servidor.')
+    if not isinstance(alvo, discord.Member):
+        raise ValueError('O membro selecionado não foi localizado corretamente no servidor.')
+    if alvo.id == guild.owner_id:
+        raise ValueError('O proprietário do servidor não pode ser alterado pelo bot.')
+    if alvo.id == executor.id:
+        raise ValueError('Você não pode executar esta ação em você mesmo.')
+    if bot.user and alvo.id == bot.user.id:
+        raise ValueError('O bot não pode executar esta ação contra ele mesmo.')
+    if executor.id != guild.owner_id and alvo.top_role >= executor.top_role:
+        raise ValueError('Você não pode alterar um membro com cargo igual ou superior ao seu.')
+
+    bot_member = guild.me
+    if bot_member is None and bot.user is not None:
+        bot_member = guild.get_member(bot.user.id)
+    if bot_member is None:
+        raise ValueError('Não foi possível localizar o membro do bot no servidor.')
+    if alvo.top_role >= bot_member.top_role:
+        raise ValueError('O cargo do bot precisa ficar acima do cargo do membro selecionado.')
+
+    if para_expulsao:
+        try:
+            permissoes = bot_member.guild_permissions
+            pode_expulsar = bool(getattr(permissoes, 'kick_members', False) or getattr(permissoes, 'administrator', False))
+        except Exception:
+            pode_expulsar = False
+        if not pode_expulsar:
+            raise ValueError('O bot não possui a permissão **Expulsar membros** no servidor.')
+
+# Substitui a função global usada pelos fluxos V72/V73/V138.
+_v72_validar_hierarquia = _v140_validar_hierarquia_retirada
+
+# Autodiagnóstico de build: detecta atributo real no AST, sem falsos positivos em comentários/logs.
+try:
+    import ast as _v140_ast
+    _v140_fonte = Path(__file__).read_text(encoding='utf-8', errors='ignore')
+    _v140_arvore = _v140_ast.parse(_v140_fonte)
+    _v140_linhas_invalidas = sorted({
+        int(getattr(no, 'lineno', 0) or 0)
+        for no in _v140_ast.walk(_v140_arvore)
+        if isinstance(no, _v140_ast.Attribute) and str(getattr(no, 'attr', '')) == 'kickable'
+    })
+    if _v140_linhas_invalidas:
+        raise RuntimeError(f'V140 recusou iniciar: atributo inválido kickable nas linhas {_v140_linhas_invalidas[:10]}')
+except RuntimeError:
+    raise
+except Exception as _v140_diag_erro:
+    print(f'⚠️ V140 autodiagnóstico de fonte indisponível: {type(_v140_diag_erro).__name__}: {_v140_diag_erro}', flush=True)
+
+print('✅ V140 ATIVA — Retirar da DICOR SEM Member.kickable; validação por Kick Members/Administrator + hierarquia. Fluxo mostra V140 no Discord.', flush=True)
 
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
