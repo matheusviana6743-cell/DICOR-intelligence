@@ -39613,6 +39613,7 @@ V72_CARGO_INVESTIGADOR_ID = 1490200390426165290
 V72_PREFIXO_ESTAGIARIO = '[E.DICOR]'
 V72_PREFIXO_INVESTIGADOR = '[DICOR]'
 V72_HISTORICO_GESTAO_JSON = DATA_DIR / 'historico_gestao_cargos_dicor.json'
+V138_DESLIGAMENTOS_CHANNEL_ID = 1490200494885306498
 
 def _v72_normalizar_rg(valor: Any) -> str:
     rg = re.sub('\\D+', '', str(valor or ''))
@@ -39669,6 +39670,66 @@ def _v72_validar_hierarquia(interaction: discord.Interaction, alvo: discord.Memb
     if para_expulsao and (not alvo.kickable):
         raise ValueError('O bot não consegue expulsar esse membro. Verifique a hierarquia de cargos.')
 
+async def _v138_publicar_desligamento(
+    guild: discord.Guild,
+    *,
+    alvo_id: int,
+    executor_id: int,
+    cargo_id: int,
+    cargo_nome: str,
+    rg: str,
+    motivo: str,
+) -> Optional[discord.Message]:
+    """Publica o desligamento no canal oficial sem interferir na retirada em si."""
+    canal = guild.get_channel(V138_DESLIGAMENTOS_CHANNEL_ID)
+    if canal is None:
+        try:
+            canal = await bot.fetch_channel(V138_DESLIGAMENTOS_CHANNEL_ID)
+        except Exception as erro:
+            await enviar_log(
+                f'⚠️ V138: canal de desligamentos `{V138_DESLIGAMENTOS_CHANNEL_ID}` não localizado: '
+                f'{type(erro).__name__}: {erro}'
+            )
+            return None
+    if not isinstance(canal, discord.TextChannel):
+        await enviar_log(f'⚠️ V138: `{V138_DESLIGAMENTOS_CHANNEL_ID}` não é um canal de texto.')
+        return None
+
+    data_exoneracao = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=-3))
+    ).strftime('%d/%m/%Y')
+    cargo_texto = (
+        f'<@&{int(cargo_id)}>'
+        if int(cargo_id or 0)
+        else (str(cargo_nome or 'Não informado').strip() or 'Não informado')
+    )
+    texto = (
+        '🛑 **DESLIGAMENTO DE OFICIAL**\n\n'
+        f'👤 **Nome do Oficial:** <@{int(alvo_id)}>\n'
+        f'⛔ **Cargo/Função:** {cargo_texto}\n'
+        f'📜 **RG:** {str(rg).strip()}\n'
+        f'📅 **Data da Exoneração:** {data_exoneracao}\n'
+        f'📄 **Motivo da Exoneração:** {str(motivo).strip()}\n'
+        f'🗣️ **Responsável pela exoneração:** <@{int(executor_id)}>'
+    )
+    try:
+        mensagem = await canal.send(
+            texto,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        await enviar_log(
+            f'✅ V138: desligamento publicado no canal `{V138_DESLIGAMENTOS_CHANNEL_ID}` '
+            f'| mensagem `{mensagem.id}` | alvo `{alvo_id}` | responsável `{executor_id}`.'
+        )
+        return mensagem
+    except Exception as erro:
+        await enviar_log(
+            f'⚠️ V138: retirada concluída, mas a publicação do desligamento falhou: '
+            f'{type(erro).__name__}: {erro}'
+        )
+        return None
+
+
 async def _v72_aplicar_acao(interaction: discord.Interaction, alvo: discord.Member, acao: str, rg: str, motivo: str) -> Dict[str, Any]:
     if not usuario_e_administrador(interaction.user):
         raise PermissionError('Apenas Inspetor+ pode executar esta ação.')
@@ -39687,6 +39748,23 @@ async def _v72_aplicar_acao(interaction: discord.Interaction, alvo: discord.Memb
     antes_cargos = [cargo.id for cargo in alvo.roles]
     agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
     executor = interaction.user
+    # Guarda o cargo/função antes da retirada para publicar o registro oficial depois.
+    cargo_registro = None
+    for _cargo in sorted(list(alvo.roles or []), key=lambda c: getattr(c, 'position', 0), reverse=True):
+        if getattr(_cargo, 'is_default', lambda: False)():
+            continue
+        _nome_norm = normalizar_busca(getattr(_cargo, 'name', ''))
+        if int(getattr(_cargo, 'id', 0) or 0) in {V72_CARGO_ESTAGIARIO_ID, V72_CARGO_INVESTIGADOR_ID} or 'dicor' in _nome_norm:
+            cargo_registro = _cargo
+            break
+    if cargo_registro is None:
+        for _cargo in sorted(list(alvo.roles or []), key=lambda c: getattr(c, 'position', 0), reverse=True):
+            if not getattr(_cargo, 'is_default', lambda: False)():
+                cargo_registro = _cargo
+                break
+    cargo_registro_id = int(getattr(cargo_registro, 'id', 0) or 0)
+    cargo_registro_nome = str(getattr(cargo_registro, 'name', '') or '').strip()
+    publicacao_desligamento = None
     if acao == 'subir':
         _v72_validar_hierarquia(interaction, alvo)
         if cargo_estagiario not in alvo.roles:
@@ -39711,12 +39789,35 @@ async def _v72_aplicar_acao(interaction: discord.Interaction, alvo: discord.Memb
         _v72_validar_hierarquia(interaction, alvo, para_expulsao=True)
         novo_apelido = 'EXPULSO DO SERVIDOR'
         titulo = 'RETIRADA DA DICOR — EXPULSÃO DO SERVIDOR'
-        await guild.kick(alvo, reason=f'Retirada DICOR por {executor} ({executor.id}) | RG {rg_limpo} | {motivo_limpo}'[:512])
+        # Publica enquanto o oficial ainda está no servidor, garantindo que a menção seja resolvida corretamente.
+        publicacao_desligamento = await _v138_publicar_desligamento(
+            guild,
+            alvo_id=int(alvo.id),
+            executor_id=int(executor.id),
+            cargo_id=cargo_registro_id,
+            cargo_nome=cargo_registro_nome,
+            rg=rg_limpo,
+            motivo=motivo_limpo,
+        )
+        try:
+            await guild.kick(alvo, reason=f'Retirada DICOR por {executor} ({executor.id}) | RG {rg_limpo} | {motivo_limpo}'[:512])
+        except Exception:
+            # Se a expulsão falhar, remove o aviso para não registrar uma exoneração que não ocorreu.
+            if publicacao_desligamento is not None:
+                try:
+                    await publicacao_desligamento.delete()
+                except Exception:
+                    pass
+            raise
     else:
         raise ValueError('Ação de gestão desconhecida.')
     registro = {'acao': acao, 'titulo': titulo, 'alvo_id': alvo.id, 'alvo_usuario': str(alvo), 'alvo_apelido_anterior': antes_apelido, 'alvo_apelido_novo': novo_apelido, 'cargos_anteriores': antes_cargos, 'rg': rg_limpo, 'motivo': motivo_limpo, 'executor_id': executor.id, 'executor_usuario': str(executor), 'data': agora, 'status': 'CONCLUIDA'}
     await asyncio.to_thread(_v72_registrar_historico_sync, registro)
     await enviar_log(f'🛡️ **{titulo}**\n**Membro:** {alvo} (`{alvo.id}`)\n**RG:** `{rg_limpo}`\n**Apelido anterior:** `{antes_apelido}`\n**Novo estado:** `{novo_apelido}`\n**Motivo:** {motivo_limpo}\n**Responsável:** {executor.mention} (`{executor.id}`)')
+    if acao == 'retirar':
+        registro['desligamento_publicado'] = bool(publicacao_desligamento is not None)
+        registro['desligamentos_canal_id'] = V138_DESLIGAMENTOS_CHANNEL_ID
+        registro['desligamento_mensagem_id'] = int(getattr(publicacao_desligamento, 'id', 0) or 0)
     return registro
 
 class V72GestaoModal(discord.ui.Modal):
@@ -62725,6 +62826,12 @@ async def _v137_iniciar_hierarquia_semanal() -> None:
 print(
     '✅ V137 carregada — SOMENTE hierarquia alterada: renovação real a cada 7 dias, '
     'apaga a publicação antiga e envia uma nova. Reinícios não resetam o prazo semanal.',
+    flush=True,
+)
+
+print(
+    '✅ V138 carregada — Retirar da DICOR publica automaticamente o DESLIGAMENTO DE OFICIAL '
+    'no canal 1490200494885306498, mencionando o oficial e o responsável.',
     flush=True,
 )
 
