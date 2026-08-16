@@ -63343,5 +63343,189 @@ print(
 )
 
 
+
+# =========================
+# V143 — STARTUP/GATEWAY + GESTÃO DICOR BLINDADOS
+# Motivo: o setup_hook antigo ainda fazia trabalho HTTP (tree.sync) ANTES do gateway.
+# Railway podia ficar Online enquanto o Discord permanecia Offline e todos os botões expiravam.
+# Nesta versão o setup_hook final faz SOMENTE registro local de Views e retorna imediatamente.
+# O sync dos slash commands passa a ocorrer apenas DEPOIS do READY e em background.
+# =========================
+
+_V143_READY_EVENT = asyncio.Event()
+_V143_SYNC_TASK = None
+_V143_READY_WATCHDOG = None
+
+
+def _v143_instalar_view_gestao() -> tuple[int, list[str]]:
+    """Garante que os 3 custom_ids do painel de gestão apontem para a V141/V143.
+
+    Remove somente Views que possuam os IDs de gestão e preserva todas as demais Views.
+    Depois atualiza também o roteador V13, para painéis antigos e novos usarem o mesmo callback.
+    """
+    ids_gestao = set(_V141_GESTAO_IDS)
+    removidas = 0
+    erros: list[str] = []
+
+    # Remove qualquer implementação antiga dos mesmos 3 IDs da ViewStore.
+    for view in list(getattr(bot, 'persistent_views', []) or []):
+        try:
+            cids = {
+                str(getattr(child, 'custom_id', '') or '')
+                for child in list(getattr(view, 'children', []) or [])
+                if str(getattr(child, 'custom_id', '') or '')
+            }
+            if cids & ids_gestao:
+                bot.remove_view(view)
+                removidas += 1
+        except Exception as erro:
+            erros.append(f'remove:{type(erro).__name__}:{erro}')
+
+    # Limpa apenas os três IDs no roteador legado V13.
+    try:
+        for cid in ids_gestao:
+            _V13_CUSTOM_IDS.discard(cid)
+            _V13_ROTAS.pop(cid, None)
+    except Exception as erro:
+        erros.append(f'rotas:{type(erro).__name__}:{erro}')
+
+    # Registra a View final e mapeia callbacks no fallback V13.
+    try:
+        view = V141PainelGestaoView()
+        bot.add_view(view)
+        try:
+            _V13_VIEWS.append(view)
+        except Exception:
+            pass
+        for item in list(getattr(view, 'children', []) or []):
+            cid = str(getattr(item, 'custom_id', '') or '')
+            if not cid:
+                continue
+            _V13_CUSTOM_IDS.add(cid)
+            callback = getattr(item, 'callback', None)
+            if callable(callback):
+                _V13_ROTAS[cid] = callback
+    except Exception as erro:
+        erros.append(f'add:{type(erro).__name__}:{erro}')
+
+    # O fallback independente fica ativo para mensagens antigas.
+    try:
+        bot.remove_listener(_v141_component_fallback, 'on_interaction')
+    except Exception:
+        pass
+    try:
+        bot.add_listener(_v141_component_fallback, 'on_interaction')
+    except Exception as erro:
+        erros.append(f'fallback:{type(erro).__name__}:{erro}')
+
+    ativos = []
+    try:
+        for view in list(getattr(bot, 'persistent_views', []) or []):
+            for child in list(getattr(view, 'children', []) or []):
+                cid = str(getattr(child, 'custom_id', '') or '')
+                if cid in ids_gestao:
+                    ativos.append(cid)
+    except Exception as erro:
+        erros.append(f'diagnostico:{type(erro).__name__}:{erro}')
+    return removidas, sorted(set(ativos))
+
+
+async def _v143_setup_hook(self) -> None:
+    """Setup final deliberadamente local/rápido: ZERO HTTP e ZERO tree.sync."""
+    inicio = time.monotonic()
+    try:
+        # Registra todas as Views do sistema localmente. Esta função é síncrona e não faz HTTP.
+        qtd = _v13_registrar_todas_views()
+    except Exception as erro:
+        qtd = 0
+        traceback.print_exc()
+        print(f'⚠️ V143 registro base de Views falhou: {type(erro).__name__}: {erro}', flush=True)
+
+    removidas, ids_ativos = _v143_instalar_view_gestao()
+    duracao = time.monotonic() - inicio
+    print(
+        f'✅ V143 SETUP LOCAL concluído em {duracao:.2f}s — views_base={qtd} '
+        f'gestao_ids={ids_ativos} views_antigas_gestao_removidas={removidas}.',
+        flush=True,
+    )
+    print('✅ V143 GATEWAY LIBERADO — nenhum sync HTTP é executado antes do Discord conectar.', flush=True)
+
+
+# Override FINAL: não encadeia o setup antigo justamente porque ele continha sync pré-gateway.
+bot.setup_hook = _v13_types.MethodType(_v143_setup_hook, bot)
+
+
+async def _v143_sync_pos_ready() -> None:
+    """Sincroniza comandos depois que o bot JÁ está online; nunca derruba interações."""
+    try:
+        await bot.wait_until_ready()
+        await asyncio.sleep(4.0)
+        if bot.is_closed():
+            return
+        resultado = await _v142_sync_direto(timeout=12.0)
+        if resultado == -1:
+            print('⚠️ V143 sync pós-READY expirou; comandos já existentes permanecem utilizáveis.', flush=True)
+        else:
+            print(f'✅ V143 sync pós-READY finalizado: {max(0, int(resultado or 0))} comando(s).', flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as erro:
+        print(f'⚠️ V143 sync pós-READY ignorou falha: {type(erro).__name__}: {erro}', flush=True)
+
+
+async def _v143_watchdog_ready() -> None:
+    """Diagnóstico: avisa claramente se o processo está vivo sem gateway READY."""
+    try:
+        await asyncio.wait_for(_V143_READY_EVENT.wait(), timeout=45.0)
+    except asyncio.TimeoutError:
+        print(
+            '❌ V143 READY WATCHDOG: 45s após o setup e o Discord ainda não ficou READY. '
+            'O problema está na conexão/login/gateway, não nos painéis. O supervisor continuará ativo.',
+            flush=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as erro:
+        print(f'⚠️ V143 watchdog READY: {type(erro).__name__}: {erro}', flush=True)
+
+
+@bot.listen('on_ready')
+async def _v143_on_ready() -> None:
+    global _V143_SYNC_TASK, _V143_READY_WATCHDOG
+    try:
+        _V143_READY_EVENT.set()
+    except Exception:
+        pass
+
+    # Reinstala a gestão depois do READY para blindar qualquer limpeza tardia.
+    removidas, ids_ativos = _v143_instalar_view_gestao()
+    print(
+        f'✅ V143 DISCORD READY — bot={bot.user} guilds={len(list(bot.guilds or []))} '
+        f'latencia_ms={round(float(getattr(bot, "latency", 0.0) or 0.0)*1000)} '
+        f'gestao_ids={ids_ativos}.',
+        flush=True,
+    )
+
+    if _V143_SYNC_TASK is None or _V143_SYNC_TASK.done():
+        _V143_SYNC_TASK = asyncio.create_task(_v143_sync_pos_ready(), name='v143-sync-pos-ready')
+
+
+# Começa o watchdog somente quando o setup local for chamado pelo discord.py.
+# Um listener on_connect não serve para isso porque ainda depende do gateway.
+_V143_SETUP_ORIGINAL_FINAL = bot.setup_hook
+async def _v143_setup_hook_com_watchdog(self) -> None:
+    global _V143_READY_WATCHDOG
+    await _V143_SETUP_ORIGINAL_FINAL()
+    if _V143_READY_WATCHDOG is None or _V143_READY_WATCHDOG.done():
+        _V143_READY_WATCHDOG = asyncio.create_task(_v143_watchdog_ready(), name='v143-ready-watchdog')
+
+bot.setup_hook = _v13_types.MethodType(_v143_setup_hook_com_watchdog, bot)
+
+print(
+    '✅ V143 carregada — startup restaurado: setup local sem HTTP, gateway imediato, '
+    'sync somente pós-READY e Gestão DICOR persistente revalidada.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
