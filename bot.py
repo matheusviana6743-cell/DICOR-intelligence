@@ -62908,5 +62908,351 @@ except Exception as _v140_diag_erro:
 
 print('✅ V140 ATIVA — Retirar da DICOR SEM Member.kickable; validação por Kick Members/Administrator + hierarquia. Fluxo mostra V140 no Discord.', flush=True)
 
+
+# =========================
+# V141 — GESTÃO DICOR: roteamento persistente + fallback de interação
+# Corrige "aplicativo não respondeu" nos painéis antigos após deploy/restart.
+# NÃO altera mesa, dossiê, banco de dados, hierarquia ou reconhecimento visual.
+# =========================
+
+_V141_GESTAO_IDS = {
+    'dicor:gestao:subir:v72': 'subir',
+    'dicor:gestao:descer:v72': 'descer',
+    'dicor:gestao:retirar:v72': 'retirar',
+}
+
+
+class V141GestaoModal(discord.ui.Modal):
+    def __init__(self, alvo: discord.Member, acao: str):
+        titulos = {
+            'subir': 'Subir para Investigador',
+            'descer': 'Descer para Estagiário',
+            'retirar': 'Retirar da DICOR • V141',
+        }
+        super().__init__(title=titulos.get(acao, 'Gestão DICOR'))
+        self.alvo = alvo
+        self.acao = acao
+        self.rg = discord.ui.TextInput(
+            label='RG DO MEMBRO', placeholder='Ex.: 28905', min_length=1, max_length=12, required=True
+        )
+        self.motivo = discord.ui.TextInput(
+            label='MOTIVO', placeholder='Informe o motivo da alteração',
+            style=discord.TextStyle.paragraph, min_length=3, max_length=700, required=True
+        )
+        self.add_item(self.rg)
+        self.add_item(self.motivo)
+        if acao == 'retirar':
+            self.confirmacao = discord.ui.TextInput(
+                label='CONFIRMAÇÃO DA EXPULSÃO', placeholder='Digite EXPULSAR',
+                min_length=8, max_length=8, required=True
+            )
+            self.add_item(self.confirmacao)
+        else:
+            self.confirmacao = None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # ACK imediato: o processamento posterior pode envolver edição/kick/logs.
+        if self.acao == 'retirar':
+            valor = str(getattr(self.confirmacao, 'value', '') or '').strip().upper()
+            if valor != 'EXPULSAR':
+                return await interaction.response.send_message(
+                    '❌ Digite **EXPULSAR** para confirmar a retirada do servidor.', ephemeral=True
+                )
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except discord.InteractionResponded:
+            pass
+        except Exception:
+            # Se o defer falhar, não seguimos silenciosamente sem ACK.
+            if not interaction.response.is_done():
+                return
+        try:
+            registro = await asyncio.wait_for(
+                _v72_aplicar_acao(
+                    interaction,
+                    self.alvo,
+                    self.acao,
+                    str(self.rg.value or ''),
+                    str(self.motivo.value or ''),
+                ),
+                timeout=25.0,
+            )
+            textos = {
+                'subir': '✅ Membro promovido para **Investigador**.\nCargo e apelido foram atualizados.',
+                'descer': '✅ Membro rebaixado para **Estagiário**.\nCargo e apelido foram atualizados.',
+                'retirar': '✅ Membro retirado da DICOR e expulso do servidor.',
+            }
+            await interaction.followup.send(
+                f"{textos[self.acao]}\n**Membro:** {registro['alvo_usuario']}\n"
+                f"**RG:** `{registro['rg']}`\n**Motivo:** {registro['motivo']}\n`Fluxo: V141`",
+                ephemeral=True,
+            )
+        except asyncio.TimeoutError:
+            await enviar_log(
+                f'⌛ V141 timeout na gestão DICOR | ação `{self.acao}` | alvo `{getattr(self.alvo, "id", 0)}` '
+                f'| executor `{getattr(interaction.user, "id", 0)}`'
+            )
+            await interaction.followup.send(
+                '⌛ A ação demorou além do limite. Confira os logs antes de tentar novamente.', ephemeral=True
+            )
+        except Exception as erro:
+            traceback.print_exc()
+            await enviar_log(
+                f"❌ V141 falha na gestão DICOR | ação `{self.acao}` | alvo `{getattr(self.alvo, 'id', 0)}` "
+                f"| executor `{getattr(interaction.user, 'id', 0)}` | {type(erro).__name__}: {erro}\n"
+                f"```py\n{traceback.format_exc()[-2200:]}\n```"
+            )
+            await interaction.followup.send(
+                f'❌ Não foi possível concluir: `{str(erro)[:450]}`', ephemeral=True
+            )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        try:
+            await enviar_log(f'❌ V141 modal error: {type(error).__name__}: {error}')
+        except Exception:
+            pass
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send('❌ Falha no formulário de gestão. O erro foi registrado.', ephemeral=True)
+            else:
+                await interaction.response.send_message('❌ Falha no formulário de gestão. O erro foi registrado.', ephemeral=True)
+        except Exception:
+            pass
+
+
+class V141SelecionarMembro(discord.ui.UserSelect):
+    def __init__(self, acao: str):
+        self.acao = acao
+        descricoes = {
+            'subir': 'Selecione o Estagiário que será promovido',
+            'descer': 'Selecione o Investigador que será rebaixado',
+            'retirar': 'Selecione o membro que será retirado',
+        }
+        super().__init__(
+            placeholder=descricoes.get(acao, 'Selecione o membro'),
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            if not usuario_e_administrador(interaction.user):
+                return await interaction.response.send_message(
+                    '❌ Apenas Inspetor+ pode utilizar este painel.', ephemeral=True
+                )
+            selecionado = self.values[0]
+            membro = selecionado if isinstance(selecionado, discord.Member) else (
+                interaction.guild.get_member(selecionado.id) if interaction.guild else None
+            )
+            if membro is None:
+                return await interaction.response.send_message(
+                    '❌ O membro selecionado não foi localizado no servidor.', ephemeral=True
+                )
+            # Modal precisa ser a primeira resposta; por isso não fazemos defer aqui.
+            await interaction.response.send_modal(V141GestaoModal(membro, self.acao))
+        except discord.InteractionResponded:
+            return
+        except Exception as erro:
+            traceback.print_exc()
+            try:
+                await enviar_log(
+                    f'❌ V141 seleção gestão | ação `{self.acao}` | {type(erro).__name__}: {erro}'
+                )
+            except Exception:
+                pass
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send('❌ Não foi possível abrir o formulário.', ephemeral=True)
+                else:
+                    await interaction.response.send_message('❌ Não foi possível abrir o formulário.', ephemeral=True)
+            except Exception:
+                pass
+
+
+class V141SelecionarMembroView(discord.ui.View):
+    def __init__(self, acao: str):
+        super().__init__(timeout=180)
+        self.add_item(V141SelecionarMembro(acao))
+
+
+class V141PainelGestaoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            if usuario_e_administrador(interaction.user):
+                return True
+            await interaction.response.send_message(
+                '❌ Apenas **Inspetor, Vice-Diretor ou Diretor** pode usar este painel.', ephemeral=True
+            )
+        except Exception:
+            pass
+        return False
+
+    @discord.ui.button(
+        label='Subir para Investigador', emoji='⬆️', style=discord.ButtonStyle.success,
+        custom_id='dicor:gestao:subir:v72', row=0
+    )
+    async def subir(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            'Selecione o **Estagiário** que será promovido.\n`Fluxo ativo: V141`',
+            view=V141SelecionarMembroView('subir'), ephemeral=True
+        )
+
+    @discord.ui.button(
+        label='Descer para Estagiário', emoji='⬇️', style=discord.ButtonStyle.secondary,
+        custom_id='dicor:gestao:descer:v72', row=0
+    )
+    async def descer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            'Selecione o **Investigador** que será rebaixado.\n`Fluxo ativo: V141`',
+            view=V141SelecionarMembroView('descer'), ephemeral=True
+        )
+
+    @discord.ui.button(
+        label='Retirar da DICOR', emoji='🚫', style=discord.ButtonStyle.danger,
+        custom_id='dicor:gestao:retirar:v72', row=1
+    )
+    async def retirar(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            'Selecione o membro que será **retirado e expulso do servidor**.\n`Fluxo ativo: V141`',
+            view=V141SelecionarMembroView('retirar'), ephemeral=True
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        try:
+            await enviar_log(
+                f'❌ V141 painel gestão error | custom_id=`{getattr(item, "custom_id", "")}` '
+                f'| {type(error).__name__}: {error}'
+            )
+        except Exception:
+            pass
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message('❌ O botão falhou. O erro foi registrado.', ephemeral=True)
+        except Exception:
+            pass
+
+
+# Os comandos e setup-hooks antigos consultam estes nomes em runtime.
+# Reapontá-los garante que painéis novos e antigos usem a implementação V141.
+V72GestaoModal = V141GestaoModal
+V72SelecionarMembro = V141SelecionarMembro
+V72SelecionarMembroView = V141SelecionarMembroView
+V72PainelGestaoView = V141PainelGestaoView
+
+
+async def _v141_component_fallback(interaction: discord.Interaction) -> None:
+    """Resgata botões de gestão antigos se a ViewStore perder a associação após restart.
+
+    Aguarda poucos milissegundos e só responde se o callback normal ainda não respondeu.
+    Assim não disputa com a View persistente quando ela está saudável.
+    """
+    try:
+        if getattr(interaction, 'type', None) != discord.InteractionType.component:
+            return
+        data = dict(getattr(interaction, 'data', {}) or {})
+        custom_id = str(data.get('custom_id') or '')
+        acao = _V141_GESTAO_IDS.get(custom_id)
+        if not acao:
+            return
+        await asyncio.sleep(0.18)
+        if interaction.response.is_done():
+            return
+        if not usuario_e_administrador(interaction.user):
+            return await interaction.response.send_message(
+                '❌ Apenas Inspetor+ pode utilizar este painel.', ephemeral=True
+            )
+        textos = {
+            'subir': 'Selecione o **Estagiário** que será promovido.',
+            'descer': 'Selecione o **Investigador** que será rebaixado.',
+            'retirar': 'Selecione o membro que será **retirado e expulso do servidor**.',
+        }
+        print(
+            f'🛟 V141 fallback gestão acionado custom_id={custom_id} '
+            f'interaction={getattr(interaction, "id", 0)}', flush=True
+        )
+        await interaction.response.send_message(
+            textos[acao] + '\n`Fluxo ativo: V141 • fallback`',
+            view=V141SelecionarMembroView(acao),
+            ephemeral=True,
+        )
+    except discord.InteractionResponded:
+        return
+    except Exception as erro:
+        traceback.print_exc()
+        try:
+            await enviar_log(f'❌ V141 fallback gestão: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    '❌ Não foi possível processar este botão. O erro foi registrado.', ephemeral=True
+                )
+        except Exception:
+            pass
+
+
+_V141_SETUP_ANTERIOR = bot.setup_hook
+async def _v141_setup_hook(self):
+    await _V141_SETUP_ANTERIOR()
+    # Último registro ganha a associação dos custom_ids antigos na ViewStore.
+    try:
+        bot.add_view(V141PainelGestaoView())
+    except Exception as erro:
+        print(f'⚠️ V141 add_view gestão falhou: {type(erro).__name__}: {erro}', flush=True)
+    # Fallback independente da ViewStore; útil para mensagens antigas após restart.
+    try:
+        bot.remove_listener(_v141_component_fallback, 'on_interaction')
+    except Exception:
+        pass
+    try:
+        bot.add_listener(_v141_component_fallback, 'on_interaction')
+    except Exception as erro:
+        print(f'⚠️ V141 fallback listener não registrado: {type(erro).__name__}: {erro}', flush=True)
+
+    # Diagnóstico explícito no startup.
+    try:
+        ids = set()
+        donos = []
+        for view in list(getattr(bot, 'persistent_views', []) or []):
+            cids = {
+                str(getattr(child, 'custom_id', '') or '')
+                for child in list(getattr(view, 'children', []) or [])
+            }
+            if cids & set(_V141_GESTAO_IDS):
+                donos.append((type(view).__name__, sorted(cids & set(_V141_GESTAO_IDS))))
+                ids.update(cids)
+        faltando = sorted(set(_V141_GESTAO_IDS) - ids)
+        print(
+            f'✅ V141 GESTÃO VIEW READY={not bool(faltando)} owners={donos} faltando={faltando}',
+            flush=True,
+        )
+    except Exception as erro:
+        print(f'⚠️ V141 diagnóstico da ViewStore falhou: {type(erro).__name__}: {erro}', flush=True)
+
+bot.setup_hook = _v13_types.MethodType(_v141_setup_hook, bot)
+
+
+@bot.listen('on_ready')
+async def _v141_ready_reassert_view() -> None:
+    # Reaplica após o READY para neutralizar qualquer limpeza tardia feita por módulos antigos.
+    try:
+        await asyncio.sleep(2.5)
+        bot.add_view(V141PainelGestaoView())
+        print('✅ V141 reassert: painel Gestão DICOR persistente confirmado após READY.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V141 reassert falhou: {type(erro).__name__}: {erro}', flush=True)
+
+
+print(
+    '✅ V141 carregada — Gestão DICOR com View persistente final + fallback de interação; '
+    'corrige aplicativo não respondeu em painéis antigos após deploy.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
