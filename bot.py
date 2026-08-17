@@ -63527,5 +63527,367 @@ print(
     flush=True,
 )
 
+
+# ============================================================================
+# V144 — PROCURADOS + CORREÇÃO DE FICHAS
+# Escopo restrito: procurados, edição de crimes e auditoria de RG.
+# Mesa, dossiê, reconhecimento visual e demais módulos permanecem intactos.
+# ============================================================================
+_V144_PROCURADOS_LOCK = asyncio.Lock()
+_V144_AUDITORIA_IDS = {'auditoria:revisar','auditoria:corrigir_cadastro:v66','auditoria:ignorar'}
+
+def _v144_texto_mensagem(msg: discord.Message) -> str:
+    try:
+        return coletar_texto_embed(msg) or str(getattr(msg,'content','') or '')
+    except Exception:
+        partes=[str(getattr(msg,'content','') or '')]
+        for emb in list(getattr(msg,'embeds',[]) or []):
+            partes += [str(getattr(emb,'title','') or ''),str(getattr(emb,'description','') or '')]
+            for f in list(getattr(emb,'fields',[]) or []): partes += [str(getattr(f,'name','') or ''),str(getattr(f,'value','') or '')]
+        return '\n'.join(partes)
+
+def _v144_rgs_rotulados(texto: str) -> List[str]:
+    texto=str(texto or ''); saida=[]
+    for padrao in [r'(?i)(?:^|\n|\s|🆔|🪪)\s*RG\s*[:#\-]?\s*`?\s*([0-9]{2,12})\s*`?',r'(?i)registro\s*(?:geral)?\s*[:#\-]?\s*`?\s*([0-9]{2,12})\s*`?']:
+        for valor in re.findall(padrao,texto):
+            rg=limpar_rg(valor)
+            if rg and rg not in saida: saida.append(rg)
+    return saida
+
+def _v144_nome_mensagem_procurado(texto: str) -> str:
+    texto=str(texto or '')
+    for padrao in [r'(?im)^\s*(?:👤\s*)?Nome\s*:\s*([^\n|]{2,120})',r'(?im)^\s*Procurado\s*:\s*([^\n|]{2,120})']:
+        m=re.search(padrao,texto)
+        if m: return re.sub(r'[*_`]+','',m.group(1)).strip()
+    try: return str((extrair_dados_procurado_de_texto(texto) or {}).get('nome') or '').strip()
+    except Exception: return ''
+
+async def _v144_localizar_mensagem_ativa_rg(rg: str) -> Optional[discord.Message]:
+    alvo=limpar_rg(rg)
+    if not alvo: return None
+    canal=await _obter_canal_seguro(int(PROCURADOS_CHANNEL_ID or PROCURADOS_ATIVOS_FIXO_ID or 0))
+    if canal is None or not hasattr(canal,'history'): return None
+    try:
+        async for msg in canal.history(limit=500,oldest_first=False):
+            if alvo in _v144_rgs_rotulados(_v144_texto_mensagem(msg)): return msg
+    except Exception as erro:
+        await enviar_log(f'⚠️ V144 varredura procurado ativo RG `{alvo}`: {type(erro).__name__}: {erro}')
+    return None
+
+def _v144_score_registro_procurado(reg: Dict[str,Any]) -> int:
+    if not isinstance(reg,dict): return 0
+    pontos=0
+    for chave in ('nome','rg','crimes','crimes_artigos','ultimo_avistamento','caracteristicas','foto_individuo','foto_rg','mensagem_id','numero_boletim','boletins'):
+        valor=reg.get(chave)
+        if isinstance(valor,(list,dict)): pontos+=min(5,len(valor))
+        elif str(valor or '').strip(): pontos+=2
+    if str(reg.get('status') or '').upper()=='A PROCURAR': pontos+=8
+    return pontos
+
+def _v144_fundir_registros_mesmo_rg(registros: List[Dict[str,Any]]) -> Dict[str,Any]:
+    ordenados=sorted([dict(x) for x in registros if isinstance(x,dict)],key=_v144_score_registro_procurado,reverse=True)
+    saida=dict(ordenados[0] if ordenados else {})
+    for reg in ordenados:
+        for chave,valor in reg.items():
+            atual=saida.get(chave)
+            if isinstance(valor,list):
+                lista=list(atual) if isinstance(atual,list) else []
+                for item in valor:
+                    if item not in lista: lista.append(item)
+                if lista: saida[chave]=lista
+            elif isinstance(valor,dict):
+                d=dict(atual) if isinstance(atual,dict) else {}
+                for k,v in valor.items():
+                    if k not in d or not str(d.get(k) or '').strip(): d[k]=v
+                if d: saida[chave]=d
+            elif not str(atual or '').strip() and str(valor or '').strip(): saida[chave]=valor
+    return saida
+
+async def _v144_reconciliar_procurado_ativo(guild: Optional[discord.Guild], rg: str) -> tuple[Optional[Dict[str,Any]],Optional[discord.Message]]:
+    alvo=limpar_rg(rg)
+    if not alvo: return None,None
+    async with _V144_PROCURADOS_LOCK:
+        lista=carregar_procurados() or []
+        iguais=[p for p in lista if isinstance(p,dict) and limpar_rg(p.get('rg',''))==alvo]
+        msg=await _v144_localizar_mensagem_ativa_rg(alvo)
+        if msg is None:
+            melhor=max(iguais,key=_v144_score_registro_procurado) if iguais else None
+            return (dict(melhor) if melhor else None),None
+        texto=_v144_texto_mensagem(msg); base=_v144_fundir_registros_mesmo_rg(iguais)
+        if not base:
+            try: base.update(extrair_dados_procurado_de_texto(texto) or {})
+            except Exception: pass
+        base['rg']=alvo; base['nome']=str(base.get('nome') or _v144_nome_mensagem_procurado(texto) or 'Não informado').strip(); base['status']='A PROCURAR'; base['canal_id']=int(getattr(msg.channel,'id',PROCURADOS_CHANNEL_ID) or PROCURADOS_CHANNEL_ID); base['mensagem_id']=int(msg.id); base['mensagem_url']=str(msg.jump_url); base['reconciliado_v144_em']=agora_br()
+        for chave in ('mensagem_arquivada_id','mensagem_arquivada_url','data_retirada','motivo_retirada','retirado_por','retirado_por_id'): base.pop(chave,None)
+        nova=[]; pos=None
+        for item in lista:
+            if isinstance(item,dict) and limpar_rg(item.get('rg',''))==alvo:
+                if pos is None: pos=len(nova)
+                continue
+            nova.append(item)
+        if pos is None: pos=len(nova)
+        nova.insert(pos,base); salvar_procurados(nova)
+        try: gerar_catalogo_html()
+        except Exception: pass
+        return base,msg
+
+async def retirar_procurado(interaction: discord.Interaction, rg: str, motivo: str):
+    if not interaction.response.is_done(): await interaction.response.defer(ephemeral=True,thinking=True)
+    membro=interaction.user if isinstance(interaction.user,discord.Member) else None
+    if not usuario_pode_operar_fluxo_com_aprovacao(membro): return await interaction.followup.send('❌ Apenas Estagiário, Investigador, Inspetor, Vice-Diretor ou Diretor pode usar esta função.',ephemeral=True)
+    alvo=limpar_rg(rg); registro,msg_ativo=await _v144_reconciliar_procurado_ativo(interaction.guild,alvo)
+    if not registro: return await interaction.followup.send(f'❌ Não encontrei o RG `{alvo}` nem no catálogo nem no canal de procurados ativos.',ephemeral=True)
+    if msg_ativo is None and str(registro.get('status') or '').upper()!='A PROCURAR': return await interaction.followup.send('⚠️ Esse procurado realmente já está arquivado/retirado e não existe publicação ativa dele.',ephemeral=True)
+    motivo=str(motivo or '').strip() or 'Não informado'
+    if usuario_e_administrador(membro):
+        solicitacao={'id':f"DIRETO-V144-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",'tipo':'procurado_retirada','status':'APROVADO_DIRETO','dados':{'rg':alvo,'nome':registro.get('nome'),'motivo':motivo,'registro_id':registro.get('id')},'contexto':{'canal_origem_id':getattr(interaction.channel,'id',None)},'solicitante_id':membro.id,'solicitante_nome':str(membro)}
+        try:
+            url=await executar_retirada_procurado(solicitacao,membro); await enviar_log(f'✅ V144 retirada direta RG `{alvo}` | publicação ativa reconciliada={bool(msg_ativo)} | autoridade `{membro.id}`'); return await interaction.followup.send(f'✅ Procurado retirado e arquivado com sucesso: {url}',ephemeral=True)
+        except Exception as erro:
+            await registrar_erro_interacao('v144_retirada_direta_procurado',interaction,erro); return await interaction.followup.send(f'❌ Não foi possível retirar. O registro foi preservado.\n`{type(erro).__name__}: {str(erro)[:350]}`',ephemeral=True)
+    solicitacao=await criar_solicitacao_autorizacao(interaction=interaction,tipo='procurado_retirada',dados={'rg':alvo,'nome':registro.get('nome'),'motivo':motivo,'registro_id':registro.get('id')},contexto={'canal_origem_id':getattr(interaction.channel,'id',None)})
+    await interaction.followup.send(f"📩 Solicitação `{solicitacao['id']}` enviada para autorização. O RG `{alvo}` foi confirmado no canal ativo.",ephemeral=True)
+
+async def executar_retirada_procurado(solicitacao: Dict[str,Any], autorizador: discord.Member) -> str:
+    dados=dict(solicitacao.get('dados') or {}); alvo=limpar_rg(dados.get('rg','')); registro,msg_ativo=await _v144_reconciliar_procurado_ativo(getattr(autorizador,'guild',None),alvo)
+    if not registro: raise RuntimeError(f'RG {alvo} não localizado.')
+    if msg_ativo is None and str(registro.get('status') or '').upper()!='A PROCURAR': raise RuntimeError('O procurado já foi retirado/arquivado e não existe publicação ativa.')
+    registro['status']='A PROCURAR'; motivo=str(dados.get('motivo') or 'Não informado'); mensagem_arquivada=await arquivar_procurado_discord(registro,motivo,f'{autorizador.mention} ({cargo_autorizador(autorizador)})')
+    if not mensagem_arquivada: raise RuntimeError('Não foi possível publicar o registro no canal de arquivados.')
+    await apagar_mensagem_original_procurado(registro,autorizador.guild)
+    lista=carregar_procurados() or []; atual=next((p for p in lista if isinstance(p,dict) and limpar_rg(p.get('rg',''))==alvo),None)
+    if atual is None: atual=registro; lista.append(atual)
+    atual.update({'status':'RETIRADO','motivo_retirada':motivo,'data_retirada':agora_br(),'retirado_por':str(solicitacao.get('solicitante_nome') or autorizador),'retirado_por_id':solicitacao.get('solicitante_id') or autorizador.id,'autorizado_retirada_por_id':autorizador.id,'autorizado_retirada_por_nome':str(autorizador),'autorizado_retirada_por_cargo':cargo_autorizador(autorizador),'mensagem_original_id':registro.get('mensagem_id'),'mensagem_original_url':registro.get('mensagem_url'),'mensagem_arquivada_id':mensagem_arquivada.id,'mensagem_arquivada_url':mensagem_arquivada.jump_url,'canal_id':int(HISTORICO_PROCURADOS_ID or PROCURADOS_ARQUIVADOS_FIXO_ID or 0),'mensagem_url':mensagem_arquivada.jump_url,'retirada_v144':True})
+    salvar_procurados(lista); gerar_catalogo_html(); return mensagem_arquivada.jump_url
+
+async def _v144_criar_canal_edicao_procurado(interaction: discord.Interaction, registro: Dict[str,Any]) -> discord.TextChannel:
+    canal=await _v56_criar_canal_privado_procurado(interaction,f"editar-{registro.get('nome') or 'procurado'}-{registro.get('rg') or ''}")
+    try: await canal.edit(name=f"✏️・editar-{slugify(str(registro.get('nome') or 'procurado'))[:28]}-{slugify(str(registro.get('rg') or 'rg'))[:12]}"[:100],reason='V144 edição provisória de procurado')
+    except Exception: pass
+    return canal
+
+async def _v144_apagar_canal_provisorio(canal_id: int, atraso: float=3.0) -> None:
+    await asyncio.sleep(max(0.0,float(atraso))); canal=await obter_canal_bot(int(canal_id or 0))
+    if isinstance(canal,discord.TextChannel):
+        try: await canal.delete(reason='V144 fim da edição provisória de procurado')
+        except Exception as erro: await enviar_log(f'⚠️ V144 não apagou canal provisório `{canal_id}`: {type(erro).__name__}: {erro}')
+
+class BuscarModificarProcuradoModal(Modal, title='Modificar Procurado'):
+    rg=TextInput(label='RG do procurado',placeholder='Digite o RG para localizar o cadastro',max_length=50)
+    async def on_submit(self,interaction:discord.Interaction):
+        if not isinstance(interaction.user,discord.Member) or not usuario_tem_equipe(interaction.user): return await interaction.response.send_message('❌ Apenas a equipe DICOR pode modificar procurados.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True); alvo=limpar_rg(str(self.rg.value)); registro,msg_ativo=await _v144_reconciliar_procurado_ativo(interaction.guild,alvo)
+        if not registro: return await interaction.followup.send(f'❌ Não encontrei procurado com o RG `{alvo}`.',ephemeral=True)
+        if msg_ativo is None and str(registro.get('status') or '').upper()!='A PROCURAR': return await interaction.followup.send('⚠️ Esse cadastro está arquivado/retirado. A edição de crimes é permitida apenas em procurados ativos.',ephemeral=True)
+        try: canal=await _v144_criar_canal_edicao_procurado(interaction,registro)
+        except Exception as erro:
+            await enviar_log(f'❌ V144 criar canal de edição RG `{alvo}`: {type(erro).__name__}: {erro}'); return await interaction.followup.send('❌ Não consegui criar o canal provisório. Verifique a permissão **Gerenciar Canais** do bot.',ephemeral=True)
+        artigos=_artigos_do_registro_procurado(registro); sessao={'tipo':'editar','canal_id':canal.id,'autor_id':interaction.user.id,'nome':registro.get('nome','Não informado'),'rg':registro.get('rg',''),'artigos':artigos,'crimes_legado':_texto_legado_sem_artigos_conhecidos(registro,artigos),'ultimo_avistamento':registro.get('ultimo_avistamento') or registro.get('informacoes') or 'Não informado','provisorio_v144':True,'canal_origem_id':getattr(interaction.channel,'id',0),'criado_em':agora_br()}
+        await canal.send(f"✏️ **EDIÇÃO PROVISÓRIA DE PROCURADO**\n👤 **Nome:** {registro.get('nome','Não informado')}\n🪪 **RG:** `{registro.get('rg','')}`\n👮 **Responsável:** {interaction.user.mention}\n\nPesquise, adicione ou remova crimes no painel abaixo. Ao **Salvar** ou **Cancelar**, este canal será apagado automaticamente.")
+        painel=await canal.send('Preparando painel de crimes...'); sessao['painel_id']=painel.id; _salvar_sessao_crime(str(painel.id),sessao); await painel.edit(content=_texto_painel_edicao_crimes(sessao),view=EditarCrimesPesquisaView()); await interaction.followup.send(f'✅ Canal provisório criado: {canal.mention}\nFinalize pelo botão **Salvar Alterações**.',ephemeral=True)
+
+class EditarCrimesPesquisaView(View):
+    def __init__(self): super().__init__(timeout=None)
+    def _sessao_id(self,interaction): return str(getattr(interaction.message,'id',''))
+    def _autor_ok(self,interaction,sessao): return interaction.user.id==int(sessao.get('autor_id') or 0) or usuario_e_administrador(interaction.user)
+    @discord.ui.button(label='Pesquisar Crime',emoji='🔎',style=discord.ButtonStyle.blurple,custom_id='dic_editar_pesquisar_crime_v2')
+    async def pesquisar(self,interaction,button):
+        sid=self._sessao_id(interaction); s=_obter_sessao_crime(sid)
+        if not s: return await interaction.response.send_message('❌ Sessão de edição não encontrada.',ephemeral=True)
+        if not self._autor_ok(interaction,s): return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.',ephemeral=True)
+        await interaction.response.send_modal(PesquisaCrimeModal(sid))
+    @discord.ui.button(label='Remover Crime',emoji='➖',style=discord.ButtonStyle.secondary,custom_id='dic_editar_remover_crime_v2')
+    async def remover(self,interaction,button):
+        sid=self._sessao_id(interaction); s=_obter_sessao_crime(sid)
+        if not s: return await interaction.response.send_message('❌ Sessão de edição não encontrada.',ephemeral=True)
+        if not self._autor_ok(interaction,s): return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.',ephemeral=True)
+        artigos=list(s.get('artigos') or [])
+        if not artigos: return await interaction.response.send_message('⚠️ Não existem crimes selecionados para remover.',ephemeral=True)
+        await interaction.response.send_message('➖ Selecione os crimes que deseja remover:',view=RemoverCrimeEdicaoView(sid,artigos),ephemeral=True)
+    @discord.ui.button(label='Editar Último Avistamento',emoji='📍',style=discord.ButtonStyle.secondary,custom_id='dic_editar_ultimo_avistamento_v2')
+    async def editar_ultimo(self,interaction,button):
+        sid=self._sessao_id(interaction); s=_obter_sessao_crime(sid)
+        if not s: return await interaction.response.send_message('❌ Sessão de edição não encontrada.',ephemeral=True)
+        if not self._autor_ok(interaction,s): return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.',ephemeral=True)
+        await interaction.response.send_modal(EditarUltimoAvistamentoModal(sid,str(s.get('ultimo_avistamento') or 'Não informado')))
+    @discord.ui.button(label='Salvar Alterações',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_editar_salvar_crimes_v2')
+    async def salvar(self,interaction,button):
+        sid=self._sessao_id(interaction); s=_obter_sessao_crime(sid)
+        if not s: return await interaction.response.send_message('❌ Sessão de edição não encontrada.',ephemeral=True)
+        if not self._autor_ok(interaction,s): return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True); await _v144_reconciliar_procurado_ativo(interaction.guild,str(s.get('rg') or '')); lista=carregar_procurados() or []; alvo=limpar_rg(s.get('rg','')); reg=next((p for p in lista if isinstance(p,dict) and limpar_rg(p.get('rg',''))==alvo),None)
+        if not reg: return await interaction.followup.send('❌ Esse procurado não existe mais no catálogo.',ephemeral=True)
+        artigos=list(s.get('artigos') or []); legado=str(s.get('crimes_legado') or '').strip(); crimes_fmt=_formatar_crimes_selecionados(artigos) if artigos else ''
+        if crimes_fmt=='Nenhum crime selecionado.': crimes_fmt=''
+        crimes='\n\n'.join(x for x in (crimes_fmt,legado) if x).strip()
+        if not crimes: return await interaction.followup.send('❌ O procurado precisa permanecer com pelo menos um crime.',ephemeral=True)
+        antigo=valor_crimes_registro(reg); ultimo_antigo=str(reg.get('ultimo_avistamento') or reg.get('informacoes') or 'Não informado').strip(); ultimo_novo=str(s.get('ultimo_avistamento') or ultimo_antigo).strip() or 'Não informado'; reg['crimes']=crimes; reg['crimes_artigos']=artigos; reg['ultimo_avistamento']=ultimo_novo; reg.setdefault('historico_edicoes',[]).append({'data':agora_br(),'tipo':'EDIÇÃO V144 EM CANAL PROVISÓRIO','usuario':str(interaction.user),'usuario_id':interaction.user.id,'valor_anterior':antigo,'valor_novo':crimes,'ultimo_anterior':ultimo_antigo,'ultimo_novo':ultimo_novo,'artigos':artigos}); salvar_procurados(lista); gerar_catalogo_html(); atualizado=await atualizar_post_procurado_discord(reg)
+        try: await interaction.message.edit(content=_texto_painel_edicao_crimes(s)+'\n\n✅ **ALTERAÇÕES SALVAS. O CANAL SERÁ ENCERRADO.**',view=None)
+        except Exception: pass
+        _apagar_sessao_crime(sid); await enviar_log(f"✏️ V144 procurado editado | RG `{alvo}` | autor `{interaction.user.id}` | post={bool(atualizado)}"); await interaction.followup.send(f"✅ Procurado **{reg.get('nome')}** (`{alvo}`) atualizado.\n{('✅ Post oficial atualizado.' if atualizado else '⚠️ Dados salvos; post oficial não localizado para edição.')}",ephemeral=True)
+        if s.get('provisorio_v144'): asyncio.create_task(_v144_apagar_canal_provisorio(int(s.get('canal_id') or 0),3))
+    @discord.ui.button(label='Cancelar',emoji='✖️',style=discord.ButtonStyle.red,custom_id='dic_editar_cancelar_crimes_v2')
+    async def cancelar(self,interaction,button):
+        sid=self._sessao_id(interaction); s=_obter_sessao_crime(sid)
+        if not s: return await interaction.response.send_message('❌ Sessão de edição não encontrada.',ephemeral=True)
+        if not self._autor_ok(interaction,s): return await interaction.response.send_message('❌ Esta edição pertence a outro usuário.',ephemeral=True)
+        _apagar_sessao_crime(sid); await interaction.response.edit_message(content='✖️ Edição cancelada. Nenhuma alteração foi aplicada.',view=None)
+        if s.get('provisorio_v144'): asyncio.create_task(_v144_apagar_canal_provisorio(int(s.get('canal_id') or 0),2))
+
+# -------- Auditoria de fichas: agora permite consolidar RG com vínculos --------
+def _v144_tabela_existe(db,tabela):
+    try: return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(str(tabela),)).fetchone() is not None
+    except Exception: return False
+
+def _v144_mesclar_rg_ficha_sync(*,rg_correto:str,rg_errado:str,chave_auditoria:str,autor_id:int)->Dict[str,Any]:
+    rg_correto=_auditoria_rg(rg_correto); rg_errado=_auditoria_rg(rg_errado)
+    if not rg_correto or not rg_errado or rg_correto==rg_errado: raise ValueError('RGs inválidos para consolidação.')
+    inicializar_banco_dicor(); agora=_banco_agora_iso(); res={'rg_correto':rg_correto,'rg_errado':rg_errado,'veiculos':0,'prisoes':0,'fontes':0,'organizacoes':0,'campos_aproveitados':0}
+    with _banco_conexao() as db:
+        c=db.execute('SELECT * FROM individuos WHERE rg=?',(rg_correto,)).fetchone(); e=db.execute('SELECT * FROM individuos WHERE rg=?',(rg_errado,)).fetchone()
+        if not c: raise ValueError(f'O RG correto {rg_correto} não possui ficha no banco.')
+        if not e: return res
+        c=dict(c); e=dict(e); idc=int(c.get('id') or 0); ide=int(e.get('id') or 0); nomec=str(c.get('nome') or '').strip()
+        db.execute("CREATE TABLE IF NOT EXISTS auditoria_fichas_arquivadas (id INTEGER PRIMARY KEY AUTOINCREMENT, rg TEXT NOT NULL, nome TEXT NOT NULL, dados_json TEXT NOT NULL, motivo TEXT NOT NULL, chave_auditoria TEXT NOT NULL, arquivado_por_id INTEGER NOT NULL DEFAULT 0, arquivado_em TEXT NOT NULL)")
+        db.execute('INSERT INTO auditoria_fichas_arquivadas (rg,nome,dados_json,motivo,chave_auditoria,arquivado_por_id,arquivado_em) VALUES (?,?,?,?,?,?,?)',(rg_errado,str(e.get('nome') or ''),json.dumps(e,ensure_ascii=False,default=str),f'Consolidado no RG correto {rg_correto}',str(chave_auditoria or ''),int(autor_id or 0),agora))
+        updates={}; ignorar={'id','rg','nome','criado_em','atualizado_em','status'}
+        for k,v in e.items():
+            if k in ignorar: continue
+            atual=c.get(k); vazio=atual is None or atual=='' or atual==0; util=not(v is None or v=='' or v==0)
+            if vazio and util: updates[k]=v; res['campos_aproveitados']+=1
+        if updates:
+            updates['atualizado_em']=agora; db.execute('UPDATE individuos SET '+', '.join(f'{k}=?' for k in updates)+' WHERE rg=?',tuple(updates.values())+(rg_correto,))
+        if _v144_tabela_existe(db,'veiculos'):
+            cur=db.execute('UPDATE veiculos SET proprietario_rg=?, proprietario_nome=?, atualizado_em=? WHERE proprietario_rg=?',(rg_correto,nomec,agora,rg_errado)); res['veiculos']=max(0,int(cur.rowcount or 0))
+        if _v144_tabela_existe(db,'historico_prisoes'):
+            cur=db.execute('UPDATE historico_prisoes SET individuo_id=?, rg_texto=?, atualizado_em=? WHERE individuo_id=? OR rg_texto=?',(idc,rg_correto,agora,ide,rg_errado)); res['prisoes']=max(0,int(cur.rowcount or 0))
+        if _v144_tabela_existe(db,'fontes_ficha_individuo'):
+            cur=db.execute('UPDATE fontes_ficha_individuo SET individuo_id=? WHERE individuo_id=?',(idc,ide)); res['fontes']=max(0,int(cur.rowcount or 0))
+        if _v144_tabela_existe(db,'faccao_membros'):
+            rows=db.execute('SELECT * FROM faccao_membros WHERE individuo_id=? OR rg=?',(ide,rg_errado)).fetchall()
+            for rr in rows:
+                item=dict(rr); ex=db.execute('SELECT * FROM faccao_membros WHERE faccao_id=? AND rg=?',(item.get('faccao_id'),rg_correto)).fetchone()
+                if ex and int(dict(ex).get('id') or 0)!=int(item.get('id') or 0):
+                    ex=dict(ex); db.execute('UPDATE faccao_membros SET individuo_id=?, nome=?, ativo=?, atualizado_em=? WHERE id=?',(idc,nomec,max(int(ex.get('ativo') or 0),int(item.get('ativo') or 0)),agora,int(ex.get('id')))); db.execute('DELETE FROM faccao_membros WHERE id=?',(int(item.get('id')),))
+                else: db.execute('UPDATE faccao_membros SET individuo_id=?, rg=?, nome=?, atualizado_em=? WHERE id=?',(idc,rg_correto,nomec,agora,int(item.get('id'))))
+                res['organizacoes']+=1
+        if _v144_tabela_existe(db,'historico_banco'): db.execute("UPDATE historico_banco SET entidade_chave=? WHERE entidade_tipo='individuo' AND entidade_chave=?",(rg_correto,rg_errado))
+        _banco_historico('individuo',rg_correto,'CONSOLIDACAO_RG_V144',f'RG {rg_errado} consolidado no RG correto {rg_correto}. Chave: {chave_auditoria}.',int(autor_id or 0),db=db); db.execute('DELETE FROM individuos WHERE rg=?',(rg_errado,))
+    return res
+
+def _v144_mesclar_varios_rgs_sync(*,rg_correto,rgs_conflito,chave_auditoria,autor_id):
+    total={'rg_correto':_auditoria_rg(rg_correto),'mesclados':[],'veiculos':0,'prisoes':0,'fontes':0,'organizacoes':0,'campos_aproveitados':0}
+    for rg in list(dict.fromkeys(_auditoria_rg(x) for x in rgs_conflito if _auditoria_rg(x))):
+        if rg==total['rg_correto']: continue
+        r=_v144_mesclar_rg_ficha_sync(rg_correto=total['rg_correto'],rg_errado=rg,chave_auditoria=chave_auditoria,autor_id=autor_id); total['mesclados'].append(rg)
+        for k in ('veiculos','prisoes','fontes','organizacoes','campos_aproveitados'): total[k]+=int(r.get(k) or 0)
+    return total
+
+class V144CorrigirNomeMesmoRGModal(discord.ui.Modal):
+    def __init__(self,*,registro,rg,mensagem_id,canal_id):
+        super().__init__(title=f'Corrigir nome do RG {rg}'); self.registro=dict(registro); self.rg=_auditoria_rg(rg); self.mensagem_id=int(mensagem_id or 0); self.canal_id=int(canal_id or 0); self.nome=discord.ui.TextInput(label='NOME CORRETO',placeholder='Digite o nome correto desta ficha',min_length=3,max_length=120,required=True); self.confirmar=discord.ui.TextInput(label='CONFIRMAÇÃO',placeholder='Digite CONFIRMAR',min_length=9,max_length=9,required=True); self.add_item(self.nome); self.add_item(self.confirmar)
+    async def on_submit(self,interaction):
+        if not _auditoria_autorizado(interaction.user): return await interaction.response.send_message('❌ Apenas Inspetor+ pode corrigir cadastros.',ephemeral=True)
+        if str(self.confirmar.value).strip().upper()!='CONFIRMAR': return await interaction.response.send_message('❌ Digite **CONFIRMAR** para aplicar.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            r=await asyncio.to_thread(_v66_corrigir_nome_rg_sync,chave_auditoria=str(self.registro.get('chave') or ''),rg_alvo=self.rg,nome_correto=str(self.nome.value),autor_id=int(interaction.user.id)); await asyncio.to_thread(_v67_marcar_issue_sync,self.mensagem_id,'RESOLVIDA',int(interaction.user.id)); await _v66_editar_alerta_resolvido(self.canal_id,self.mensagem_id,self.registro); _auditoria_solicitar_varredura('V144 nome corrigido'); await interaction.followup.send(f"✅ Ficha corrigida.\n**RG:** `{r['rg']}`\n**Anterior:** {r['nome_antigo']}\n**Correto:** {r['nome_novo']}",ephemeral=True)
+        except Exception as erro: await enviar_log(f'❌ V144 nome RG `{self.rg}`: {type(erro).__name__}: {erro}'); await interaction.followup.send(f'❌ Não foi possível corrigir. Nada foi apagado.\n`{str(erro)[:450]}`',ephemeral=True)
+
+class V67ConfirmarRGView(discord.ui.View):
+    def __init__(self,*,registro,rg_correto,diagnosticos,mensagem_id,canal_id): super().__init__(timeout=300); self.registro=dict(registro); self.rg_correto=_auditoria_rg(rg_correto); self.diagnosticos=list(diagnosticos); self.mensagem_id=int(mensagem_id or 0); self.canal_id=int(canal_id or 0)
+    async def interaction_check(self,interaction):
+        if _auditoria_autorizado(interaction.user): return True
+        await interaction.response.send_message('❌ Apenas Inspetor+ pode concluir esta correção.',ephemeral=True); return False
+    @discord.ui.button(label='Consolidar neste RG',emoji='✅',style=discord.ButtonStyle.success,row=0)
+    async def manter(self,interaction,button):
+        outros=[str(x.get('rg') or '') for x in self.diagnosticos if x.get('existe') and _auditoria_rg(x.get('rg'))!=self.rg_correto]
+        if not outros: return await interaction.response.send_message('✅ Não há outro RG válido para consolidar.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        try:
+            r=await asyncio.to_thread(_v144_mesclar_varios_rgs_sync,rg_correto=self.rg_correto,rgs_conflito=outros,chave_auditoria=str(self.registro.get('chave') or ''),autor_id=int(interaction.user.id)); await asyncio.to_thread(_v67_marcar_issue_sync,self.mensagem_id,'RESOLVIDA',int(interaction.user.id)); await _v66_editar_alerta_resolvido(self.canal_id,self.mensagem_id,self.registro); _auditoria_solicitar_varredura('V144 RG consolidado'); await enviar_log(f"✅ V144 RG correto `{self.rg_correto}` | mesclados={r['mesclados']} | autor `{interaction.user.id}`"); await interaction.followup.send(f"✅ **RG correto definido:** `{self.rg_correto}`\nRG(s) consolidado(s): {', '.join(f'`{x}`' for x in r['mesclados'])}\nVínculos migrados: **{r['veiculos']} veículo(s)** • **{r['prisoes']} prisão(ões)** • **{r['fontes']} fonte(s)** • **{r['organizacoes']} organização(ões)**.\n\nA ficha errada foi arquivada antes da consolidação.",ephemeral=True)
+        except Exception as erro: await enviar_log(f'❌ V144 consolidar RG `{self.rg_correto}`: {type(erro).__name__}: {erro}\n```py\n{traceback.format_exc()[-2200:]}\n```'); await interaction.followup.send(f'❌ A consolidação foi interrompida.\n`{str(erro)[:550]}`',ephemeral=True)
+    @discord.ui.button(label='Corrigir nome do outro RG',emoji='✏️',style=discord.ButtonStyle.primary,row=0)
+    async def corrigir_outro(self,interaction,button):
+        outros=[x for x in self.diagnosticos if x.get('existe') and _auditoria_rg(x.get('rg'))!=self.rg_correto]
+        if not outros: return await interaction.response.send_message('⚠️ Não existe outro RG válido para corrigir.',ephemeral=True)
+        if len(outros)==1: return await interaction.response.send_modal(V67RenomearOutroModal(registro=self.registro,rg_alvo=str(outros[0]['rg']),mensagem_id=self.mensagem_id,canal_id=self.canal_id))
+        await interaction.response.send_message('Escolha qual outro RG está com o nome incorreto:',view=V67EscolherOutroRGView(registro=self.registro,rg_correto=self.rg_correto,diagnosticos=self.diagnosticos,mensagem_id=self.mensagem_id,canal_id=self.canal_id),ephemeral=True)
+    @discord.ui.button(label='São pessoas diferentes',emoji='👥',style=discord.ButtonStyle.secondary,row=1)
+    async def homonimos(self,interaction,button):
+        await interaction.response.defer(ephemeral=True); reg=await asyncio.to_thread(_v67_marcar_issue_sync,self.mensagem_id,'IGNORADA',int(interaction.user.id))
+        if not reg: return await interaction.followup.send('⚠️ Alerta não localizado.',ephemeral=True)
+        try: await interaction.message.edit(embed=_auditoria_embed_issue({**reg,'linhas':_v66_auditoria_linhas(reg)},estado='IGNORADA'),view=None)
+        except Exception: pass
+        await interaction.followup.send('✅ Registrado como pessoas diferentes com o mesmo nome. Nenhuma ficha foi alterada.',ephemeral=True)
+
+async def _v144_abrir_correcao_auditoria(interaction,mensagem_id):
+    if not _auditoria_autorizado(interaction.user): return await interaction.response.send_message('❌ Apenas Inspetor+ pode corrigir cadastros.',ephemeral=True)
+    reg=await asyncio.to_thread(_v66_auditoria_registro_por_mensagem,int(mensagem_id or 0))
+    if not reg: return await interaction.response.send_message('⚠️ Registro de auditoria não localizado.',ephemeral=True)
+    tipo=str(reg.get('tipo') or '')
+    if tipo=='NOME_COM_RGS_DIFERENTES': return await _v67_abrir_correcao_guiada(interaction,int(mensagem_id or 0))
+    if tipo=='RG_COM_NOMES_DIFERENTES':
+        rgs=_v67_extrair_rgs(reg); rg=rgs[0] if rgs else ''
+        if not rg: return await interaction.response.send_message('❌ Não consegui extrair o RG deste alerta. Use **Revisar detalhes**.',ephemeral=True)
+        return await interaction.response.send_modal(V144CorrigirNomeMesmoRGModal(registro=reg,rg=rg,mensagem_id=int(mensagem_id or 0),canal_id=int(reg.get('canal_id') or getattr(interaction.channel,'id',0))))
+    return await interaction.response.send_message('ℹ️ Este tipo de inconsistência não altera identidade automaticamente.',ephemeral=True)
+
+class V144AuditoriaIssueView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='Revisar detalhes',emoji='🔍',style=discord.ButtonStyle.secondary,custom_id='auditoria:revisar',row=0)
+    async def revisar(self,interaction,button):
+        if not _auditoria_autorizado(interaction.user): return await interaction.response.send_message('❌ Apenas Inspetor+ pode revisar alertas.',ephemeral=True)
+        mid=int(getattr(interaction.message,'id',0) or 0); reg=await asyncio.to_thread(_v66_auditoria_registro_por_mensagem,mid)
+        if not reg: return await interaction.response.send_message('⚠️ Registro de auditoria não localizado.',ephemeral=True)
+        linhas=_v66_auditoria_linhas(reg); emb=discord.Embed(title='🔍 REVISÃO DA INCONSISTÊNCIA',description='\n'.join(linhas)[:3900] or 'Sem detalhes.',color=_auditoria_cor(reg.get('prioridade'))); emb.add_field(name='Tipo',value=f"`{reg.get('tipo')}`",inline=True); emb.add_field(name='Chave',value=f"`{reg.get('chave')}`",inline=False); await interaction.response.send_message(embed=emb,ephemeral=True)
+    @discord.ui.button(label='Corrigir cadastro',emoji='✏️',style=discord.ButtonStyle.primary,custom_id='auditoria:corrigir_cadastro:v66',row=0)
+    async def corrigir(self,interaction,button): await _v144_abrir_correcao_auditoria(interaction,int(getattr(interaction.message,'id',0) or 0))
+    @discord.ui.button(label='Marcar como correto',emoji='✅',style=discord.ButtonStyle.success,custom_id='auditoria:ignorar',row=0)
+    async def ignorar(self,interaction,button):
+        if not _auditoria_autorizado(interaction.user): return await interaction.response.send_message('❌ Apenas Inspetor+ pode concluir a revisão.',ephemeral=True)
+        await interaction.response.defer(ephemeral=True); mid=int(getattr(interaction.message,'id',0) or 0); reg=await asyncio.to_thread(_v67_marcar_issue_sync,mid,'IGNORADA',int(interaction.user.id))
+        if not reg: return await interaction.followup.send('⚠️ Registro não localizado.',ephemeral=True)
+        try: await interaction.message.edit(embed=_auditoria_embed_issue({**reg,'linhas':_v66_auditoria_linhas(reg)},estado='IGNORADA'),view=None)
+        except Exception: pass
+        await interaction.followup.send('✅ Caso marcado como correto. Ele só será reaberto se os dados mudarem.',ephemeral=True)
+
+def _v67_view_issue(issue):
+    view=V144AuditoriaIssueView(); tipo=str(issue.get('tipo') or '')
+    if tipo not in {'NOME_COM_RGS_DIFERENTES','RG_COM_NOMES_DIFERENTES'}:
+        for item in list(view.children):
+            if str(getattr(item,'custom_id','') or '')=='auditoria:corrigir_cadastro:v66': view.remove_item(item)
+    return view
+
+def _v144_instalar_view_auditoria():
+    try:
+        for view in list(getattr(bot,'persistent_views',[]) or []):
+            ids={str(getattr(c,'custom_id','') or '') for c in list(getattr(view,'children',[]) or [])}
+            if ids & _V144_AUDITORIA_IDS:
+                try: bot.remove_view(view)
+                except Exception: pass
+        bot.add_view(V144AuditoriaIssueView())
+    except Exception as erro: print(f'⚠️ V144 View auditoria: {type(erro).__name__}: {erro}',flush=True)
+
+@bot.listen('on_ready')
+async def _v144_on_ready():
+    _v144_instalar_view_auditoria()
+    try:
+        await asyncio.sleep(3); canal=await _auditoria_canal()
+        if canal is not None:
+            _auditoria_inicializar_banco()
+            with _banco_conexao() as db: rows=db.execute("SELECT * FROM auditoria_inconsistencias WHERE status='ATIVA' AND mensagem_id<>0 ORDER BY ultima_deteccao DESC LIMIT 200").fetchall()
+            n=0
+            for row in rows:
+                reg=dict(row); tipo=str(reg.get('tipo') or '')
+                if tipo not in {'NOME_COM_RGS_DIFERENTES','RG_COM_NOMES_DIFERENTES'}: continue
+                try:
+                    msg=await canal.fetch_message(int(reg.get('mensagem_id') or 0)); issue={**reg,'linhas':_v66_auditoria_linhas(reg)}; await msg.edit(embed=_auditoria_embed_issue(issue),view=_v67_view_issue(issue)); n+=1
+                except Exception: pass
+            print(f'✅ V144 auditoria de fichas pronta — alertas corrigíveis atualizados={n}.',flush=True)
+    except Exception as erro: print(f'⚠️ V144 auditoria: {type(erro).__name__}: {erro}',flush=True)
+
+print('✅ V144 carregada — retirada de procurado reconciliada pelo canal ativo, edição em canal provisório e correção/mesclagem segura de RGs.',flush=True)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
