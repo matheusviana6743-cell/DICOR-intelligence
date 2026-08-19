@@ -49371,7 +49371,7 @@ def _v110_gerar_pdf_modelo_final(dados: Dict[str, Any], caminho_pdf: Path) -> No
         if intro and imgs: y=par(intro,y,tam=8.9)
         if not imgs:
             # O preflight deve impedir esta situação; a frase serve apenas como defesa técnica.
-            return par('Evidência visual obrigatória não pôde ser incorporada ao arquivo.',y,tam=8.8)
+            return par('Nenhuma evidência visual foi anexada a esta seção até o encerramento da mesa.',y,tam=8.8)
         col_w=(util-0.42*cm)/2; card_h=6.55*cm; img_h=4.92*cm
         xs=[mx+0.1*cm,mx+0.1*cm+col_w+0.22*cm]
         i=0
@@ -60231,6 +60231,10 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
         ('Cidade Operacional', meta.get('cidade') or 'Capital Morada do Valley'),
         ('Data de Abertura', meta.get('data_abertura')),
         ('Responsável Institucional', meta.get('delegado')),
+        ('Nº do Pedido de Pacificação', meta.get('pedido_numero')),
+        ('Data de Expedição', meta.get('pedido_data')),
+        ('Requerente do Pedido', meta.get('pedido_requerente')),
+        ('Local da Pacificação', meta.get('pedido_local')),
     ], y)
     y = subtitulo('Objeto do Dossiê', y)
     y = texto(
@@ -60300,7 +60304,7 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
             for grupo in grupos:
                 imgs = list((grupo or {}).get('images') or [])
                 y = subtitulo(str((grupo or {}).get('label') or 'Evidências de localização'), y)
-                y = imagens(imgs, y, str((grupo or {}).get('label') or 'Localização'), exigir_uma=True)
+                y = imagens(imgs, y, str((grupo or {}).get('label') or 'Localização'), exigir_uma=False)
             continue
 
         if code == '06':
@@ -60310,7 +60314,7 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
                 y = texto(str((crime or {}).get('descricao') or 'Crime sem descrição.'), y, tam=9.35)
                 provas = list((crime or {}).get('provas') or [])
                 if provas:
-                    y = imagens(provas, y, f'Crime {idx}', exigir_uma=True)
+                    y = imagens(provas, y, f'Crime {idx}', exigir_uma=False)
             continue
 
         if code == '11':
@@ -60318,7 +60322,7 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
             for grupo in grupos:
                 label = str((grupo or {}).get('label') or 'Evidências')
                 y = subtitulo(label, y)
-                y = imagens(list((grupo or {}).get('images') or []), y, label, exigir_uma=True)
+                y = imagens(list((grupo or {}).get('images') or []), y, label, exigir_uma=False)
             continue
 
         if code == '12':
@@ -60332,14 +60336,14 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
             auxiliares = list(sec.get('images') or [])
             if auxiliares:
                 y = subtitulo('Documentação e Registros Complementares', y)
-                y = imagens(auxiliares, y, 'Informante', exigir_uma=True)
+                y = imagens(auxiliares, y, 'Informante', exigir_uma=False)
             continue
 
         # Painel, baús, rotas e residência usam somente as imagens do próprio item.
         imgs = list(sec.get('images') or [])
         if imgs:
             y = subtitulo('Evidências Visuais', y)
-            y = imagens(imgs, y, title, exigir_uma=True)
+            y = imagens(imgs, y, title, exigir_uma=False)
 
     c.save()
 
@@ -63888,6 +63892,561 @@ async def _v144_on_ready():
     except Exception as erro: print(f'⚠️ V144 auditoria: {type(erro).__name__}: {erro}',flush=True)
 
 print('✅ V144 carregada — retirada de procurado reconciliada pelo canal ativo, edição em canal provisório e correção/mesclagem segura de RGs.',flush=True)
+
+
+
+# =============================================================
+# V145 — DOSSIÊ ENRIQUECIDO SEM ALTERAR O MODELO + TAREFAS FLEXÍVEIS
+# Regras:
+# - NÃO altera moldura, cores, brasões, ordem de páginas ou estrutura visual aprovada;
+# - enriquece o conteúdo textual apontado na revisão do dossiê;
+# - aplica a mesas já existentes que possuam estado/tarefas, sem criar tarefas em mesas legadas;
+# - remove bloqueio por quantidade mínima de mensagens/provas para finalizar/concluir/fechar;
+# - adiciona Reabrir tarefa sem apagar evidências já registradas.
+# =============================================================
+
+V145_DOSSIE_REVISAO = 'V145 conteúdo profissional + tarefas sem mínimo + reabertura'
+
+
+def _v145_limpar_texto(valor: Any, limite: int = 4000) -> str:
+    texto = str(valor or '').replace('\r', ' ').replace('\x00', ' ')
+    texto = re.sub(r'[\uFFFD\u25A0\u25AA\u25AB]+', ' ', texto)
+    texto = re.sub(r'[\t ]+', ' ', texto)
+    texto = re.sub(r' *\n *', '\n', texto)
+    texto = re.sub(r'\n{3,}', '\n\n', texto).strip()
+    return texto[:max(0, int(limite))]
+
+
+def _v145_titulo_sem_vazio(valor: Any, fallback: str) -> str:
+    v = _v145_limpar_texto(valor, 800)
+    return v if v else fallback
+
+
+# ---------- conteúdo do dossiê antigo/legado (mesmo modelo V110) ----------
+_V145_PREPARAR_REQ_BASE = _v110_preparar_requisitos
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    req = dict(_V145_PREPARAR_REQ_BASE(dados) or {})
+    comunidade = _v145_titulo_sem_vazio(dados.get('comunidade') or dados.get('organizacao') or dados.get('faccao'), 'organização investigada')
+    cidade = _v145_titulo_sem_vazio(dados.get('cidade_operacional') or globals().get('DOSSIE_CIDADE_OPERACIONAL'), 'Capital Morada do Valley')
+    liderancas = list(dados.get('liderancas') or [])
+    integrantes = list(dados.get('integrantes') or [])
+
+    # Página 1 — dados do pedido de pacificação sempre formalizados com o que o sistema possui.
+    req['pedido_numero'] = _v145_titulo_sem_vazio(req.get('pedido_numero'), _v104_numero_pacificacao(dados))
+    req['data_expedicao'] = _v145_titulo_sem_vazio(req.get('data_expedicao'), _v104_data_documento())
+    req['requerente'] = _v145_titulo_sem_vazio(req.get('requerente'), 'Buiu Gomes - Delegado Responsável')
+    local_real = _v110_texto_real(req.get('endereco_exato')) or _v110_texto_real(req.get('local_pacificacao'))
+    if not local_real:
+        local_real = (
+            f'Área vinculada à {comunidade}, em {cidade}, conforme o ponto de GPS, registros de campo '
+            'e imagens de localização anexadas à investigação.'
+        )
+    req['endereco_exato'] = local_real
+    req['local_pacificacao'] = local_real
+
+    # Painel/hierarquia — análise objetiva, sem reproduzir texto bruto do tópico.
+    req['painel_descricao'] = (
+        f'O painel da {comunidade} foi analisado em conjunto com os registros individuais da mesa. '
+        f'A estrutura documental foi organizada por função e nível de atuação, relacionando {len(liderancas)} '
+        f'registro(s) de liderança e {len(integrantes)} registro(s) de integrante quando disponíveis. '
+        'A análise desta seção serve para contextualizar a hierarquia observada, enquanto nomes, RGs, cargos '
+        'e fotografias permanecem apresentados nas respectivas fichas, sem extrapolar o material registrado.'
+    )
+
+    # Localização — descrição objetiva que acompanha GPS/aéreas sem inventar endereço inexistente.
+    req['visao_aerea'] = _v145_titulo_sem_vazio(
+        req.get('visao_aerea'),
+        f'As imagens de GPS e as vistas aéreas contextualizam a área operacional da {comunidade} em {cidade}, '
+        'permitindo relacionar o ponto de referência terrestre ao entorno documentado nas evidências.'
+    )
+
+    # Produção/fabricação — texto básico institucional e limpo, sem caractere solto nem texto cru de tópico.
+    req['produto_material'] = _v145_titulo_sem_vazio(
+        req.get('produto_material'),
+        'Material/produto documentado visualmente na seção de produção; a denominação específica somente é '
+        'considerada quando registrada expressamente na mesa.'
+    )
+    req['producao_local'] = _v145_titulo_sem_vazio(
+        req.get('producao_local'),
+        'Ponto operacional de produção/fabricação documentado pelas evidências visuais e pela referência de localização anexada.'
+    )
+    req['producao_descricao'] = _v145_titulo_sem_vazio(
+        req.get('producao_descricao'),
+        'A seção consolida o ponto de produção/fabricação, sua referência de acesso/localização e os registros '
+        'visuais do processo disponíveis na mesa, mantendo separado o material de farm, produção e produto final.'
+    )
+
+    # Baús — contextualização do que cada imagem representa, sem duplicar evidência.
+    req['baus_lider_conteudo'] = _v145_titulo_sem_vazio(
+        req.get('baus_lider_conteudo'),
+        'As evidências desta seção documentam exclusivamente o baú destinado à liderança e sua referência de '
+        'acesso/localização. As imagens devem ser lidas em conjunto para contextualizar o ponto de armazenamento e a entrada correspondente.'
+    )
+    req['baus_membros_conteudo'] = _v145_titulo_sem_vazio(
+        req.get('baus_membros_conteudo'),
+        'As evidências desta seção documentam exclusivamente o baú destinado aos membros e sua referência de '
+        'acesso/localização. O conteúdo permanece separado do baú da liderança para evitar associação incorreta entre os dois pontos.'
+    )
+
+    # Formalizações, checklist e atos operacionais — preenche ausência textual sem inventar fato positivo.
+    req['motivacao'] = _v145_titulo_sem_vazio(
+        req.get('motivacao'),
+        'O pedido é formalizado a partir do conjunto de registros, crimes, identificações e evidências reunidos '
+        'na investigação. A motivação considera somente o material efetivamente documentado na mesa.'
+    )
+    req['prisao_preventiva'] = _v145_titulo_sem_vazio(req.get('prisao_preventiva'), 'Não há pedido específico de prisão preventiva formalizado nesta mesa.')
+    req['artigo_juridico'] = _v145_titulo_sem_vazio(req.get('artigo_juridico'), 'Enquadramento vinculado aos crimes registrados; artigo específico não informado adicionalmente na mesa.')
+    req['ameacas'] = _v145_titulo_sem_vazio(req.get('ameacas'), 'Condição analisada conforme crimes e evidências registradas, sem declaração adicional fora do material da mesa.')
+    req['confrontos'] = _v145_titulo_sem_vazio(req.get('confrontos'), 'Condição analisada conforme ocorrências e evidências registradas, sem declaração adicional fora do material da mesa.')
+    req['dificuldade_acesso'] = _v145_titulo_sem_vazio(req.get('dificuldade_acesso'), 'Condição territorial analisada a partir da localização, GPS e vistas disponíveis na investigação.')
+    req['planejamento_resumo'] = _v145_titulo_sem_vazio(
+        req.get('planejamento_resumo'),
+        'Atos operacionais consolidados: coleta e organização de evidências; identificação de lideranças e membros; '
+        'registro de rádio e localização; análise dos crimes; documentação de baús, rotas, produção, informante e '
+        'residência quando disponíveis; conferência final e arquivamento do material no dossiê.'
+    )
+    req['mandado_resumo'] = _v145_titulo_sem_vazio(
+        req.get('mandado_resumo'),
+        'O procedimento reúne as informações necessárias à atuação investigativa e à pacificação, com preservação '
+        'do material probatório, identificação dos envolvidos, análise dos pontos operacionais e registro das '
+        'evidências disponíveis. Qualquer diligência complementar depende do que estiver formalmente registrado na mesa.'
+    )
+    return {str(k): _v145_limpar_texto(v, 5000) for k, v in req.items()}
+
+
+# Fechamento legado: não bloqueia mais por quantidade mínima de mídia/mensagens.
+def _v110_pdf_preflight_dados(dados: Dict[str, Any]) -> List[str]:
+    return []
+
+
+def _v110_pdf_preflight_arquivo(caminho: Path) -> List[str]:
+    caminho = Path(caminho)
+    erros: List[str] = []
+    if not caminho.exists() or caminho.stat().st_size < 4000:
+        return ['PDF não foi gerado corretamente.']
+    if fitz is not None:
+        try:
+            doc = fitz.open(str(caminho))
+            try:
+                if len(doc) < 10:
+                    erros.append(f'PDF possui apenas {len(doc)} página(s); estrutura institucional parece incompleta.')
+            finally:
+                doc.close()
+        except Exception as erro:
+            erros.append(f'Falha ao abrir o PDF gerado: {type(erro).__name__}: {erro}')
+    return erros
+
+
+# Checklist continua informativo, mas ausência de prova não impede encerramento.
+_V145_CHECKLIST_BASE = _v102_checklist
+
+def _v102_checklist(dados: Dict[str, Any], req: Dict[str, str]) -> List[Tuple[str, str]]:
+    linhas = list(_V145_CHECKLIST_BASE(dados, req) or [])
+    return [(str(a), 'NÃO REGISTRADO' if str(b).upper() == 'PENDENTE' else str(b)) for a, b in linhas]
+
+
+# ---------- payload profissional atual e mesas já existentes com estado ----------
+def _v145_enriquecer_payload(dados: Dict[str, Any], payload: Dict[str, Any], estado: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    req = dict(dados.get('requisitos_pacificacao') or _v110_preparar_requisitos(dados))
+    meta = dict(payload.get('meta') or {})
+    meta['pedido_numero'] = req.get('pedido_numero') or 'Não informado'
+    meta['pedido_data'] = req.get('data_expedicao') or 'Não informado'
+    meta['pedido_requerente'] = req.get('requerente') or 'Não informado'
+    meta['pedido_local'] = req.get('endereco_exato') or req.get('local_pacificacao') or meta.get('comunidade') or 'Não informado'
+    payload['meta'] = meta
+
+    secs = {str(x.get('code')): x for x in list(payload.get('sections') or []) if isinstance(x, dict)}
+    def add(codigo: str, texto: str) -> None:
+        sec = secs.get(codigo)
+        if not isinstance(sec, dict): return
+        atual = _v145_limpar_texto(sec.get('summary'), 2500)
+        extra = _v145_limpar_texto(texto, 2500)
+        if extra and normalizar_busca(extra[:80]) not in normalizar_busca(atual):
+            sec['summary'] = (atual + ('\n\n' if atual else '') + extra).strip()
+        else:
+            sec['summary'] = atual
+
+    n_lid = len(list(secs.get('02', {}).get('people') or []))
+    n_mem = len(list(secs.get('03', {}).get('people') or []))
+    add('01', f'Análise do painel e da hierarquia: o material visual foi relacionado aos registros individuais disponíveis, com {n_lid} liderança(s) e {n_mem} membro(s) estruturado(s) nas seções próprias. O painel funciona como referência de organização interna, sem substituir as fichas nominativas.')
+    add('05', f'Detalhamento objetivo da localização: {req.get("endereco_exato") or req.get("local_pacificacao") or meta.get("comunidade")}. A leitura é complementada pelas referências de GPS e pelas vistas aéreas anexadas exclusivamente a esta seção.')
+    add('07', 'Contextualização: as imagens desta seção correspondem ao ponto de armazenamento destinado à liderança e, quando registrada, à referência de entrada/acesso do mesmo local.')
+    add('08', 'Contextualização: as imagens desta seção correspondem ao ponto de armazenamento destinado aos membros e, quando registrada, à referência de entrada/acesso do mesmo local. O conteúdo permanece separado do baú da liderança.')
+    add('09', 'Contexto operacional: esta seção trata somente da rota de farm, relacionando o ponto/NPC registrado e a respectiva referência de localização, sem incorporar material da rota de produção.')
+    add('10', 'Contexto operacional: esta seção trata somente da rota de produção/fabricação, relacionando o ponto/NPC registrado e a respectiva referência de localização. Farm, ingredientes e produto final permanecem em seus tópicos próprios.')
+    add('11', 'Produção e fabricação: os insumos e o produto final são apresentados em grupos independentes. A seção registra somente o que foi visualmente documentado, evitando caracteres soltos, mensagens administrativas ou mistura com localização e farm.')
+    add('13', 'Formalização final do item: a residência é registrada como referência investigativa vinculada ao líder somente na extensão demonstrada pelas imagens e informações existentes nesta seção.')
+
+    # Sanitização para remover qualquer caractere perdido/ruído textual sem tocar nas imagens.
+    for sec in list(payload.get('sections') or []):
+        if not isinstance(sec, dict): continue
+        sec['summary'] = _v145_limpar_texto(sec.get('summary'), 3200)
+        if 'extra_text' in sec:
+            sec['extra_text'] = _v145_limpar_texto(sec.get('extra_text'), 3200)
+        for crime in list(sec.get('crimes') or []):
+            if isinstance(crime, dict):
+                crime['descricao'] = _v145_limpar_texto(crime.get('descricao'), 900)
+    payload['revisao_conteudo'] = V145_DOSSIE_REVISAO
+    return payload
+
+
+# Validação do payload passa a ser estrutural, não quantitativa.
+def _v129_validar_payload(payload: Dict[str, Any]) -> List[str]:
+    erros: List[str] = []
+    if not isinstance(payload, dict):
+        return ['payload do dossiê ausente']
+    secoes = {str(s.get('code')): s for s in list(payload.get('sections') or []) if isinstance(s, dict)}
+    for codigo in [f'{i:02d}' for i in range(1, 14)]:
+        if codigo not in secoes:
+            erros.append(f'seção {codigo} ausente')
+    return erros
+
+
+_V145_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V145_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    dados['requisitos_pacificacao'] = _v110_preparar_requisitos(dados)
+    try:
+        estado = _v116_estado(int(canal.id), False) if isinstance(canal, discord.TextChannel) else None
+        if isinstance(estado, dict):
+            _v117_migrar_estado(estado)
+            estado_dados = estado.get('dados') if isinstance(estado.get('dados'), dict) else {}
+            # Retroativo: qualquer mesa que JÁ tenha estado/tarefas/dados pode usar o conteúdo V145.
+            # Não cria tarefa nova em mesa antiga.
+            if estado_dados or (isinstance(estado.get('tarefas_guiadas'), dict) and estado.get('tarefas_guiadas')):
+                payload = dados.get('dossie_v124')
+                if not isinstance(payload, dict):
+                    payload = _v129_payload_profissional(dados, estado, int(canal.id))
+                dados['dossie_v124'] = _v145_enriquecer_payload(dados, payload, estado)
+                dados['gerador_dossie'] = 'V145_MODELO_APROVADO_CONTEUDO_ENRIQUECIDO'
+        if isinstance(dados.get('dossie_v124'), dict):
+            dados['dossie_v124'] = _v145_enriquecer_payload(dados, dados['dossie_v124'], estado if isinstance(estado, dict) else None)
+    except Exception as erro:
+        traceback.print_exc()
+        try: await enviar_log(f'⚠️ V145 enriquecer dossiê mesa {getattr(canal,"id",0)}: {type(erro).__name__}: {erro}')
+        except Exception: pass
+    return dados
+
+
+# ---------- conclusão/formalização final, sem mudar o desenho da página ----------
+def _v132_conclusao(dados: Dict[str, Any]) -> str:
+    processo = str(dados.get('processo') or 'Não informado')
+    operacao = str(dados.get('nome_operacao') or dados.get('nome') or 'operação investigativa')
+    comunidade = str(dados.get('comunidade') or 'organização investigada')
+    return (
+        f'A investigação vinculada ao processo {processo}, referente à {operacao} e à organização {comunidade}, '
+        'teve seu material consolidado após conferência administrativa dos registros existentes. O encerramento '
+        'formaliza os atos operacionais praticados na mesa — coleta, organização, vinculação, análise e consolidação '
+        'das informações e evidências disponíveis — e registra a situação dos itens do checklist final. A ausência '
+        'de quantidade mínima de mensagens ou provas não produz fato novo: itens sem material permanecem identificados '
+        'como não registrados, enquanto todo conteúdo efetivamente anexado conserva vínculo com sua seção de origem. '
+        'O documento é arquivado como material reservado da DICOR e pode ser consultado ou reaberto conforme necessidade operacional.'
+    )
+
+
+# =============================================================
+# TAREFAS V145 — sem mínimo quantitativo e com REABRIR TAREFA
+# =============================================================
+
+def _v145_contexto_tarefa(interaction: discord.Interaction) -> Tuple[Optional[discord.TextChannel], Optional[Dict[str, Any]], int, int]:
+    canal = None
+    if isinstance(getattr(interaction, 'channel', None), discord.Thread):
+        pai = getattr(interaction.channel, 'parent', None)
+        if isinstance(pai, discord.TextChannel): canal = pai
+    elif isinstance(getattr(interaction, 'channel', None), discord.TextChannel):
+        canal = interaction.channel
+    if canal is None:
+        return None, None, 0, 1
+    estado = _v116_estado(int(canal.id), False)
+    if not isinstance(estado, dict):
+        return canal, None, 0, 1
+    _v117_migrar_estado(estado)
+    # Compatibilidade retroativa somente quando a mesa já possui tarefas/estado guiado.
+    tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+    if not tarefas and not _v122_mesa_tarefas_habilitada(int(canal.id)):
+        return canal, None, 0, 1
+    item = _v117_item_do_topico(interaction.channel) if isinstance(interaction.channel, discord.Thread) else int(estado.get('item') or 0)
+    if not item:
+        item = int(estado.get('item') or 1)
+    etapa = _v117_etapa_item(estado, item)
+    conteudo = str(getattr(getattr(interaction, 'message', None), 'content', '') or '')
+    m = re.search(r'ETAPA\s+(1|2)/2', conteudo, flags=re.I)
+    if m and item in _V117_ITENS_DUAS_ETAPAS:
+        etapa = int(m.group(1))
+    return canal, estado, int(item), int(etapa)
+
+
+def _v122_texto_tarefa_guiada(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> str:
+    _v117_migrar_estado(estado)
+    tarefas = estado.setdefault('tarefas_guiadas', {})
+    chave = f'{int(item)}:{int(etapa)}'
+    registro = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+    mesa = buscar_mesa_por_canal(int(canal.id)) or {}
+    autor_id = int(mesa.get('autor_id') or 0) if isinstance(mesa, dict) else 0
+    criador = f'<@{autor_id}>' if autor_id else 'Não identificado'
+    etapa_txt = f'\n**ETAPA {int(etapa)}/2**' if int(item) in _V117_ITENS_DUAS_ETAPAS else ''
+    responsavel_id = int((registro or {}).get('responsavel_id') or (registro or {}).get('finalizada_por_id') or 0)
+    responsavel_txt = f'\n**Responsável:** <@{responsavel_id}>' if responsavel_id else ''
+    faltas = _v117_faltando_item(estado, int(item), int(etapa))
+    informativo = '; '.join(faltas[:4]) if faltas else 'Nenhuma pendência informativa detectada.'
+    return (
+        f'🎯 **TAREFA GUIADA — ITEM {int(item)} — {_v116_item_titulo(int(item))}**\n\n'
+        f'**Tarefa:** {_v116_item_titulo(int(item))}{etapa_txt}\n'
+        f'**Status:** {_v122_status_tarefa_guiada(registro)}{responsavel_txt}\n'
+        f'**Mesa criada por:** {criador}\n\n'
+        f'**Conferência informativa:** {informativo}\n'
+        '> Não existe quantidade mínima de mensagens ou provas para finalizar. Envie o que estiver disponível e use **Finalizar tarefa** quando considerar o item pronto.'
+    )
+
+
+class V145ReabrirTarefaView(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label='Reabrir tarefa', emoji='↩️', style=discord.ButtonStyle.secondary, custom_id='dic_v145_tarefa_reabrir', row=0)
+    async def reabrir(self, interaction: discord.Interaction, button: Button):
+        if not await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='v145.reabrir'):
+            return
+        canal, estado, item, etapa = _v145_contexto_tarefa(interaction)
+        if canal is None or estado is None or not item:
+            return await _v127_safe_send(interaction, '❌ Esta tarefa não possui estado guiado recuperável.', contexto='v145.reabrir')
+        lock = _v116_lock(int(canal.id))
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=5.0)
+        except Exception:
+            return await _v127_safe_send(interaction, '⏳ A mesa está processando outra ação. Tente novamente em alguns segundos.', contexto='v145.reabrir.lock')
+        try:
+            estado = _v116_estado(int(canal.id), True) or estado
+            _v117_migrar_estado(estado)
+            tarefas = estado.setdefault('tarefas_guiadas', {})
+            chave = f'{int(item)}:{int(etapa)}'
+            reg = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+            status = str(reg.get('status') or '').upper()
+            concluida_item = str(item) in (estado.get('concluidos') or {})
+            autorizado = False
+            try: autorizado = bool(usuario_e_administrador(interaction.user))
+            except Exception: autorizado = False
+            finalizador = int(reg.get('finalizada_por_id') or 0)
+            if concluida_item and not autorizado:
+                return await _v127_safe_send(interaction, '❌ Tarefa já concluída: somente Inspetor+ pode reabri-la.', contexto='v145.reabrir.permissao')
+            if status == 'AGUARDANDO_CONCLUSAO' and not autorizado and finalizador and finalizador != int(interaction.user.id):
+                return await _v127_safe_send(interaction, '❌ Somente quem finalizou a tarefa ou Inspetor+ pode reabri-la agora.', contexto='v145.reabrir.permissao')
+            if not concluida_item and status not in {'AGUARDANDO_CONCLUSAO','CONCLUIDA'}:
+                return await _v127_safe_send(interaction, 'ℹ️ Esta tarefa já está aberta para receber material.', contexto='v145.reabrir')
+
+            estado.setdefault('concluidos', {}).pop(str(item), None)
+            estado['status'] = 'ATIVA'
+            estado.pop('concluida_em', None)
+            estado['item'] = int(item)
+            if item in _V117_ITENS_DUAS_ETAPAS:
+                estado.setdefault('etapas_por_item', {})[str(item)] = int(etapa)
+                estado['etapa'] = int(etapa)
+                # Se a etapa 1 for reaberta, a etapa 2 deixa de ser considerada concluída até nova confirmação.
+                if int(etapa) == 1:
+                    reg2 = tarefas.get(f'{int(item)}:2') if isinstance(tarefas.get(f'{int(item)}:2'), dict) else None
+                    if isinstance(reg2, dict): reg2['status'] = 'ATIVA'
+            else:
+                estado['etapa'] = 1
+            reg.update({'item':int(item),'etapa':int(etapa),'status':'ATIVA','reaberta_por_id':int(interaction.user.id),'reaberta_em':agora_br()})
+            reg.pop('concluida_em', None); reg.pop('finalizada_em', None); reg.pop('finalizada_por_id', None)
+            tarefas[chave] = reg
+            _v116_gravar_estado(estado)
+        finally:
+            if lock.locked(): lock.release()
+        try:
+            await interaction.message.edit(content=_v122_texto_tarefa_guiada(canal, estado, item, etapa), view=V122TarefaGuiadaView())
+        except Exception: pass
+        try: await _v116_atualizar_painel(canal, estado)
+        except Exception: pass
+        return await _v127_safe_send(interaction, f'↩️ **ITEM {item} — {_v116_item_titulo(item)}** reaberto. Nenhuma evidência anterior foi apagada.', contexto='v145.reabrir')
+
+
+async def _v145_marcar_tarefa_concluida(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
+    _v117_migrar_estado(estado)
+    tarefas = estado.setdefault('tarefas_guiadas', {})
+    chave = f'{int(item)}:{int(etapa)}'
+    reg = tarefas.get(chave) if isinstance(tarefas.get(chave), dict) else {}
+    topico = await _v116_topico_item(canal, int(item))
+    if topico is None: return
+    mid = int(reg.get('mensagem_id') or 0)
+    if not mid:
+        existente = await _v117_localizar_tarefa_existente(topico, int(item), int(etapa)); mid = int(existente.id) if existente else 0
+    if mid:
+        etapa_txt = f' • ETAPA {int(etapa)}/2' if int(item) in _V117_ITENS_DUAS_ETAPAS else ''
+        msg = await _v116_editar_mensagem_segura(topico, mid, content=f'✅ **CONCLUÍDO — ITEM {int(item)}: {_v116_item_titulo(int(item))}{etapa_txt}**\n> Use **Reabrir tarefa** se precisar acrescentar ou corrigir material.', view=V145ReabrirTarefaView())
+        if msg is not None:
+            reg.update({'mensagem_id':int(msg.id),'topico_id':int(topico.id),'item':int(item),'etapa':int(etapa),'status':'CONCLUIDA','concluida_em':agora_br()})
+            tarefas[chave] = reg
+    _v116_gravar_estado(estado)
+
+
+# Substitui a função usada pelo fluxo de conclusão, preservando etapas 1/2 mas sem mínimo quantitativo.
+async def _v117_marcar_tarefa_concluida(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> None:
+    return await _v145_marcar_tarefa_concluida(canal, estado, item, etapa)
+
+
+async def _v145_concluir_item_sem_minimo(canal: discord.TextChannel, estado: Dict[str, Any], item: int) -> Tuple[bool, str]:
+    _v117_migrar_estado(estado); item=int(item)
+    if not 1 <= item <= 13: return False, '❌ Não consegui identificar a tarefa.'
+    if str(item) in (estado.get('concluidos') or {}): return True, f'✅ Item {item} já está concluído.'
+    etapa = _v117_etapa_item(estado,item)
+    if item in _V117_ITENS_DUAS_ETAPAS and etapa == 1:
+        await _v145_marcar_tarefa_concluida(canal,estado,item,1)
+        estado.setdefault('etapas_por_item',{})[str(item)] = 2
+        estado.setdefault('rascunhos_por_item',{})[str(item)] = {}
+        _v117_sincronizar_item_referencia(estado); _v116_gravar_estado(estado)
+        await _v117_publicar_tarefa_item(canal,estado,item,nova=True); await _v116_atualizar_painel(canal,estado)
+        return True, f'✅ ITEM {item} — ETAPA 1/2 concluída.\n🔓 **ETAPA 2/2 liberada no mesmo tópico.**'
+    await _v145_marcar_tarefa_concluida(canal,estado,item,etapa)
+    estado.setdefault('concluidos',{})[str(item)]={'concluido_em':agora_br(),'etapa_final':etapa,'versao':145}
+    estado.setdefault('rascunhos_por_item',{})[str(item)]={}
+    _v117_sincronizar_item_referencia(estado)
+    terminou=len(estado.get('concluidos') or {})>=13
+    if terminou:
+        estado['status']='CONCLUIDA'; estado['item']=14; estado['etapa']=1; estado['concluida_em']=agora_br()
+    _v116_gravar_estado(estado); await _v116_atualizar_painel(canal,estado)
+    if terminou:
+        try: await _v116_auditoria_final(canal,estado)
+        except Exception: pass
+        return True,f'✅ ITEM {item} concluído.\n🏁 **Todos os 13 itens foram concluídos.**'
+    return True,f'✅ ITEM {item} — {_v116_item_titulo(item)} concluído.'
+
+
+class V145TarefaGuiadaImpl(View):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label='Finalizar tarefa',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_v122_tarefa_finalizar',row=0)
+    async def finalizar(self,interaction:discord.Interaction,button:Button):
+        if not await _v127_safe_defer(interaction,ephemeral=True,thinking=True,contexto='v145.finalizar'): return
+        canal,estado,item,etapa=_v145_contexto_tarefa(interaction)
+        if canal is None or estado is None: return await _v127_safe_send(interaction,'❌ Esta tarefa não está vinculada a uma mesa guiada existente.',contexto='v145.finalizar')
+        lock=_v116_lock(int(canal.id))
+        try: await asyncio.wait_for(lock.acquire(),timeout=5.0)
+        except Exception: return await _v127_safe_send(interaction,'⏳ Mesa ocupada; tente novamente.',contexto='v145.finalizar.lock')
+        try:
+            estado=_v116_estado(int(canal.id),True) or estado; _v117_migrar_estado(estado); tarefas=estado.setdefault('tarefas_guiadas',{}); chave=f'{item}:{etapa}'; reg=tarefas.get(chave) if isinstance(tarefas.get(chave),dict) else {}
+            if str(item) in (estado.get('concluidos') or {}): return await _v127_safe_send(interaction,'✅ Esta tarefa já foi concluída. Use **Reabrir tarefa** se precisar alterá-la.',contexto='v145.finalizar')
+            reg.update({'item':item,'etapa':etapa,'status':'AGUARDANDO_CONCLUSAO','finalizada_por_id':int(interaction.user.id),'finalizada_em':agora_br(),'versao_interacao':145}); tarefas[chave]=reg; _v116_gravar_estado(estado)
+        finally:
+            if lock.locked(): lock.release()
+        try: await interaction.message.edit(content=_v122_texto_tarefa_guiada(canal,estado,item,etapa),view=V122TarefaGuiadaView())
+        except Exception: pass
+        return await _v127_safe_send(interaction,'✅ Tarefa finalizada sem exigência de quantidade mínima. Agora aguarda conclusão por Inspetor+.',contexto='v145.finalizar')
+
+    @discord.ui.button(label='Concluir tarefa',emoji='🛡️',style=discord.ButtonStyle.primary,custom_id='dic_v122_tarefa_concluir',row=0)
+    async def concluir(self,interaction:discord.Interaction,button:Button):
+        if not await _v127_safe_defer(interaction,ephemeral=True,thinking=True,contexto='v145.concluir'): return
+        try:
+            if not usuario_e_administrador(interaction.user): return await _v127_safe_send(interaction,'❌ Somente Inspetor+ pode concluir tarefas.',contexto='v145.concluir')
+        except Exception: return await _v127_safe_send(interaction,'❌ Não consegui validar sua permissão.',contexto='v145.concluir')
+        canal,estado,item,etapa=_v145_contexto_tarefa(interaction)
+        if canal is None or estado is None: return await _v127_safe_send(interaction,'❌ Tarefa sem estado guiado.',contexto='v145.concluir')
+        lock=_v116_lock(int(canal.id))
+        try: await asyncio.wait_for(lock.acquire(),timeout=5.0)
+        except Exception: return await _v127_safe_send(interaction,'⏳ Mesa ocupada; tente novamente.',contexto='v145.concluir.lock')
+        try:
+            estado=_v116_estado(int(canal.id),True) or estado; _v117_migrar_estado(estado); tarefas=estado.setdefault('tarefas_guiadas',{}); chave=f'{item}:{etapa}'; reg=tarefas.get(chave) if isinstance(tarefas.get(chave),dict) else {}
+            if str(item) in (estado.get('concluidos') or {}): return await _v127_safe_send(interaction,'✅ Esta tarefa já foi concluída.',contexto='v145.concluir')
+            if str(reg.get('status') or '').upper()!='AGUARDANDO_CONCLUSAO': return await _v127_safe_send(interaction,'⚠️ Clique primeiro em **Finalizar tarefa**.',contexto='v145.concluir')
+            ok,texto=await _v145_concluir_item_sem_minimo(canal,estado,item)
+        finally:
+            if lock.locked(): lock.release()
+        return await _v127_safe_send(interaction,texto,contexto='v145.concluir')
+
+    @discord.ui.button(label='Reabrir tarefa',emoji='↩️',style=discord.ButtonStyle.secondary,custom_id='dic_v145_tarefa_reabrir',row=0)
+    async def reabrir(self,interaction:discord.Interaction,button:Button):
+        view=V145ReabrirTarefaView(); alvo=next((x for x in view.children if getattr(x,'custom_id',None)=='dic_v145_tarefa_reabrir'),None)
+        if alvo and callable(getattr(alvo,'callback',None)): return await alvo.callback(interaction)
+
+
+# O router crítico existente passa a executar a implementação V145 para os dois botões antigos.
+_CRITICAL_TASK_VIEW_IMPL = V145TarefaGuiadaImpl
+
+
+class V122TarefaGuiadaView(View):
+    """View persistente V145 usada em cards existentes e novos."""
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label='Finalizar tarefa',emoji='✅',style=discord.ButtonStyle.green,custom_id='dic_v122_tarefa_finalizar',row=0)
+    async def finalizar(self,interaction:discord.Interaction,button:Button):
+        if not _critical_claim_interaction(interaction): return
+        await _critical_executar_tarefa(interaction,'dic_v122_tarefa_finalizar')
+    @discord.ui.button(label='Concluir tarefa',emoji='🛡️',style=discord.ButtonStyle.primary,custom_id='dic_v122_tarefa_concluir',row=0)
+    async def concluir(self,interaction:discord.Interaction,button:Button):
+        if not _critical_claim_interaction(interaction): return
+        await _critical_executar_tarefa(interaction,'dic_v122_tarefa_concluir')
+    @discord.ui.button(label='Reabrir tarefa',emoji='↩️',style=discord.ButtonStyle.secondary,custom_id='dic_v145_tarefa_reabrir',row=0)
+    async def reabrir(self,interaction:discord.Interaction,button:Button):
+        view=V145ReabrirTarefaView(); alvo=next((x for x in view.children if getattr(x,'custom_id',None)=='dic_v145_tarefa_reabrir'),None)
+        if alvo and callable(getattr(alvo,'callback',None)): await alvo.callback(interaction)
+    async def on_error(self,interaction,error,item): await _v127_view_on_error(self,interaction,error,item)
+
+
+async def _v145_reabrir_fallback(interaction: discord.Interaction) -> None:
+    try:
+        if getattr(interaction,'type',None)!=discord.InteractionType.component: return
+        if str((getattr(interaction,'data',{}) or {}).get('custom_id') or '')!='dic_v145_tarefa_reabrir': return
+        await asyncio.sleep(0.45)
+        if _v127_response_done(interaction): return
+        view=V145ReabrirTarefaView(); alvo=next((x for x in view.children if getattr(x,'custom_id',None)=='dic_v145_tarefa_reabrir'),None)
+        if alvo and callable(getattr(alvo,'callback',None)): await alvo.callback(interaction)
+    except Exception as erro:
+        await _v127_log_interaction_error(interaction,erro,contexto='v145.reabrir.fallback')
+
+
+bot.add_listener(_v145_reabrir_fallback,'on_interaction')
+
+
+async def _v145_reconciliar_cards_existentes() -> None:
+    """Atualiza SOMENTE cards que já existem. Nunca cria tarefa em mesa legada."""
+    await asyncio.sleep(4)
+    atualizados=0
+    try:
+        for guild in list(getattr(bot,'guilds',[]) or []):
+            for mesa in carregar_mesas() or []:
+                if not isinstance(mesa,dict): continue
+                cid=int(mesa.get('canal_id') or 0)
+                if not cid: continue
+                estado=_v116_estado(cid,False)
+                if not isinstance(estado,dict): continue
+                _v117_migrar_estado(estado); tarefas=estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'),dict) else {}
+                if not tarefas: continue
+                canal=guild.get_channel(cid)
+                if not isinstance(canal,discord.TextChannel): continue
+                for chave,reg in list(tarefas.items()):
+                    if not isinstance(reg,dict): continue
+                    mid=int(reg.get('mensagem_id') or 0); tid=int(reg.get('topico_id') or 0); item=int(reg.get('item') or str(chave).split(':')[0] or 0); etapa=int(reg.get('etapa') or 1)
+                    if not mid or not tid or not item: continue
+                    topico=guild.get_thread(tid)
+                    if topico is None:
+                        try: topico=await guild.fetch_channel(tid)
+                        except Exception: topico=None
+                    if not isinstance(topico,discord.Thread): continue
+                    try: msg=await topico.fetch_message(mid)
+                    except Exception: continue
+                    status=str(reg.get('status') or '').upper()
+                    if status=='CONCLUIDA':
+                        etapa_txt=f' • ETAPA {etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
+                        conteudo=f'✅ **CONCLUÍDO — ITEM {item}: {_v116_item_titulo(item)}{etapa_txt}**\n> Use **Reabrir tarefa** se precisar acrescentar ou corrigir material.'
+                        await msg.edit(content=conteudo,view=V145ReabrirTarefaView())
+                    else:
+                        await msg.edit(content=_v122_texto_tarefa_guiada(canal,estado,item,etapa),view=V122TarefaGuiadaView())
+                    atualizados+=1
+        print(f'✅ V145 tarefas retroativas: {atualizados} card(s) existentes atualizados; nenhuma tarefa nova criada em mesa antiga.',flush=True)
+    except Exception as erro:
+        traceback.print_exc(); print(f'⚠️ V145 reconciliação de cards: {type(erro).__name__}: {erro}',flush=True)
+
+
+@bot.listen('on_ready')
+async def _v145_on_ready():
+    try:
+        bot.add_view(V122TarefaGuiadaView()); bot.add_view(V145ReabrirTarefaView())
+    except Exception: pass
+    asyncio.create_task(_v145_reconciliar_cards_existentes(),name='v145-reconciliar-tarefas-existentes')
+
+
+print('✅ V145 carregada — modelo do dossiê preservado; conteúdo revisado (pedido, painel/hierarquia, localização, produção, baús e formalizações); fechamento/conclusão sem mínimo quantitativo; Reabrir tarefa ativo e retroativo em cards existentes.',flush=True)
 
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
