@@ -64695,5 +64695,431 @@ print(
     flush=True,
 )
 
+
+# =============================================================
+# V147 — LOCAL DA PACIFICAÇÃO 100% MANUAL NO FLUXO DE FECHAMENTO
+# Regras:
+# - NÃO altera o modelo visual V131/V133;
+# - ao clicar em Fechar Mesa, exibe um painel intermediário com botão para informar/editar o local;
+# - o local é persistido por canal/mesa e funciona em mesas atuais e antigas;
+# - o dossiê usa SOMENTE o valor manual para "Local da Pacificação";
+# - nunca reutiliza texto de tópico, OCR, tarefa guiada, localização ou fallback automático nesse campo;
+# - a geração/encerramento fica bloqueada enquanto o local manual não estiver preenchido.
+# =============================================================
+
+V147_LOCAL_PACIFICACAO_JSON = DATA_DIR / 'local_pacificacao_manual.json'
+V147_LOCAL_PACIFICACAO_VERSAO = 'V147 local da pacificação manual no fechamento'
+
+
+def _v147_local_limpo(valor: Any, limite: int = 500) -> str:
+    txt = str(valor or '').replace('\r', ' ').replace('\n', ' ').replace('\x00', ' ')
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    # Blindagem: este campo nunca pode carregar texto administrativo de tarefas.
+    if not txt:
+        return ''
+    norm = _v146_norm(txt) if '_v146_norm' in globals() else normalizar_busca(txt)
+    proibidos = (
+        'tarefa guiada', 'checklist atual', 'finalizar tarefa', 'concluir tarefa',
+        'mesa criada por', 'etapa 1 2', 'etapa 2 2', 'ingredientes e produtos',
+        'gerenciamento de tarefas',
+    )
+    if any((_v146_norm(p) if '_v146_norm' in globals() else normalizar_busca(p)) in norm for p in proibidos):
+        return ''
+    return txt[:max(1, int(limite))]
+
+
+def _v147_local_registros() -> Dict[str, Any]:
+    try:
+        dados = _carregar_dict_json(V147_LOCAL_PACIFICACAO_JSON)
+        return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v147_local_get(mesa_id: int) -> str:
+    mesa_id = int(mesa_id or 0)
+    if not mesa_id:
+        return ''
+    # Fonte primária: arquivo próprio, para não ativar/migrar tarefas de mesa antiga.
+    try:
+        todos = _v147_local_registros()
+        item = todos.get(str(mesa_id))
+        if isinstance(item, dict):
+            valor = _v147_local_limpo(item.get('local'))
+            if valor:
+                return valor
+        elif isinstance(item, str):
+            valor = _v147_local_limpo(item)
+            if valor:
+                return valor
+    except Exception:
+        pass
+    # Compatibilidade: se a mesa já possui estado guiado, também reconhece o espelho salvo nele.
+    try:
+        estado = _v116_estado(mesa_id, False)
+        if isinstance(estado, dict):
+            dados = estado.get('dados') if isinstance(estado.get('dados'), dict) else {}
+            return _v147_local_limpo(dados.get('local_pacificacao_manual'))
+    except Exception:
+        pass
+    return ''
+
+
+def _v147_local_set(mesa_id: int, local: str, usuario: Optional[Any]=None) -> str:
+    mesa_id = int(mesa_id or 0)
+    valor = _v147_local_limpo(local)
+    if not mesa_id:
+        raise ValueError('mesa/canal inválido')
+    if not valor:
+        raise ValueError('informe um local válido da pacificação')
+
+    todos = _v147_local_registros()
+    todos[str(mesa_id)] = {
+        'local': valor,
+        'atualizado_em': agora_br(),
+        'atualizado_por_id': int(getattr(usuario, 'id', 0) or 0),
+        'atualizado_por_nome': str(getattr(usuario, 'display_name', '') or getattr(usuario, 'name', '') or ''),
+    }
+    _salvar_dict_json(V147_LOCAL_PACIFICACAO_JSON, todos)
+
+    # Espelha no estado apenas quando ele JÁ existe. Nunca cria tarefa/estado novo em mesa antiga.
+    try:
+        estado = _v116_estado(mesa_id, False)
+        if isinstance(estado, dict):
+            dados = estado.setdefault('dados', {})
+            dados['local_pacificacao_manual'] = valor
+            _v116_gravar_estado(estado)
+    except Exception:
+        traceback.print_exc()
+    return valor
+
+
+class V147LocalPacificacaoModal(Modal):
+    def __init__(self, mesa_id: int, valor_atual: str=''):
+        super().__init__(title='Local da Pacificação', timeout=300)
+        self.mesa_id = int(mesa_id or 0)
+        self.local_input = TextInput(
+            label='Local da Pacificação',
+            placeholder='Ex.: Complexo Elements — acesso principal pela região norte',
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+            default=_v147_local_limpo(valor_atual)[:500] or None,
+        )
+        self.add_item(self.local_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            valor = _v147_local_set(self.mesa_id, str(self.local_input.value or ''), interaction.user)
+            await interaction.response.send_message(
+                '✅ **Local da Pacificação salvo.**\n'
+                f'📍 {valor}\n\n'
+                'Volte ao painel de fechamento e clique em **Continuar fechamento**.',
+                ephemeral=True,
+            )
+            try:
+                await enviar_log(
+                    f'✅ V147 local pacificação definido | mesa={self.mesa_id} | '
+                    f'user={getattr(interaction.user,"id",0)} | local={valor[:180]}'
+                )
+            except Exception:
+                pass
+        except Exception as erro:
+            traceback.print_exc()
+            msg = f'❌ Não foi possível salvar o Local da Pacificação: {erro}'
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+
+class V147PrepararFechamentoView(View):
+    def __init__(self, mesa_id: int, dados_mesa: Optional[Dict[str, Any]]=None):
+        super().__init__(timeout=300)
+        self.mesa_id = int(mesa_id or 0)
+        self.dados_mesa = dict(dados_mesa or {})
+
+    @discord.ui.button(
+        label='Definir / Editar Local',
+        emoji='📍',
+        style=discord.ButtonStyle.primary,
+        custom_id='dic_v147_local_pacificacao',
+        row=0,
+    )
+    async def definir_local(self, interaction: discord.Interaction, button: Button):
+        atual = _v147_local_get(self.mesa_id)
+        await interaction.response.send_modal(V147LocalPacificacaoModal(self.mesa_id, atual))
+
+    @discord.ui.button(
+        label='Continuar fechamento',
+        emoji='✅',
+        style=discord.ButtonStyle.green,
+        custom_id='dic_v147_continuar_fechamento',
+        row=0,
+    )
+    async def continuar(self, interaction: discord.Interaction, button: Button):
+        local = _v147_local_get(self.mesa_id)
+        if not local:
+            return await interaction.response.send_message(
+                '📍 **Informe primeiro o Local da Pacificação.**\n'
+                'Use o botão **Definir / Editar Local** e depois tente novamente.',
+                ephemeral=True,
+            )
+        dados = dict(self.dados_mesa or {})
+        dados['local_pacificacao_manual'] = local
+        req = dict(dados.get('requisitos_pacificacao') or {})
+        req['local_pacificacao'] = local
+        req['endereco_exato'] = local
+        dados['requisitos_pacificacao'] = req
+        self.dados_mesa = dados
+        try:
+            await interaction.response.edit_message(
+                content=(
+                    '⚠️ **Confirmação DICOR**\n\n'
+                    f'📍 **Local da Pacificação:** {local}\n\n'
+                    'As tarefas obrigatórias estão concluídas. Deseja encerrar esta mesa e consolidar o Dossiê Operacional?'
+                ),
+                view=ConfirmacaoFecharMesaView(dados),
+            )
+        except Exception:
+            traceback.print_exc()
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    '✅ Local confirmado. Confirme abaixo o encerramento.',
+                    view=ConfirmacaoFecharMesaView(dados),
+                    ephemeral=True,
+                )
+
+    @discord.ui.button(
+        label='Cancelar',
+        emoji='❌',
+        style=discord.ButtonStyle.secondary,
+        custom_id='dic_v147_cancelar_pre_fechamento',
+        row=0,
+    )
+    async def cancelar(self, interaction: discord.Interaction, button: Button):
+        try:
+            await interaction.response.edit_message(
+                content='❌ Encerramento cancelado. A mesa continua aberta.',
+                view=None,
+            )
+        except Exception:
+            if not interaction.response.is_done():
+                await interaction.response.send_message('❌ Encerramento cancelado.', ephemeral=True)
+
+
+# O campo de requisitos deixa de aceitar qualquer fallback automático.
+_V147_PREPARAR_REQUISITOS_BASE = _v110_preparar_requisitos
+
+def _v110_preparar_requisitos(dados: Dict[str, Any]) -> Dict[str, str]:
+    req = dict(_V147_PREPARAR_REQUISITOS_BASE(dados) or {})
+    manual = _v147_local_limpo(dados.get('local_pacificacao_manual'))
+    req['local_pacificacao'] = manual
+    req['endereco_exato'] = manual
+    return req
+
+
+# Injeta o valor manual na coleta final e força o payload profissional a usá-lo.
+_V147_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]]=None,
+) -> Dict[str, Any]:
+    dados = await _V147_COLETAR_BASE(
+        canal, mesa, interaction, pasta_dossie,
+        dados_confirmacao=dados_confirmacao,
+    )
+    if not isinstance(dados, dict):
+        return dados
+
+    manual = _v147_local_get(int(getattr(canal, 'id', 0) or 0))
+    # Dados enviados na confirmação também podem carregar o valor; o persistido continua sendo a fonte oficial.
+    if not manual and isinstance(dados_confirmacao, dict):
+        manual = _v147_local_limpo(dados_confirmacao.get('local_pacificacao_manual'))
+        if manual:
+            try:
+                _v147_local_set(int(canal.id), manual, interaction.user)
+            except Exception:
+                pass
+
+    dados['local_pacificacao_manual'] = manual
+    req = dict(dados.get('requisitos_pacificacao') or {})
+    req['local_pacificacao'] = manual
+    req['endereco_exato'] = manual
+    dados['requisitos_pacificacao'] = req
+
+    payload = dados.get('dossie_v124')
+    if isinstance(payload, dict):
+        # Mantém todo o modelo/conteúdo V146 e altera exclusivamente o campo de Local da Pacificação.
+        meta = dict(payload.get('meta') or {})
+        meta['pedido_local'] = manual or 'Não informado'
+        payload['meta'] = meta
+        # A seção de localização pode contextualizar o local manual sem substituir suas próprias provas/GPS.
+        for sec in list(payload.get('sections') or []):
+            if isinstance(sec, dict) and str(sec.get('code') or '').zfill(2) == '05':
+                if manual:
+                    resumo = _v146_limpar_string(sec.get('summary'), 2600)
+                    frase = f'Local da Pacificação informado manualmente no fechamento: {manual}.'
+                    if _v146_norm(frase) not in _v146_norm(resumo):
+                        sec['summary'] = (frase + ('\n\n' + resumo if resumo else '')).strip()
+                break
+        dados['dossie_v124'] = _v146_sanitizar_payload(payload)
+    dados['gerador_dossie'] = 'V147_MODELO_APROVADO_LOCAL_MANUAL'
+    return dados
+
+
+# Blindagem de geração: nunca deixa um valor automático reaparecer na capa.
+def _v147_forcar_local_manual_em_dados(dados: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(dados, dict):
+        return dados
+    manual = _v147_local_limpo(dados.get('local_pacificacao_manual'))
+    req = dict(dados.get('requisitos_pacificacao') or {})
+    req['local_pacificacao'] = manual
+    req['endereco_exato'] = manual
+    dados['requisitos_pacificacao'] = req
+    payload = dados.get('dossie_v124')
+    if isinstance(payload, dict):
+        meta = dict(payload.get('meta') or {})
+        meta['pedido_local'] = manual or 'Não informado'
+        payload['meta'] = meta
+        dados['dossie_v124'] = payload
+    return dados
+
+
+_V147_GERAR_PDF_BASE = gerar_pdf_dossie
+_V147_GERAR_DOCX_BASE = gerar_docx_dossie
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    import copy as _v147_copy
+    d = _v147_copy.deepcopy(dados) if isinstance(dados, dict) else dados
+    d = _v147_forcar_local_manual_em_dados(d)
+    return _V147_GERAR_PDF_BASE(d, caminho_pdf)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    import copy as _v147_copy
+    d = _v147_copy.deepcopy(dados) if isinstance(dados, dict) else dados
+    d = _v147_forcar_local_manual_em_dados(d)
+    return _V147_GERAR_DOCX_BASE(d, caminho_docx)
+
+
+# Todo fechamento efetivo exige que o local manual já esteja preenchido.
+_V147_FECHAR_CORE_BASE = fechar_mesa_core
+async def fechar_mesa_core(
+    interaction: discord.Interaction,
+    motivo: str='Fechada',
+    dados_confirmacao: Optional[Dict[str, Any]]=None,
+):
+    canal = getattr(interaction, 'channel', None)
+    if isinstance(canal, discord.TextChannel):
+        local = _v147_local_get(int(canal.id))
+        if not local:
+            mensagem = (
+                '📍 **Local da Pacificação ainda não foi informado.**\n'
+                'Clique novamente em **Fechar Mesa** e use **Definir / Editar Local** antes de gerar o dossiê.'
+            )
+            try:
+                return await responder_interacao(interaction, mensagem, ephemeral=True)
+            except Exception:
+                try:
+                    return await _v127_safe_send(interaction, mensagem, contexto='v147.fechar.sem_local')
+                except Exception:
+                    return None
+        dados_confirmacao = dict(dados_confirmacao or {})
+        dados_confirmacao['local_pacificacao_manual'] = local
+        req = dict(dados_confirmacao.get('requisitos_pacificacao') or {})
+        req['local_pacificacao'] = local
+        req['endereco_exato'] = local
+        dados_confirmacao['requisitos_pacificacao'] = req
+    return await _V147_FECHAR_CORE_BASE(interaction, motivo=motivo, dados_confirmacao=dados_confirmacao)
+
+
+# Substitui somente a etapa final do botão Fechar Mesa: em vez de ir direto à confirmação,
+# abre primeiro o painel de Local da Pacificação. Regras de permissão e tarefas permanecem iguais.
+async def _critical_fechar_mesa(interaction: discord.Interaction, dados_mesa: Optional[Dict[str, Any]]=None) -> None:
+    if not await _v127_safe_defer(interaction, ephemeral=True, thinking=True, contexto='v147.fechar_mesa'):
+        return
+    try:
+        canal = interaction.channel
+        if not isinstance(canal, discord.TextChannel):
+            return await _v127_safe_send(interaction, '❌ Este botão só funciona dentro de um canal de mesa.', contexto='v147.fechar_mesa')
+        if not usuario_pode_fechar_mesa(interaction.user):
+            return await _v127_safe_send(interaction, mensagem_sem_permissao_fechar_mesa(), contexto='v147.fechar_mesa')
+
+        if _v122_mesa_tarefas_habilitada(int(canal.id)) or _v118_mesa_guiada_habilitada(int(canal.id)):
+            estado = _v116_estado(int(canal.id), False)
+            if isinstance(estado, dict):
+                _v117_migrar_estado(estado)
+                if str(estado.get('status') or '').upper() != 'CONCLUIDA':
+                    item_atual = int(estado.get('item') or 1)
+                    topico = None
+                    try:
+                        topico = await asyncio.wait_for(_v116_topico_item(canal, item_atual), timeout=5.0)
+                    except Exception:
+                        topico = None
+                    destino = f'\n📌 Tópico atual: {topico.mention}' if topico else ''
+                    return await _v127_safe_send(
+                        interaction,
+                        '❌ **Ainda existem tarefas obrigatórias da investigação.**\n\n'
+                        + _v116_progresso_texto(estado)
+                        + destino
+                        + '\n\nConclua os 13 itens antes de fechar a mesa. Não há quantidade mínima de mensagens ou provas.',
+                        contexto='v147.fechar_mesa.incompleta',
+                    )
+
+        dados = dict(dados_mesa or {})
+        if not dados:
+            mesa_banco = buscar_mesa_por_canal(canal.id)
+            if mesa_banco:
+                dados = {
+                    'nome': f"OPERAÇÃO {str(mesa_banco.get('familia') or canal.name).upper()}",
+                    'comunidade': mesa_banco.get('familia', 'Mapeada em logs'),
+                    'delegado': mesa_banco.get('autor_nome', 'Superintendência DICOR'),
+                    'data_abertura': mesa_banco.get('criada_em', agora_br()),
+                    'processo': f'PF-DICOR-{canal.id}',
+                    'numero': f'INV-{str(canal.id)[-6:]}',
+                }
+        if not dados:
+            dados = {
+                'nome': canal.name.upper(),
+                'comunidade': 'Setor Mapeado em Campo',
+                'delegado': getattr(interaction.user, 'display_name', str(interaction.user)),
+                'data_abertura': agora_br(),
+                'processo': f'PF-DICOR-{canal.id}',
+                'numero': f'INV-{str(canal.id)[-6:]}',
+            }
+
+        atual = _v147_local_get(int(canal.id))
+        if atual:
+            dados['local_pacificacao_manual'] = atual
+        status = f'✅ **Local atual:** {atual}' if atual else '⚠️ **Local atual:** Não informado'
+        await _v127_safe_send(
+            interaction,
+            '📍 **PREPARAÇÃO PARA FECHAMENTO DA MESA**\n\n'
+            + status
+            + '\n\nO **Local da Pacificação é exclusivamente manual** e será usado exatamente como informado no PDF/DOCX. '
+              'Ele nunca será preenchido por texto de tópico, OCR ou tarefa guiada.\n\n'
+              'Defina ou confira o local e depois clique em **Continuar fechamento**.',
+            view=V147PrepararFechamentoView(int(canal.id), dados),
+            contexto='v147.fechar_mesa.local',
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto='v147.fechar_mesa')
+        await _v127_safe_send(interaction, '❌ O botão de fechar mesa encontrou um erro. Nada foi apagado.', contexto='v147.fechar_mesa.error')
+
+
+print(
+    '✅ V147 carregada — Local da Pacificação agora é 100% MANUAL; botão aparece após Fechar Mesa; '
+    'valor persistente por mesa; PDF/DOCX nunca puxam esse campo de tópico/OCR/tarefa; modelo V131/V133 preservado.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
