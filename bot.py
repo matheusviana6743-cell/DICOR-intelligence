@@ -65121,5 +65121,349 @@ print(
     flush=True,
 )
 
+
+# =============================================================
+# V148 — TAREFAS: ACK IMEDIATO + VIEW FINAL + THREADS ARQUIVADAS
+# Escopo restrito ao sistema de tarefas guiadas.
+# - Corrige "DICOR Intelligence não respondeu a tempo" nos botões.
+# - Reinstala os custom_id de tarefa no setup FINAL (V143 havia pulado o CORE crítico).
+# - Mantém fallback independente para cards antigos após restart/deploy.
+# - NÃO tenta editar cards dentro de threads arquivadas durante reconciliação.
+# - NÃO altera mesa, dossiê, modelo visual, provas, dados ou regras de fechamento.
+# =============================================================
+
+V148_TAREFAS_FIX = 'V148 ACK imediato + persistência final + skip archived threads'
+_V148_TASK_IDS = {
+    'dic_v122_tarefa_finalizar',
+    'dic_v122_tarefa_concluir',
+    'dic_v145_tarefa_reabrir',
+}
+
+
+def _v148_thread_ativa(topico: Any) -> bool:
+    return bool(isinstance(topico, discord.Thread) and not bool(getattr(topico, 'archived', False)))
+
+
+async def _v148_executar_interacao_tarefa(interaction: discord.Interaction, custom_id: str) -> None:
+    """ACK vem ANTES de claim/estado/I/O para nunca estourar os 3 segundos do Discord."""
+    # Primeiro ato de qualquer clique: responder/deferir.
+    if not await _v127_safe_defer(
+        interaction,
+        ephemeral=True,
+        thinking=True,
+        contexto=f'v148.{custom_id}.preack',
+    ):
+        return
+
+    # Depois do ACK, define um único dono lógico da ação.
+    if not _critical_claim_interaction(interaction):
+        return
+
+    try:
+        if custom_id in {'dic_v122_tarefa_finalizar', 'dic_v122_tarefa_concluir'}:
+            await _critical_executar_tarefa(interaction, custom_id)
+            return
+
+        if custom_id == 'dic_v145_tarefa_reabrir':
+            view = V145ReabrirTarefaView()
+            alvo = next(
+                (x for x in list(getattr(view, 'children', []) or []) if str(getattr(x, 'custom_id', '') or '') == custom_id),
+                None,
+            )
+            callback = getattr(alvo, 'callback', None)
+            if callable(callback):
+                await callback(interaction)
+                return
+            await _v127_safe_send(
+                interaction,
+                '❌ O botão de reabrir perdeu o vínculo interno. Nenhuma evidência foi alterada.',
+                contexto='v148.reabrir.sem_callback',
+            )
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto=f'v148.{custom_id}')
+        await _v127_safe_send(
+            interaction,
+            '❌ Não consegui processar esta tarefa agora. O estado e as evidências foram preservados.',
+            contexto=f'v148.{custom_id}.erro',
+        )
+
+
+class V148TarefaGuiadaView(View):
+    """Dono persistente FINAL dos três botões de tarefa."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label='Finalizar tarefa', emoji='✅', style=discord.ButtonStyle.green,
+        custom_id='dic_v122_tarefa_finalizar', row=0,
+    )
+    async def finalizar(self, interaction: discord.Interaction, button: Button):
+        await _v148_executar_interacao_tarefa(interaction, 'dic_v122_tarefa_finalizar')
+
+    @discord.ui.button(
+        label='Concluir tarefa', emoji='🛡️', style=discord.ButtonStyle.primary,
+        custom_id='dic_v122_tarefa_concluir', row=0,
+    )
+    async def concluir(self, interaction: discord.Interaction, button: Button):
+        await _v148_executar_interacao_tarefa(interaction, 'dic_v122_tarefa_concluir')
+
+    @discord.ui.button(
+        label='Reabrir tarefa', emoji='↩️', style=discord.ButtonStyle.secondary,
+        custom_id='dic_v145_tarefa_reabrir', row=0,
+    )
+    async def reabrir(self, interaction: discord.Interaction, button: Button):
+        await _v148_executar_interacao_tarefa(interaction, 'dic_v145_tarefa_reabrir')
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _v127_view_on_error(self, interaction, error, item)
+
+
+# Todas as funções antigas que consultam V122TarefaGuiadaView passam a receber a View V148.
+V122TarefaGuiadaView = V148TarefaGuiadaView
+
+
+def _v148_instalar_view_tarefas() -> Tuple[int, List[str], List[str]]:
+    """Remove apenas donos antigos desses custom_ids e instala uma única View final."""
+    removidas = 0
+    erros: List[str] = []
+
+    for view in list(getattr(bot, 'persistent_views', []) or []):
+        try:
+            ids_view = {
+                str(getattr(child, 'custom_id', '') or '')
+                for child in list(getattr(view, 'children', []) or [])
+            }
+            if ids_view & _V148_TASK_IDS:
+                bot.remove_view(view)
+                removidas += 1
+        except Exception as erro:
+            erros.append(f'remove:{type(erro).__name__}:{erro}')
+
+    # Limpa também o roteador V13, para ele não apontar para callbacks antigos.
+    try:
+        for cid in _V148_TASK_IDS:
+            _V13_CUSTOM_IDS.discard(cid)
+            _V13_ROTAS.pop(cid, None)
+    except Exception as erro:
+        erros.append(f'rotas-clean:{type(erro).__name__}:{erro}')
+
+    try:
+        view = V148TarefaGuiadaView()
+        bot.add_view(view)
+        try:
+            _V13_VIEWS.append(view)
+        except Exception:
+            pass
+        for item in list(getattr(view, 'children', []) or []):
+            cid = str(getattr(item, 'custom_id', '') or '')
+            if not cid:
+                continue
+            _V13_CUSTOM_IDS.add(cid)
+            callback = getattr(item, 'callback', None)
+            if callable(callback):
+                _V13_ROTAS[cid] = callback
+    except Exception as erro:
+        erros.append(f'add:{type(erro).__name__}:{erro}')
+
+    ativos: List[str] = []
+    try:
+        for view in list(getattr(bot, 'persistent_views', []) or []):
+            for child in list(getattr(view, 'children', []) or []):
+                cid = str(getattr(child, 'custom_id', '') or '')
+                if cid in _V148_TASK_IDS:
+                    ativos.append(cid)
+    except Exception as erro:
+        erros.append(f'diagnostico:{type(erro).__name__}:{erro}')
+    return removidas, sorted(set(ativos)), erros
+
+
+# Fallback independente: se a ViewStore não reconhecer um card antigo, assume em 180 ms.
+async def _v148_fallback_tarefas(interaction: discord.Interaction) -> None:
+    try:
+        if getattr(interaction, 'type', None) != discord.InteractionType.component:
+            return
+        custom_id = str((getattr(interaction, 'data', {}) or {}).get('custom_id') or '')
+        if custom_id not in _V148_TASK_IDS:
+            return
+        await asyncio.sleep(0.18)
+        if _v127_response_done(interaction):
+            return
+        print(
+            f'[V148-TASK-FALLBACK] custom_id={custom_id} interaction={getattr(interaction, "id", 0)} '
+            f'channel={getattr(interaction, "channel_id", 0)}',
+            flush=True,
+        )
+        await _v148_executar_interacao_tarefa(interaction, custom_id)
+    except Exception as erro:
+        traceback.print_exc()
+        await _v127_log_interaction_error(interaction, erro, contexto='v148.task.fallback')
+
+
+try:
+    bot.remove_listener(_v148_fallback_tarefas, 'on_interaction')
+except Exception:
+    pass
+bot.add_listener(_v148_fallback_tarefas, 'on_interaction')
+
+
+# O setup V143 é rápido/local. Envolvemos APÓS V147 para garantir que os botões
+# finais sejam registrados antes de o gateway abrir, sem qualquer HTTP adicional.
+_V148_SETUP_BASE = bot.setup_hook
+async def _v148_setup_hook(self) -> None:
+    await _V148_SETUP_BASE()
+    removidas, ativos, erros = _v148_instalar_view_tarefas()
+    print(
+        f'✅ V148 SETUP TAREFAS — ativos={ativos} removidas={removidas} '
+        f'erros={erros or []}.',
+        flush=True,
+    )
+
+bot.setup_hook = _v13_types.MethodType(_v148_setup_hook, bot)
+
+
+@bot.listen('on_ready')
+async def _v148_on_ready_tarefas() -> None:
+    removidas, ativos, erros = _v148_instalar_view_tarefas()
+    print(
+        f'✅ V148 READY TAREFAS — ativos={ativos} removidas={removidas} '
+        f'erros={erros or []}.',
+        flush=True,
+    )
+
+
+# ---------- reconciliação antiga: NUNCA editar thread arquivada ----------
+async def _compat_card_tarefa_existente(canal: discord.TextChannel, estado: Dict[str, Any], item: int, etapa: int) -> bool:
+    """Atualiza somente card existente em thread ATIVA. Thread arquivada fica intocada."""
+    try:
+        tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+        reg = tarefas.get(f'{int(item)}:{int(etapa)}') if isinstance(tarefas, dict) else None
+        if not isinstance(reg, dict):
+            return False
+        mid = int(reg.get('mensagem_id') or 0)
+        tid = int(reg.get('topico_id') or 0)
+        if not mid or not tid or canal.guild is None:
+            return False
+        topico = canal.guild.get_thread(tid)
+        if topico is None:
+            try:
+                fetched = await canal.guild.fetch_channel(tid)
+                topico = fetched if isinstance(fetched, discord.Thread) else None
+            except Exception:
+                topico = None
+        if not _v148_thread_ativa(topico):
+            return False
+        try:
+            mensagem = await asyncio.wait_for(topico.fetch_message(mid), timeout=6.0)
+        except Exception:
+            return False
+        texto = _v122_texto_tarefa_guiada(canal, estado, int(item), int(etapa))
+        ok = await _v127_safe_message_edit(
+            mensagem,
+            timeout=6.0,
+            contexto=f'v148.compat_card.item{int(item)}',
+            content=texto,
+            view=V148TarefaGuiadaView(),
+        )
+        return bool(ok)
+    except Exception as erro:
+        print(
+            f'⚠️ [V148-COMPAT] card ativo não atualizado mesa={getattr(canal, "id", 0)} '
+            f'item={item}: {type(erro).__name__}: {erro}',
+            flush=True,
+        )
+        return False
+
+
+async def _v145_reconciliar_cards_existentes() -> None:
+    """Atualiza cards existentes SOMENTE em threads ativas; arquivadas não geram 50083."""
+    await asyncio.sleep(4)
+    atualizados = 0
+    arquivados_ignorados = 0
+    erros = 0
+    try:
+        for guild in list(getattr(bot, 'guilds', []) or []):
+            for mesa in carregar_mesas() or []:
+                if not isinstance(mesa, dict):
+                    continue
+                cid = int(mesa.get('canal_id') or 0)
+                if not cid:
+                    continue
+                estado = _v116_estado(cid, False)
+                if not isinstance(estado, dict):
+                    continue
+                _v117_migrar_estado(estado)
+                tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+                if not tarefas:
+                    continue
+                canal = guild.get_channel(cid)
+                if not isinstance(canal, discord.TextChannel):
+                    continue
+                for chave, reg in list(tarefas.items()):
+                    if not isinstance(reg, dict):
+                        continue
+                    try:
+                        mid = int(reg.get('mensagem_id') or 0)
+                        tid = int(reg.get('topico_id') or 0)
+                        item = int(reg.get('item') or str(chave).split(':')[0] or 0)
+                        etapa = int(reg.get('etapa') or 1)
+                    except Exception:
+                        continue
+                    if not mid or not tid or not item:
+                        continue
+                    topico = guild.get_thread(tid)
+                    if topico is None:
+                        try:
+                            fetched = await guild.fetch_channel(tid)
+                            topico = fetched if isinstance(fetched, discord.Thread) else None
+                        except Exception:
+                            topico = None
+                    if not isinstance(topico, discord.Thread):
+                        continue
+                    if bool(getattr(topico, 'archived', False)):
+                        arquivados_ignorados += 1
+                        continue
+                    try:
+                        msg = await asyncio.wait_for(topico.fetch_message(mid), timeout=6.0)
+                    except Exception:
+                        continue
+                    status = str(reg.get('status') or '').upper()
+                    if status == 'CONCLUIDA':
+                        etapa_txt = f' • ETAPA {etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
+                        conteudo = (
+                            f'✅ **CONCLUÍDO — ITEM {item}: {_v116_item_titulo(item)}{etapa_txt}**\n'
+                            '> Use **Reabrir tarefa** se precisar acrescentar ou corrigir material.'
+                        )
+                        ok = await _v127_safe_message_edit(
+                            msg, timeout=6.0, contexto='v148.reconciliar.concluida',
+                            content=conteudo, view=V145ReabrirTarefaView(),
+                        )
+                    else:
+                        ok = await _v127_safe_message_edit(
+                            msg, timeout=6.0, contexto='v148.reconciliar.ativa',
+                            content=_v122_texto_tarefa_guiada(canal, estado, item, etapa),
+                            view=V148TarefaGuiadaView(),
+                        )
+                    if ok:
+                        atualizados += 1
+                    else:
+                        erros += 1
+        print(
+            f'✅ V148 reconciliação tarefas — cards_ativos_atualizados={atualizados} '
+            f'threads_arquivadas_ignoradas={arquivados_ignorados} falhas={erros}; '
+            'nenhuma tarefa nova criada.',
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ V148 reconciliação de cards: {type(erro).__name__}: {erro}', flush=True)
+
+
+print(
+    '✅ V148 carregada — botões Finalizar/Concluir/Reabrir com ACK imediato e fallback persistente; '
+    'threads arquivadas não são mais editadas na reconciliação; mesa/dossiê V147 preservados.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
