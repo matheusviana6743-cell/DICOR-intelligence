@@ -64448,5 +64448,252 @@ async def _v145_on_ready():
 
 print('✅ V145 carregada — modelo do dossiê preservado; conteúdo revisado (pedido, painel/hierarquia, localização, produção, baús e formalizações); fechamento/conclusão sem mínimo quantitativo; Reabrir tarefa ativo e retroativo em cards existentes.',flush=True)
 
+
+# =============================================================
+# V146 — SANITIZAÇÃO FINAL DO DOSSIÊ, SEM ALTERAR O MODELO V131/V133
+# Corrige vazamento de mensagens administrativas em mesas novas e já em andamento.
+# NÃO altera moldura, cores, brasões, ordem das seções, cartões, assinaturas ou imagens.
+# =============================================================
+
+V146_DOSSIE_SANITIZER = 'V146 sanitização administrativa final'
+
+_V146_ADMIN_TERMS = (
+    'tarefa guiada',
+    'gerenciamento de tarefas',
+    'checklist atual',
+    'finalizar tarefa',
+    'concluir tarefa',
+    'reabrir tarefa',
+    'mesa criada por',
+    'clique em finalizar',
+    'clique em concluir',
+    'clique primeiro em finalizar',
+    'use finalizar tarefa',
+    'use concluir tarefa',
+    'aguarda conclusao por inspetor',
+    'aguardando conclusao',
+    'conclusao definitiva exige autorizacao',
+    'envie o material neste topico',
+    'material minimo completo',
+    'status pendente',
+    'status concluida',
+    'status concluido',
+    'etapa 1 2 completa',
+    'etapa 2 2 completa',
+)
+
+_V146_ADMIN_PREFIXES = (
+    'tarefa:', 'status:', 'checklist:', 'checklist atual:', 'mesa criada por:',
+    'responsavel:', 'etapa 1/2', 'etapa 2/2', 'etapa 1 / 2', 'etapa 2 / 2',
+)
+
+
+def _v146_norm(valor: Any) -> str:
+    try:
+        s = normalizar_busca(str(valor or ''))
+    except Exception:
+        s = str(valor or '').lower()
+    s = re.sub(r'[^a-z0-9]+', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _v146_linha_administrativa(linha: str) -> bool:
+    bruto = str(linha or '').strip()
+    if not bruto:
+        return False
+    norm = _v146_norm(bruto)
+    if not norm:
+        return False
+    if any(_v146_norm(t) in norm for t in _V146_ADMIN_TERMS):
+        return True
+    # Prefixos administrativos isolados só são removidos quando a linha realmente começa com eles.
+    low = bruto.lower().lstrip('>•-—–▪■✅🛡️↩️🎯📋📌⚠️⏳🔒 ')
+    if any(low.startswith(p) for p in _V146_ADMIN_PREFIXES):
+        return True
+    # Cabeçalhos gerados pelos cards de tarefa.
+    if re.match(r'^(concluido|concluída|concluida)\s*[-—–].*item\s+\d+', norm):
+        return True
+    if re.match(r'^item\s+\d+\s*[-—–]', norm) and ('tarefa' in norm or 'etapa' in norm):
+        return True
+    return False
+
+
+def _v146_limpar_string(valor: Any, limite: int = 6000) -> str:
+    txt = str(valor or '').replace('\r', '\n').replace('\x00', ' ')
+    linhas = []
+    for linha in txt.split('\n'):
+        if _v146_linha_administrativa(linha):
+            continue
+        # Remove fragmentos administrativos caso tenham sido concatenados na mesma linha.
+        limpo = linha
+        # Se a linha contém um marcador típico de card, conserva apenas o texto anterior ao marcador.
+        norm = _v146_norm(limpo)
+        cortes = []
+        for termo in _V146_ADMIN_TERMS:
+            tn = _v146_norm(termo)
+            if tn and tn in norm:
+                # A linha inteira já seria administrativa na maioria dos casos; por segurança, descarte.
+                limpo = ''
+                break
+        if limpo.strip():
+            linhas.append(limpo.strip())
+    txt = '\n'.join(linhas)
+    txt = re.sub(r'[\t ]+', ' ', txt)
+    txt = re.sub(r' *\n *', '\n', txt)
+    txt = re.sub(r'\n{3,}', '\n\n', txt).strip()
+    return txt[:max(0, int(limite))]
+
+
+def _v146_sanitizar_objeto(obj: Any, chave: str = '') -> Any:
+    if isinstance(obj, dict):
+        novo = {}
+        for k, v in obj.items():
+            ks = str(k)
+            # IDs, URLs, caminhos locais e hashes não são conteúdo textual do dossiê.
+            if ks.lower() in {'url','proxy_url','local','arquivo','imagem','foto','id','mensagem_id','topico_id','canal_id','guild_id','hash','sha256'}:
+                novo[k] = v
+            else:
+                novo[k] = _v146_sanitizar_objeto(v, ks)
+        return novo
+    if isinstance(obj, list):
+        return [_v146_sanitizar_objeto(x, chave) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_v146_sanitizar_objeto(x, chave) for x in obj)
+    if isinstance(obj, str):
+        return _v146_limpar_string(obj)
+    return obj
+
+
+def _v146_fallback_resumo(codigo: str, payload: Dict[str, Any]) -> str:
+    meta = payload.get('meta') if isinstance(payload.get('meta'), dict) else {}
+    org = _v146_limpar_string(meta.get('comunidade') or meta.get('organizacao') or 'organização investigada', 300)
+    bases = {
+        '01': f'O painel da {org} é apresentado como referência documental da estrutura interna observada, mantendo as identificações individuais em suas seções próprias.',
+        '02': 'Relação das lideranças identificadas na investigação, organizada por nome, RG, função/cargo e registro visual disponível.',
+        '03': 'Relação dos membros identificados na investigação, organizada por nome, RG, função/cargo e registro visual disponível.',
+        '04': 'Registro da numeração ou frequência de rádio vinculada à organização conforme informação documentada na investigação.',
+        '05': 'Localização documentada por registros do ponto, GPS e vistas aéreas disponíveis, mantidos exclusivamente nesta seção.',
+        '06': 'Crimes relacionados à organização são consolidados individualmente com as respectivas evidências registradas, sem extrapolar o material da mesa.',
+        '07': 'Registro do baú destinado à liderança e de sua referência de entrada ou acesso, conforme as evidências desta seção.',
+        '08': 'Registro do baú destinado aos membros e de sua referência de entrada ou acesso, separado do armazenamento da liderança.',
+        '09': 'Registro da rota de farm, incluindo o ponto/NPC e a referência de GPS documentados na investigação.',
+        '10': 'Registro da rota de produção, incluindo o ponto/NPC e a referência de GPS documentados na investigação.',
+        '11': 'Ingredientes e produto final são apresentados separadamente, conforme os registros visuais existentes nesta seção.',
+        '12': 'Identificação do informante e resumo operacional são apresentados somente com base nas informações efetivamente registradas.',
+        '13': 'Registro visual da residência vinculada ao líder, limitado às informações e imagens efetivamente documentadas na investigação.',
+    }
+    return bases.get(str(codigo).zfill(2), 'Conteúdo consolidado a partir dos registros válidos desta seção da investigação.')
+
+
+def _v146_sanitizar_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import copy as _v146_copy
+    if not isinstance(payload, dict):
+        return payload
+    limpo = _v146_sanitizar_objeto(_v146_copy.deepcopy(payload))
+    secoes = list(limpo.get('sections') or []) if isinstance(limpo, dict) else []
+    for sec in secoes:
+        if not isinstance(sec, dict):
+            continue
+        codigo = str(sec.get('code') or '').zfill(2)
+        resumo = _v146_limpar_string(sec.get('summary'), 3200)
+        sec['summary'] = resumo or _v146_fallback_resumo(codigo, limpo)
+        if 'extra_text' in sec:
+            sec['extra_text'] = _v146_limpar_string(sec.get('extra_text'), 3200)
+        # Crimes mantêm só a descrição real; qualquer texto de card administrativo é descartado.
+        for crime in list(sec.get('crimes') or []):
+            if isinstance(crime, dict):
+                crime['descricao'] = _v146_limpar_string(crime.get('descricao'), 1200) or 'Crime registrado na investigação; consulte as evidências vinculadas abaixo.'
+        # Campos textuais simples também passam por limpeza final.
+        if isinstance(sec.get('field_lines'), list):
+            fl = []
+            for item in sec.get('field_lines') or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    a = _v146_limpar_string(item[0], 300)
+                    b = _v146_limpar_string(item[1], 1000)
+                    if a or b:
+                        fl.append((a, b))
+                else:
+                    s = _v146_limpar_string(item, 1000)
+                    if s: fl.append(s)
+            sec['field_lines'] = fl
+    limpo['revisao_sanitizacao'] = V146_DOSSIE_SANITIZER
+    return limpo
+
+
+# Sanitiza o payload imediatamente após a coleta, inclusive em mesas antigas que já possuem tarefas/estado.
+_V146_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(canal: discord.TextChannel, mesa: Optional[Dict[str, Any]], interaction: discord.Interaction, pasta_dossie: Path, dados_confirmacao: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    dados = await _V146_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    if isinstance(dados, dict) and isinstance(dados.get('dossie_v124'), dict):
+        dados['dossie_v124'] = _v146_sanitizar_payload(dados['dossie_v124'])
+        dados['gerador_dossie'] = 'V146_MODELO_APROVADO_SANITIZADO'
+    return dados
+
+
+# Blindagem final: mesmo que um payload antigo já esteja em memória, ele é limpo antes de gerar PDF/DOCX.
+_V146_GERAR_PDF_BASE = gerar_pdf_dossie
+_V146_GERAR_DOCX_BASE = gerar_docx_dossie
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    import copy as _v146_copy
+    d = _v146_copy.deepcopy(dados) if isinstance(dados, dict) else dados
+    if isinstance(d, dict) and isinstance(d.get('dossie_v124'), dict):
+        d['dossie_v124'] = _v146_sanitizar_payload(d['dossie_v124'])
+    return _V146_GERAR_PDF_BASE(d, caminho_pdf)
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    import copy as _v146_copy
+    d = _v146_copy.deepcopy(dados) if isinstance(dados, dict) else dados
+    if isinstance(d, dict) and isinstance(d.get('dossie_v124'), dict):
+        d['dossie_v124'] = _v146_sanitizar_payload(d['dossie_v124'])
+    return _V146_GERAR_DOCX_BASE(d, caminho_docx)
+
+
+# Preflight final: mantém a checagem de estrutura, mas reporta apenas vazamento REAL após a sanitização.
+def _v123_preflight_arquivo(caminho: Path, tipo: str) -> List[str]:
+    erros: List[str] = []
+    caminho = Path(caminho)
+    tipo_norm = str(tipo or '').lower()
+    minimo = 6000 if tipo_norm == 'pdf' else 3500
+    if not caminho.exists() or caminho.stat().st_size < minimo:
+        return [f'{tipo_norm.upper()} V146 não foi gerado corretamente ou está vazio.']
+    if tipo_norm != 'pdf' or fitz is None:
+        return erros
+    try:
+        doc = fitz.open(str(caminho))
+        try:
+            if len(doc) < 15:
+                erros.append(f'PDF V146 gerou apenas {len(doc)} página(s); estrutura institucional parece incompleta.')
+            texto_pdf = '\n'.join(page.get_text('text') for page in doc)
+            normalizado = _v129_norm_preflight(texto_pdf)
+            obrigatorios = [
+                '01 painel', '02 fotos dos lideres', '03 fotos dos membros', '04 radio',
+                '05 localizacao', '06 crimes da comunidade', '07 bau de lider',
+                '08 bau de membros', '09 rota de farm', '10 rota de producao',
+                '11 ingredientes e produtos', '12 informante', '13 residencia do lider',
+                'indice de evidencias',
+            ]
+            for termo in obrigatorios:
+                if _v129_norm_preflight(termo) not in normalizado:
+                    erros.append(f'Seção obrigatória ausente no PDF V146: {termo}.')
+            # Esses termos não podem aparecer no documento final em hipótese alguma.
+            proibidos = ('tarefa guiada','gerenciamento de tarefas','checklist atual','finalizar tarefa','concluir tarefa','mesa criada por')
+            for termo in proibidos:
+                if _v129_norm_preflight(termo) in normalizado:
+                    erros.append(f'Conteúdo administrativo ainda presente no PDF V146: {termo}.')
+        finally:
+            doc.close()
+    except Exception as erro:
+        erros.append(f'Falha no preflight PDF V146: {type(erro).__name__}: {erro}')
+    return erros
+
+
+print(
+    '✅ V146 carregada — MODELO V131/V133 PRESERVADO; payload sanitizado antes do PDF/DOCX; '
+    'mensagens de tarefa/checklist/status/mesa criada por removidas inclusive de mesas já em andamento.',
+    flush=True,
+)
+
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
