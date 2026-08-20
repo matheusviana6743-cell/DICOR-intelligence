@@ -60213,12 +60213,30 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
         return y
 
     def informante_card(info: Dict[str, Any], y: float) -> float:
-        return pessoas([{
-            'nome': info.get('nome'),
-            'rg': info.get('rg'),
-            'cargo': info.get('cargo') or 'Informante',
-            'foto': info.get('foto'),
-        }], y, 'Informante')
+        # V151: somente o cartão do informante é tolerante a mídia ausente/quebrada.
+        # Lideranças e membros continuam usando a validação visual rígida original.
+        info = info if isinstance(info, dict) else {}
+        nome = seguro(info.get('nome'))
+        rg = seguro(info.get('rg'))
+        cargo = seguro(info.get('cargo') or 'Informante')
+        foto = info.get('foto') if isinstance(info.get('foto'), dict) else None
+        if foto:
+            try:
+                return pessoas([{
+                    'nome': nome,
+                    'rg': rg,
+                    'cargo': cargo,
+                    'foto': foto,
+                }], y, 'Informante')
+            except RuntimeError as erro:
+                # Foto indisponível ou já usada: preserva os dados sem derrubar o dossiê.
+                print(f'⚠️ V151 informante sem cartão fotográfico: {erro}', flush=True)
+        return campos([
+            ('Nome do Informante', nome),
+            ('RG', rg),
+            ('Função/Cargo', cargo),
+            ('Registro fotográfico', 'Não disponível no fechamento'),
+        ], y)
 
     # CAPA/IDENTIFICAÇÃO - no modelo aprovado, sem a capa branca nova.
     y = iniciar_pagina('DOSSIÊ OPERACIONAL DICOR')
@@ -60326,9 +60344,15 @@ def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) 
             continue
 
         if code == '12':
-            info = sec.get('informante') if isinstance(sec.get('informante'), dict) else {}
-            y = subtitulo('Identificação do Informante', y)
-            y = informante_card(info, y)
+            info = sec.get('informante') if isinstance(sec.get('informante'), dict) else None
+            # V151: o Item 12 não pode abortar o dossiê apenas porque a foto de
+            # identificação do informante está ausente, quebrada ou não materializável.
+            # A V150 já valida/materializa a mídia antes de chegar aqui; quando ela
+            # não é utilizável, sec['informante'] vira None e os dados nominais
+            # disponíveis são preservados no resumo profissional da própria seção.
+            if isinstance(info, dict) and isinstance(info.get('foto'), dict):
+                y = subtitulo('Identificação do Informante', y)
+                y = informante_card(info, y)
             extra = str(sec.get('extra_text') or '').strip()
             if extra:
                 y = subtitulo('Resumo da Operação do Informante', y)
@@ -65893,6 +65917,25 @@ if '_v128_validar_payload_estado' in globals():
 print(
     '✅ V150 carregada — V149 agora executa antes do runtime; Chat permanece aberto; foto do RG do informante opcional; '
     'Item 12 não aborta mais o PDF/DOCX quando a foto de identificação estiver ausente/indisponível. Modelo preservado.',
+    flush=True,
+)
+
+
+# =============================================================
+# V151 — ITEM 12 TOLERANTE NO RENDERER FINAL
+# - Corrige o erro residual: 'foto não pôde ser carregada para pessoa não identificada'.
+# - Se não houver foto de identificação utilizável, o cartão fotográfico é simplesmente omitido.
+# - Nome/RG disponíveis permanecem no resumo profissional preparado pela V150.
+# - Foto do RG/documento continua opcional.
+# - Resumo da operação e demais imagens válidas continuam no dossiê.
+# - Modelo visual V131/V133 preservado; nenhuma outra seção foi alterada.
+# =============================================================
+
+V151_INFORMANTE_RENDER_FIX = 'V151 item 12 sem foto não bloqueia renderer'
+
+print(
+    '✅ V151 carregada — Item 12 não chama mais o cartão fotográfico quando a foto do informante estiver ausente/indisponível; '
+    'nome/RG e resumo permanecem quando existentes; documento do RG continua opcional; modelo preservado.',
     flush=True,
 )
 
