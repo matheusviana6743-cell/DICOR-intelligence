@@ -49827,7 +49827,7 @@ async def _v110_fechar_core_transacional(interaction: discord.Interaction, motiv
         msg_aviso=await canal.send('🔎 **[DICOR] Validação final iniciada.**\nA mesa continuará aberta até o dossiê ser validado, gerado e enviado com sucesso.')
     except Exception: pass
     try:
-        await interaction.followup.send('✅ Validação final iniciada. A mesa só será arquivada depois que PDF e DOCX estiverem íntegros.',ephemeral=True)
+        await interaction.followup.send('✅ Validação final iniciada. A mesa só será arquivada depois que o PDF estiver íntegro e confirmado.',ephemeral=True)
     except Exception: pass
 
     try:
@@ -49887,7 +49887,7 @@ async def _v110_fechar_core_transacional(interaction: discord.Interaction, motiv
                         mensagem_dossie_url=mensagem_dossie_url or m.jump_url; enviado=True
             except Exception as erro: erros_envio.append(f'mesa: {erro}')
         if not enviado:
-            raise RuntimeError('PDF/DOCX foram gerados, mas nenhum destino confirmou o recebimento. '+(' | '.join(erros_envio) if erros_envio else ''))
+            raise RuntimeError('O dossiê foi gerado, mas nenhum destino confirmou o recebimento do PDF. '+(' | '.join(erros_envio) if erros_envio else ''))
 
         await editar_progresso_dossie(msg_aviso,'🔒 **[DICOR] Etapa 5/6 - Arquivamento**\nArquivos confirmados. Bloqueando a mesa, protegendo os tópicos e registrando o encerramento...')
         try: await bloquear_mesa_para_novas_mensagens(canal)
@@ -49908,11 +49908,11 @@ async def _v110_fechar_core_transacional(interaction: discord.Interaction, motiv
             else: await canal.edit(name=novo,reason='Mesa encerrada e dossiê validado pela DICOR')
         except Exception as erro: await enviar_log(f'⚠️ V110 não conseguiu mover/renomear a mesa {canal.id}: {erro}')
 
-        await editar_progresso_dossie(msg_aviso,'✅ **[DICOR] Etapa 6/6 - Concluído**\nDossiê validado, PDF/DOCX enviados e investigação arquivada.')
+        await editar_progresso_dossie(msg_aviso,'✅ **[DICOR] Etapa 6/6 - Concluído**\nPDF do dossiê enviado e investigação arquivada.')
         stats=dados_dossie.get('estatisticas',{}) or {}
-        emb=discord.Embed(title='🏛️ Polícia Federal - DICOR',description='✅ **Mesa encerrada com sucesso.**\n\nO dossiê passou pela validação final antes do arquivamento. PDF e DOCX foram enviados e as evidências da mesa foram preservadas.',color=discord.Color.from_rgb(0,43,91))
-        emb.add_field(name='Processo',value=f"`{dados_dossie.get('processo')}`",inline=True); emb.add_field(name='Investigação',value=f"`{dados_dossie.get('numero_investigacao')}`",inline=True); emb.add_field(name='Evidências',value=f"`{stats.get('evidencias',0)}`",inline=True)
-        if mensagem_dossie_url: emb.add_field(name='Arquivos',value=f'[Abrir PDF/DOCX]({mensagem_dossie_url})',inline=False)
+        emb=discord.Embed(title='✅ Mesa encerrada',description='Dossiê em PDF gerado e evidências preservadas.',color=discord.Color.from_rgb(0,43,91))
+        pass
+        if mensagem_dossie_url: emb.add_field(name='📄 Dossiê',value=f'[Abrir PDF]({mensagem_dossie_url})',inline=False)
         try: await canal.send(embed=emb,view=ReabrirMesaView())
         except Exception: pass
         try: await interaction.followup.send('✅ Mesa encerrada somente após a validação e o envio dos arquivos.',ephemeral=True)
@@ -51450,7 +51450,7 @@ class V114FechamentoView(discord.ui.View):
         todos[chave] = atual
         salvar_json(DOSSIE_COMPLEMENTOS_PACIFICACAO_FILE, todos)
 
-        await interaction.edit_original_response(content='✅ **Validação concluída.** Gerando PDF/DOCX e encerrando a mesa somente após a confirmação dos arquivos...', view=None)
+        await interaction.edit_original_response(content='✅ **Validação concluída.** Gerando o dossiê em PDF e encerrando a mesa somente após a confirmação do arquivo...', view=None)
         confirmacao = dict(self.dados_mesa or {})
         confirmacao['_v103_complementacao_validada'] = True
         confirmacao['_v114_validado'] = True
@@ -65127,7 +65127,7 @@ async def _critical_fechar_mesa(interaction: discord.Interaction, dados_mesa: Op
             interaction,
             '📍 **PREPARAÇÃO PARA FECHAMENTO DA MESA**\n\n'
             + status
-            + '\n\nO **Local da Pacificação é exclusivamente manual** e será usado exatamente como informado no PDF/DOCX. '
+            + '\n\nO **Local da Pacificação é exclusivamente manual** e será usado exatamente como informado no PDF. '
               'Ele nunca será preenchido por texto de tópico, OCR ou tarefa guiada.\n\n'
               'Defina ou confira o local e depois clique em **Continuar fechamento**.',
             view=V147PrepararFechamentoView(int(canal.id), dados),
@@ -65141,7 +65141,7 @@ async def _critical_fechar_mesa(interaction: discord.Interaction, dados_mesa: Op
 
 print(
     '✅ V147 carregada — Local da Pacificação agora é 100% MANUAL; botão aparece após Fechar Mesa; '
-    'valor persistente por mesa; PDF/DOCX nunca puxam esse campo de tópico/OCR/tarefa; modelo V131/V133 preservado.',
+    'valor persistente por mesa; o PDF nunca puxa esse campo de tópico/OCR/tarefa; modelo V131/V133 preservado.',
     flush=True,
 )
 
@@ -66437,7 +66437,7 @@ class V153ConfirmacaoFecharMesaView(View):
         # Em mensagens efêmeras, edit_original_response é o caminho suportado.
         try:
             await interaction.edit_original_response(
-                content='⏳ **Encerramento confirmado.** Coletando dados e gerando PDF/DOCX. A mesa continuará aberta até a confirmação dos arquivos.',
+                content='⏳ **Encerramento confirmado.** Coletando dados e gerando o PDF. A mesa continuará aberta até a confirmação do arquivo.',
                 view=self,
             )
         except Exception as erro:
@@ -66623,6 +66623,367 @@ print(
     flush=True,
 )
 
-# RUNTIME ÚNICO E FINAL
+
+# =============================================================
+# V155 — PDF COM WATCHDOG REAL / PROCESSO ISOLADO
+# Problema observado: a Etapa 2/6 podia permanecer indefinidamente no gerador PDF,
+# normalmente por mídia remota/lenta, processamento de imagem ou biblioteca nativa.
+# A V155 preserva o MESMO gerador/modelo aprovado, mas o executa em processo isolado:
+#   1) tentativa completa com limite rígido;
+#   2) fallback com o MESMO layout, porém somente mídias já locais/cacheadas;
+#   3) processo travado é encerrado sem congelar o bot/Railway.
+# Não altera textos, seções, moldura, brasões, assinaturas ou estrutura do PDF.
+# =============================================================
+
+V155_PDF_WATCHDOG = 'V155 PDF watchdog real + processo isolado + fallback local'
+V155_PDF_TIMEOUT_COMPLETO = max(35, min(180, int(os.getenv('DICOR_PDF_TIMEOUT_COMPLETO', '75') or 75)))
+V155_PDF_TIMEOUT_LOCAL = max(20, min(90, int(os.getenv('DICOR_PDF_TIMEOUT_LOCAL', '35') or 35)))
+
+_V155_GERAR_PDF_BASE = gerar_pdf_dossie
+_V155_MATERIALIZAR_BASE = _v124_materializar_midia
+_V155_PDF_LOCAL_ONLY = False
+
+
+def _v155_midias_local_only(item: Any, pasta_cache: Path) -> Optional[Path]:
+    """Resolve mídia sem rede. Usado somente no fallback do PDF para preservar o layout sem travar."""
+    try:
+        obj = _v124_normalizar_midia(item) if '_v124_normalizar_midia' in globals() else item
+    except Exception:
+        obj = item
+    if not isinstance(obj, dict) or not obj:
+        return None
+
+    # 1) caminho local explícito.
+    for chave in ('local', 'caminho', 'path'):
+        valor = str(obj.get(chave) or '').strip()
+        if not valor:
+            continue
+        try:
+            p = Path(valor)
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                try:
+                    return _v130_otimizar_imagem_documento(p, Path(pasta_cache))
+                except Exception:
+                    return p
+        except Exception:
+            pass
+
+    # 2) ponteiro B2/R2 já presente no cache local do bot.
+    for valor in (obj.get('local'), obj.get('arquivo'), obj.get('url'), obj.get('proxy_url')):
+        s = str(valor or '').strip()
+        if not s.startswith(('b2://', 'r2://')):
+            continue
+        try:
+            key = _v78_key_pointer(s) if '_v78_key_pointer' in globals() else s[5:].lstrip('/')
+            nome = str(obj.get('arquivo') or Path(key).name or '')
+            p = _v78_cache_path(key, nome) if '_v78_cache_path' in globals() else None
+            if p and Path(p).exists() and Path(p).stat().st_size > 0:
+                p = Path(p)
+                try:
+                    return _v130_otimizar_imagem_documento(p, Path(pasta_cache))
+                except Exception:
+                    return p
+        except Exception:
+            pass
+
+    # 3) arquivo já criado pelo cache compartilhado V153 durante tentativa anterior.
+    try:
+        url = str(obj.get('url') or obj.get('proxy_url') or '').strip()
+        if url.startswith(('http://', 'https://')):
+            raiz = Path(pasta_cache)
+            compartilhado = (raiz.parent if raiz.name.startswith('_v') else raiz) / '_v153_media_shared'
+            ext = _v153_ext_url(url) if '_v153_ext_url' in globals() else '.png'
+            nome = hashlib.sha1(url.encode('utf-8', errors='ignore')).hexdigest()[:24] + ext
+            p = compartilhado / nome
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return p
+    except Exception:
+        pass
+
+    # 4) cache global positivo já conhecido no processo.
+    try:
+        key = _v153_media_key(obj) if '_v153_media_key' in globals() else ''
+        if key:
+            salvo = _V153_MEDIA_CACHE.get(key) if '_V153_MEDIA_CACHE' in globals() else None
+            if salvo:
+                p = Path(salvo)
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+    except Exception:
+        pass
+    return None
+
+
+def _v124_materializar_midia(item: Any, pasta_cache: Path) -> Optional[Path]:
+    """V155: modo normal preserva V154; fallback local nunca acessa rede."""
+    if globals().get('_V155_PDF_LOCAL_ONLY', False):
+        return _v155_midias_local_only(item, pasta_cache)
+    return _V155_MATERIALIZAR_BASE(item, pasta_cache)
+
+
+def _v155_pdf_worker(dados: Dict[str, Any], destino: str, local_only: bool) -> None:
+    """Worker síncrono isolado. Se travar, o processo pai pode encerrá-lo de verdade."""
+    global _V155_PDF_LOCAL_ONLY
+    _V155_PDF_LOCAL_ONLY = bool(local_only)
+    caminho = Path(destino)
+    try:
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        caminho.unlink(missing_ok=True)
+    except Exception:
+        pass
+    modo = 'LOCAL/CACHE' if local_only else 'COMPLETO'
+    print(f'📄 V155 PDF worker iniciado — modo={modo} destino={caminho.name}', flush=True)
+    try:
+        _V155_GERAR_PDF_BASE(dados, caminho)
+        if not caminho.exists() or caminho.stat().st_size <= 6000:
+            raise RuntimeError(f'PDF V155 {modo} não produziu arquivo válido.')
+        print(f'✅ V155 PDF worker concluído — modo={modo} tamanho={caminho.stat().st_size} bytes', flush=True)
+    except BaseException as erro:
+        print(f'❌ V155 PDF worker falhou — modo={modo}: {type(erro).__name__}: {erro}', flush=True)
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+        raise
+
+
+def _v155_rodar_pdf_isolado(dados: Dict[str, Any], destino: Path, *, local_only: bool, timeout: int) -> tuple:
+    """Retorna (ok, motivo). Em Linux/Railway usa fork para permitir kill real do gerador."""
+    import multiprocessing as _mp
+    destino = Path(destino)
+    tmp = destino.with_name(destino.stem + ('.v155_local.pdf' if local_only else '.v155_full.pdf'))
+    try:
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    try:
+        metodos = _mp.get_all_start_methods()
+        ctx = _mp.get_context('fork') if 'fork' in metodos else None
+    except Exception:
+        ctx = None
+
+    if ctx is None:
+        # Fallback para ambientes sem fork. Railway/Linux normalmente nunca entra aqui.
+        resultado = {'erro': None}
+        def _thread_worker():
+            try:
+                _v155_pdf_worker(dados, str(tmp), local_only)
+            except BaseException as erro:
+                resultado['erro'] = erro
+        th = threading.Thread(target=_thread_worker, name='v155-pdf-thread-fallback', daemon=True)
+        th.start(); th.join(float(timeout))
+        if th.is_alive():
+            return False, f'timeout>{timeout}s (ambiente sem fork)'
+        if resultado.get('erro') is not None:
+            return False, f'{type(resultado["erro"]).__name__}: {resultado["erro"]}'
+        if tmp.exists() and tmp.stat().st_size > 6000:
+            try: tmp.replace(destino)
+            except Exception:
+                import shutil as _shutil; _shutil.copy2(tmp, destino)
+            return True, 'ok'
+        return False, 'arquivo inválido'
+
+    proc = ctx.Process(
+        target=_v155_pdf_worker,
+        args=(dados, str(tmp), bool(local_only)),
+        name='v155-pdf-local' if local_only else 'v155-pdf-completo',
+        daemon=False,
+    )
+    proc.start()
+    proc.join(float(timeout))
+    if proc.is_alive():
+        print(f'⚠️ V155 PDF excedeu {timeout}s — encerrando worker modo={"LOCAL" if local_only else "COMPLETO"}.', flush=True)
+        try: proc.terminate()
+        except Exception: pass
+        proc.join(5.0)
+        if proc.is_alive():
+            try: proc.kill()
+            except Exception: pass
+            proc.join(3.0)
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+        return False, f'timeout>{timeout}s'
+
+    if proc.exitcode != 0:
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+        return False, f'exitcode={proc.exitcode}'
+    if not tmp.exists() or tmp.stat().st_size <= 6000:
+        return False, 'arquivo ausente/vazio'
+    try:
+        destino.unlink(missing_ok=True)
+        tmp.replace(destino)
+    except Exception:
+        import shutil as _shutil
+        _shutil.copy2(tmp, destino)
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+    return True, 'ok'
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    """V155: o PDF mantém o mesmo modelo, mas não consegue mais congelar a Etapa 2/6."""
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    print(f'📄 V155 PDF: tentativa completa com limite de {V155_PDF_TIMEOUT_COMPLETO}s.', flush=True)
+    ok, motivo = _v155_rodar_pdf_isolado(
+        dados, caminho_pdf, local_only=False, timeout=V155_PDF_TIMEOUT_COMPLETO,
+    )
+    if ok:
+        print(f'✅ V155 PDF completo confirmado: {caminho_pdf.name}', flush=True)
+        return
+
+    print(
+        f'⚠️ V155 PDF completo não terminou ({motivo}). '
+        f'Iniciando o MESMO modelo em modo local/cache por até {V155_PDF_TIMEOUT_LOCAL}s.',
+        flush=True,
+    )
+    ok, motivo_local = _v155_rodar_pdf_isolado(
+        dados, caminho_pdf, local_only=True, timeout=V155_PDF_TIMEOUT_LOCAL,
+    )
+    if ok:
+        print(f'✅ V155 PDF local/cache confirmado sem alterar o modelo: {caminho_pdf.name}', flush=True)
+        return
+
+    raise RuntimeError(
+        'PDF V155 não pôde ser concluído sem risco de travamento. '
+        f'Tentativa completa: {motivo}; fallback local/cache: {motivo_local}. '
+        'A mesa permaneceu aberta e nenhum tópico foi arquivado.'
+    )
+
+
+print(
+    f'✅ V155 carregada — PDF isolado com watchdog real: completo≤{V155_PDF_TIMEOUT_COMPLETO}s, '
+    f'fallback MESMO MODELO local/cache≤{V155_PDF_TIMEOUT_LOCAL}s; processo travado é encerrado sem congelar o bot.',
+    flush=True,
+)
+
+
+
+# =============================================================
+# V156 — ENTREGA SOMENTE EM PDF / MESA LIMPA
+# Pedido: no fechamento, mostrar somente o PDF do dossiê.
+# - O DOCX pode continuar sendo produzido/preservado internamente pelo fluxo legado,
+#   mas NUNCA é enviado para a mesa/canal de entrega.
+# - Remove o embed intermediário "CÓPIA DO DOSSIÊ...".
+# - Entrega direta: 1 mensagem curta + 1 PDF.
+# - Se o PDF for grande, usa link/compactação somente do PDF.
+# - Diagnósticos ficam no log; não poluem a mesa.
+# - Mantém o PDF/modelo V131/V133/V155 inalterado.
+# =============================================================
+
+V156_PDF_ONLY = 'V156 somente PDF + fechamento visual limpo'
+
+
+async def enviar_arquivos_dossie_destino(
+    destino,
+    dados_dossie: Dict[str, Any],
+    arquivos: Dict[str, str],
+    nome_pdf: str,
+    nome_docx: str,
+    canal_mesa: discord.TextChannel,
+    usuario: discord.abc.User,
+    titulo: str='🏛️ DOSSIÊ OPERACIONAL AUTOMÁTICO DICOR',
+) -> Optional[discord.Message]:
+    """V156: entrega pública do dossiê é SOMENTE PDF e sem embed intermediário."""
+    if not destino or not hasattr(destino, 'send'):
+        return None
+
+    pdf_raw = str((arquivos or {}).get('pdf') or '').strip()
+    if not pdf_raw:
+        raise RuntimeError('V156: caminho do PDF não informado para entrega.')
+    caminho = Path(pdf_raw)
+    if not caminho.exists() or not caminho.is_file() or caminho.stat().st_size <= 0:
+        raise RuntimeError('V156: PDF inexistente ou vazio.')
+
+    tamanho = int(caminho.stat().st_size)
+    limite_real = int(getattr(getattr(destino, 'guild', None), 'filesize_limit', 10 * 1024 * 1024) or 10 * 1024 * 1024)
+    limite = max(1024 * 1024, limite_real - 256 * 1024)
+    nome = str(nome_pdf or caminho.name or 'DOSSIE_OPERACIONAL_DICOR.pdf')
+    falhas: List[str] = []
+
+    # 1) Melhor caso: UMA mensagem curta com o PDF anexado.
+    if tamanho <= limite:
+        try:
+            return await destino.send(
+                content='📄 **Dossiê Operacional DICOR**',
+                file=discord.File(str(caminho), filename=nome),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as erro:
+            falhas.append(f'upload direto: {type(erro).__name__}: {erro}')
+
+    # 2) Link permanente do próprio serviço, somente para o PDF.
+    try:
+        persistido, url_web = await asyncio.to_thread(
+            _v130_persistir_para_download, caminho, nome, dados_dossie, canal_mesa,
+        )
+    except Exception as erro:
+        persistido, url_web = None, ''
+        falhas.append(f'link Railway: {type(erro).__name__}: {erro}')
+    if url_web:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label='Abrir PDF', emoji='📄', style=discord.ButtonStyle.link, url=url_web))
+        return await destino.send(
+            content='📄 **Dossiê Operacional DICOR**',
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    # 3) B2 privado, ainda somente PDF.
+    try:
+        url_b2, erro_b2 = await asyncio.to_thread(
+            _v130_b2_link,
+            persistido or caminho,
+            f'dossies/{slugify(str(dados_dossie.get("processo") or "mesa"))}',
+        )
+    except Exception as erro:
+        url_b2, erro_b2 = '', f'{type(erro).__name__}: {erro}'
+    if url_b2:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label='Abrir PDF', emoji='📄', style=discord.ButtonStyle.link, url=url_b2))
+        return await destino.send(
+            content='📄 **Dossiê Operacional DICOR**',
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    if erro_b2:
+        falhas.append(f'B2: {erro_b2}')
+
+    # 4) Último recurso: cópia PDF compacta; DOCX nunca entra nessa etapa.
+    try:
+        compacto_dir = caminho.parent / '_v156_pdf_compacto'
+        compacto_dir.mkdir(parents=True, exist_ok=True)
+        compacto = compacto_dir / (Path(nome).stem + '_LEVE.pdf')
+        gerado = await asyncio.to_thread(_v130_pdf_raster_compacto, caminho, compacto, limite)
+        if gerado:
+            gerado = Path(gerado)
+            if gerado.exists() and gerado.stat().st_size > 0 and gerado.stat().st_size <= limite:
+                return await destino.send(
+                    content='📄 **Dossiê Operacional DICOR**',
+                    file=discord.File(str(gerado), filename=gerado.name),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+    except Exception as erro:
+        falhas.append(f'compactação PDF: {type(erro).__name__}: {erro}')
+
+    detalhe = ' | '.join(falhas[:8]) or 'nenhum método de entrega confirmou recebimento'
+    print(f'❌ V156 entrega PDF falhou: {detalhe}', flush=True)
+    raise RuntimeError('V156: o PDF não pôde ser entregue. ' + detalhe)
+
+
+print(
+    '✅ V156 carregada — fechamento limpo: somente o PDF é exibido/enviado; DOCX não aparece na mesa; '
+    'embed intermediário de cópia removido; entrega reduzida a PDF + confirmação final compacta.',
+    flush=True,
+)
+
+# RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
