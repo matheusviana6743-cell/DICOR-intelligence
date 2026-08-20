@@ -65940,6 +65940,541 @@ print(
 )
 
 
+
+
+# =============================================================
+# V152 — RECONCILIAÇÃO DE TAREFAS DEFINITIVA / THREAD 50083
+# - Remove o listener legado V145 que ainda podia disparar a rotina antiga em deploys/reconexões.
+# - Reatribui _v145_reconciliar_cards_existentes para uma implementação segura por card.
+# - Thread arquivada é ignorada antes de fetch/edit e 50083 é tratado como condição normal.
+# - Em caso de corrida (thread arquivada entre a checagem e o edit), apenas aquele card é ignorado.
+# - Não cria tarefa nova, não reabre thread e não altera dossiê/mesa/provas.
+# =============================================================
+
+V152_RECONCILIACAO_THREADS_FIX = 'V152 skip definitivo de threads arquivadas (50083)'
+_V152_RECONCILIAR_TASK = None
+
+
+def _v152_http_thread_arquivada(erro: BaseException) -> bool:
+    try:
+        return int(getattr(erro, 'code', 0) or 0) == 50083
+    except Exception:
+        return 'thread is archived' in str(erro).lower()
+
+
+async def _v152_editar_card_se_ativo(
+    topico: discord.Thread,
+    msg: discord.Message,
+    *,
+    content: str,
+    view: View,
+) -> str:
+    """Retorna: atualizado | arquivado | falha. Nunca propaga 50083."""
+    try:
+        if bool(getattr(topico, 'archived', False)):
+            return 'arquivado'
+        # Reconsulta estado imediatamente antes do edit para reduzir corrida de arquivamento.
+        try:
+            topico_atual = topico.guild.get_thread(topico.id) if getattr(topico, 'guild', None) else None
+            if isinstance(topico_atual, discord.Thread):
+                topico = topico_atual
+        except Exception:
+            pass
+        if bool(getattr(topico, 'archived', False)):
+            return 'arquivado'
+        try:
+            await asyncio.wait_for(msg.edit(content=content, view=view), timeout=6.0)
+            return 'atualizado'
+        except discord.HTTPException as erro:
+            if _v152_http_thread_arquivada(erro):
+                return 'arquivado'
+            raise
+    except Exception as erro:
+        if _v152_http_thread_arquivada(erro):
+            return 'arquivado'
+        print(
+            f'⚠️ [V152-CARD] edição ignorada thread={getattr(topico,"id",0)} '
+            f'msg={getattr(msg,"id",0)}: {type(erro).__name__}: {erro}',
+            flush=True,
+        )
+        return 'falha'
+
+
+async def _v152_reconciliar_cards_existentes() -> None:
+    """Reconciliador único: somente cards já existentes em threads ativas."""
+    await asyncio.sleep(4.0)
+    atualizados = 0
+    arquivados = 0
+    falhas = 0
+    vistos = set()
+    try:
+        for guild in list(getattr(bot, 'guilds', []) or []):
+            for mesa in carregar_mesas() or []:
+                if not isinstance(mesa, dict):
+                    continue
+                cid = int(mesa.get('canal_id') or 0)
+                if not cid or (guild.id, cid) in vistos:
+                    continue
+                vistos.add((guild.id, cid))
+                canal = guild.get_channel(cid)
+                if not isinstance(canal, discord.TextChannel):
+                    continue
+                estado = _v116_estado(cid, False)
+                if not isinstance(estado, dict):
+                    continue
+                try:
+                    _v117_migrar_estado(estado)
+                except Exception:
+                    pass
+                tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+                if not tarefas:
+                    continue
+
+                for chave, reg in list(tarefas.items()):
+                    if not isinstance(reg, dict):
+                        continue
+                    try:
+                        mid = int(reg.get('mensagem_id') or 0)
+                        tid = int(reg.get('topico_id') or 0)
+                        item = int(reg.get('item') or str(chave).split(':')[0] or 0)
+                        etapa = int(reg.get('etapa') or 1)
+                    except Exception:
+                        continue
+                    if not mid or not tid or not item:
+                        continue
+
+                    topico = guild.get_thread(tid)
+                    if topico is None:
+                        try:
+                            fetched = await asyncio.wait_for(guild.fetch_channel(tid), timeout=6.0)
+                            topico = fetched if isinstance(fetched, discord.Thread) else None
+                        except Exception as erro:
+                            if _v152_http_thread_arquivada(erro):
+                                arquivados += 1
+                            continue
+                    if not isinstance(topico, discord.Thread):
+                        continue
+                    if bool(getattr(topico, 'archived', False)):
+                        arquivados += 1
+                        continue
+
+                    try:
+                        msg = await asyncio.wait_for(topico.fetch_message(mid), timeout=6.0)
+                    except discord.HTTPException as erro:
+                        if _v152_http_thread_arquivada(erro):
+                            arquivados += 1
+                        else:
+                            falhas += 1
+                        continue
+                    except Exception:
+                        falhas += 1
+                        continue
+
+                    status = str(reg.get('status') or '').upper()
+                    if status == 'CONCLUIDA':
+                        etapa_txt = f' • ETAPA {etapa}/2' if item in _V117_ITENS_DUAS_ETAPAS else ''
+                        conteudo = (
+                            f'✅ **CONCLUÍDO — ITEM {item}: {_v116_item_titulo(item)}{etapa_txt}**\n'
+                            '> Use **Reabrir tarefa** se precisar acrescentar ou corrigir material.'
+                        )
+                        view = V145ReabrirTarefaView()
+                    else:
+                        conteudo = _v122_texto_tarefa_guiada(canal, estado, item, etapa)
+                        view = V148TarefaGuiadaView()
+
+                    resultado = await _v152_editar_card_se_ativo(
+                        topico, msg, content=conteudo, view=view,
+                    )
+                    if resultado == 'atualizado':
+                        atualizados += 1
+                    elif resultado == 'arquivado':
+                        arquivados += 1
+                    else:
+                        falhas += 1
+
+        print(
+            f'✅ V152 reconciliação segura — atualizados={atualizados} '
+            f'arquivados_ignorados={arquivados} falhas={falhas}; nenhuma tarefa nova criada.',
+            flush=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as erro:
+        traceback.print_exc()
+        print(f'⚠️ V152 reconciliação geral: {type(erro).__name__}: {erro}', flush=True)
+
+
+# Qualquer caller legado que ainda referencie este nome passa a usar a implementação segura.
+_v145_reconciliar_cards_existentes = _v152_reconciliar_cards_existentes
+
+# Remove explicitamente o on_ready antigo da V145; ele não é mais necessário.
+try:
+    bot.remove_listener(_v145_on_ready, 'on_ready')
+except Exception:
+    pass
+
+
+@bot.listen('on_ready')
+async def _v152_on_ready_reconciliacao() -> None:
+    global _V152_RECONCILIAR_TASK
+    try:
+        antiga = _V152_RECONCILIAR_TASK
+        if antiga is not None and not antiga.done():
+            antiga.cancel()
+        # Também cancela tarefas antigas eventualmente sobreviventes de reconnect no mesmo processo.
+        atual = asyncio.current_task()
+        for tarefa in list(asyncio.all_tasks()):
+            if tarefa is atual or tarefa.done():
+                continue
+            try:
+                if tarefa.get_name() == 'v145-reconciliar-tarefas-existentes':
+                    tarefa.cancel()
+            except Exception:
+                pass
+        _V152_RECONCILIAR_TASK = asyncio.create_task(
+            _v152_reconciliar_cards_existentes(),
+            name='v152-reconciliar-tarefas-seguro',
+        )
+    except Exception as erro:
+        print(f'⚠️ V152 on_ready: {type(erro).__name__}: {erro}', flush=True)
+
+
+print(
+    '✅ V152 carregada — listener legado V145 removido; reconciliação única ignora threads arquivadas e trata Discord 50083 como condição normal.',
+    flush=True,
+)
+
+
+
+# =============================================================
+# V153 — FECHAMENTO SEM TRAVAR / DOCX BLINDADO
+# - Mantém o modelo PDF V131/V133 e todo o conteúdo V152.
+# - Compartilha o cache de mídias entre PDF e DOCX e reduz espera em URLs mortas.
+# - Falhas de mídia são memorizadas para não repetir dezenas de timeouts no DOCX.
+# - DOCX possui limite de tempo; se o gerador completo travar, gera uma cópia editável
+#   de contingência sem bloquear/derrubar o fechamento.
+# - A confirmação de fechamento não tenta mais editar a mensagem pelo caminho frágil
+#   interaction.message.edit depois do defer; usa edit_original_response e ignora
+#   mensagens efêmeras expiradas sem traceback.
+# =============================================================
+
+V153_FECHAMENTO_FIX = 'V153 fechamento sem travar + cache compartilhado + DOCX timeout'
+
+_V153_MEDIA_CACHE: Dict[str, Optional[str]] = {}
+_V153_MEDIA_LOCK = threading.RLock()
+_V153_GERAR_DOCX_BASE = gerar_docx_dossie
+
+
+def _v153_media_key(item: Any) -> str:
+    try:
+        obj = _v124_normalizar_midia(item) if '_v124_normalizar_midia' in globals() else item
+    except Exception:
+        obj = item
+    if not isinstance(obj, dict):
+        return hashlib.sha1(str(obj).encode('utf-8', errors='ignore')).hexdigest()
+    base = '|'.join([
+        str(obj.get('local') or ''), str(obj.get('arquivo') or ''),
+        str(obj.get('url') or ''), str(obj.get('proxy_url') or ''),
+        str(obj.get('message_id') or obj.get('mensagem_id') or ''),
+    ])
+    return hashlib.sha1(base.encode('utf-8', errors='ignore')).hexdigest()
+
+
+def _v153_ext_url(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        ext = Path(urlparse(url).path).suffix.lower()
+        if ext in {'.png','.jpg','.jpeg','.webp','.bmp','.gif'}:
+            return ext
+    except Exception:
+        pass
+    return '.png'
+
+
+def _v124_materializar_midia(item: Any, pasta_cache: Path) -> Optional[Path]:
+    """Materializador final V153: cache compartilhado + timeout curto + cache negativo."""
+    try:
+        obj = _v124_normalizar_midia(item) if '_v124_normalizar_midia' in globals() else item
+    except Exception:
+        obj = item
+    if not isinstance(obj, dict) or not obj:
+        return None
+
+    try:
+        pasta_cache = Path(pasta_cache)
+        pasta_cache.mkdir(parents=True, exist_ok=True)
+        raiz = pasta_cache.parent if pasta_cache.name.startswith('_v') else pasta_cache
+        compartilhado = raiz / '_v153_media_shared'
+        compartilhado.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+
+    chave = _v153_media_key(obj)
+    with _V153_MEDIA_LOCK:
+        if chave in _V153_MEDIA_CACHE:
+            salvo = _V153_MEDIA_CACHE[chave]
+            if not salvo:
+                return None
+            p = Path(salvo)
+            return p if p.exists() and p.is_file() and p.stat().st_size > 0 else None
+
+    # 1) Arquivo já local.
+    local = str(obj.get('local') or '').strip()
+    nome = str(obj.get('arquivo') or Path(local).name or 'imagem').strip() or 'imagem'
+    if local:
+        try:
+            p = Path(local)
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                try:
+                    p = _v130_otimizar_imagem_documento(p, compartilhado)
+                except Exception:
+                    pass
+                with _V153_MEDIA_LOCK:
+                    _V153_MEDIA_CACHE[chave] = str(p)
+                return p
+        except Exception:
+            pass
+        # Ponteiro do storage interno/B2: tenta uma única vez.
+        try:
+            if 'materializar_sync' in globals():
+                mat = materializar_sync(local, nome)
+                if mat:
+                    p = Path(mat)
+                    if p.exists() and p.is_file() and p.stat().st_size > 0:
+                        try:
+                            p = _v130_otimizar_imagem_documento(p, compartilhado)
+                        except Exception:
+                            pass
+                        with _V153_MEDIA_LOCK:
+                            _V153_MEDIA_CACHE[chave] = str(p)
+                        return p
+        except Exception:
+            pass
+
+    # 2) URL Discord/CDN. Timeout curto evita 20-25 s por foto morta.
+    url = str(obj.get('url') or obj.get('proxy_url') or '').strip()
+    if url.startswith(('http://','https://')):
+        try:
+            import urllib.request
+            destino = compartilhado / f'{hashlib.sha1(url.encode("utf-8",errors="ignore")).hexdigest()[:24]}{_v153_ext_url(url)}'
+            if destino.exists() and destino.stat().st_size > 0:
+                p = destino
+            else:
+                req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 DICOR-V153'})
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    dados = resp.read(18 * 1024 * 1024)
+                if not dados:
+                    raise RuntimeError('mídia vazia')
+                destino.write_bytes(dados)
+                p = destino
+            try:
+                p = _v130_otimizar_imagem_documento(p, compartilhado)
+            except Exception:
+                pass
+            if p.exists() and p.stat().st_size > 0:
+                with _V153_MEDIA_LOCK:
+                    _V153_MEDIA_CACHE[chave] = str(p)
+                return p
+        except Exception:
+            pass
+
+    # Cache negativo: PDF falhou uma vez -> DOCX não perde mais 25 s tentando a mesma mídia.
+    with _V153_MEDIA_LOCK:
+        _V153_MEDIA_CACHE[chave] = None
+    return None
+
+
+def _v153_docx_contingencia(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """DOCX editável garantido. Só é usado se o gerador completo exceder o limite/falhar."""
+    from docx import Document as _Doc
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    meta = dict(payload.get('meta') or {})
+    secoes = [x for x in list(payload.get('sections') or []) if isinstance(x, dict)]
+
+    doc = _Doc()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run('DOSSIÊ OPERACIONAL — DICOR')
+    r.bold = True; r.font.size = Pt(18)
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run('POLÍCIA FEDERAL • CAPITAL MORADA DO VALLEY').bold = True
+
+    tabela = doc.add_table(rows=0, cols=2); tabela.style = 'Table Grid'
+    for a,b in [
+        ('Processo Nº', meta.get('processo') or dados.get('processo')),
+        ('Investigação Nº', meta.get('numero') or dados.get('numero_investigacao') or dados.get('numero')),
+        ('Nome da Operação', meta.get('nome_operacao') or dados.get('nome_operacao') or dados.get('nome')),
+        ('Organização / Família', meta.get('comunidade') or dados.get('comunidade')),
+        ('Cidade Operacional', meta.get('cidade') or 'Capital Morada do Valley'),
+        ('Data de Abertura', meta.get('data_abertura') or dados.get('data_abertura')),
+        ('Responsável Institucional', meta.get('delegado') or dados.get('delegado')),
+        ('Nº do Pedido de Pacificação', meta.get('pedido_numero') or 'Não informado'),
+        ('Data de Expedição', meta.get('pedido_data') or 'Não informado'),
+        ('Requerente do Pedido', meta.get('pedido_requerente') or 'Não informado'),
+        ('Local da Pacificação', meta.get('pedido_local') or dados.get('local_pacificacao_manual') or 'Não informado'),
+    ]:
+        c=tabela.add_row().cells; c[0].text=str(a); c[1].text=str(b or 'Não informado')
+
+    doc.add_page_break()
+    h=doc.add_paragraph(); rr=h.add_run('ÍNDICE DE EVIDÊNCIAS'); rr.bold=True; rr.font.size=Pt(15)
+    for sec in secoes:
+        doc.add_paragraph(f"{str(sec.get('code') or '').zfill(2)}. {str(sec.get('title') or '').upper()}")
+
+    # Usa SOMENTE arquivos já locais/cacheados; nunca acessa rede no fallback.
+    cache = caminho_docx.parent / '_v153_media_shared'
+    for sec in secoes:
+        doc.add_page_break()
+        code=str(sec.get('code') or '').zfill(2); title=str(sec.get('title') or '').upper()
+        p=doc.add_paragraph(); rr=p.add_run(f'{code}. {title}'); rr.bold=True; rr.font.size=Pt(15)
+        resumo=str(sec.get('summary') or '').strip()
+        if resumo: doc.add_paragraph(resumo)
+        for a,b in list(sec.get('field_lines') or []): doc.add_paragraph(f'{a}: {b}')
+        for pessoa in list(sec.get('people') or []):
+            if not isinstance(pessoa,dict): continue
+            doc.add_paragraph(f"{pessoa.get('nome') or 'Não informado'} | RG: {pessoa.get('rg') or 'Não informado'} | Cargo: {pessoa.get('cargo') or pessoa.get('funcao') or 'Não informado'}")
+        info=sec.get('informante') if isinstance(sec.get('informante'),dict) else None
+        if info:
+            doc.add_paragraph(f"Informante: {info.get('nome') or 'Não informado'} | RG: {info.get('rg') or 'Não informado'}")
+        extra=str(sec.get('extra_text') or '').strip()
+        if extra: doc.add_paragraph(extra)
+        for crime in list(sec.get('crimes') or []):
+            if isinstance(crime,dict): doc.add_paragraph(f"Crime: {crime.get('descricao') or 'Não informado'}")
+        imgs=[]
+        imgs.extend(list(sec.get('images') or []))
+        for grupo in list(sec.get('subgroups') or []):
+            if isinstance(grupo,dict): imgs.extend(list(grupo.get('images') or []))
+        for crime in list(sec.get('crimes') or []):
+            if isinstance(crime,dict): imgs.extend(list(crime.get('provas') or []))
+        vistos=set(); qtd=0
+        for item in imgs:
+            key=_v153_media_key(item)
+            if key in vistos: continue
+            vistos.add(key)
+            with _V153_MEDIA_LOCK: salvo=_V153_MEDIA_CACHE.get(key)
+            if not salvo: continue
+            pth=Path(salvo)
+            if not pth.exists(): continue
+            try:
+                doc.add_picture(str(pth), width=Inches(4.8)); qtd+=1
+                if qtd>=24: break
+            except Exception: pass
+
+    doc.add_page_break()
+    p=doc.add_paragraph(); rr=p.add_run('CONCLUSÃO E ASSINATURAS'); rr.bold=True; rr.font.size=Pt(15)
+    doc.add_paragraph('Documento consolidado a partir das informações e evidências validadas na mesa de investigação. O material permanece vinculado ao procedimento para consulta e eventual reabertura.')
+    doc.add_paragraph('\nBuiu Gomes — Delegado Geral\n\nArthur Fleker — Delegado DICOR')
+    doc.save(str(caminho_docx))
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """Gerador final com watchdog real. Nunca deixa a mesa parada indefinidamente no DOCX."""
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho_docx.with_name(caminho_docx.stem + f'.v153_full_{int(time.time())}.docx')
+    resultado: Dict[str, Any] = {'erro': None}
+
+    def _rodar():
+        try:
+            _V153_GERAR_DOCX_BASE(dados, tmp)
+        except BaseException as erro:
+            resultado['erro'] = erro
+
+    th = threading.Thread(target=_rodar, name='v153-docx-full', daemon=True)
+    th.start()
+    th.join(timeout=120.0)
+    if not th.is_alive() and resultado.get('erro') is None:
+        try:
+            if tmp.exists() and tmp.stat().st_size > 3500:
+                tmp.replace(caminho_docx)
+                print(f'✅ V153 DOCX completo concluído: {caminho_docx.name}', flush=True)
+                return
+        except Exception as erro:
+            resultado['erro'] = erro
+
+    if th.is_alive():
+        print('⚠️ V153 DOCX completo excedeu 120s; ativando DOCX editável de contingência sem travar a mesa.', flush=True)
+    elif resultado.get('erro') is not None:
+        print(f'⚠️ V153 DOCX completo falhou: {type(resultado["erro"]).__name__}: {resultado["erro"]}; ativando contingência.', flush=True)
+    else:
+        print('⚠️ V153 DOCX completo não produziu arquivo válido; ativando contingência.', flush=True)
+
+    _v153_docx_contingencia(dados, caminho_docx)
+    if not caminho_docx.exists() or caminho_docx.stat().st_size <= 3500:
+        raise RuntimeError('DOCX V153 de contingência não foi criado corretamente.')
+    print(f'✅ V153 DOCX contingência concluído: {caminho_docx.name} ({caminho_docx.stat().st_size} bytes).', flush=True)
+
+
+class V153ConfirmacaoFecharMesaView(View):
+    def __init__(self, dados_mesa=None):
+        super().__init__(timeout=180)
+        self.dados_mesa = dict(dados_mesa or {})
+        self._gerando = False
+
+    @discord.ui.button(label='Confirmar Encerramento', emoji='✅', style=discord.ButtonStyle.danger, custom_id='dic_confirmar_fechamento_mesa')
+    async def confirmar(self, interaction: discord.Interaction, button: Button):
+        if self._gerando:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message('⏳ O dossiê já está sendo gerado.', ephemeral=True)
+            except Exception: pass
+            return
+        self._gerando = True
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception:
+            pass
+        for item in self.children:
+            try: item.disabled = True
+            except Exception: pass
+        # Em mensagens efêmeras, edit_original_response é o caminho suportado.
+        try:
+            await interaction.edit_original_response(
+                content='⏳ **Encerramento confirmado.** Coletando dados e gerando PDF/DOCX. A mesa continuará aberta até a confirmação dos arquivos.',
+                view=self,
+            )
+        except Exception as erro:
+            print(f'ℹ️ V153 confirmação efêmera não precisou ser editada: {type(erro).__name__}: {erro}', flush=True)
+        try:
+            return await fechar_mesa_core(interaction, motivo='Fechada por botão', dados_confirmacao=self.dados_mesa)
+        except Exception as erro:
+            self._gerando = False
+            try: await enviar_log(f'❌ V153 erro crítico no fechamento: {type(erro).__name__}: {erro}')
+            except Exception: pass
+            try:
+                await interaction.followup.send('❌ O fechamento encontrou um erro e foi interrompido com segurança. A mesa permanece aberta.', ephemeral=True)
+            except Exception: pass
+
+    @discord.ui.button(label='Cancelar', emoji='❌', style=discord.ButtonStyle.secondary, custom_id='dic_cancelar_fechamento_mesa')
+    async def cancelar(self, interaction: discord.Interaction, button: Button):
+        try:
+            await interaction.response.edit_message(content='❌ Encerramento cancelado. A mesa continua aberta.', view=None)
+        except Exception:
+            try:
+                if not interaction.response.is_done(): await interaction.response.send_message('❌ Encerramento cancelado.', ephemeral=True)
+            except Exception: pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        try: await enviar_log(f'❌ V153 erro em confirmação: {type(error).__name__}: {error}')
+        except Exception: pass
+
+
+# Toda nova confirmação (inclusive V147 Local da Pacificação) passa a usar a versão segura.
+ConfirmacaoFecharMesaView = V153ConfirmacaoFecharMesaView
+
+print(
+    '✅ V153 carregada — fechamento sem travar: cache de mídia compartilhado PDF/DOCX, URLs com timeout curto, '
+    'cache negativo, DOCX com watchdog de 120s + contingência e confirmação efêmera sem interaction.message.edit.',
+    flush=True,
+)
+
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
