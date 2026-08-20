@@ -67505,6 +67505,747 @@ print(
     flush=True,
 )
 
+
+
+# =============================================================
+# V161 — RECONSTRUÇÃO READ-ONLY PELO DISCORD + FOTOS ÚNICAS
+#
+# Corrige dois problemas observados em produção:
+# 1) mesas com tarefas/conteúdo no Discord podiam perder/ficar sem o JSON V116 e
+#    o fechamento abortava com "estado guiado ... não foi localizado";
+# 2) uma mesma fotografia podia chegar ao payload com metadados/URLs diferentes
+#    e ser exibida em duas fichas de pessoas, embora o tópico tivesse fotos distintas.
+#
+# Regras desta versão:
+# - NÃO cria tarefas, NÃO grava/migra estado persistente e NÃO edita tópicos;
+# - quando o estado V116 existe, ele é usado em CÓPIA e as fotos das pessoas são
+#   reconciliadas com as mensagens reais do respectivo tópico (RG/nome/mensagem);
+# - quando o estado V116 não existe, as 13 seções são reconstruídas SOMENTE EM
+#   MEMÓRIA a partir das mensagens/anexos dos tópicos da própria mesa;
+# - deduplicação final também compara o CONTEÚDO VISUAL materializado, e não apenas URL;
+# - se duas pessoas ainda apontarem para a mesma foto e não houver outra foto correta,
+#   a segunda recebe um placeholder individual "?" — nunca a foto errada de outra pessoa;
+# - o renderer/layout continua EXATAMENTE o V131/V133 aprovado pela V158/V160.
+# =============================================================
+
+V161_RECONSTRUCAO_DISCORD = 'V161 — payload read-only pelos tópicos + foto por pessoa + dedupe visual'
+
+
+def _v161_norm(valor: Any) -> str:
+    try:
+        return _v116_norm(valor)
+    except Exception:
+        import unicodedata as _u
+        s = str(valor or '').lower()
+        s = ''.join(ch for ch in _u.normalize('NFKD', s) if not _u.combining(ch))
+        return re.sub(r'[^a-z0-9]+', ' ', s).strip()
+
+
+def _v161_media_meta_unique(lista: Any, limite: int=200) -> List[Dict[str, Any]]:
+    saida: List[Dict[str, Any]] = []
+    vistos: set[str] = set()
+    for bruto in list(lista or []):
+        try:
+            item = _v124_normalizar_midia(bruto)
+        except Exception:
+            item = bruto if isinstance(bruto, dict) else None
+        if not isinstance(item, dict):
+            continue
+        try:
+            ident = _v129_midia_id(item)
+        except Exception:
+            ident = '|'.join([
+                str(item.get('mensagem_id') or ''),
+                str(item.get('indice') if item.get('indice') is not None else ''),
+                str(item.get('url') or item.get('proxy_url') or ''),
+                str(item.get('local') or item.get('arquivo') or ''),
+            ])
+        ident = ident or repr(sorted(item.items()))
+        if ident in vistos:
+            continue
+        vistos.add(ident)
+        saida.append(item)
+        if len(saida) >= max(1, int(limite or 200)):
+            break
+    return saida
+
+
+def _v161_person_key(p: Dict[str, Any]) -> Tuple[str, str]:
+    rg = re.sub(r'\D', '', str((p or {}).get('rg') or ''))
+    nome = _v161_norm((p or {}).get('nome'))
+    return rg, nome
+
+
+def _v161_parse_people_records(records: List[Dict[str, Any]], *, informante: bool=False) -> List[Dict[str, Any]]:
+    """Parser puro: associa a foto SOMENTE às mensagens do mesmo registro/pessoa."""
+    saida: List[Dict[str, Any]] = []
+    pend: Dict[str, Any] = {}
+
+    def completo(p: Dict[str, Any]) -> bool:
+        if not str(p.get('nome') or '').strip() or not str(p.get('rg') or '').strip():
+            return False
+        if not informante and not str(p.get('cargo') or '').strip():
+            return False
+        return bool(p.get('foto'))
+
+    def finalizar(*, permitir_incompleto: bool=False) -> None:
+        nonlocal pend
+        if not pend:
+            return
+        tem_ident = bool(str(pend.get('nome') or '').strip() or str(pend.get('rg') or '').strip())
+        if completo(pend) or (permitir_incompleto and tem_ident):
+            reg = dict(pend)
+            if informante and not str(reg.get('cargo') or '').strip():
+                reg['cargo'] = 'Informante'
+            rg, nome = _v161_person_key(reg)
+            existente = None
+            for x in saida:
+                xrg, xnome = _v161_person_key(x)
+                if (rg and xrg == rg) or (not rg and nome and xnome == nome):
+                    existente = x
+                    break
+            if existente is None:
+                saida.append(reg)
+            else:
+                # O registro mais recente pode completar campos, mas foto só muda se vier
+                # de uma mensagem realmente ligada a esta mesma pessoa.
+                for k in ('nome','rg','cargo','foto','documento','mensagens'):
+                    if reg.get(k):
+                        existente[k] = reg[k]
+        pend = {}
+
+    # Primeiro caminho: mensagens humanas. Uma pessoa por vez, como definido no fluxo.
+    for rec in list(records or []):
+        if bool(rec.get('bot')):
+            continue
+        conteudo = str(rec.get('content') or '')
+        try:
+            campos = _v116_extrair_pessoa(conteudo)
+        except Exception:
+            campos = {'nome':'','rg':'','cargo':''}
+        imgs = _v161_media_meta_unique(rec.get('images') or [], 20)
+
+        novo_rg = re.sub(r'\D', '', str(campos.get('rg') or ''))
+        pend_rg = re.sub(r'\D', '', str(pend.get('rg') or ''))
+        novo_nome = _v161_norm(campos.get('nome'))
+        pend_nome = _v161_norm(pend.get('nome'))
+        # Se chegou identidade inequivocamente de outra pessoa, fecha o registro anterior.
+        if pend and ((novo_rg and pend_rg and novo_rg != pend_rg) or (novo_nome and pend_nome and novo_nome != pend_nome and completo(pend))):
+            finalizar(permitir_incompleto=True)
+
+        for k in ('nome','rg','cargo'):
+            if str(campos.get(k) or '').strip():
+                pend[k] = str(campos.get(k)).strip()
+        if imgs and not pend.get('foto'):
+            pend['foto'] = imgs[0]
+            if informante and len(imgs) > 1 and not pend.get('documento'):
+                pend['documento'] = imgs[1]
+        pend.setdefault('mensagens', [])
+        mid = int(rec.get('id') or 0)
+        if mid and mid not in pend['mensagens']:
+            pend['mensagens'].append(mid)
+        if completo(pend):
+            finalizar()
+
+    finalizar(permitir_incompleto=True)
+
+    # Segundo caminho: confirmações do próprio bot ajudam a recuperar nome/RG caso o
+    # usuário tenha mandado foto e texto em mensagens separadas e o parser acima não feche.
+    # NÃO usa foto de bot; procura somente foto humana imediatamente anterior ainda não usada.
+    usados_mid = {int(m) for p in saida for m in list(p.get('mensagens') or []) if str(m).isdigit()}
+    human_imgs: List[Tuple[int, Dict[str, Any]]] = []
+    for rec in list(records or []):
+        if rec.get('bot'):
+            continue
+        for img in _v161_media_meta_unique(rec.get('images') or [], 10):
+            human_imgs.append((int(rec.get('id') or 0), img))
+
+    for rec in list(records or []):
+        if not rec.get('bot'):
+            continue
+        txt = str(rec.get('content') or '')
+        n = _v161_norm(txt)
+        if 'registrad' not in n or ('lideranca' not in n and 'membro' not in n and 'informante' not in n):
+            continue
+        rgm = re.search(r'(?i)\bRG\s*`?\s*(\d{3,8})', txt)
+        if not rgm:
+            continue
+        rg = rgm.group(1)
+        if any(re.sub(r'\D','',str(p.get('rg') or '')) == rg for p in saida):
+            continue
+        # tenta nome entre ** ** depois de "registrado(a):"
+        nm = re.search(r'(?is)registrad[oa]\s*:\s*\*\*(.+?)\*\*', txt)
+        nome = ' '.join((nm.group(1) if nm else '').split()).strip()
+        if not nome:
+            continue
+        cargo = 'Informante' if informante else ''
+        if not informante:
+            # trecho entre o nome e RG costuma conter o cargo
+            trecho = txt[nm.end():rgm.start()] if nm else ''
+            trecho = re.sub(r'[`*_—\-]+', ' ', trecho)
+            cargo = ' '.join(trecho.split()).strip(' :')
+        foto = None
+        confirma_id = int(rec.get('id') or 0)
+        candidatos = [(mid,img) for mid,img in human_imgs if mid < confirma_id and mid not in usados_mid]
+        if candidatos:
+            mid, foto = candidatos[-1]
+            usados_mid.add(mid)
+        saida.append({'nome':nome,'rg':rg,'cargo':cargo or ('Informante' if informante else 'Não informado'),'foto':foto,'mensagens':[mid] if foto else []})
+
+    return saida
+
+
+def _v161_merge_people(base: List[Dict[str, Any]], topico: List[Dict[str, Any]], *, cargo_padrao: str) -> List[Dict[str, Any]]:
+    """Mantém identidade estruturada, mas a FOTO do tópico real vence por RG/nome."""
+    base = [dict(x) for x in list(base or []) if isinstance(x, dict)]
+    topico = [dict(x) for x in list(topico or []) if isinstance(x, dict)]
+    usados: set[int] = set()
+    saida: List[Dict[str, Any]] = []
+    for p in base:
+        rg, nome = _v161_person_key(p)
+        match_i = None
+        for i, q in enumerate(topico):
+            if i in usados:
+                continue
+            qrg, qnome = _v161_person_key(q)
+            if (rg and qrg and rg == qrg) or (nome and qnome and nome == qnome):
+                match_i = i
+                break
+        r = dict(p)
+        if match_i is not None:
+            q = topico[match_i]
+            usados.add(match_i)
+            # a foto real localizada na mensagem daquele RG/nome tem prioridade absoluta
+            if q.get('foto'):
+                r['foto'] = q.get('foto')
+            for k in ('nome','rg','cargo'):
+                if not str(r.get(k) or '').strip() and str(q.get(k) or '').strip():
+                    r[k] = q.get(k)
+            if q.get('mensagens'):
+                r['mensagens'] = list(q.get('mensagens') or [])
+        if not str(r.get('cargo') or '').strip():
+            r['cargo'] = cargo_padrao
+        saida.append(r)
+    for i, q in enumerate(topico):
+        if i in usados:
+            continue
+        r = dict(q)
+        if not str(r.get('cargo') or '').strip():
+            r['cargo'] = cargo_padrao
+        saida.append(r)
+    return saida
+
+
+def _v161_records_stage(records: List[Dict[str, Any]], stage: int) -> List[Dict[str, Any]]:
+    return [r for r in list(records or []) if not r.get('bot') and int(r.get('stage') or 1) == int(stage)]
+
+
+def _v161_imgs_records(records: List[Dict[str, Any]], limite: int=100) -> List[Dict[str, Any]]:
+    imgs: List[Dict[str, Any]] = []
+    for r in list(records or []):
+        if r.get('bot'):
+            continue
+        imgs.extend(list(r.get('images') or []))
+    return _v161_media_meta_unique(imgs, limite)
+
+
+def _v161_textos_records(records: List[Dict[str, Any]], limite: int=30) -> List[str]:
+    out=[]
+    for r in list(records or []):
+        if r.get('bot'):
+            continue
+        t=' '.join(str(r.get('content') or '').split()).strip()
+        if not t:
+            continue
+        if t not in out:
+            out.append(t)
+        if len(out)>=limite:
+            break
+    return out
+
+
+def _v161_parse_crimes(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    crimes=[]
+    pend_desc=''
+    pend_provas=[]
+    for r in list(records or []):
+        if r.get('bot'):
+            continue
+        texto=str(r.get('content') or '').strip()
+        texto=re.sub(r'https?://[^\s<>]+','',texto).strip(' \n-•')
+        provas=list(r.get('attachments') or r.get('images') or [])
+        if texto and pend_desc and pend_provas:
+            crimes.append({'descricao':pend_desc[:1200],'provas':_v161_media_meta_unique(pend_provas,12)})
+            pend_desc=''; pend_provas=[]
+        if texto:
+            try:
+                d=_v116_rotulo(texto,['crime','delito','descri[cç][aã]o'],1000) or texto
+            except Exception:
+                d=texto
+            pend_desc=d[:1200]
+        if provas:
+            pend_provas.extend(provas)
+        if pend_desc and pend_provas:
+            crimes.append({'descricao':pend_desc[:1200],'provas':_v161_media_meta_unique(pend_provas,12)})
+            pend_desc=''; pend_provas=[]
+    if pend_desc or pend_provas:
+        crimes.append({'descricao':pend_desc[:1200] or 'Crime registrado na investigação','provas':_v161_media_meta_unique(pend_provas,12)})
+    # dedupe por descrição normalizada
+    saida=[]; vistos=set()
+    for c in crimes:
+        k=_v161_norm(c.get('descricao'))
+        if k in vistos and k:
+            continue
+        if k: vistos.add(k)
+        saida.append(c)
+    return saida
+
+
+async def _v161_topicos_readonly(canal: discord.TextChannel) -> Dict[int, discord.Thread]:
+    """Localiza tópicos sem abrir/desarquivar/editar nenhum deles."""
+    try:
+        todos = await _v116_topicos_mesa(canal)
+    except Exception:
+        todos = list(getattr(canal, 'threads', []) or [])
+    mapa: Dict[int, discord.Thread] = {}
+    for item in range(1,14):
+        aliases=[_v161_norm(x) for x in _v116_topico_chaves(item)]
+        cand=[]
+        for t in list(todos or []):
+            if not isinstance(t, discord.Thread):
+                continue
+            nome=_v161_norm(getattr(t,'name',''))
+            if any(a and a in nome for a in aliases):
+                # quanto mais próximo do alias, melhor; tópico mais recente desempata
+                score=max((len(a) for a in aliases if a and a in nome), default=0)
+                created=getattr(t,'created_at',None)
+                ts=getattr(created,'timestamp',lambda:0.0)() if created else 0.0
+                cand.append((score,ts,t))
+        if cand:
+            cand.sort(key=lambda x:(x[0],x[1]), reverse=True)
+            mapa[item]=cand[0][2]
+    return mapa
+
+
+async def _v161_ler_topico_readonly(topico: discord.Thread, limite: int=600) -> List[Dict[str, Any]]:
+    registros=[]
+    stage=1
+    try:
+        async for msg in topico.history(limit=limite, oldest_first=True):
+            conteudo=str(getattr(msg,'content','') or '')
+            eh_bot=bool(getattr(getattr(msg,'author',None),'bot',False))
+            if eh_bot:
+                n=_v161_norm(conteudo)
+                # Só avança a etapa quando o próprio card/retorno do bot anuncia 2/2.
+                if ('etapa 2 2' in n) or bool(re.search(r'(?i)ETAPA\s*2\s*/\s*2',conteudo)):
+                    stage=2
+            try:
+                imgs=_v116_imagens(msg) if not eh_bot else []
+            except Exception:
+                imgs=[]
+            try:
+                anexos=_v116_anexos_prova(msg) if not eh_bot else []
+            except Exception:
+                anexos=list(imgs)
+            registros.append({
+                'id':int(getattr(msg,'id',0) or 0),
+                'content':conteudo,
+                'bot':eh_bot,
+                'stage':int(stage),
+                'images':imgs,
+                'attachments':anexos,
+                'created_at':str(getattr(msg,'created_at','') or ''),
+            })
+    except Exception as erro:
+        print(f'⚠️ V161 leitura readonly tópico {getattr(topico,"id",0)}: {type(erro).__name__}: {erro}', flush=True)
+    return registros
+
+
+async def _v161_dados_topicos(canal: discord.TextChannel) -> Tuple[Dict[str, Any], Dict[int,List[Dict[str,Any]]]]:
+    topicos=await _v161_topicos_readonly(canal)
+    regs: Dict[int,List[Dict[str,Any]]] = {}
+    for item,t in topicos.items():
+        regs[item]=await _v161_ler_topico_readonly(t)
+
+    g: Dict[str,Any] = {}
+    # 01 painel
+    g['painel_imagens']=_v161_imgs_records(regs.get(1,[]),20)
+
+    # 02/03 pessoas — foto presa ao próprio registro/mensagem
+    g['liderancas']=_v161_parse_people_records(regs.get(2,[]), informante=False)
+    g['membros']=_v161_parse_people_records(regs.get(3,[]), informante=False)
+
+    # 04 rádio
+    textos_radio=_v161_textos_records(regs.get(4,[]),20)
+    if textos_radio:
+        g['radio']=textos_radio[-1][:800]
+
+    # 05 localização: usa marcadores de etapa; sem marcador, 2 primeiras + próximas 4.
+    r5=regs.get(5,[])
+    b5=_v161_imgs_records(_v161_records_stage(r5,1),20)
+    a5=_v161_imgs_records(_v161_records_stage(r5,2),20)
+    todas5=_v161_imgs_records(r5,20)
+    if not a5:
+        b5=todas5[:2]; a5=todas5[2:6]
+    g['localizacao_etapa1']=b5[:2]
+    g['localizacao_aereas']=a5[:4]
+
+    # 06 crimes
+    g['crimes']=_v161_parse_crimes(regs.get(6,[]))
+
+    # 07..10 evidências diretas do próprio tópico
+    g['bau_lider']=_v161_imgs_records(regs.get(7,[]),20)
+    g['bau_membros']=_v161_imgs_records(regs.get(8,[]),20)
+    g['rota_farm']=_v161_imgs_records(regs.get(9,[]),20)
+    g['rota_producao']=_v161_imgs_records(regs.get(10,[]),20)
+
+    # 11 ingredientes/produto, respeitando a etapa do card.
+    r11=regs.get(11,[])
+    i11=_v161_imgs_records(_v161_records_stage(r11,1),20)
+    p11=_v161_imgs_records(_v161_records_stage(r11,2),20)
+    todas11=_v161_imgs_records(r11,20)
+    if not p11 and len(todas11)>=2:
+        i11=todas11[:-1]; p11=todas11[-1:]
+    g['ingredientes_fotos']=i11[:8]
+    g['produto_final_fotos']=p11[:8]
+
+    # 12 informante: documento é opcional; etapa 2 é resumo.
+    r12=regs.get(12,[])
+    r12e1=[r for r in r12 if int(r.get('stage') or 1)==1]
+    pessoas_inf=_v161_parse_people_records(r12e1,informante=True)
+    if pessoas_inf:
+        inf=dict(pessoas_inf[0]); inf['cargo']='Informante'
+        g['informante']=inf
+    r12e2=[r for r in r12 if not r.get('bot') and int(r.get('stage') or 1)==2]
+    txt12=_v161_textos_records(r12e2,60)
+    if txt12:
+        g['informante_resumo']='\n'.join(txt12)[:6000]
+    g['informante_resumo_fotos']=_v161_imgs_records(r12e2,20)
+
+    # 13 residência
+    g['residencia_fotos']=_v161_imgs_records(regs.get(13,[]),30)
+    return g, regs
+
+
+def _v161_estado_existente_readonly(canal_id: int) -> Optional[Dict[str, Any]]:
+    import copy as _copy
+    try:
+        todos=_v116_carregar()
+    except Exception:
+        todos={}
+    if not isinstance(todos,dict):
+        return None
+    direto=todos.get(str(int(canal_id)))
+    if isinstance(direto,dict):
+        return _copy.deepcopy(direto)
+    # Corrige arquivo com chave antiga/errada mas mesa_canal_id interno correto.
+    for e in todos.values():
+        if isinstance(e,dict) and int(e.get('mesa_canal_id') or 0)==int(canal_id):
+            return _copy.deepcopy(e)
+    return None
+
+
+def _v161_merge_estado_topicos(estado: Optional[Dict[str,Any]], topico: Dict[str,Any], canal_id: int) -> Dict[str,Any]:
+    import copy as _copy
+    if isinstance(estado,dict):
+        e=_copy.deepcopy(estado)
+        try:
+            _v117_migrar_estado(e)  # somente cópia em memória
+        except Exception:
+            pass
+    else:
+        e=_v116_estado_padrao(int(canal_id))
+        e['status']='CONCLUIDA'
+        e['concluidos']={str(i):{'versao':161,'origem':'reconstrucao_readonly_discord'} for i in range(1,14)}
+    g=dict(e.get('dados') or {})
+
+    # Pessoas: identidade estruturada permanece, FOTO encontrada no tópico real vence.
+    g['liderancas']=_v161_merge_people(list(g.get('liderancas') or []),list(topico.get('liderancas') or []),cargo_padrao='Liderança')
+    g['membros']=_v161_merge_people(list(g.get('membros') or []),list(topico.get('membros') or []),cargo_padrao='Membro')
+
+    # Mídias dos próprios tópicos são a fonte visual mais confiável no fechamento.
+    for chave in ('painel_imagens','localizacao_etapa1','localizacao_aereas','bau_lider','bau_membros','rota_farm','rota_producao','ingredientes_fotos','produto_final_fotos','residencia_fotos'):
+        if list(topico.get(chave) or []):
+            g[chave]=_v161_media_meta_unique(topico.get(chave),100)
+    if str(topico.get('radio') or '').strip():
+        g['radio']=str(topico.get('radio')).strip()
+    if list(topico.get('crimes') or []):
+        # Se o estado já tem descrições estruturadas, preserva; provas do tópico podem completar.
+        if not list(g.get('crimes') or []):
+            g['crimes']=list(topico.get('crimes') or [])
+        else:
+            crimes=[dict(c) for c in list(g.get('crimes') or []) if isinstance(c,dict)]
+            topcr=[dict(c) for c in list(topico.get('crimes') or []) if isinstance(c,dict)]
+            for idx,c in enumerate(crimes):
+                if idx < len(topcr) and list(topcr[idx].get('provas') or []):
+                    c['provas']=_v161_media_meta_unique(topcr[idx].get('provas'),20)
+            g['crimes']=crimes
+
+    # Informante: foto/nome/RG do próprio tópico; documento opcional; resumo da etapa 2.
+    inf_top=topico.get('informante') if isinstance(topico.get('informante'),dict) else None
+    inf_base=g.get('informante') if isinstance(g.get('informante'),dict) else {}
+    if inf_top:
+        inf=dict(inf_base)
+        for k in ('nome','rg','cargo','foto','documento','mensagens'):
+            if inf_top.get(k):
+                inf[k]=inf_top.get(k)
+        inf['cargo']='Informante'
+        g['informante']=inf
+    if str(topico.get('informante_resumo') or '').strip():
+        g['informante_resumo']=str(topico.get('informante_resumo')).strip()
+    if list(topico.get('informante_resumo_fotos') or []):
+        g['informante_resumo_fotos']=_v161_media_meta_unique(topico.get('informante_resumo_fotos'),20)
+
+    e['dados']=g
+    e['mesa_canal_id']=int(canal_id)
+    return e
+
+
+def _v161_placeholder(pasta: Path, pessoa: Dict[str,Any], indice: int) -> Dict[str,Any]:
+    pasta=Path(pasta); pasta.mkdir(parents=True,exist_ok=True)
+    rg=re.sub(r'\D','',str(pessoa.get('rg') or '')) or str(indice)
+    nome=_v161_norm(pessoa.get('nome')).replace(' ','-')[:35] or 'sem-nome'
+    destino=pasta/f'_v161_sem_foto_{rg}_{nome}.png'
+    if not destino.exists():
+        if PILImage is None:
+            # fallback: usa um PNG mínimo gerado via ReportLab/Pillow indisponível não deve ocorrer.
+            raise RuntimeError('Pillow indisponível para placeholder de foto.')
+        from PIL import ImageDraw, ImageFont
+        im=PILImage.new('RGB',(360,520),(7,7,7))
+        d=ImageDraw.Draw(im)
+        try:
+            fbig=ImageFont.truetype('DejaVuSans-Bold.ttf',220)
+            fsmall=ImageFont.truetype('DejaVuSans-Bold.ttf',24)
+        except Exception:
+            fbig=ImageFont.load_default(); fsmall=ImageFont.load_default()
+        q='?'
+        box=d.textbbox((0,0),q,font=fbig)
+        d.text(((360-(box[2]-box[0]))/2,80),q,fill=(245,245,245),font=fbig)
+        label='FOTO NÃO LOCALIZADA'
+        box2=d.textbbox((0,0),label,font=fsmall)
+        d.text(((360-(box2[2]-box2[0]))/2,430),label,fill=(220,220,220),font=fsmall)
+        # pequena identificação torna cada placeholder único sem alterar o layout do cartão
+        d.text((12,488),f'RG {rg}'[:30],fill=(90,90,90),font=fsmall)
+        im.save(destino,'PNG',optimize=True)
+    return {'local':str(destino),'arquivo':destino.name,'_v161_placeholder':True,'mensagem_id':0,'indice':indice}
+
+
+def _v161_visual_signature(item: Any, pasta_cache: Path) -> Optional[Tuple[int,int,int,int]]:
+    """Assinatura visual robusta a URL diferente/recompressão leve."""
+    if isinstance(item,dict) and item.get('_v161_placeholder'):
+        # placeholders são deliberadamente individuais
+        return None
+    try:
+        p=_v124_materializar_midia(item,Path(pasta_cache))
+    except Exception:
+        p=None
+    if not p or not Path(p).exists() or PILImage is None:
+        return None
+    try:
+        with PILImage.open(str(p)) as im:
+            im=im.convert('RGB')
+            w,h=im.size
+            # dHash 16x16 (240 bits) + média de cor quantizada.
+            gray=im.convert('L').resize((17,16))
+            px=list(gray.getdata())
+            bits=0; pos=0
+            for y in range(16):
+                row=y*17
+                for x in range(16):
+                    bits=(bits<<1) | (1 if px[row+x] > px[row+x+1] else 0)
+                    pos+=1
+            sm=im.resize((16,16))
+            vals=list(sm.getdata())
+            avg=tuple(int(sum(v[i] for v in vals)/len(vals)/8) for i in range(3))
+            ratio=int(round((w/max(1,h))*100))
+            return (bits,avg[0]*10000+avg[1]*100+avg[2],ratio,256)
+    except Exception:
+        return None
+
+
+def _v161_sig_igual(a: Optional[Tuple[int,int,int,int]], b: Optional[Tuple[int,int,int,int]]) -> bool:
+    if not a or not b:
+        return False
+    if abs(int(a[2])-int(b[2]))>2:
+        return False
+    # imagens iguais/reencodadas: dHash praticamente idêntico; limite conservador.
+    dist=(int(a[0]) ^ int(b[0])).bit_count()
+    return dist <= 2 and abs(int(a[1])-int(b[1])) <= 10101
+
+
+def _v161_dedupe_visual_payload(payload: Dict[str,Any], pasta_base: Path) -> Dict[str,Any]:
+    import copy as _copy
+    p=_copy.deepcopy(payload) if isinstance(payload,dict) else payload
+    if not isinstance(p,dict):
+        return p
+    cache=Path(pasta_base)/'_v161_visual_cache'; cache.mkdir(parents=True,exist_ok=True)
+    placeholders=Path(pasta_base)/'_v161_placeholders'; placeholders.mkdir(parents=True,exist_ok=True)
+    assinaturas: List[Tuple[Tuple[int,int,int,int],str]]=[]
+
+    def duplicada(item: Any) -> bool:
+        sig=_v161_visual_signature(item,cache)
+        if not sig:
+            return False
+        for antiga,_origem in assinaturas:
+            if _v161_sig_igual(sig,antiga):
+                return True
+        return False
+
+    def reservar(item: Any, origem: str) -> bool:
+        sig=_v161_visual_signature(item,cache)
+        if not sig:
+            return True
+        for antiga,_ in assinaturas:
+            if _v161_sig_igual(sig,antiga):
+                return False
+        assinaturas.append((sig,origem))
+        return True
+
+    secoes={str(s.get('code') or '').zfill(2):s for s in list(p.get('sections') or []) if isinstance(s,dict)}
+    for codigo in [f'{i:02d}' for i in range(1,14)]:
+        sec=secoes.get(codigo)
+        if not isinstance(sec,dict):
+            continue
+        # Pessoas: nunca reutiliza a mesma foto em dois indivíduos.
+        if codigo in ('02','03'):
+            pessoas=[]
+            for idx,br in enumerate(list(sec.get('people') or []),1):
+                if not isinstance(br,dict): continue
+                pessoa=dict(br); foto=pessoa.get('foto')
+                if foto and reservar(foto,f'{codigo}:pessoa:{idx}'):
+                    pass
+                else:
+                    pessoa['foto']=_v161_placeholder(placeholders,pessoa,idx)
+                pessoas.append(pessoa)
+            sec['people']=pessoas
+            sec['images']=[x.get('foto') for x in pessoas if isinstance(x.get('foto'),dict)]
+            continue
+
+        if codigo=='12':
+            info=sec.get('informante') if isinstance(sec.get('informante'),dict) else None
+            if info and info.get('foto'):
+                if not reservar(info.get('foto'),'12:informante'):
+                    info=dict(info); info['foto']=_v161_placeholder(placeholders,info,1); sec['informante']=info
+            # documento/resumo serão filtrados abaixo, sem repetir a foto do cartão.
+
+        if codigo in ('05','11'):
+            grupos=[]
+            for gi,g in enumerate(list(sec.get('subgroups') or []),1):
+                if not isinstance(g,dict): continue
+                novo=dict(g); imgs=[]
+                for ii,item in enumerate(list(g.get('images') or []),1):
+                    if reservar(item,f'{codigo}:g{gi}:{ii}'):
+                        imgs.append(item)
+                novo['images']=imgs; grupos.append(novo)
+            sec['subgroups']=grupos
+            sec['images']=[x for g in grupos for x in list(g.get('images') or [])]
+            continue
+
+        if codigo=='06':
+            crimes=[]
+            for ci,c in enumerate(list(sec.get('crimes') or []),1):
+                if not isinstance(c,dict): continue
+                novo=dict(c); provas=[]
+                for pi,item in enumerate(list(c.get('provas') or []),1):
+                    if reservar(item,f'06:c{ci}:{pi}'):
+                        provas.append(item)
+                novo['provas']=provas; crimes.append(novo)
+            sec['crimes']=crimes
+            sec['images']=[x for c in crimes for x in list(c.get('provas') or [])]
+            continue
+
+        imgs=[]
+        for ii,item in enumerate(list(sec.get('images') or []),1):
+            # Item 12: se a própria foto do informante reaparecer na galeria, cai aqui e é removida.
+            if reservar(item,f'{codigo}:{ii}'):
+                imgs.append(item)
+        sec['images']=imgs
+
+    p['sections']=[secoes[f'{i:02d}'] for i in range(1,14) if f'{i:02d}' in secoes]
+    p['evidence_index']=[{'code':s.get('code'),'title':s.get('title'),'count':len(list(s.get('images') or []))} for s in p['sections']]
+    return p
+
+
+# ---------- Coleta final V161: estado é opcional; Discord real é a fonte de recuperação. ----------
+_V161_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]]=None,
+) -> Dict[str, Any]:
+    dados=await _V161_COLETAR_BASE(canal,mesa,interaction,pasta_dossie,dados_confirmacao=dados_confirmacao)
+    if not isinstance(dados,dict) or not isinstance(canal,discord.TextChannel):
+        return dados
+    try:
+        topico_dados, regs = await _v161_dados_topicos(canal)
+        estado_base=_v161_estado_existente_readonly(int(canal.id))
+        estado=_v161_merge_estado_topicos(estado_base,topico_dados,int(canal.id))
+
+        payload=_v129_payload_profissional(dados,estado,int(canal.id))
+        if not isinstance(payload,dict):
+            raise RuntimeError('construtor V129 não retornou payload')
+        payload=_v160_aplicar_local_manual_copia(dados,payload,int(canal.id))
+        try:
+            payload=_v146_sanitizar_payload(payload)
+        except Exception:
+            pass
+        # Deduplica pelo conteúdo visual em thread separada para não bloquear interações.
+        payload=await asyncio.to_thread(_v161_dedupe_visual_payload,payload,Path(pasta_dossie))
+        secoes=_v160_secoes_13(payload)
+        faltantes=[f'{i:02d}' for i in range(1,14) if f'{i:02d}' not in secoes]
+        if faltantes:
+            raise RuntimeError('payload reconstruído incompleto: '+', '.join(faltantes))
+        payload['sections']=[secoes[f'{i:02d}'] for i in range(1,14)]
+        dados['dossie_v124']=payload
+        dados['_v161_estado_readonly']=estado
+        dados['_v161_topicos_lidos']=sorted(regs.keys())
+        dados['gerador_dossie']='V161_DISCORD_READONLY_FOTOS_UNICAS'
+        print(
+            f'✅ V161 coleta mesa={canal.id}: payload 13/13 reconstruído/read-only | '
+            f'estado_original={"sim" if estado_base else "não"} | tópicos_lidos={sorted(regs.keys())} | fotos reconciliadas e dedupe visual aplicado.',
+            flush=True,
+        )
+    except Exception as erro:
+        # Não destrói um payload bom já produzido pela cadeia anterior.
+        print(f'⚠️ V161 reconstrução Discord mesa={getattr(canal,"id",0)}: {type(erro).__name__}: {erro}',flush=True)
+        try: traceback.print_exc()
+        except Exception: pass
+    return dados
+
+
+# ---------- Renderer: nunca volta a exigir o JSON V116 se a coleta V161 já montou o payload. ----------
+_V161_PREPARAR_V160_BASE = _v160_preparar_dados_pdf
+def _v160_preparar_dados_pdf(dados: Dict[str,Any]) -> Dict[str,Any]:
+    import copy as _copy
+    if isinstance(dados,dict):
+        d=_copy.deepcopy(dados)
+        payload=d.get('dossie_v124')
+        secoes=_v160_secoes_13(payload)
+        if len(secoes)==13:
+            payload=dict(payload); payload['sections']=[secoes[f'{i:02d}'] for i in range(1,14)]
+            try: payload=_v146_sanitizar_payload(payload)
+            except Exception: pass
+            canal_id=int(d.get('canal_id') or (payload.get('meta') or {}).get('mesa_canal_id') or 0)
+            d['dossie_v124']=_v160_aplicar_local_manual_copia(d,payload,canal_id)
+            return d
+        estado=d.get('_v161_estado_readonly')
+        if isinstance(estado,dict):
+            canal_id=int(d.get('canal_id') or estado.get('mesa_canal_id') or 0)
+            payload=_v129_payload_profissional(d,estado,canal_id)
+            payload=_v160_aplicar_local_manual_copia(d,payload,canal_id)
+            d['dossie_v124']=payload
+            return d
+    return _V161_PREPARAR_V160_BASE(dados)
+
+
+print(
+    '✅ V161 carregada — fechamento não depende mais exclusivamente do JSON V116; 13 tópicos podem reconstruir o payload em memória; '
+    'fotos de líderes/membros são reconciliadas por pessoa e imagens visualmente repetidas são removidas/substituídas sem alterar o modelo V131/V133.',
+    flush=True,
+)
+
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
