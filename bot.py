@@ -66475,6 +66475,154 @@ print(
     flush=True,
 )
 
-# RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
+
+
+# =============================================================
+# V154 — DOCX RÁPIDO / FECHAMENTO COM LIMITE REAL
+# Problema observado: mesmo com a V153, o gerador DOCX completo podia permanecer
+# na Etapa 3/6 por tempo excessivo. A V154 não usa mais o gerador pesado antigo
+# durante o fechamento: tenta uma cópia editável local por no máximo 25 s e,
+# se necessário, cria imediatamente um DOCX textual de emergência.
+# O PDF aprovado permanece INALTERADO e continua sendo a fonte visual completa.
+# =============================================================
+
+V154_DOCX_FAST_FIX = 'V154 DOCX rápido + watchdog real de 25s'
+
+
+def _v154_docx_texto_emergencia(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """Gera um DOCX editável sem rede/imagens para garantir que o fechamento continue."""
+    from docx import Document as _Doc
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+    payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+    payload = payload if isinstance(payload, dict) else {}
+    meta = dict(payload.get('meta') or {})
+    secoes = [x for x in list(payload.get('sections') or []) if isinstance(x, dict)]
+
+    doc = _Doc()
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run('DOSSIÊ OPERACIONAL — DICOR'); r.bold = True; r.font.size = Pt(18)
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run('POLÍCIA FEDERAL • CAPITAL MORADA DO VALLEY').bold = True
+
+    tabela = doc.add_table(rows=0, cols=2); tabela.style = 'Table Grid'
+    campos = [
+        ('Processo Nº', meta.get('processo') or dados.get('processo')),
+        ('Investigação Nº', meta.get('numero') or dados.get('numero_investigacao') or dados.get('numero')),
+        ('Nome da Operação', meta.get('nome_operacao') or dados.get('nome_operacao') or dados.get('nome')),
+        ('Organização / Família', meta.get('comunidade') or dados.get('comunidade')),
+        ('Cidade Operacional', meta.get('cidade') or 'Capital Morada do Valley'),
+        ('Data de Abertura', meta.get('data_abertura') or dados.get('data_abertura')),
+        ('Responsável Institucional', meta.get('delegado') or dados.get('delegado')),
+        ('Nº do Pedido de Pacificação', meta.get('pedido_numero') or 'Não informado'),
+        ('Data de Expedição', meta.get('pedido_data') or 'Não informado'),
+        ('Requerente do Pedido', meta.get('pedido_requerente') or 'Não informado'),
+        ('Local da Pacificação', meta.get('pedido_local') or dados.get('local_pacificacao_manual') or 'Não informado'),
+    ]
+    for a, b in campos:
+        c = tabela.add_row().cells; c[0].text = str(a); c[1].text = str(b or 'Não informado')
+
+    doc.add_paragraph('')
+    p = doc.add_paragraph()
+    rr = p.add_run('Observação: as evidências visuais completas permanecem no PDF oficial gerado em conjunto com este arquivo editável.')
+    rr.italic = True
+
+    doc.add_page_break()
+    h = doc.add_paragraph(); rr = h.add_run('ÍNDICE DE EVIDÊNCIAS'); rr.bold = True; rr.font.size = Pt(15)
+    for sec in secoes:
+        doc.add_paragraph(f"{str(sec.get('code') or '').zfill(2)}. {str(sec.get('title') or '').upper()}")
+
+    for sec in secoes:
+        doc.add_page_break()
+        code = str(sec.get('code') or '').zfill(2)
+        title = str(sec.get('title') or '').upper()
+        h = doc.add_paragraph(); rr = h.add_run(f'{code}. {title}'); rr.bold = True; rr.font.size = Pt(15)
+        resumo = str(sec.get('summary') or '').strip()
+        if resumo:
+            doc.add_paragraph(resumo)
+        for linha in list(sec.get('field_lines') or []):
+            try:
+                a, b = linha
+                doc.add_paragraph(f'{a}: {b}')
+            except Exception:
+                pass
+        for pessoa in list(sec.get('people') or []):
+            if not isinstance(pessoa, dict):
+                continue
+            doc.add_paragraph(
+                f"{pessoa.get('nome') or 'Não informado'} | RG: {pessoa.get('rg') or 'Não informado'} | "
+                f"Cargo: {pessoa.get('cargo') or pessoa.get('funcao') or 'Não informado'}"
+            )
+        info = sec.get('informante') if isinstance(sec.get('informante'), dict) else None
+        if info:
+            doc.add_paragraph(f"Informante: {info.get('nome') or 'Não informado'} | RG: {info.get('rg') or 'Não informado'}")
+        extra = str(sec.get('extra_text') or '').strip()
+        if extra:
+            doc.add_paragraph(extra)
+        for crime in list(sec.get('crimes') or []):
+            if isinstance(crime, dict):
+                doc.add_paragraph(f"Crime: {crime.get('descricao') or 'Não informado'}")
+
+    doc.add_page_break()
+    h = doc.add_paragraph(); rr = h.add_run('CONCLUSÃO E ASSINATURAS'); rr.bold = True; rr.font.size = Pt(15)
+    doc.add_paragraph(
+        'Documento consolidado a partir das informações e evidências validadas na mesa de investigação. '
+        'O PDF oficial preserva integralmente o conjunto visual do procedimento.'
+    )
+    doc.add_paragraph('\nBuiu Gomes — Delegado Geral\n\nArthur Fleker — Delegado DICOR')
+    doc.save(str(caminho_docx))
+
+
+def gerar_docx_dossie(dados: Dict[str, Any], caminho_docx: Path) -> None:
+    """V154: DOCX nunca segura a mesa por mais de ~25 s."""
+    caminho_docx = Path(caminho_docx)
+    caminho_docx.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho_docx.with_name(caminho_docx.stem + f'.v154_editavel_{int(time.time())}.docx')
+    resultado: Dict[str, Any] = {'erro': None}
+
+    def _rodar_editavel_local():
+        try:
+            # Usa somente o gerador local/cacheado da V153. Não chama o gerador pesado antigo.
+            _v153_docx_contingencia(dados, tmp)
+        except BaseException as erro:
+            resultado['erro'] = erro
+
+    th = threading.Thread(target=_rodar_editavel_local, name='v154-docx-local', daemon=True)
+    th.start()
+    th.join(timeout=25.0)
+
+    if not th.is_alive() and resultado.get('erro') is None:
+        try:
+            if tmp.exists() and tmp.stat().st_size > 2500:
+                tmp.replace(caminho_docx)
+                print(f'✅ V154 DOCX editável local concluído: {caminho_docx.name}', flush=True)
+                return
+        except Exception as erro:
+            resultado['erro'] = erro
+
+    if th.is_alive():
+        print('⚠️ V154 DOCX local excedeu 25s; gerando DOCX textual imediato para não travar a mesa.', flush=True)
+    elif resultado.get('erro') is not None:
+        print(f'⚠️ V154 DOCX local falhou: {type(resultado["erro"]).__name__}: {resultado["erro"]}; usando fallback textual.', flush=True)
+    else:
+        print('⚠️ V154 DOCX local não produziu arquivo válido; usando fallback textual.', flush=True)
+
+    # Fallback sem qualquer mídia/rede. Deve terminar em poucos segundos.
+    _v154_docx_texto_emergencia(dados, caminho_docx)
+    if not caminho_docx.exists() or caminho_docx.stat().st_size <= 2000:
+        raise RuntimeError('DOCX V154 de emergência não foi criado corretamente.')
+    print(f'✅ V154 DOCX textual concluído: {caminho_docx.name} ({caminho_docx.stat().st_size} bytes).', flush=True)
+
+
+print(
+    '✅ V154 carregada — Etapa 3/6 não usa mais o gerador DOCX pesado: limite real de 25s, '
+    'fallback textual imediato e PDF/modelo oficial preservados.',
+    flush=True,
+)
+
+# RUNTIME ÚNICO E FINAL
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
