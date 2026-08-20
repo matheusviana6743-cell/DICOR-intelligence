@@ -67319,6 +67319,192 @@ print(
 )
 
 
+
+# =============================================================
+# V160 — CORREÇÃO CIRÚRGICA DO PAYLOAD 13/13
+#
+# Problema real observado no fechamento:
+#   V158: payload guiado 13/13 ausente
+#
+# A mesa pode ter as 13 tarefas concluídas e, ainda assim, o coletor legado
+# não carregar `dossie_v124` naquela tentativa de fechamento. A V158 então
+# abortava ANTES do renderer, mesmo com o estado guiado completo.
+#
+# Esta correção NÃO altera o modelo do PDF, NÃO cria tarefa, NÃO grava/migra
+# estado e NÃO muda nenhuma mecânica da mesa. Quando o payload já existe,
+# ele é usado normalmente. Quando estiver ausente, é reconstruído SOMENTE EM
+# MEMÓRIA a partir de uma CÓPIA do estado guiado já salvo para aquela mesa.
+# =============================================================
+
+V160_PAYLOAD_READONLY = 'V160 — payload 13/13 reconstruído em memória; modelo V131/V133 intacto'
+
+
+def _v160_secoes_13(payload: Any) -> dict[str, Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    saida: dict[str, Dict[str, Any]] = {}
+    for secao in list(payload.get('sections') or []):
+        if not isinstance(secao, dict):
+            continue
+        codigo = str(secao.get('code') or '').strip().zfill(2)
+        if codigo in {f'{i:02d}' for i in range(1, 14)}:
+            saida[codigo] = secao
+    return saida
+
+
+def _v160_aplicar_local_manual_copia(dados: Dict[str, Any], payload: Dict[str, Any], canal_id: int) -> Dict[str, Any]:
+    """Aplica somente à CÓPIA do payload o Local da Pacificação já salvo."""
+    manual = ''
+    try:
+        manual = _v147_local_limpo(dados.get('local_pacificacao_manual'))
+    except Exception:
+        manual = str(dados.get('local_pacificacao_manual') or '').strip()
+    if not manual and canal_id:
+        try:
+            manual = _v147_local_get(int(canal_id)) or ''
+        except Exception:
+            manual = ''
+
+    dados['local_pacificacao_manual'] = manual
+    req = dict(dados.get('requisitos_pacificacao') or {})
+    req['local_pacificacao'] = manual
+    req['endereco_exato'] = manual
+    dados['requisitos_pacificacao'] = req
+
+    meta = dict(payload.get('meta') or {})
+    meta['pedido_local'] = manual or 'Não informado'
+    payload['meta'] = meta
+
+    if manual:
+        for secao in list(payload.get('sections') or []):
+            if not isinstance(secao, dict) or str(secao.get('code') or '').zfill(2) != '05':
+                continue
+            resumo = str(secao.get('summary') or '').strip()
+            frase = f'Local da Pacificação informado manualmente no fechamento: {manual}.'
+            try:
+                ja_tem = _v146_norm(frase) in _v146_norm(resumo)
+            except Exception:
+                ja_tem = frase.lower() in resumo.lower()
+            if not ja_tem:
+                secao['summary'] = (frase + ('\n\n' + resumo if resumo else '')).strip()
+            break
+    return payload
+
+
+def _v160_preparar_dados_pdf(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """Obtém as 13 seções sem tocar no estado persistente da mesa."""
+    import copy as _copy
+    if not isinstance(dados, dict):
+        raise RuntimeError('V160: dados do dossiê ausentes.')
+
+    d = _copy.deepcopy(dados)
+    payload = d.get('dossie_v124')
+    secoes = _v160_secoes_13(payload)
+
+    # Caminho normal: payload já veio do coletor. Apenas normaliza a CÓPIA.
+    if len(secoes) == 13:
+        payload = dict(payload)
+        payload['sections'] = [secoes[f'{i:02d}'] for i in range(1, 14)]
+        try:
+            payload = _v146_sanitizar_payload(payload)
+        except Exception:
+            pass
+        canal_id = int(d.get('canal_id') or (payload.get('meta') or {}).get('mesa_canal_id') or 0)
+        d['dossie_v124'] = _v160_aplicar_local_manual_copia(d, payload, canal_id)
+        print(f'✅ V160 payload: 13/13 já presente no coletor (mesa={canal_id or "?"}).', flush=True)
+        return d
+
+    # Fallback seguro: reconstrução SOMENTE EM MEMÓRIA usando o estado guiado já salvo.
+    canal_id = 0
+    try:
+        canal_id = int(d.get('canal_id') or d.get('mesa_canal_id') or 0)
+    except Exception:
+        canal_id = 0
+    if not canal_id and isinstance(payload, dict):
+        try:
+            canal_id = int((payload.get('meta') or {}).get('mesa_canal_id') or 0)
+        except Exception:
+            canal_id = 0
+    if not canal_id:
+        raise RuntimeError('V160: não foi possível identificar o canal da mesa para reconstruir o payload 13/13.')
+
+    estado_original = _v116_estado(int(canal_id), False)
+    if not isinstance(estado_original, dict):
+        raise RuntimeError(f'V160: estado guiado da mesa {canal_id} não foi localizado.')
+
+    estado = _copy.deepcopy(estado_original)
+    try:
+        _v117_migrar_estado(estado)
+    except Exception as erro:
+        # A migração ocorre só na cópia. Se ela não for necessária, seguimos com os dados existentes.
+        print(f'⚠️ V160 migração somente-em-memória ignorada: {type(erro).__name__}: {erro}', flush=True)
+
+    concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
+    concluidos_validos = {str(i) for i in range(1, 14) if str(i) in concluidos}
+    if len(concluidos_validos) < 13 and str(estado.get('status') or '').upper() != 'CONCLUIDA':
+        raise RuntimeError(
+            f'V160: estado guiado encontrado, mas somente {len(concluidos_validos)}/13 itens estão concluídos. '
+            'Nenhuma tarefa foi criada ou alterada.'
+        )
+
+    # O construtor V129/V128 é state-only: usa `estado["dados"]`, que é justamente
+    # o conteúdo estruturado das 13 tarefas. Passamos uma CÓPIA, portanto nenhuma
+    # alteração interna consegue persistir na mesa.
+    payload_novo = _v129_payload_profissional(d, estado, int(canal_id))
+    if not isinstance(payload_novo, dict):
+        raise RuntimeError('V160: o construtor state-only não retornou um payload válido.')
+
+    secoes_novas = _v160_secoes_13(payload_novo)
+    faltantes = [f'{i:02d}' for i in range(1, 14) if f'{i:02d}' not in secoes_novas]
+    if faltantes:
+        raise RuntimeError('V160: reconstrução em memória ficou incompleta: ' + ', '.join(faltantes))
+
+    payload_novo['sections'] = [secoes_novas[f'{i:02d}'] for i in range(1, 14)]
+    try:
+        payload_novo = _v146_sanitizar_payload(payload_novo)
+    except Exception:
+        pass
+    payload_novo = _v160_aplicar_local_manual_copia(d, payload_novo, int(canal_id))
+    d['dossie_v124'] = payload_novo
+    d['gerador_dossie'] = 'V160_PAYLOAD_13_READONLY'
+
+    print(
+        f'✅ V160 payload reconstruído SOMENTE EM MEMÓRIA: mesa={canal_id} | 13/13 seções | '
+        'estado persistente não alterado.',
+        flush=True,
+    )
+    return d
+
+
+def _v160_render_pdf_aprovado(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    """Mesmo renderer V131/V133; muda somente a origem do payload quando ele faltar."""
+    if not callable(_V158_RENDERER_APROVADO):
+        raise RuntimeError('V160: renderer V131/V133 aprovado não está disponível.')
+
+    caminho_pdf = Path(caminho_pdf)
+    d = _v160_preparar_dados_pdf(dados)
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    _V158_RENDERER_APROVADO(d, caminho_pdf)
+    _v158_validar_modelo_sem_mudar_conteudo(caminho_pdf)
+    print(f'🔒 ✅ V160 PDF gerado no MESMO modelo aprovado: {caminho_pdf.name}', flush=True)
+
+
+# A V159 já cuida do fechamento simples e do PDF sem multiprocessing.
+# Trocamos APENAS o callable interno de renderização por esta variante que
+# aceita payload ausente e o reconstrói em memória. Todo o restante da V159 fica igual.
+_V159_RENDER_PDF_APROVADO = _v160_render_pdf_aprovado
+
+print(
+    '✅ V160 carregada — corrigido “payload guiado 13/13 ausente”: quando necessário, '
+    'o payload é reconstruído em memória a partir das tarefas já salvas; nenhuma mesa/tarefa é modificada; '
+    'modelo V131/V133 permanece intacto.',
+    flush=True,
+)
+
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
