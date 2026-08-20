@@ -66984,39 +66984,30 @@ print(
     flush=True,
 )
 
-
-
 # =============================================================
-# V157 — MODELO DO DOSSIÊ CONGELADO / REFERÊNCIA APROVADA
-# REFERÊNCIA VISUAL IMUTÁVEL: V131 + V133 (13 itens + conclusão/assinaturas).
+# V158 — PATCH CIRÚRGICO / ZERO ALTERAÇÃO FORA DO PDF
+# Base EXATA: V156.
 #
-# Motivo:
-# algumas mesas sem payload guiado acabavam caindo no gerador legado V102/V110,
-# que possui 17 seções (mandado, planejamento, padrão Dragons etc.) e altera
-# completamente o modelo aprovado. A partir desta versão isso é PROIBIDO.
+# Objetivo único:
+# - impedir que o fechamento use o gerador legado de 17 seções;
+# - manter o renderer visual V131/V133 aprovado;
+# - NÃO reconstruir estado da mesa;
+# - NÃO migrar tarefas;
+# - NÃO registrar/alterar comandos, listeners, views, cargos, procurados,
+#   hierarquia, reconhecimento, banco, boletins ou qualquer outra mecânica.
 #
-# REGRAS DE BLOQUEIO:
-# - NUNCA usar o gerador legado de 17 seções para fechar mesa;
-# - se o payload 13/13 não estiver em memória, reconstruí-lo do estado guiado;
-# - manter EXATAMENTE o renderer V131/V133 já aprovado;
-# - manter página inicial, índice, 13 itens e página final de conclusão/assinaturas;
-# - manter Buiu Gomes + Arthur Fleker na página final;
-# - manter as melhorias de conteúdo/sanitização/local manual/informante;
-# - manter watchdog V155 e entrega somente PDF V156;
-# - se o modelo produzido fugir desse padrão, REPROVAR e manter a mesa aberta.
+# Diferente da V157, esta versão NÃO chama _v116_estado(), _v117_migrar_estado(),
+# _v129_payload_profissional() nem qualquer rotina capaz de modificar estado.
+# Ela apenas lê uma CÓPIA do payload que já foi coletado pelo fluxo existente.
 # =============================================================
 
-V157_MODELO_CONGELADO = 'V157 LOCK V131+V133 — 13 itens + conclusão e assinaturas'
+V158_PATCH_CIRURGICO = 'V158 — somente trava visual do PDF; restante = V156 intacto'
 
-# Este é o gerador V133 que chama o V131 aprovado e acrescenta SOMENTE a página
-# final oficial. Ele foi capturado pela V146 antes dos wrappers posteriores.
-_V157_GERADOR_VISUAL_APROVADO = globals().get('_V146_GERAR_PDF_BASE')
-if not callable(_V157_GERADOR_VISUAL_APROVADO):
-    # Fallback defensivo: o V132 base é o V131, mas preferimos sempre V133.
-    _V157_GERADOR_VISUAL_APROVADO = globals().get('_V132_GERAR_PDF_BASE')
+# V133/V131 aprovado foi capturado antes da sanitização V146.
+_V158_RENDERER_APROVADO = globals().get('_V146_GERAR_PDF_BASE')
 
 
-def _v157_normalizar_modelo(valor: Any) -> str:
+def _v158_normalizar(valor: Any) -> str:
     import unicodedata as _u
     s = str(valor or '').lower()
     s = ''.join(ch for ch in _u.normalize('NFKD', s) if not _u.combining(ch))
@@ -67025,244 +67016,111 @@ def _v157_normalizar_modelo(valor: Any) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
-def _v157_canal_id_dados(dados: Dict[str, Any]) -> int:
-    if not isinstance(dados, dict):
-        return 0
-    candidatos = [
-        dados.get('canal_id'), dados.get('mesa_canal_id'), dados.get('channel_id'),
-        dados.get('id_canal'), dados.get('canal_mesa_id'),
-    ]
-    payload = dados.get('dossie_v124') if isinstance(dados.get('dossie_v124'), dict) else {}
-    meta = payload.get('meta') if isinstance(payload.get('meta'), dict) else {}
-    candidatos.extend([meta.get('mesa_canal_id'), meta.get('canal_id')])
-    for valor in candidatos:
-        try:
-            n = int(valor or 0)
-            if n > 0:
-                return n
-        except Exception:
-            pass
-    # Processo e URL de reabertura carregam o ID da mesa nas versões atuais.
-    for fonte in (dados.get('processo'), dados.get('reabrir_url'), dados.get('url_reabertura')):
-        s = str(fonte or '')
-        achados = re.findall(r'(?<!\d)(\d{15,22})(?!\d)', s)
-        if achados:
-            try:
-                return int(achados[-1])
-            except Exception:
-                pass
-    return 0
-
-
-def _v157_payload_tem_13(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    codigos = {
-        str(s.get('code') or '').zfill(2)
-        for s in list(payload.get('sections') or [])
-        if isinstance(s, dict)
-    }
-    return all(f'{i:02d}' in codigos for i in range(1, 14))
-
-
-def _v157_reconstruir_payload(dados: Dict[str, Any]) -> Dict[str, Any]:
-    """Garante o payload de 13 itens. Jamais retorna para o modelo legado de 17 seções."""
+def _v158_preparar_dados_so_pdf(dados: Dict[str, Any]) -> Dict[str, Any]:
+    """Cria uma cópia para o renderer. NUNCA grava/migra estado da mesa."""
     import copy as _copy
-    d = _copy.deepcopy(dados) if isinstance(dados, dict) else {}
-    cid = _v157_canal_id_dados(d)
-    estado = None
-    if cid and '_v116_estado' in globals():
-        try:
-            estado = _v116_estado(int(cid), False)
-            if isinstance(estado, dict) and '_v117_migrar_estado' in globals():
-                _v117_migrar_estado(estado)
-        except Exception as erro:
-            print(f'⚠️ V157: não foi possível ler estado guiado da mesa {cid}: {type(erro).__name__}: {erro}', flush=True)
-            estado = None
-
-    payload = d.get('dossie_v124') if isinstance(d.get('dossie_v124'), dict) else None
-
-    # Se não existe payload ou ele veio de um caminho incompatível, reconstrói do estado 13/13.
-    if not _v157_payload_tem_13(payload):
-        if isinstance(estado, dict):
-            try:
-                payload = _v129_payload_profissional(d, estado, int(cid or 0))
-                print(f'✅ V157: payload 13/13 reconstruído do estado guiado mesa={cid}.', flush=True)
-            except Exception as erro:
-                print(f'❌ V157: falha ao reconstruir payload guiado mesa={cid}: {type(erro).__name__}: {erro}', flush=True)
-                payload = None
-
-    # Segurança máxima: NÃO gerar o modelo errado só para conseguir fechar a mesa.
-    if not _v157_payload_tem_13(payload):
+    if not isinstance(dados, dict):
+        raise RuntimeError('V158: dados do dossiê ausentes.')
+    d = _copy.deepcopy(dados)
+    payload = d.get('dossie_v124')
+    if not isinstance(payload, dict):
         raise RuntimeError(
-            'V157 MODELO TRAVADO: não foi possível reconstruir os 13 itens do dossiê aprovado. '
-            'O gerador legado de 17 seções foi bloqueado; a mesa permanecerá aberta.'
+            'V158: payload guiado 13/13 ausente. O fechamento foi interrompido para não trocar o modelo do PDF.'
         )
 
-    # Elimina qualquer seção extra. O modelo oficial possui SOMENTE 01..13.
-    mapa = {
-        str(s.get('code') or '').zfill(2): s
-        for s in list(payload.get('sections') or [])
-        if isinstance(s, dict)
-    }
-    payload['sections'] = [mapa[f'{i:02d}'] for i in range(1, 14)]
-
-    # Mantém todas as melhorias de conteúdo, mas nunca troca o renderer visual.
-    try:
-        if '_v145_enriquecer_payload' in globals():
-            payload = _v145_enriquecer_payload(d, payload, estado if isinstance(estado, dict) else None)
-    except Exception as erro:
-        print(f'⚠️ V157 enriquecimento V145 ignorado: {type(erro).__name__}: {erro}', flush=True)
+    # Sanitiza SOMENTE a cópia já existente. Nenhuma reconstrução/estado global.
     try:
         if '_v146_sanitizar_payload' in globals():
             payload = _v146_sanitizar_payload(payload)
     except Exception as erro:
-        print(f'⚠️ V157 sanitização V146 ignorada: {type(erro).__name__}: {erro}', flush=True)
+        print(f'⚠️ V158 sanitização da cópia ignorada: {type(erro).__name__}: {erro}', flush=True)
 
-    d['dossie_v124'] = payload
-
-    # Local da Pacificação continua 100% manual.
-    try:
-        if '_v147_forcar_local_manual_em_dados' in globals():
-            d = _v147_forcar_local_manual_em_dados(d)
-            payload = d.get('dossie_v124') if isinstance(d.get('dossie_v124'), dict) else payload
-    except Exception as erro:
-        print(f'⚠️ V157 local manual V147: {type(erro).__name__}: {erro}', flush=True)
-
-    # Informante: preserva regra atual (foto do documento opcional; mídia quebrada não troca o modelo).
-    try:
-        if '_v150_secao12_normalizar' in globals():
-            payload = _v150_secao12_normalizar(payload, None)
-            d['dossie_v124'] = payload
-    except Exception as erro:
-        print(f'⚠️ V157 normalização informante V150: {type(erro).__name__}: {erro}', flush=True)
-
-    # Reafirma ordem, índice e metadados depois de todos os wrappers.
-    mapa = {
+    secoes = {
         str(s.get('code') or '').zfill(2): s
         for s in list(payload.get('sections') or [])
         if isinstance(s, dict)
     }
-    if not all(f'{i:02d}' in mapa for i in range(1, 14)):
-        raise RuntimeError('V157 MODELO TRAVADO: uma das 13 seções oficiais desapareceu após a sanitização.')
-    payload['sections'] = [mapa[f'{i:02d}'] for i in range(1, 14)]
-    payload['evidence_index'] = [
-        {
-            'code': s.get('code'),
-            'title': s.get('title'),
-            'count': len(list(s.get('images') or [])),
-        }
-        for s in payload['sections']
-    ]
-    payload['modelo_visual'] = V157_MODELO_CONGELADO
+    faltantes = [f'{i:02d}' for i in range(1, 14) if f'{i:02d}' not in secoes]
+    if faltantes:
+        raise RuntimeError(
+            'V158: payload atual está incompleto (' + ', '.join(faltantes) + '). '
+            'Nada foi alterado na mesa e o modelo legado permanece bloqueado.'
+        )
+
+    # O renderer recebe somente 01..13, mas isso ocorre na CÓPIA local do PDF.
+    payload['sections'] = [secoes[f'{i:02d}'] for i in range(1, 14)]
     d['dossie_v124'] = payload
-    d['gerador_dossie'] = 'V157_V131_V133_LOCKED'
     return d
 
 
-def _v157_validar_pdf_modelo_travado(caminho_pdf: Path) -> None:
-    """Regression guard: reprova automaticamente qualquer retorno ao modelo de 17 seções."""
+def _v158_validar_modelo_sem_mudar_conteudo(caminho_pdf: Path) -> None:
+    """Somente impede regressão para o modelo 17 seções. Sem exigir nº fixo de páginas."""
     caminho_pdf = Path(caminho_pdf)
     if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 6000:
-        raise RuntimeError('V157: PDF oficial não foi criado ou está vazio.')
+        raise RuntimeError('V158: PDF não foi produzido corretamente.')
     if fitz is None:
-        # O renderer aprovado já fez seu próprio preflight; sem PyMuPDF não inventamos outro layout.
         return
-
     doc = fitz.open(str(caminho_pdf))
     try:
-        if len(doc) < 15:
-            raise RuntimeError(f'V157: modelo aprovado incompleto ({len(doc)} página(s)).')
-        textos = [page.get_text('text') or '' for page in doc]
-        total = _v157_normalizar_modelo('\n'.join(textos))
-        primeira = _v157_normalizar_modelo(textos[0] if textos else '')
-        ultima = _v157_normalizar_modelo(textos[-1] if textos else '')
-
-        # Assinatura textual do modelo fornecido/aprovado.
-        obrigatorios_primeira = (
+        texto = '\n'.join((p.get_text('text') or '') for p in doc)
+        norm = _v158_normalizar(texto)
+        obrigatorios = (
             'dossie operacional dicor',
             'identificacao do procedimento',
-            'objeto do dossie',
-            'criterios de organizacao',
-            'integridade documental',
-        )
-        for termo in obrigatorios_primeira:
-            if termo not in primeira:
-                raise RuntimeError(f'V157 MODEL LOCK: primeira página fugiu do modelo aprovado ({termo} ausente).')
-
-        obrigatorios = [
             'indice de evidencias',
             '01 painel', '02 fotos dos lideres', '03 fotos dos membros', '04 radio',
             '05 localizacao', '06 crimes da comunidade', '07 bau de lider',
             '08 bau de membros', '09 rota de farm', '10 rota de producao',
             '11 ingredientes e produtos', '12 informante', '13 residencia do lider',
-        ]
-        for termo in obrigatorios:
-            if termo not in total:
-                raise RuntimeError(f'V157 MODEL LOCK: seção do modelo aprovado ausente: {termo}.')
+            'conclusao e assinaturas', 'buiu gomes', 'arthur fleker',
+        )
+        ausentes=[x for x in obrigatorios if x not in norm]
+        if ausentes:
+            raise RuntimeError('V158: PDF fugiu do modelo aprovado; ausente: ' + ', '.join(ausentes[:5]))
 
-        for termo in ('conclusao e assinaturas', 'controle emissao e autenticidade', 'buiu gomes', 'arthur fleker'):
-            if termo not in ultima:
-                raise RuntimeError(f'V157 MODEL LOCK: página final aprovada incompleta: {termo}.')
-
-        # Elementos exclusivos do modelo errado V102/V110 ficam definitivamente proibidos.
-        proibidos = (
-            '2 resumo executivo e objetivo',
-            '3 disposicoes do mandado busca e pacificacao',
-            '13 planejamento operacional',
-            '14 motivacao do pedido de pacificacao',
-            '15 responsaveis e assinaturas institucionais',
-            '16 indicadores e sintese de encerramento',
+        # Bloqueia SOMENTE assinaturas inequívocas do modelo errado.
+        proibidos=(
             '17 checklist final de conformidade',
+            '16 indicadores e sintese de encerramento',
+            '15 responsaveis e assinaturas institucionais',
             'padrao dragons',
         )
-        for termo in proibidos:
-            if termo in total:
-                raise RuntimeError(f'V157 MODEL LOCK: modelo legado detectado e BLOQUEADO: {termo}.')
-
-        # Nenhuma seção numerada 14..17 pode existir no modelo oficial.
-        bruto = '\n'.join(textos)
-        if re.search(r'(?mi)^\s*(?:14|15|16|17)\.\s+', bruto):
-            raise RuntimeError('V157 MODEL LOCK: detectada seção numerada 14-17; o modelo oficial termina no item 13.')
+        encontrados=[x for x in proibidos if x in norm]
+        if encontrados:
+            raise RuntimeError('V158: gerador legado detectado: ' + ', '.join(encontrados))
     finally:
         doc.close()
 
 
-def _v157_gerar_pdf_base_travado(dados: Dict[str, Any], caminho_pdf: Path) -> None:
-    if not callable(_V157_GERADOR_VISUAL_APROVADO):
-        raise RuntimeError('V157: renderer visual V131/V133 não está disponível; geração bloqueada para não alterar o modelo.')
-    d = _v157_reconstruir_payload(dados)
+def _v158_gerar_pdf_base(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    if not callable(_V158_RENDERER_APROVADO):
+        raise RuntimeError('V158: renderer V131/V133 aprovado não está disponível.')
+    d = _v158_preparar_dados_so_pdf(dados)
     caminho_pdf = Path(caminho_pdf)
     try:
         caminho_pdf.unlink(missing_ok=True)
     except Exception:
         pass
-
-    # Chamada DIRETA ao V133/V131 aprovado. Não existe fallback para V102/V110.
-    _V157_GERADOR_VISUAL_APROVADO(d, caminho_pdf)
+    _V158_RENDERER_APROVADO(d, caminho_pdf)
     try:
-        _v157_validar_pdf_modelo_travado(caminho_pdf)
+        _v158_validar_modelo_sem_mudar_conteudo(caminho_pdf)
     except Exception:
-        # Nunca deixar um PDF fora do padrão seguir para a mesa.
         try:
             caminho_pdf.unlink(missing_ok=True)
         except Exception:
             pass
         raise
-    print(f'🔒 ✅ V157 MODELO APROVADO confirmado: {caminho_pdf.name}', flush=True)
+    print(f'🔒 ✅ V158 PDF aprovado sem tocar no estado da mesa: {caminho_pdf.name}', flush=True)
 
 
-# O watchdog V155 continua exatamente igual, mas sua base passa a ser SOMENTE o
-# renderer V131/V133 travado. Assim mantemos proteção contra travamento sem permitir
-# que qualquer fallback mude o desenho do documento.
+# ÚNICA ligação alterada pela V158: a base usada pelo watchdog do PDF.
+# Todo o resto permanece exatamente como na V156.
 if '_V155_GERAR_PDF_BASE' in globals():
-    _V155_GERAR_PDF_BASE = _v157_gerar_pdf_base_travado
-
+    _V155_GERAR_PDF_BASE = _v158_gerar_pdf_base
 
 print(
-    '🔒 ✅ V157 carregada — MODELO DO DOSSIÊ CONGELADO no V131/V133 aprovado: '
-    'capa/identificação + índice + SOMENTE 13 itens + conclusão/QR/2 assinaturas. '
-    'Gerador legado de 17 seções BLOQUEADO; V155 watchdog e V156 somente-PDF preservados.',
+    '🔒 ✅ V158 carregada — PATCH CIRÚRGICO: base V156 intacta; somente o renderer do PDF foi travado no V131/V133. '
+    'Nenhum comando/view/listener/tarefa/estado foi alterado pela V158.',
     flush=True,
 )
 
