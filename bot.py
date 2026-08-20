@@ -65465,10 +65465,6 @@ print(
     flush=True,
 )
 
-if __name__ == '__main__':
-    asyncio.run(_runtime_lifecycle_entrypoint())
-
-
 # =============================================================
 # V149 — CHAT DA MESA PERMANECE ABERTO + RG/DOCUMENTO DO INFORMANTE OPCIONAL
 # Escopo restrito:
@@ -65743,3 +65739,164 @@ print(
     'mas foto do RG/documento agora é opcional. Modelo do dossiê e V147/V148 preservados.',
     flush=True,
 )
+
+
+# =============================================================
+# V150 — INFORMANTE NÃO BLOQUEIA GERAÇÃO + RUNTIME FINAL CORRIGIDO
+# Correções:
+# - V149 agora é realmente carregada antes do runtime (o asyncio.run voltou para o FINAL do arquivo).
+# - A foto do RG/documento continua opcional.
+# - Se o Item 12 foi concluído sem uma identificação visual materializável (fluxo sem mínimos),
+#   o PDF/DOCX NÃO aborta: registra a ausência de forma profissional e preserva o resumo/evidências válidas.
+# - Se nome/RG existirem, mas a foto estiver indisponível, os dados são mantidos no texto da própria seção.
+# - Não altera o modelo visual, a ordem das páginas nem as demais seções.
+# =============================================================
+
+V150_INFORMANTE_DOSSIE_FIX = 'V150 informante tolerante + runtime final'
+
+
+def _v150_valor_real(valor: Any) -> str:
+    s = str(valor or '').strip()
+    if not s:
+        return ''
+    n = _v116_norm(s)
+    if n in {'nao informado', 'nao informada', 'sem registro', 'sem registros', 'n a'}:
+        return ''
+    return s
+
+
+def _v150_secao12_normalizar(payload: Dict[str, Any], pasta_cache: Optional[Path]=None) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    secoes = [s for s in list(payload.get('sections') or []) if isinstance(s, dict)]
+    sec = next((s for s in secoes if str(s.get('code') or '').zfill(2) == '12'), None)
+    if not isinstance(sec, dict):
+        return payload
+
+    info = sec.get('informante') if isinstance(sec.get('informante'), dict) else None
+    if not isinstance(info, dict):
+        return payload
+
+    nome = _v150_valor_real(info.get('nome'))
+    rg = _v150_valor_real(info.get('rg'))
+    foto = info.get('foto') if isinstance(info.get('foto'), dict) else None
+
+    foto_ok = bool(foto)
+    # No preflight do PDF podemos confirmar se a mídia realmente materializa.
+    if foto_ok and pasta_cache is not None:
+        try:
+            pasta_cache.mkdir(parents=True, exist_ok=True)
+            p = _v124_materializar_midia(foto, pasta_cache)
+            foto_ok = bool(p and Path(p).exists() and Path(p).stat().st_size > 0)
+        except Exception:
+            foto_ok = False
+
+    # Sem foto utilizável, não chama o cartão rígido do modelo (que exigia imagem e abortava).
+    if not foto_ok:
+        sec['informante'] = None
+        partes = []
+        if nome:
+            partes.append(f'Nome: {nome}')
+        if rg:
+            partes.append(f'RG: {rg}')
+        if partes:
+            aviso = 'Identificação do informante registrada sem fotografia materializável no fechamento: ' + '; '.join(partes) + '.'
+        else:
+            aviso = 'Identificação nominal/visual do informante não estava disponível no estado consolidado no momento do fechamento.'
+        resumo = str(sec.get('summary') or '').strip()
+        if _v116_norm(aviso) not in _v116_norm(resumo):
+            sec['summary'] = (resumo + ('\n\n' if resumo else '') + aviso).strip()
+
+        # Não deixa uma referência quebrada contar como foto de identificação.
+        if foto:
+            fid = _v129_midia_id(foto) if '_v129_midia_id' in globals() else ''
+            novas = []
+            for m in list(sec.get('images') or []):
+                mid = _v129_midia_id(m) if '_v129_midia_id' in globals() else ''
+                if fid and mid == fid:
+                    continue
+                novas.append(m)
+            sec['images'] = novas
+    else:
+        info['nome'] = nome or 'Não informado'
+        info['rg'] = rg or 'Não informado'
+        info['foto'] = foto
+        # documento continua totalmente opcional
+        if not isinstance(info.get('documento'), dict):
+            info['documento'] = None
+        sec['informante'] = info
+
+    # Recalcula somente a contagem da seção 12 no índice, sem tocar nas outras seções.
+    try:
+        for idx in list(payload.get('evidence_index') or []):
+            if isinstance(idx, dict) and str(idx.get('code') or '').zfill(2) == '12':
+                idx['count'] = len(list(sec.get('images') or []))
+                break
+    except Exception:
+        pass
+    return payload
+
+
+# Normaliza o payload no coletor final (mesas novas e já em andamento).
+_V150_COLETAR_BASE = coletar_dados_operacionais_mesa
+async def coletar_dados_operacionais_mesa(
+    canal: discord.TextChannel,
+    mesa: Optional[Dict[str, Any]],
+    interaction: discord.Interaction,
+    pasta_dossie: Path,
+    dados_confirmacao: Optional[Dict[str, Any]]=None,
+) -> Dict[str, Any]:
+    dados = await _V150_COLETAR_BASE(canal, mesa, interaction, pasta_dossie, dados_confirmacao=dados_confirmacao)
+    try:
+        payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+        if isinstance(payload, dict):
+            dados['dossie_v124'] = _v150_secao12_normalizar(payload, None)
+    except Exception as erro:
+        try:
+            await enviar_log(f'⚠️ V150 normalização Item 12 mesa {getattr(canal,"id",0)}: {type(erro).__name__}: {erro}')
+        except Exception:
+            pass
+    return dados
+
+
+# Blindagem do gerador PDF aprovado: confirma a foto do informante antes do cartão rígido.
+_V150_GERAR_PDF_APROVADO_BASE = _v131_gerar_pdf_modelo_aprovado
+def _v131_gerar_pdf_modelo_aprovado(payload: Dict[str, Any], caminho_pdf: Path) -> None:
+    try:
+        cache = Path(caminho_pdf).parent / '_v150_preflight_informante'
+        payload = _v150_secao12_normalizar(payload, cache)
+    except Exception as erro:
+        print(f'⚠️ V150 preflight informante PDF: {type(erro).__name__}: {erro}', flush=True)
+    return _V150_GERAR_PDF_APROVADO_BASE(payload, caminho_pdf)
+
+
+# Qualquer validador legado deixa de reprovar o dossiê apenas por ausência da foto/documento do informante.
+if '_v129_validar_payload' in globals():
+    _V150_VALIDAR_PAYLOAD_BASE = _v129_validar_payload
+    def _v129_validar_payload(payload: Dict[str, Any]) -> List[str]:
+        erros = list(_V150_VALIDAR_PAYLOAD_BASE(payload) or [])
+        saida = []
+        for erro in erros:
+            n = _v116_norm(erro)
+            if 'informante' in n and any(x in n for x in ('sem foto', 'foto nao', 'documento', 'foto do rg', 'rg do informante nao vinculado')):
+                continue
+            saida.append(erro)
+        return saida
+
+if '_v128_validar_payload_estado' in globals():
+    _V150_VALIDAR_ESTADO_BASE = _v128_validar_payload_estado
+    def _v128_validar_payload_estado(payload: Dict[str, Any]) -> List[str]:
+        erros = list(_V150_VALIDAR_ESTADO_BASE(payload) or [])
+        return [e for e in erros if not ('informante' in _v116_norm(e) and 'sem foto' in _v116_norm(e))]
+
+
+print(
+    '✅ V150 carregada — V149 agora executa antes do runtime; Chat permanece aberto; foto do RG do informante opcional; '
+    'Item 12 não aborta mais o PDF/DOCX quando a foto de identificação estiver ausente/indisponível. Modelo preservado.',
+    flush=True,
+)
+
+
+# RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
+if __name__ == '__main__':
+    asyncio.run(_runtime_lifecycle_entrypoint())
