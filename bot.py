@@ -65467,3 +65467,279 @@ print(
 
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
+
+
+# =============================================================
+# V149 — CHAT DA MESA PERMANECE ABERTO + RG/DOCUMENTO DO INFORMANTE OPCIONAL
+# Escopo restrito:
+# - Ao encerrar a mesa, o tópico "💬 Chat" NÃO é travado/arquivado.
+# - O canal principal continua bloqueado e todos os demais tópicos continuam protegidos.
+# - A permissão de enviar mensagens em threads é preservada para que o Chat continue utilizável.
+# - No Item 12 / Informante, a FOTO DO RG/DOCUMENTO deixa de ser obrigatória.
+# - Continuam necessários: foto do informante, nome e número do RG.
+# - Se uma foto do RG/documento for enviada, ela continua sendo salva e exibida normalmente.
+# - Modelo do dossiê, Local da Pacificação manual e demais mecânicas V148 permanecem intactos.
+# =============================================================
+
+V149_CHAT_INFORMANTE_FIX = 'V149 chat aberto + documento do informante opcional'
+
+
+def _v149_eh_topico_chat(topico: Any) -> bool:
+    if not isinstance(topico, discord.Thread):
+        return False
+    try:
+        nome = _v116_norm(getattr(topico, 'name', ''))
+    except Exception:
+        nome = normalizar_busca(str(getattr(topico, 'name', '') or ''))
+    # Evita falso positivo em nomes maiores e reconhece os formatos já usados pelo bot.
+    return nome == 'chat' or nome.startswith('chat ') or nome.endswith(' chat') or ' chat ' in f' {nome} '
+
+
+# ---------- Fechamento da mesa: bloqueia o canal, mas preserva escrita em threads ----------
+# O bloqueio antigo negava send_messages_in_threads no canal pai; isso tornava o Chat inútil
+# mesmo quando o tópico não estivesse locked. Nesta versão esse bit é preservado.
+async def bloquear_mesa_para_novas_mensagens(canal: discord.TextChannel) -> None:
+    guild = canal.guild
+    try:
+        overwrite_default = canal.overwrites_for(guild.default_role)
+        # Mantém o valor atual de send_messages_in_threads; bloqueia somente o canal principal
+        # e a criação de novos tópicos.
+        send_threads_atual = overwrite_default.send_messages_in_threads
+        overwrite_default.send_messages = False
+        overwrite_default.create_public_threads = False
+        overwrite_default.create_private_threads = False
+        overwrite_default.send_messages_in_threads = send_threads_atual
+        await canal.set_permissions(guild.default_role, overwrite=overwrite_default)
+    except Exception as erro:
+        try:
+            await enviar_log(f'⚠️ V149 não conseguiu bloquear @everyone preservando o Chat na mesa {canal.id}: {erro}')
+        except Exception:
+            pass
+
+    try:
+        for alvo, overwrite in list(canal.overwrites.items()):
+            if guild.me and alvo == guild.me:
+                continue
+            send_threads_atual = overwrite.send_messages_in_threads
+            overwrite.send_messages = False
+            overwrite.create_public_threads = False
+            overwrite.create_private_threads = False
+            overwrite.send_messages_in_threads = send_threads_atual
+            await canal.set_permissions(alvo, overwrite=overwrite)
+            await asyncio.sleep(0.03)
+    except Exception as erro:
+        try:
+            await enviar_log(f'⚠️ V149 bloqueio parcial da mesa {canal.id}, Chat preservado: {erro}')
+        except Exception:
+            pass
+
+    if guild.me:
+        try:
+            await canal.set_permissions(
+                guild.me,
+                view_channel=True,
+                send_messages=True,
+                send_messages_in_threads=True,
+                manage_channels=True,
+                manage_threads=True,
+                attach_files=True,
+                read_message_history=True,
+            )
+        except Exception:
+            traceback.print_exc()
+
+
+# ---------- Fechamento dos tópicos: todos protegidos, EXCETO o Chat ----------
+async def travar_threads_mesa(threads: List[discord.Thread]) -> None:
+    for thread in list(threads or []):
+        if not isinstance(thread, discord.Thread):
+            continue
+        try:
+            if _v149_eh_topico_chat(thread):
+                # Se uma versão anterior já tinha fechado o Chat, reabre imediatamente.
+                kwargs = {
+                    'archived': False,
+                    'locked': False,
+                    'reason': 'V149: Chat da mesa permanece aberto após encerramento',
+                }
+                # Usa o maior auto-archive padrão aceito pelo Discord quando disponível.
+                try:
+                    kwargs['auto_archive_duration'] = 10080
+                    await thread.edit(**kwargs)
+                except Exception:
+                    kwargs.pop('auto_archive_duration', None)
+                    await thread.edit(**kwargs)
+                continue
+
+            # Preserva o comportamento aprovado para todos os outros tópicos.
+            if bool(getattr(thread, 'archived', False)):
+                await thread.edit(archived=False, reason='V149: preparando proteção do tópico encerrado')
+            await thread.edit(locked=True, reason='Mesa encerrada e dossiê operacional gerado')
+        except Exception as erro:
+            try:
+                await enviar_log(
+                    f'⚠️ V149 falha ao proteger tópico {getattr(thread,"id",0)} '
+                    f'({getattr(thread,"name","Tópico")}): {type(erro).__name__}: {erro}'
+                )
+            except Exception:
+                pass
+
+
+# ---------- Item 12: foto do RG/documento passa a ser OPCIONAL ----------
+_V149_FALTANDO_PESSOA_BASE = _v116_faltando_pessoa
+
+def _v116_faltando_pessoa(
+    estado: Dict[str, Any], *, lideranca: bool=False, informante: bool=False
+) -> List[str]:
+    faltas = list(_V149_FALTANDO_PESSOA_BASE(estado, lideranca=lideranca, informante=informante) or [])
+    if informante:
+        # O número do RG continua obrigatório; apenas a FOTO/IMAGEM do documento deixa de ser.
+        faltas = [x for x in faltas if _v116_norm(x) not in {'rg documento', 'documento rg', 'documento'}]
+    return faltas
+
+
+_V149_FALTANDO_BASE = _v116_faltando
+
+def _v116_faltando(estado: Dict[str, Any]) -> List[str]:
+    item = int(estado.get('item') or 1)
+    etapa = int(estado.get('etapa') or 1)
+    if item == 12 and etapa == 1:
+        dados = estado.setdefault('dados', {})
+        inf = dados.get('informante')
+        if isinstance(inf, dict):
+            if (
+                inf.get('foto')
+                and str(inf.get('nome') or '').strip()
+                and str(inf.get('rg') or '').strip()
+            ):
+                return []
+        # Se ainda está em rascunho, usa a validação acima sem exigir documento.
+        return _v116_faltando_pessoa(estado, informante=True)
+    return list(_V149_FALTANDO_BASE(estado) or [])
+
+
+_V149_PROMPT_BASE = _v116_prompt
+
+def _v116_prompt(estado: Dict[str, Any]) -> str:
+    item = int(estado.get('item') or 1)
+    etapa = int(estado.get('etapa') or 1)
+    if item == 12 and etapa == 1:
+        faltas = _v116_faltando(estado)
+        if not faltas:
+            return (
+                'ITEM 12 — INFORMANTE\nETAPA 1/2\n\n'
+                '🟢 Identificação mínima registrada. Revise e clique em **Finalizar tarefa** para confirmar.\n\n'
+                'A foto do RG/documento é **opcional**.'
+            )
+        return (
+            'ITEM 12 — INFORMANTE\nETAPA 1/2\n\n'
+            'Envie o informante com:\n'
+            '- Foto do informante;\n'
+            '- Nome;\n'
+            '- Número do RG.\n\n'
+            '📎 **Opcional:** foto do RG/documento. Se for enviada, será salva normalmente.'
+        )
+    return _V149_PROMPT_BASE(estado)
+
+
+# A rotina original passa a aceitar a ausência do documento porque consulta
+# _v116_faltando_pessoa() dinamicamente. Este wrapper resolve também o caso de uma mesa
+# já em andamento cujo informante já está salvo sem documento.
+_V149_PROCESSAR_ITEM_BASE = _v116_processar_item
+
+async def _v116_processar_item(
+    canal: discord.TextChannel,
+    estado: Dict[str, Any],
+    msg: discord.Message,
+    *,
+    silencioso: bool=False,
+) -> None:
+    item = int(estado.get('item') or 1)
+    etapa = int(estado.get('etapa') or 1)
+    if item == 12 and etapa == 1:
+        dados = estado.setdefault('dados', {})
+        inf = dados.get('informante')
+        if isinstance(inf, dict) and inf.get('foto') and str(inf.get('nome') or '').strip() and str(inf.get('rg') or '').strip():
+            if not silencioso:
+                await _v116_responder(
+                    msg,
+                    '🟢 O informante da ETAPA 1/2 já possui **foto, nome e RG**. '
+                    'A foto do documento é opcional. Revise e clique em **Finalizar tarefa**.'
+                )
+            return
+    return await _V149_PROCESSAR_ITEM_BASE(canal, estado, msg, silencioso=silencioso)
+
+
+# ---------- Preflight final: documento do informante jamais vira pendência ----------
+# V145 já tornou o payload estrutural, mas mantemos esta blindagem para qualquer caminho
+# legado que ainda invoque uma validação anterior em runtime.
+if '_v129_validar_payload' in globals():
+    _V149_VALIDAR_PAYLOAD_BASE = _v129_validar_payload
+
+    def _v129_validar_payload(payload: Dict[str, Any]) -> List[str]:
+        erros = list(_V149_VALIDAR_PAYLOAD_BASE(payload) or [])
+        filtrados = []
+        for erro in erros:
+            norm = _v116_norm(erro)
+            if 'informante' in norm and ('documento' in norm or 'foto do rg' in norm or 'rg do informante nao vinculado' in norm):
+                continue
+            filtrados.append(erro)
+        return filtrados
+
+
+# Atualiza somente cards já existentes do Item 12 quando o bot ficar pronto.
+async def _v149_atualizar_cards_informante_existentes() -> None:
+    await asyncio.sleep(5.0)
+    atualizados = 0
+    try:
+        for guild in list(getattr(bot, 'guilds', []) or []):
+            for mesa in carregar_mesas() or []:
+                if not isinstance(mesa, dict):
+                    continue
+                cid = int(mesa.get('canal_id') or 0)
+                if not cid:
+                    continue
+                estado = _v116_estado(cid, False)
+                if not isinstance(estado, dict):
+                    continue
+                tarefas = estado.get('tarefas_guiadas') if isinstance(estado.get('tarefas_guiadas'), dict) else {}
+                reg = tarefas.get('12:1') if isinstance(tarefas, dict) else None
+                if not isinstance(reg, dict):
+                    continue
+                tid = int(reg.get('topico_id') or 0)
+                mid = int(reg.get('mensagem_id') or 0)
+                if not tid or not mid:
+                    continue
+                topico = guild.get_thread(tid)
+                if topico is None:
+                    try:
+                        topico = await guild.fetch_channel(tid)
+                    except Exception:
+                        topico = None
+                if not isinstance(topico, discord.Thread) or bool(getattr(topico, 'archived', False)):
+                    continue
+                try:
+                    mensagem = await topico.fetch_message(mid)
+                    await mensagem.edit(
+                        content=_v122_texto_tarefa_guiada(guild.get_channel(cid), estado, 12, 1),
+                        view=V122TarefaGuiadaView(),
+                    )
+                    atualizados += 1
+                except Exception:
+                    continue
+        print(f'✅ V149 Informante: {atualizados} card(s) existente(s) atualizado(s); foto do RG/documento opcional.', flush=True)
+    except Exception as erro:
+        print(f'⚠️ V149 atualização dos cards de Informante: {type(erro).__name__}: {erro}', flush=True)
+
+
+@bot.listen('on_ready')
+async def _v149_on_ready() -> None:
+    asyncio.create_task(_v149_atualizar_cards_informante_existentes(), name='v149-atualizar-informante')
+
+
+print(
+    '✅ V149 carregada — ao encerrar a mesa, o tópico Chat permanece aberto/desbloqueado; '
+    'demais tópicos continuam protegidos; Item 12 exige foto do informante + nome + RG, '
+    'mas foto do RG/documento agora é opcional. Modelo do dossiê e V147/V148 preservados.',
+    flush=True,
+)
