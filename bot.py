@@ -67125,6 +67125,200 @@ print(
 )
 
 
+
+# =============================================================
+# V159 — FECHAMENTO SIMPLES + PDF DIRETO (SEM MUDAR O MODELO)
+# Pedido atual:
+# - NÃO perguntar Diretrizes / Planejamento / Fundamentação / Baús / Evidências / Estrutura.
+# - A única exigência investigativa continua sendo: as 13 tarefas guiadas concluídas.
+# - Local da Pacificação continua 100% manual pela V147.
+# - Corrige o erro V155 exitcode=1 removendo multiprocessing/fork do PDF.
+# - O renderer visual continua EXATAMENTE o V158/V131/V133 aprovado.
+# - Nenhum comando, tarefa, procurado, ficha, hierarquia, reconhecimento ou layout é alterado.
+# =============================================================
+
+V159_FECHAMENTO_SIMPLES = 'V159 fechamento = 13 tarefas + local manual; sem questionário extra; PDF direto'
+
+
+def _v159_estado_13_concluido(canal_id: int) -> tuple[bool, int]:
+    """Consulta SOMENTE o estado já existente. Nunca cria tarefa nova."""
+    try:
+        estado = _v116_estado(int(canal_id), False)
+        if not isinstance(estado, dict):
+            return False, 0
+        try:
+            _v117_migrar_estado(estado)
+        except Exception:
+            pass
+        concluidos = estado.get('concluidos') if isinstance(estado.get('concluidos'), dict) else {}
+        total = sum(1 for i in range(1, 14) if str(i) in concluidos)
+        return total >= 13, total
+    except Exception:
+        return False, 0
+
+
+def _v159_preflight_apenas_roteiro(dados: Dict[str, Any]) -> List[str]:
+    """Não exige complementações artificiais. Valida só o roteiro guiado e a estrutura 01..13."""
+    erros: List[str] = []
+
+    # 1) Se a coleta trouxe o snapshot guiado, ele é a fonte principal.
+    try:
+        estado_guiado = dados.get('_dossie_guiado_estado') if isinstance(dados, dict) else None
+        if isinstance(estado_guiado, dict):
+            concluidos = estado_guiado.get('concluidos') if isinstance(estado_guiado.get('concluidos'), dict) else {}
+            total = sum(1 for i in range(1, 14) if str(i) in concluidos)
+            if total < 13:
+                erros.append(f'Roteiro guiado incompleto: {total}/13 tarefas concluídas.')
+    except Exception:
+        pass
+
+    # 2) O payload final precisa ter as 13 seções. Não exige texto/foto mínima em cada uma.
+    try:
+        payload = dados.get('dossie_v124') if isinstance(dados, dict) else None
+        if isinstance(payload, dict):
+            codigos = {
+                str(s.get('code') or '').zfill(2)
+                for s in list(payload.get('sections') or [])
+                if isinstance(s, dict)
+            }
+            faltantes = [f'{i:02d}' for i in range(1, 14) if f'{i:02d}' not in codigos]
+            if faltantes:
+                erros.append('Estrutura do roteiro ausente no payload: ' + ', '.join(faltantes) + '.')
+    except Exception as erro:
+        erros.append(f'Falha ao conferir estrutura 13/13: {type(erro).__name__}: {erro}')
+
+    return erros
+
+
+# O núcleo transacional antigo chamava um preflight que exigia Diretrizes, Planejamento,
+# Fundamentação, descrição dos baús etc. Isso deixa de ser requisito de FECHAMENTO.
+# O conteúdo do PDF continua podendo contextualizar essas áreas a partir das 13 tarefas.
+_v110_pdf_preflight_dados = _v159_preflight_apenas_roteiro
+
+
+# Se alguma tela V114 antiga for invocada diretamente, ela também fica compacta e não pergunta extras.
+def _v103_status_requisitos(dados: Dict[str, Any]) -> Tuple[Dict[str, str], List[str], List[str], List[str]]:
+    try:
+        req = dict(_v110_preparar_requisitos(dados) or {})
+    except Exception:
+        req = {}
+    try:
+        dados['requisitos_pacificacao'] = dict(req)
+    except Exception:
+        pass
+    return req, [], [], []
+
+
+def _v103_resumo_diagnostico(dados: Dict[str, Any]) -> str:
+    canal_id = int((dados or {}).get('canal_id') or 0) if isinstance(dados, dict) else 0
+    ok, total = _v159_estado_13_concluido(canal_id) if canal_id else (True, 13)
+    if ok:
+        return (
+            '🏛️ **FECHAMENTO DA MESA — DICOR**\n'
+            '✅ **13/13 tarefas concluídas.**\n'
+            '📄 O dossiê será consolidado somente com os dados e evidências já registrados na investigação.\n'
+            'Nenhuma complementação adicional será solicitada.'
+        )
+    return (
+        '🏛️ **FECHAMENTO DA MESA — DICOR**\n'
+        f'⚠️ **Progresso: {total}/13 tarefas concluídas.**\n'
+        'Conclua as tarefas restantes antes do fechamento.'
+    )
+
+
+# Bypass definitivo do questionário V114 no fluxo real de fechamento.
+# A V147 continua executando ANTES e continua exigindo o Local da Pacificação manual.
+_V159_FECHAR_BASE = fechar_mesa_core
+async def fechar_mesa_core(
+    interaction: discord.Interaction,
+    motivo: str='Fechada',
+    dados_confirmacao: Optional[Dict[str, Any]]=None,
+):
+    canal = getattr(interaction, 'channel', None)
+    if isinstance(canal, discord.TextChannel) and (
+        _v122_mesa_tarefas_habilitada(int(canal.id)) or _v118_mesa_guiada_habilitada(int(canal.id))
+    ):
+        completo, total = _v159_estado_13_concluido(int(canal.id))
+        if not completo:
+            mensagem = (
+                f'❌ **A mesa ainda não pode ser encerrada.**\n\n'
+                f'Progresso: **{total}/13** tarefas concluídas.\n'
+                'Conclua os 13 itens. Não há quantidade mínima de mensagens, fotos ou provas.'
+            )
+            try:
+                return await responder_interacao(interaction, mensagem, ephemeral=True)
+            except Exception:
+                return None
+
+    confirmacao = dict(dados_confirmacao or {})
+    # Estes flags apenas pulam o questionário legado. Não marcam tarefa como concluída.
+    confirmacao['_v103_complementacao_validada'] = True
+    confirmacao['_v114_validado'] = True
+    confirmacao['_v159_sem_questionario_extra'] = True
+    return await _V159_FECHAR_BASE(interaction, motivo=motivo, dados_confirmacao=confirmacao)
+
+
+# -----------------------------------------------------------------
+# PDF: V155 usava multiprocessing/fork e o Railway retornou exitcode=1
+# nas duas tentativas. A chamada do fechamento JÁ roda gerar_pdf_dossie
+# dentro de asyncio.to_thread(), então não precisamos criar outro processo.
+# Renderizamos no mesmo processo do bot, usando o mesmo materializador V153
+# (cache + timeout curto) e o mesmo renderer V158 aprovado.
+# -----------------------------------------------------------------
+_V159_RENDER_PDF_APROVADO = _v158_gerar_pdf_base
+
+
+def gerar_pdf_dossie(dados: Dict[str, Any], caminho_pdf: Path) -> None:
+    global _V155_PDF_LOCAL_ONLY
+    caminho_pdf = Path(caminho_pdf)
+    caminho_pdf.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # Tentativa normal no processo atual. Sem fork = sem exitcode opaco.
+    _V155_PDF_LOCAL_ONLY = False
+    try:
+        print('📄 V159 PDF direto: iniciando renderer aprovado no processo atual.', flush=True)
+        _V159_RENDER_PDF_APROVADO(dados, caminho_pdf)
+        if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 6000:
+            raise RuntimeError('renderer terminou sem produzir PDF válido')
+        print(f'✅ V159 PDF direto concluído: {caminho_pdf.name} ({caminho_pdf.stat().st_size} bytes)', flush=True)
+        return
+    except Exception as erro_normal:
+        print(f'⚠️ V159 PDF direto falhou: {type(erro_normal).__name__}: {erro_normal}', flush=True)
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+
+    # Segunda tentativa sem rede, apenas com mídia já local/cacheada.
+    # Continua usando exatamente o MESMO renderer/modelo.
+    try:
+        caminho_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _V155_PDF_LOCAL_ONLY = True
+    try:
+        print('📄 V159 PDF fallback: mesmo renderer, somente mídia local/cacheada.', flush=True)
+        _V159_RENDER_PDF_APROVADO(dados, caminho_pdf)
+        if not caminho_pdf.exists() or caminho_pdf.stat().st_size <= 6000:
+            raise RuntimeError('fallback local terminou sem produzir PDF válido')
+        print(f'✅ V159 PDF fallback local concluído: {caminho_pdf.name}', flush=True)
+        return
+    finally:
+        _V155_PDF_LOCAL_ONLY = False
+
+
+print(
+    '✅ V159 carregada — fechamento simplificado: 13 tarefas + Local da Pacificação manual; '
+    'Diretrizes/Planejamento/Fundamentação/Baús/Evidências/Estrutura não são mais perguntados; '
+    'PDF usa o MESMO modelo V158/V131/V133 sem multiprocessing/fork.',
+    flush=True,
+)
+
+
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
