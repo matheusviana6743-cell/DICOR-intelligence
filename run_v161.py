@@ -2,10 +2,13 @@
 import asyncio
 import bot
 import dossie_v161
+import dossie_v161_signatures
 
 
 def _instalar_renderer_visual_v161() -> None:
     """Conecta o layout V161 ao fluxo real de fechamento V159/V160."""
+    # Regra oficial: a página final possui somente as assinaturas dos dois delegados.
+    dossie_v161_signatures.install(dossie_v161)
     dossie_v161.install(bot)
 
     def _render_v161(dados, caminho):
