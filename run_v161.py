@@ -3,6 +3,7 @@ import asyncio
 import bot
 import dossie_v161
 import dossie_v161_signatures
+import procurados_central_v162
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -29,6 +30,11 @@ def _instalar_renderer_visual_v161() -> None:
     print('✅ V162 visual conectado ao fechamento real V159/V160.', flush=True)
 
 
+def _instalar_correcao_procurados_e_central() -> None:
+    """Lista estrita pelo canal oficial e reabre a Central DICOR normal."""
+    procurados_central_v162.install(bot)
+
+
 if __name__ == '__main__':
     try:
         if hasattr(bot, '_v70_iniciar_health_bootstrap'):
@@ -37,4 +43,5 @@ if __name__ == '__main__':
         pass
 
     _instalar_renderer_visual_v161()
+    _instalar_correcao_procurados_e_central()
     asyncio.run(bot._runtime_lifecycle_entrypoint())
