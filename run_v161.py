@@ -5,6 +5,7 @@ import dossie_v161
 import dossie_v161_signatures
 import procurados_central_v162
 import central_pf_v163
+import central_auth_v164
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -28,13 +29,14 @@ def _instalar_renderer_visual_v161() -> None:
     if hasattr(bot, '_V155_GERAR_PDF_BASE'):
         bot._V155_GERAR_PDF_BASE = _render_v161
 
-    print('✅ V163 visual conectado ao fechamento real V159/V160.', flush=True)
+    print('✅ V164 visual conectado ao fechamento real V159/V160.', flush=True)
 
 
 def _instalar_correcao_procurados_e_central() -> None:
-    """Mantém filtro estrito de procurados e aplica a Central PF V163 por último."""
+    """Mantém filtro estrito, Central PF e aplica a autenticação V164 por último."""
     procurados_central_v162.install(bot)
     central_pf_v163.install(bot)
+    central_auth_v164.install(bot)
 
 
 if __name__ == '__main__':
