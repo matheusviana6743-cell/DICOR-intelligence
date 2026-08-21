@@ -8,7 +8,8 @@ import dossie_v161_signatures
 def _instalar_renderer_visual_v161() -> None:
     """Conecta o layout V161 ao fluxo real de fechamento V159/V160."""
     # Regra oficial: a página final possui somente as assinaturas dos dois delegados.
-    dossie_v161_signatures.install(dossie_v161)
+    # Passamos o módulo do bot para o renderer conseguir usar as imagens reais cadastradas.
+    dossie_v161_signatures.install(dossie_v161, bot)
     dossie_v161.install(bot)
 
     def _render_v161(dados, caminho):
@@ -25,7 +26,7 @@ def _instalar_renderer_visual_v161() -> None:
     if hasattr(bot, '_V155_GERAR_PDF_BASE'):
         bot._V155_GERAR_PDF_BASE = _render_v161
 
-    print('✅ V161 visual conectado ao fechamento real V159/V160.', flush=True)
+    print('✅ V162 visual conectado ao fechamento real V159/V160.', flush=True)
 
 
 if __name__ == '__main__':
