@@ -1,322 +1,889 @@
 # -*- coding: utf-8 -*-
-"""V163 — Central DICOR: visual PF, mídia real e acesso por nível."""
+"""V163 - Central DICOR: visual PF preto/dourado, mídia ao vivo e acesso em camadas.
+
+Instala uma camada web nova sem reescrever o bot.py gigante e sem tocar no dossiê.
+"""
 from __future__ import annotations
-import asyncio, base64, hashlib, hmac, html, json, os, re, secrets, time
+
+import asyncio
+import hashlib
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
-WANTED_CHANNEL = 1490200533980545097
-IMG_EXTS = ('.png','.jpg','.jpeg','.webp','.gif')
-COOKIE_STRATEGY = 'dicor_strategy_v163'
-COOKIE_APPROVAL = 'dicor_approved_v163_'
-COOKIE_TTL = 12 * 3600
-REQUEST_TTL = 24 * 3600
+APPROVAL_PATHS = ("/boletins", "/pericias")
+STRATEGIC_PATHS = ("/fichas", "/arvore")
+PUBLIC_PREFIXES = (
+    "/central/", "/uploads/", "/public/", "/catalogo-media/", "/favicon",
+    "/health", "/healthz",
+)
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
-def install(b):
-    web, discord = b.web, b.discord
-    data = Path(str(getattr(b, 'DATA_DIR', Path(__file__).parent/'data')))
-    data.mkdir(parents=True, exist_ok=True)
-    req_file = data/'central_web_access_requests.json'
-    req_lock = asyncio.Lock()
-    views, pericia_cache = set(), {'at':0.0,'items':[]}
-    pericia_lock = asyncio.Lock()
+def install(bot_module) -> None:
+    web = bot_module.web
+    discord = bot_module.discord
+    client = bot_module.bot
 
-    def env_i(n, d=0):
-        try: return int(str(os.getenv(n,'') or d).strip())
-        except Exception: return int(d or 0)
-    def safe_next(v):
-        s=str(v or '/').strip(); return s[:1200] if s.startswith('/') and not s.startswith('//') else '/'
-    def module(path):
-        p=str(path or '').lower()
-        if 'pericia' in p: return 'pericias'
-        if 'bolet' in p: return 'boletins'
-        if 'arvore' in p: return 'arvore'
-        if 'ficha' in p or 'banco' in p: return 'banco'
-        return ''
-    def label(m): return {'pericias':'Perícias','boletins':'Boletins','arvore':'Árvore de Inteligência','banco':'Banco de Dados'}.get(m,'Área restrita')
-    def strategy_pass(): return str(os.getenv('CENTRAL_ESTRATEGICA_PASSWORD','') or os.getenv('CENTRAL_DICOR_PASSWORD','')).strip()
-    def secret(): return str(os.getenv('CENTRAL_DICOR_COOKIE_SECRET','') or strategy_pass()).strip()
-    def sign(kind, subject):
-        sec=secret()
-        if not sec: return ''
-        raw=f'{kind}|{subject}|{int(time.time())+COOKIE_TTL}'.encode(); body=base64.urlsafe_b64encode(raw).decode().rstrip('=')
-        sig=hmac.new(sec.encode(),body.encode(),hashlib.sha256).hexdigest(); return body+'.'+sig
-    def verify(token, kind, subject=None):
-        try:
-            body,sig=str(token).rsplit('.',1); sec=secret()
-            if not sec or not hmac.compare_digest(sig,hmac.new(sec.encode(),body.encode(),hashlib.sha256).hexdigest()): return False
-            raw=base64.urlsafe_b64decode((body+'='*(-len(body)%4)).encode()).decode(); k,s,exp=raw.split('|',2)
-            return k==kind and int(exp)>=int(time.time()) and (subject is None or s==subject)
-        except Exception: return False
-    def load_req():
-        try:
-            x=json.loads(req_file.read_text(encoding='utf-8')) if req_file.exists() else []
-            if isinstance(x,dict): x=x.get('requests') or []
-            return [r for r in x if isinstance(r,dict)] if isinstance(x,list) else []
-        except Exception: return []
-    def save_req(rows):
-        tmp=req_file.with_suffix('.tmp'); tmp.write_text(json.dumps(rows[-500:],ensure_ascii=False,indent=2),encoding='utf-8'); os.replace(tmp,req_file)
-    def get_req(rid): return next((r for r in reversed(load_req()) if secrets.compare_digest(str(r.get('id') or ''),rid)),None)
-    async def update_req(rid,**changes):
-        async with req_lock:
-            rows=load_req(); found=None
-            for r in rows:
-                if secrets.compare_digest(str(r.get('id') or ''),rid): r.update(changes); found=r; break
-            if found: save_req(rows)
-            return found
-    def approver(): return env_i('CENTRAL_APROVADOR_USER_ID') or int(getattr(b,'INSPETOR_BAIANO_USER_ID',0) or 0)
-    def approval_channel(): return env_i('CENTRAL_ACESSO_APROVACAO_CHANNEL_ID') or int(getattr(b,'AUTORIZACOES_CHANNEL_ID',0) or 0) or env_i('SET_APROVACAO_CHANNEL_ID') or int(getattr(b,'LOGS_CHANNEL_ID',0) or 0)
-    async def channel(cid):
-        bot=getattr(b,'bot',None)
-        if not bot or not cid: return None
-        ch=bot.get_channel(int(cid))
-        if ch: return ch
-        try: return await bot.fetch_channel(int(cid))
-        except Exception: return None
+    data_dir = Path(str(getattr(bot_module, "DATA_DIR", Path(__file__).parent / "data")))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    access_file = data_dir / "central_access_v163.json"
 
-    def approval_view(rid):
-        v=discord.ui.View(timeout=None)
-        yes=discord.ui.Button(label='Aprovar acesso',emoji='✅',style=discord.ButtonStyle.success,custom_id=f'dicor_web_yes:{rid}')
-        no=discord.ui.Button(label='Negar acesso',emoji='⛔',style=discord.ButtonStyle.danger,custom_id=f'dicor_web_no:{rid}')
-        async def decide(i,status):
-            if not approver() or int(getattr(i.user,'id',0) or 0)!=approver(): return await i.response.send_message('❌ Somente o responsável autorizado pode decidir.',ephemeral=True)
-            row=get_req(rid)
-            if not row or row.get('status')!='pending': return await i.response.send_message('ℹ️ Solicitação já encerrada ou expirada.',ephemeral=True)
-            await update_req(rid,status=status,decided_at=int(time.time()),decided_by_id=int(i.user.id))
-            for x in v.children: x.disabled=True
-            try: await i.response.edit_message(content='✅ ACESSO APROVADO' if status=='approved' else '⛔ ACESSO NEGADO',embed=None,view=v)
-            except Exception: pass
-        async def y(i): await decide(i,'approved')
-        async def n(i): await decide(i,'denied')
-        yes.callback=y; no.callback=n; v.add_item(yes); v.add_item(no); return v
-    async def send_request(row):
-        ch=await channel(approval_channel())
-        if not ch or not hasattr(ch,'send'): return False
-        emb=discord.Embed(title='🔐 SOLICITAÇÃO DE ACESSO — CENTRAL DICOR',description=f'<@{approver()}>\nPedido de acesso a **{label(row["module"])}**.',color=0x0B3D2E)
-        emb.add_field(name='QRA',value=row['qra'],inline=True); emb.add_field(name='Passaporte',value=row['passaporte'],inline=True)
-        emb.set_footer(text='Aprove ou negue pelos botões abaixo')
-        try:
-            msg=await ch.send(embed=emb,view=approval_view(row['id'])); await update_req(row['id'],discord_message_id=int(msg.id)); views.add(row['id']); return True
-        except Exception as e: print(f'⚠️ V163 acesso: {type(e).__name__}: {e}',flush=True); return False
-    async def restore_views():
-        bot=getattr(b,'bot',None)
-        if not bot or not hasattr(bot,'add_view'): return
-        now=int(time.time())
-        for r in load_req():
-            rid=str(r.get('id') or '')
-            if rid and rid not in views and r.get('status')=='pending' and int(r.get('expires_at') or 0)>now:
-                try: bot.add_view(approval_view(rid),message_id=int(r.get('discord_message_id') or 0) or None); views.add(rid)
-                except Exception: pass
-    if getattr(b,'bot',None): b.bot.add_listener(restore_views,'on_ready')
+    state: Dict[str, Any] = {
+        "wanted_media": {},
+        "pericias": [],
+        "pericias_ready": False,
+        "refresh_task": None,
+        "loop_task": None,
+        "pending_views_restored": False,
+    }
 
-    CSS=""":root{--g:#d5b45a;--pf:#0d5a45;--bg:#050b0f;--p:#0a181b;--l:#315348;--t:#f4f7f2;--m:#9ba9a3}*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07131d,#06100f 55%,#050908);color:var(--t);font-family:Inter,Segoe UI,Arial;min-height:100vh}a{color:inherit}.stripe{height:5px;background:linear-gradient(90deg,#0d5a45 0 65%,#d5b45a 65% 79%,#183d73 79%)}.top{height:90px;padding:0 5vw;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--l);background:linear-gradient(90deg,#06131c,#073b2e,#06131c)}.brand{display:flex;gap:14px;align-items:center}.brand img{width:58px;height:58px;object-fit:contain}.brand b{display:block;font-family:Georgia,serif;font-size:20px;letter-spacing:1.5px}.brand small,.eyebrow{color:var(--g);font-size:10px;letter-spacing:1.8px}.wrap{max-width:1260px;margin:auto;padding:52px 22px 70px}.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:32px;align-items:center;margin-bottom:42px}.hero h1{font:52px Georgia,serif;margin:8px 0 15px}.hero h1 span{color:var(--g)}.hero p{color:#b7c4be;line-height:1.65}.crest{min-height:230px;border:1px solid var(--l);border-radius:22px;background:linear-gradient(145deg,#0b2330,#08271f);display:grid;place-items:center}.crest img{width:150px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}.card{position:relative;border:1px solid #2e4d43;border-radius:16px;background:linear-gradient(160deg,#0d1f25,#0a1716);padding:24px;min-height:205px}.card:before{content:'';position:absolute;inset:0 auto 0 0;width:4px;background:var(--pf)}.card.public:before{background:var(--g)}.card h3{font:22px Georgia,serif;margin:16px 0 8px}.card p{color:#aab8b2;line-height:1.55;min-height:46px}.badge{position:absolute;right:15px;top:15px;border:1px solid #6e795f;border-radius:99px;padding:5px 8px;font-size:8px;letter-spacing:1.2px;color:#d0d9d4}.card a,.btn{display:inline-flex;text-decoration:none;background:#0d5a45;border:1px solid #328068;padding:10px 14px;border-radius:8px;font-weight:800}.public a{background:#c9a844;color:#102017;border-color:#e2c96e}.box{max-width:500px;margin:55px auto;border:1px solid var(--l);background:var(--p);border-radius:18px;padding:30px}.box h1{font-family:Georgia,serif}.box p{color:#aab8b2;line-height:1.55}.box label{display:block;font-size:11px;margin-top:13px}.box input{width:100%;margin-top:7px;padding:13px;background:#061013;border:1px solid #36574d;border-radius:8px;color:white}.box button{width:100%;margin-top:18px;padding:13px;border:0;border-radius:8px;background:#0d5a45;color:white;font-weight:900}.notice{padding:11px;border:1px solid #664e28;background:#2b2412;color:#ead38a;border-radius:8px}.error{border-color:#713a36;background:#2d1514;color:#ffc8c2}.back{display:block;text-align:center;color:#9db2a9;margin-top:18px;text-decoration:none}.spin{width:34px;height:34px;margin:15px auto;border:3px solid #ffffff22;border-top-color:var(--g);border-radius:50%;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}@media(max-width:850px){.hero{grid-template-columns:1fr}.crest{display:none}.grid{grid-template-columns:1fr}.hero h1{font-size:40px}.top{height:auto;padding:14px 18px}}"""
-    def page(title,body,refresh=''):
-        r=f'<meta http-equiv="refresh" content="{html.escape(refresh,quote=True)}">' if refresh else ''
-        return f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{r}<title>{html.escape(title)}</title><style>{CSS}</style></head><body><div class="stripe"></div><header class="top"><div class="brand"><img src="/central/brasao-dicor.png"><div><b>POLÍCIA FEDERAL — DICOR</b><small>CENTRAL DE INTELIGÊNCIA</small></div></div><div class="eyebrow">SISTEMA OPERACIONAL</div></header>{body}</body></html>'
+    def _now() -> int:
+        return int(time.time())
 
-    async def central(request):
-        try:
-            ref=getattr(b,'_v162_refresh_procurados_ativos',None)
-            if callable(ref) and not b._v43_procurados_ativos(): await asyncio.wait_for(ref('central v163'),8)
-        except Exception: pass
-        try: count=len(b._v43_procurados_ativos())
-        except Exception: count=0
-        cards=f'''<section class="grid"><article class="card public"><span class="badge">PÚBLICO</span><div>🎯</div><h3>Procurados</h3><p>{count} registro(s) confirmado(s) no canal oficial.</p><a href="/catalogo">Consultar procurados</a></article><article class="card"><span class="badge">SENHA ESTRATÉGICA</span><div>🗃️</div><h3>Banco de Dados</h3><p>Fichas, veículos, organizações, evidências e histórico.</p><a href="/fichas">Acessar banco</a></article><article class="card"><span class="badge">SENHA ESTRATÉGICA</span><div>🧬</div><h3>Árvore de Inteligência</h3><p>Conexões entre pessoas, veículos, ocorrências e organizações.</p><a href="/arvore">Abrir inteligência</a></article><article class="card"><span class="badge">APROVAÇÃO NECESSÁRIA</span><div>📋</div><h3>Boletins</h3><p>Consulta interna de boletins e anexos operacionais.</p><a href="/boletins">Solicitar acesso</a></article><article class="card"><span class="badge">APROVAÇÃO NECESSÁRIA</span><div>🧪</div><h3>Perícias</h3><p>Relatórios e fotografias do canal oficial.</p><a href="/pericias">Solicitar acesso</a></article></section>'''
-        body=f'<main class="wrap"><section class="hero"><div><div class="eyebrow">DEPARTAMENTO DE INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</div><h1>Central Operacional <span>DICOR</span></h1><p>Ambiente unificado com acesso separado por nível de sensibilidade.</p></div><div class="crest"><img src="/central/brasao-dicor.png"></div></section>{cards}</main>'
-        return web.Response(text=page('Central DICOR',body),content_type='text/html',charset='utf-8')
-    b.central_portal_http=central
+    def _escape(value: Any) -> str:
+        return html.escape(str(value or ""))
 
-    async def login_get(request):
-        nxt=safe_next(request.query.get('next')); m=module(nxt); rid=str(request.query.get('rid') or '')
-        if rid:
-            row=get_req(rid)
-            if not row or int(row.get('expires_at') or 0)<int(time.time()): return web.Response(text=page('Acesso','<main class="wrap"><div class="box"><h1>Solicitação expirada</h1><a class="back" href="/">Voltar</a></div></main>'),content_type='text/html')
-            status=str(row.get('status') or 'pending'); m=str(row.get('module') or m); nxt=safe_next(row.get('next'))
-            if status=='approved':
-                resp=web.HTTPFound(nxt); token=sign('approved:'+m,rid)
-                if token: resp.set_cookie(COOKIE_APPROVAL+m,token,max_age=COOKIE_TTL,httponly=True,secure=True,samesite='Lax',path='/')
-                raise resp
-            if status=='denied': return web.Response(text=page('Negado',f'<main class="wrap"><div class="box"><h1>Acesso negado</h1><p>O responsável negou o acesso a {label(m)}.</p><a class="back" href="/">Voltar</a></div></main>'),content_type='text/html')
-            ref=f'3;url=/acesso?next={quote(nxt,safe="/?=&")}&rid={quote(rid)}'; body=f'<main class="wrap"><div class="box" style="text-align:center"><div class="spin"></div><h1>Aguardando aprovação</h1><p>Pedido de acesso a <b>{label(m)}</b> enviado ao responsável.</p><div class="notice">QRA: {html.escape(str(row.get("qra") or ""))} • Passaporte: {html.escape(str(row.get("passaporte") or ""))}</div></div></main>'
-            return web.Response(text=page('Aguardando',body,ref),content_type='text/html')
-        if m in {'banco','arvore'}:
-            body=f'<main class="wrap"><form class="box" method="post" action="/acesso"><div class="eyebrow">NÍVEL ESTRATÉGICO</div><h1>Senha estratégica</h1><p>Sem cadastro: acesso somente para quem recebeu a senha diretamente.</p><input type="hidden" name="mode" value="strategic"><input type="hidden" name="next" value="{html.escape(nxt,quote=True)}"><label>Senha</label><input type="password" name="senha" required autofocus><button>VALIDAR ACESSO</button><a class="back" href="/">Voltar</a></form></main>'
-            return web.Response(text=page('Acesso estratégico',body),content_type='text/html')
-        if m in {'pericias','boletins'}:
-            body=f'<main class="wrap"><form class="box" method="post" action="/acesso"><div class="eyebrow">AUTORIZAÇÃO INDIVIDUAL</div><h1>Solicitar acesso</h1><p>O pedido será enviado ao Discord para aprovação ou recusa.</p><input type="hidden" name="mode" value="approval"><input type="hidden" name="next" value="{html.escape(nxt,quote=True)}"><label>QRA / Nome</label><input name="qra" maxlength="80" required><label>Passaporte / RG</label><input name="passaporte" maxlength="40" required><button>ENVIAR PARA APROVAÇÃO</button><a class="back" href="/">Voltar</a></form></main>'
-            return web.Response(text=page('Solicitar acesso',body),content_type='text/html')
-        raise web.HTTPFound('/')
+    def _norm(value: Any) -> str:
+        text = str(value or "").casefold()
+        text = re.sub(r"[^a-z0-9áàâãéèêíìîóòôõúùûç]+", " ", text)
+        return " ".join(text.split())
 
-    async def login_post(request):
-        form=await request.post(); nxt=safe_next(form.get('next')); m=module(nxt); mode=str(form.get('mode') or '')
-        if mode=='strategic' and m in {'banco','arvore'}:
-            supplied=str(form.get('senha') or ''); expected=strategy_pass()
-            if not expected or not hmac.compare_digest(supplied,expected): return web.Response(text=page('Senha inválida',f'<main class="wrap"><div class="box"><h1>Senha inválida</h1><div class="notice error">Acesso recusado.</div><a class="back" href="/acesso?next={quote(nxt,safe="/?=&")}">Tentar novamente</a></div></main>'),content_type='text/html',status=403)
-            resp=web.HTTPFound(nxt); resp.set_cookie(COOKIE_STRATEGY,sign('strategic','central'),max_age=COOKIE_TTL,httponly=True,secure=True,samesite='Lax',path='/'); raise resp
-        if mode=='approval' and m in {'pericias','boletins'}:
-            qra=str(form.get('qra') or '').strip()[:80]; pas=str(form.get('passaporte') or '').strip()[:40]
-            if not qra or not pas: return web.Response(text='Identificação incompleta.',status=400)
-            if not approver() or not approval_channel(): return web.Response(text='Aprovação não configurada.',status=503)
-            rid=secrets.token_urlsafe(24); now=int(time.time()); row={'id':rid,'module':m,'qra':qra,'passaporte':pas,'next':nxt,'status':'pending','created_at':now,'expires_at':now+REQUEST_TTL}
-            async with req_lock: rows=load_req(); rows.append(row); save_req(rows)
-            if not await send_request(row): await update_req(rid,status='error'); return web.Response(text='Falha ao enviar pedido.',status=503)
-            raise web.HTTPFound(f'/acesso?next={quote(nxt,safe="/?=&")}&rid={quote(rid)}')
-        raise web.HTTPFound('/')
-    async def logout(request):
-        r=web.HTTPFound('/'); r.del_cookie(COOKIE_STRATEGY,path='/')
-        for m in ('pericias','boletins'): r.del_cookie(COOKIE_APPROVAL+m,path='/')
-        raise r
-    b.central_login_get=login_get; b.central_login_post=login_post; b.central_logout_http=logout
-
-    async def auth_impl(request,handler):
-        p=str(request.path or '/').lower()
-        if p in {'/','/index.html','/catalogo','/acesso','/sair','/health','/healthz'} or p=='/central/brasao-dicor.png' or p.startswith('/uploads/'): return await handler(request)
-        if p.startswith('/dossies-central'): raise web.HTTPFound('/')
-        m=module(p)
-        if p.startswith('/api/') and not m: m='banco'
-        if m in {'banco','arvore'}:
-            if verify(request.cookies.get(COOKIE_STRATEGY,''),'strategic','central'): return await handler(request)
-            raise web.HTTPFound('/acesso?next='+quote(str(request.rel_url),safe='/?=&'))
-        if m in {'pericias','boletins'}:
-            if verify(request.cookies.get(COOKIE_APPROVAL+m,''),'approved:'+m): return await handler(request)
-            raise web.HTTPFound('/acesso?next='+quote(str(request.rel_url),safe='/?=&'))
-        return await handler(request)
-    b.central_auth_middleware=web.middleware(auth_impl)
-
-    def msg_id(r):
-        for k in ('mensagem_id','publicacao_mensagem_id','message_id','discord_message_id'):
+    def _record_message_id(registro: Dict[str, Any]) -> int:
+        for key in (
+            "mensagem_id", "publicacao_mensagem_id", "message_id",
+            "discord_message_id", "procurado_mensagem_id",
+        ):
             try:
-                if int(r.get(k) or 0): return int(r.get(k))
-            except Exception: pass
-        for k in ('mensagem_url','jump_url','publicacao_url','url'):
-            x=re.findall(r'(?<!\d)(\d{15,25})(?!\d)',str(r.get(k) or ''))
-            if x: return int(x[-1])
+                value = int(registro.get(key) or 0)
+                if value:
+                    return value
+            except Exception:
+                pass
+        for key in ("mensagem_url", "jump_url", "publicacao_url", "url"):
+            found = re.findall(r"(?<!\d)(\d{15,25})(?!\d)", str(registro.get(key) or ""))
+            if found:
+                try:
+                    return int(found[-1])
+                except Exception:
+                    pass
         return 0
-    def flatten(v,d=0):
-        if d>4: return []
-        if isinstance(v,dict): return [str(k) for k in v]+[z for x in v.values() for z in flatten(x,d+1)]
-        if isinstance(v,(list,tuple,set)): return [z for x in v for z in flatten(x,d+1)]
-        return [] if v is None else [str(v)]
-    def extract_bo(*vals):
-        text='\n'.join(x for v in vals for x in flatten(v))
-        for pat in (r'\bBO[\s._:/-]*DICOR[\s._:/-]*(\d{1,8})\b',r'\bBOLETIM[^\d]{0,30}(?:DICOR[^\d]{0,10})?(\d{1,8})\b'):
-            m=re.search(pat,text,re.I)
-            if m: return f'BO-DICOR-{int(m.group(1)):03d}'
-        return ''
-    def is_img(u,ct=''): return str(ct).lower().startswith('image/') or str(u).lower().split('?',1)[0].endswith(IMG_EXTS)
-    def msg_text(msg):
-        out=[str(getattr(msg,'content','') or '')]
-        for e in list(getattr(msg,'embeds',[]) or []):
-            out += [str(getattr(e,'title','') or ''),str(getattr(e,'description','') or '')]
-            for f in list(getattr(e,'fields',[]) or []): out += [str(getattr(f,'name','') or ''),str(getattr(f,'value','') or '')]
-        return '\n'.join(x for x in out if x)
-    def msg_images(msg):
-        out=[]
-        for a in list(getattr(msg,'attachments',[]) or []):
-            u=str(getattr(a,'url','') or '')
-            if u and is_img(u,str(getattr(a,'content_type','') or '')): out.append(u)
-        for e in list(getattr(msg,'embeds',[]) or []):
-            for k in ('image','thumbnail'):
-                o=getattr(e,k,None); u=str(getattr(o,'url','') or '') if o else ''
-                if u: out.append(u)
-        return list(dict.fromkeys(out))
-    def record_images(r):
-        out=[]
-        def walk(v,k='',d=0):
-            if d>4:return
-            if isinstance(v,dict):
-                for a,z in v.items(): walk(z,str(a),d+1)
-            elif isinstance(v,(list,tuple)):
-                for z in v: walk(z,k,d+1)
-            elif isinstance(v,str):
-                s=v.strip()
-                if (s.startswith('http') or s.startswith('/')) and (is_img(s) or any(x in k.lower() for x in ('foto','imagem','image','rg','document'))): out.append(s)
-        walk(r); return list(dict.fromkeys(out))
-    async def wanted_live(records):
-        ch=await channel(WANTED_CHANNEL); result={}
-        if not ch or not hasattr(ch,'fetch_message'): return result
-        async def one(mid):
-            try:
-                m=await ch.fetch_message(mid); return mid,{'images':msg_images(m),'text':msg_text(m)}
-            except Exception:return mid,{}
-        pairs=await asyncio.gather(*(one(x) for x in {msg_id(r) for r in records if msg_id(r)})); return dict(pairs)
-    def val(r,*keys,default='Não informado'):
-        for k in keys:
-            v=r.get(k)
-            if v not in (None,'',[],{}): return ('\n'.join(map(str,v)) if isinstance(v,(list,tuple)) else str(v))[:5000]
-        return default
-    def wanted_card(r,live):
-        name=val(r,'nome','name',default='Nome não informado'); rg=val(r,'rg','passaporte','documento'); crimes=val(r,'crimes','crime','infracoes','infrações'); last=val(r,'ultimo_avistamento','informacoes','último_avistamento'); bo=extract_bo(r,live.get('text','')); imgs=list(dict.fromkeys(list(live.get('images') or [])+record_images(r))); person=imgs[0] if imgs else ''; doc=imgs[1] if len(imgs)>1 else ''
-        def photo(u,title):
-            return f'<button class="photo" data-u="{html.escape(u,quote=True)}" onclick="openP(this.dataset.u)"><img src="{html.escape(u,quote=True)}" loading="lazy"></button>' if u else f'<div class="empty">SEM IMAGEM<br><small>{title}</small></div>'
-        bohtml=f'<a href="/boletins?busca={quote(bo)}">{html.escape(bo)}</a>' if bo else 'Não informado'
-        return f'<article class="wanted"><div class="photos"><div><b>FOTO DO INDIVÍDUO</b>{photo(person,"FOTO")}</div><div><b>DOCUMENTO / RG</b>{photo(doc,"RG")}</div></div><section class="wi"><small>IDENTIFICAÇÃO</small><h2>{html.escape(name)}</h2><strong>RG • {html.escape(rg)}</strong><div class="danger"><small>CRIMES</small><p>{html.escape(crimes).replace(chr(10),"<br>")}</p></div><div class="info"><small>ÚLTIMO AVISTAMENTO</small><p>{html.escape(last)}</p></div><div class="info"><small>BOLETIM VINCULADO</small><p>{bohtml}</p></div></section></article>'
-    async def catalog(request):
-        try:
-            ref=getattr(b,'_v162_refresh_procurados_ativos',None)
-            if callable(ref): await asyncio.wait_for(ref('catalogo v163'),10)
-        except Exception: pass
-        try: rows=list(b._v43_procurados_ativos() or [])
-        except Exception: rows=[]
-        live=await wanted_live(rows); cards=''.join(wanted_card(r,live.get(msg_id(r),{})) for r in rows) or '<div class="none">Nenhum procurado ativo.</div>'
-        extra=""".cat{max-width:1280px;margin:auto;padding:38px 18px}.cat h1{text-align:center;font-family:Georgia,serif}.wanted{border:1px solid var(--l);border-radius:16px;overflow:hidden;margin:20px 0;background:#07100f;display:grid;grid-template-columns:1.55fr .85fr}.photos{display:grid;grid-template-columns:1fr 1fr;border-right:1px solid var(--l)}.photos>div{position:relative;min-height:420px;border-right:1px solid var(--l)}.photos>div:last-child{border:0}.photos b{position:absolute;z-index:2;top:12px;left:12px;background:#06110fee;border:1px solid #7a6531;color:#e5ce7d;padding:7px;border-radius:7px;font-size:10px}.photo{width:100%;height:100%;border:0;background:#030807;padding:0;cursor:zoom-in}.photo img{width:100%;height:100%;object-fit:contain}.empty{height:100%;display:grid;place-items:center;color:#71847b}.wi{padding:26px}.wi h2{font-family:Georgia,serif;font-size:30px}.wi>strong{color:#e5ce7d}.danger,.info{margin-top:14px;padding:13px;border:1px solid #425b52;border-radius:10px}.danger{background:#24100f;border-color:#6d3631}.wi small{color:var(--g);letter-spacing:1.3px}.wi p{line-height:1.55}.light{display:none;position:fixed;inset:0;background:#000e;z-index:100;align-items:center;justify-content:center}.light.on{display:flex}.light img{max-width:95vw;max-height:92vh}@media(max-width:900px){.wanted{grid-template-columns:1fr}.photos{border-right:0;border-bottom:1px solid var(--l)}}"""
-        body=f'<main class="cat"><h1>Indivíduos Procurados</h1>{cards}</main><div id="lp" class="light" onclick="this.classList.remove(\'on\')"><img id="lpi"></div><script>function openP(u){{document.getElementById("lpi").src=u;document.getElementById("lp").classList.add("on")}}</script>'
-        return web.Response(text=page('Procurados',body).replace('</style>',extra+'</style>'),content_type='text/html',charset='utf-8')
-    b.pagina_inicial=catalog
 
-    async def scan_pericias():
-        async with pericia_lock:
-            if pericia_cache['items'] and time.monotonic()-pericia_cache['at']<30:return list(pericia_cache['items'])
-            ch=await channel(int(getattr(b,'PERICIAS_CHANNEL_ID',0) or env_i('PERICIAS_CHANNEL_ID'))); items=[]
-            if not ch:return []
-            async def collect(th):
-                texts=[]; imgs=[]; links=[]; jump=''
+    def _flatten_dicts(value: Any) -> Iterable[Dict[str, Any]]:
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from _flatten_dicts(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from _flatten_dicts(child)
+
+    def _first(record: Dict[str, Any], keys: Iterable[str], default: str = "") -> str:
+        for key in keys:
+            value = record.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+        return default
+
+    def _candidate_image(value: Any) -> str:
+        if not value:
+            return ""
+        if isinstance(value, dict):
+            for key in ("url", "proxy_url", "caminho", "path", "arquivo"):
+                found = _candidate_image(value.get(key))
+                if found:
+                    return found
+            return ""
+        text = str(value).strip()
+        low = text.lower().split("?", 1)[0]
+        if text.startswith(("https://", "http://", "/")) and low.endswith(IMAGE_EXTS):
+            return text
+        if text.startswith(("https://", "http://")) and "cdn.discordapp.com/attachments/" in text:
+            return text
+        return ""
+
+    def _record_images(record: Dict[str, Any]) -> List[str]:
+        results: List[str] = []
+        keys = (
+            "foto", "foto_url", "imagem", "imagem_url", "foto_individuo", "foto_pessoa",
+            "foto_rg", "rg_foto", "documento", "documento_url", "rg_url",
+            "fotos", "imagens", "anexos", "attachments",
+        )
+        for key in keys:
+            value = record.get(key)
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    candidate = _candidate_image(item)
+                    if candidate and candidate not in results:
+                        results.append(candidate)
+            else:
+                candidate = _candidate_image(value)
+                if candidate and candidate not in results:
+                    results.append(candidate)
+        return results
+
+    def _message_images(message) -> List[str]:
+        results: List[str] = []
+        for attachment in list(getattr(message, "attachments", []) or []):
+            url = str(getattr(attachment, "url", "") or "")
+            content_type = str(getattr(attachment, "content_type", "") or "").lower()
+            filename = str(getattr(attachment, "filename", "") or "").lower()
+            if url and (content_type.startswith("image/") or filename.endswith(IMAGE_EXTS)):
+                if url not in results:
+                    results.append(url)
+        for embed in list(getattr(message, "embeds", []) or []):
+            for obj_name in ("image", "thumbnail"):
+                obj = getattr(embed, obj_name, None)
+                url = str(getattr(obj, "url", "") or "") if obj is not None else ""
+                if url and url not in results:
+                    results.append(url)
+        return results
+
+    async def _resolve_channel(channel_id: int):
+        if not channel_id:
+            return None
+        channel = client.get_channel(int(channel_id))
+        if channel is not None:
+            return channel
+        try:
+            return await client.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+
+    def _guild_id() -> int:
+        try:
+            value = int(getattr(bot_module, "GUILD_ID", 0) or 0)
+            if value:
+                return value
+        except Exception:
+            pass
+        guilds = list(getattr(client, "guilds", []) or [])
+        return int(guilds[0].id) if guilds else 0
+
+    async def _refresh_wanted_media() -> None:
+        channel_id = int(getattr(bot_module, "PROCURADOS_CHANNEL_ID", 1490200533980545097) or 1490200533980545097)
+        channel = await _resolve_channel(channel_id)
+        if channel is None or not hasattr(channel, "history"):
+            return
+        mapping: Dict[int, Dict[str, Any]] = {}
+        try:
+            async for message in channel.history(limit=None, oldest_first=False):
+                mapping[int(message.id)] = {
+                    "images": _message_images(message),
+                    "content": str(getattr(message, "content", "") or ""),
+                    "jump_url": str(getattr(message, "jump_url", "") or ""),
+                    "created_at": getattr(message, "created_at", None),
+                }
+        except Exception as exc:
+            print(f"⚠️ V163: falha ao atualizar mídia dos procurados: {type(exc).__name__}: {exc}", flush=True)
+            return
+        state["wanted_media"] = mapping
+
+    def _active_wanted() -> List[Dict[str, Any]]:
+        base = getattr(bot_module, "_v43_procurados_ativos", None)
+        try:
+            records = list(base() if callable(base) else (bot_module.carregar_procurados() or []))
+        except Exception:
+            records = []
+        enriched: List[Dict[str, Any]] = []
+        for original in records:
+            if not isinstance(original, dict):
+                continue
+            record = dict(original)
+            message_id = _record_message_id(record)
+            live = state["wanted_media"].get(message_id, {})
+            live_images = list(live.get("images") or [])
+            fallback_images = _record_images(record)
+            images: List[str] = []
+            for url in live_images + fallback_images:
+                if url and url not in images:
+                    images.append(url)
+            record["_v163_images"] = images
+            record["_v163_jump_url"] = live.get("jump_url") or _first(record, ("mensagem_url", "jump_url", "publicacao_url"))
+            enriched.append(record)
+        return enriched
+
+    def _boletim_records() -> List[Dict[str, Any]]:
+        fn = getattr(bot_module, "_v44_boletins_ativos_snapshot", None)
+        if callable(fn):
+            try:
+                data = fn() or []
+                if isinstance(data, list):
+                    return [dict(x) for x in data if isinstance(x, dict)]
+            except Exception:
+                pass
+        path = getattr(bot_module, "BOLETINS_JSON", None)
+        if path:
+            try:
+                raw = bot_module.carregar_json(path, [])
+                return list(_flatten_dicts(raw))
+            except Exception:
+                pass
+        return []
+
+    def _boletim_number(record: Dict[str, Any]) -> str:
+        return _first(record, ("numero_boletim", "boletim_numero", "numero", "boletim", "bo", "protocolo"))
+
+    def _discord_link_from_record(record: Dict[str, Any]) -> str:
+        for key in (
+            "mensagem_url", "jump_url", "url", "thread_url", "area_url",
+            "boletim_url", "boletim_mensagem_url", "publicacao_url",
+        ):
+            value = str(record.get(key) or "").strip()
+            if value.startswith("http"):
+                return value
+        guild_id = _guild_id()
+        channel_id = 0
+        message_id = 0
+        for key in ("area_id", "thread_id", "canal_id", "channel_id"):
+            try:
+                channel_id = int(record.get(key) or 0)
+            except Exception:
+                channel_id = 0
+            if channel_id:
+                break
+        for key in ("mensagem_id", "message_id", "publicacao_mensagem_id"):
+            try:
+                message_id = int(record.get(key) or 0)
+            except Exception:
+                message_id = 0
+            if message_id:
+                break
+        if guild_id and channel_id:
+            return f"https://discord.com/channels/{guild_id}/{channel_id}" + (f"/{message_id}" if message_id else "")
+        return ""
+
+    def _find_boletim(record: Dict[str, Any]) -> Tuple[str, str]:
+        direct_number = _boletim_number(record)
+        direct_link = _discord_link_from_record(record)
+        if direct_number and direct_link:
+            return direct_number, direct_link
+
+        target_number = _norm(direct_number)
+        target_rg = _norm(_first(record, ("rg", "passaporte", "registro_geral")))
+        target_name = _norm(_first(record, ("nome", "nome_completo", "procurado")))
+        best: Optional[Dict[str, Any]] = None
+        best_score = 0
+        for item in _boletim_records():
+            score = 0
+            number = _norm(_boletim_number(item))
+            rg = _norm(_first(item, ("rg", "passaporte", "suspeito_rg", "procurado_rg")))
+            name = _norm(_first(item, ("nome", "suspeito", "suspeito_nome", "procurado")))
+            hay = _norm(json.dumps(item, ensure_ascii=False, default=str))
+            if target_number and target_number == number:
+                score += 10
+            elif target_number and target_number in hay:
+                score += 7
+            if target_rg and (target_rg == rg or target_rg in hay):
+                score += 5
+            if target_name and len(target_name) >= 4 and (target_name == name or target_name in hay):
+                score += 3
+            if score > best_score:
+                best, best_score = item, score
+        if best is not None and best_score >= 5:
+            return _boletim_number(best) or direct_number, _discord_link_from_record(best) or direct_link
+        return direct_number, direct_link
+
+    async def _scan_thread(thread) -> Optional[Dict[str, Any]]:
+        messages = []
+        try:
+            async for message in thread.history(limit=100, oldest_first=True):
+                messages.append(message)
+        except Exception:
+            return None
+        text_parts: List[str] = []
+        images: List[str] = []
+        jump_url = ""
+        for message in messages:
+            content = str(getattr(message, "content", "") or "").strip()
+            if content:
+                text_parts.append(content)
+            for url in _message_images(message):
+                if url not in images:
+                    images.append(url)
+            if not jump_url:
+                jump_url = str(getattr(message, "jump_url", "") or "")
+        if not text_parts and not images:
+            return None
+        return {
+            "title": str(getattr(thread, "name", "") or "Perícia"),
+            "content": "\n\n".join(text_parts),
+            "images": images,
+            "jump_url": jump_url or f"https://discord.com/channels/{_guild_id()}/{getattr(thread, 'id', 0)}",
+        }
+
+    async def _refresh_pericias() -> None:
+        channel_ids: List[int] = []
+        for attr in ("PERICIAS_CHANNEL_ID", "PERICIA_FLUXO_CHANNEL_ID", "BANCO_PERICIA_CHANNEL_ID"):
+            try:
+                value = int(getattr(bot_module, attr, 0) or 0)
+                if value and value not in channel_ids:
+                    channel_ids.append(value)
+            except Exception:
+                pass
+
+        records: List[Dict[str, Any]] = []
+        seen_threads = set()
+        seen_links = set()
+
+        async def add_channel(channel) -> None:
+            if channel is None:
+                return
+            threads = list(getattr(channel, "threads", []) or [])
+            for thread in threads:
                 try:
-                    async for m in th.history(limit=150,oldest_first=True):
-                        t=msg_text(m)
-                        if t:texts.append(t)
-                        imgs+=msg_images(m); jump=jump or str(getattr(m,'jump_url','') or '')
-                        for a in list(getattr(m,'attachments',[]) or []):
-                            u=str(getattr(a,'url','') or ''); n=str(getattr(a,'filename','') or 'Anexo')
-                            if u and not is_img(u,str(getattr(a,'content_type','') or '')):links.append((n,u))
-                except Exception:return
-                if texts or imgs or links:
-                    txt='\n\n'.join(texts)[:12000]; title=str(getattr(th,'name','') or 'Perícia'); items.append({'title':title,'text':txt,'images':list(dict.fromkeys(imgs))[:20],'links':links,'jump':jump,'bo':extract_bo(title,txt)})
-            threads=list(getattr(ch,'threads',[]) or []); guild=getattr(ch,'guild',None)
-            if guild:
-                for th in list(getattr(guild,'threads',[]) or []):
-                    if int(getattr(th,'parent_id',0) or 0)==int(getattr(ch,'id',0) or 0) and th not in threads:threads.append(th)
-            arch=getattr(ch,'archived_threads',None)
-            if callable(arch):
+                    seen_threads.add(int(thread.id))
+                except Exception:
+                    pass
+                item = await _scan_thread(thread)
+                if item and item.get("jump_url") not in seen_links:
+                    seen_links.add(item.get("jump_url"))
+                    records.append(item)
+
+            archived = getattr(channel, "archived_threads", None)
+            if callable(archived):
                 try:
-                    async for th in arch(limit=50):
-                        if th not in threads:threads.append(th)
-                except Exception:pass
-            if threads: await asyncio.gather(*(collect(t) for t in threads[:100]))
-            if hasattr(ch,'history'):
+                    count = 0
+                    async for thread in archived(limit=50):
+                        if int(getattr(thread, "id", 0) or 0) in seen_threads:
+                            continue
+                        item = await _scan_thread(thread)
+                        if item and item.get("jump_url") not in seen_links:
+                            seen_links.add(item.get("jump_url"))
+                            records.append(item)
+                        count += 1
+                        if count >= 50:
+                            break
+                except Exception:
+                    pass
+
+            if not threads and hasattr(channel, "history"):
                 try:
-                    async for m in ch.history(limit=300,oldest_first=False):
-                        t=msg_text(m); imgs=msg_images(m)
-                        if not t and not imgs:continue
-                        title=next((str(getattr(e,'title','') or '') for e in list(getattr(m,'embeds',[]) or []) if getattr(e,'title',None)),f'Perícia • {m.id}')
-                        items.append({'title':title,'text':t[:12000],'images':imgs,'links':[],'jump':str(getattr(m,'jump_url','') or ''),'bo':extract_bo(title,t)})
-                except Exception:pass
-            seen=set(); clean=[]
-            for x in items:
-                k=(x.get('jump'),x.get('title'),x.get('text','')[:160])
-                if k not in seen:seen.add(k);clean.append(x)
-            pericia_cache.update(at=time.monotonic(),items=clean); return list(clean)
-    def pericia_card(x):
-        imgs=''.join(f'<button class="pi" data-u="{html.escape(u,quote=True)}" onclick="openP(this.dataset.u)"><img src="{html.escape(u,quote=True)}" loading="lazy"></button>' for u in x.get('images') or []) or '<div class="nomedia">Sem imagens anexadas.</div>'
-        bo=x.get('bo') or ''; bohtml=f'<a href="/boletins?busca={quote(bo)}">{html.escape(bo)}</a>' if bo else 'Sem BO identificado'; jump=f'<a class="btn" href="{html.escape(x.get("jump") or "",quote=True)}" target="_blank">Abrir no Discord</a>' if x.get('jump') else ''
-        return f'<article class="pc"><header><div><small>REGISTRO DE PERÍCIA</small><h2>{html.escape(x.get("title") or "Perícia")}</h2></div><b>{bohtml}</b></header><div class="pt">{html.escape(x.get("text") or "Sem descrição").replace(chr(10),"<br>")}</div><div class="pg">{imgs}</div>{jump}</article>'
-    async def pericias(request):
-        cards=''.join(pericia_card(x) for x in await scan_pericias()) or '<div class="none">Nenhuma perícia localizada.</div>'
-        extra=""".per{max-width:1280px;margin:auto;padding:38px 18px}.per>h1{text-align:center;font-family:Georgia,serif}.pc{border:1px solid var(--l);border-radius:16px;overflow:hidden;background:#081413;margin:20px 0}.pc header{padding:17px 19px;background:#0a1c1b;border-bottom:1px solid var(--l);display:flex;justify-content:space-between;align-items:center;gap:15px}.pc h2{margin:5px 0;font-family:Georgia,serif}.pc small{color:var(--g)}.pt{padding:18px;line-height:1.6;color:#d0d8d4}.pg{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--l);border-top:1px solid var(--l)}.pi{border:0;padding:0;background:#020706;min-height:220px;cursor:zoom-in}.pi img{width:100%;height:100%;max-height:360px;object-fit:contain}.nomedia{grid-column:1/-1;background:#07100f;color:#71847b;text-align:center;padding:45px}.pc>.btn{margin:14px}.light{display:none;position:fixed;inset:0;background:#000e;z-index:100;align-items:center;justify-content:center}.light.on{display:flex}.light img{max-width:95vw;max-height:92vh}@media(max-width:850px){.pg{grid-template-columns:1fr 1fr}}@media(max-width:550px){.pg{grid-template-columns:1fr}.pc header{align-items:flex-start;flex-direction:column}}"""
-        body=f'<main class="per"><h1>Perícias • Relatórios e Anexos</h1>{cards}</main><div id="lp" class="light" onclick="this.classList.remove(\'on\')"><img id="lpi"></div><script>function openP(u){{document.getElementById("lpi").src=u;document.getElementById("lp").classList.add("on")}}</script>'
-        return web.Response(text=page('Perícias',body).replace('</style>',extra+'</style>'),content_type='text/html',charset='utf-8')
-    b.central_pericias_http=pericias
-    async def no_dossies(request): raise web.HTTPFound('/')
-    b.central_dossies_http=no_dossies
-    print('✅ V163 Central PF: mídia real, BO vinculado, acesso por aprovação/senha e Dossiês fora da Central.',flush=True)
+                    async for message in channel.history(limit=120, oldest_first=False):
+                        content = str(getattr(message, "content", "") or "").strip()
+                        images = _message_images(message)
+                        if not content and not images:
+                            continue
+                        jump = str(getattr(message, "jump_url", "") or "")
+                        if jump and jump in seen_links:
+                            continue
+                        if jump:
+                            seen_links.add(jump)
+                        title = content.splitlines()[0][:90] if content else "Perícia externa"
+                        records.append({
+                            "title": title,
+                            "content": content,
+                            "images": images,
+                            "jump_url": jump,
+                        })
+                except Exception as exc:
+                    print(f"⚠️ V163: falha ao ler perícias: {type(exc).__name__}: {exc}", flush=True)
+
+        for channel_id in channel_ids:
+            await add_channel(await _resolve_channel(channel_id))
+
+        state["pericias"] = records[:100]
+        state["pericias_ready"] = True
+        print(f"✅ V163: perícias sincronizadas com {len(state['pericias'])} registro(s) e mídia do Discord.", flush=True)
+
+    async def _refresh_all(reason: str = "") -> None:
+        try:
+            await _refresh_wanted_media()
+            await _refresh_pericias()
+        except Exception as exc:
+            print(f"⚠️ V163 refresh ({reason}): {type(exc).__name__}: {exc}", flush=True)
+
+    async def _refresh_loop() -> None:
+        while True:
+            await asyncio.sleep(45)
+            await _refresh_all("loop")
+
+    access_lock = asyncio.Lock()
+
+    def _load_access() -> List[Dict[str, Any]]:
+        try:
+            if access_file.exists():
+                raw = json.loads(access_file.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    return [x for x in raw if isinstance(x, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _save_access(items: List[Dict[str, Any]]) -> None:
+        tmp = access_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(items[-500:], ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, access_file)
+
+    def _token_hash(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def _find_access_by_id(request_id: str) -> Optional[Dict[str, Any]]:
+        async with access_lock:
+            for item in _load_access():
+                if str(item.get("id")) == str(request_id):
+                    return item
+        return None
+
+    async def _find_approved_token(token: str, module: str) -> Optional[Dict[str, Any]]:
+        if not token:
+            return None
+        digest = _token_hash(token)
+        now = _now()
+        async with access_lock:
+            items = _load_access()
+        for item in reversed(items):
+            if item.get("token_hash") != digest:
+                continue
+            if item.get("module") != module:
+                continue
+            if item.get("status") != "approved":
+                continue
+            if int(item.get("expires_at") or 0) < now:
+                continue
+            return item
+        return None
+
+    async def _update_access(request_id: str, status: str, approver: str = "") -> Optional[Dict[str, Any]]:
+        async with access_lock:
+            items = _load_access()
+            found = None
+            for item in items:
+                if str(item.get("id")) == str(request_id):
+                    item["status"] = status
+                    item["decided_at"] = _now()
+                    item["decided_by"] = approver
+                    found = dict(item)
+                    break
+            _save_access(items)
+        return found
+
+    def _approval_channel_id() -> int:
+        for attr in ("AUTORIZACOES_CHANNEL_ID", "SET_APROVACAO_CHANNEL_ID", "LOGS_CHANNEL_ID", "BOLETIM_ATENDIMENTO_CHANNEL_ID"):
+            try:
+                value = int(getattr(bot_module, attr, 0) or 0)
+                if value:
+                    return value
+            except Exception:
+                pass
+        return 0
+
+    def _is_approver(member) -> bool:
+        allowed_ids = set()
+        for attr in ("INSPETOR_BAIANO_USER_ID", "DIRETOR_GERAL_USER_ID", "DIRETOR_DICOR_USER_ID"):
+            try:
+                value = int(getattr(bot_module, attr, 0) or 0)
+                if value:
+                    allowed_ids.add(value)
+            except Exception:
+                pass
+        member_id = int(getattr(member, "id", 0) or 0)
+        if allowed_ids:
+            return member_id in allowed_ids
+        fn = getattr(bot_module, "usuario_e_administrador", None)
+        if callable(fn):
+            try:
+                return bool(fn(member))
+            except Exception:
+                pass
+        return False
+
+    def _module_label(module: str) -> str:
+        return {"boletins": "Boletins", "pericias": "Perícias"}.get(module, module.title())
+
+    class ApprovalView(discord.ui.View):
+        def __init__(self, request_id: str):
+            super().__init__(timeout=None)
+            self.request_id = str(request_id)
+            approve = discord.ui.Button(
+                label="Aprovar acesso", emoji="✅", style=discord.ButtonStyle.success,
+                custom_id=f"dicor_v163_access_approve:{self.request_id}",
+            )
+            deny = discord.ui.Button(
+                label="Negar acesso", emoji="⛔", style=discord.ButtonStyle.danger,
+                custom_id=f"dicor_v163_access_deny:{self.request_id}",
+            )
+
+            async def approve_cb(interaction):
+                if not _is_approver(interaction.user):
+                    return await interaction.response.send_message("❌ Você não pode autorizar acessos da Central.", ephemeral=True)
+                updated = await _update_access(self.request_id, "approved", str(interaction.user))
+                if not updated:
+                    return await interaction.response.send_message("❌ Solicitação não encontrada.", ephemeral=True)
+                embed = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else discord.Embed(title="Acesso aprovado")
+                embed.color = discord.Color.green()
+                embed.add_field(name="DECISÃO", value=f"✅ APROVADO por {interaction.user.mention}", inline=False)
+                await interaction.response.edit_message(embed=embed, view=None)
+
+            async def deny_cb(interaction):
+                if not _is_approver(interaction.user):
+                    return await interaction.response.send_message("❌ Você não pode negar acessos da Central.", ephemeral=True)
+                updated = await _update_access(self.request_id, "denied", str(interaction.user))
+                if not updated:
+                    return await interaction.response.send_message("❌ Solicitação não encontrada.", ephemeral=True)
+                embed = interaction.message.embeds[0] if interaction.message and interaction.message.embeds else discord.Embed(title="Acesso negado")
+                embed.color = discord.Color.red()
+                embed.add_field(name="DECISÃO", value=f"⛔ NEGADO por {interaction.user.mention}", inline=False)
+                await interaction.response.edit_message(embed=embed, view=None)
+
+            approve.callback = approve_cb
+            deny.callback = deny_cb
+            self.add_item(approve)
+            self.add_item(deny)
+
+    async def _send_approval(record: Dict[str, Any]) -> bool:
+        channel = await _resolve_channel(_approval_channel_id())
+        if channel is None or not hasattr(channel, "send"):
+            return False
+        embed = discord.Embed(
+            title="🔐 Solicitação de acesso à Central DICOR",
+            description=f"Pedido para acessar **{_module_label(record['module'])}**.",
+            color=discord.Color.from_rgb(201, 162, 39),
+        )
+        embed.add_field(name="QRA / NOME", value=str(record.get("qra") or "Não informado")[:1024], inline=True)
+        embed.add_field(name="PASSAPORTE", value=str(record.get("passaporte") or "Não informado")[:1024], inline=True)
+        embed.add_field(name="DISCORD", value=str(record.get("discord") or "Não informado")[:1024], inline=True)
+        embed.add_field(name="MOTIVO", value=str(record.get("motivo") or "Não informado")[:1024], inline=False)
+        embed.set_footer(text=f"Central DICOR • Solicitação {record['id']}")
+        try:
+            message = await channel.send(embed=embed, view=ApprovalView(record["id"]))
+        except Exception as exc:
+            print(f"⚠️ V163: falha ao enviar aprovação: {type(exc).__name__}: {exc}", flush=True)
+            return False
+        async with access_lock:
+            items = _load_access()
+            for item in items:
+                if str(item.get("id")) == str(record["id"]):
+                    item["discord_message_id"] = int(message.id)
+                    item["approval_channel_id"] = int(channel.id)
+                    break
+            _save_access(items)
+        return True
+
+    def _strategic_password() -> str:
+        return (
+            os.getenv("CENTRAL_ESTRATEGICA_PASSWORD", "").strip()
+            or os.getenv("PLATAFORMA_DONO_PASSWORD", "").strip()
+            or os.getenv("CENTRAL_DICOR_PASSWORD", "").strip()
+        )
+
+    def _cookie_secret() -> bytes:
+        secret = (
+            os.getenv("CENTRAL_DICOR_COOKIE_SECRET", "").strip()
+            or os.getenv("PLATAFORMA_DONO_PASSWORD", "").strip()
+            or os.getenv("CENTRAL_DICOR_PASSWORD", "").strip()
+            or "dicor-v163-fallback-secret-change-me"
+        )
+        return secret.encode("utf-8")
+
+    def _make_strategic_cookie() -> str:
+        expiry = _now() + 12 * 3600
+        payload = f"strategic:{expiry}"
+        sig = hmac.new(_cookie_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{expiry}.{sig}"
+
+    def _valid_strategic_cookie(value: str) -> bool:
+        try:
+            expiry_text, sig = str(value or "").split(".", 1)
+            expiry = int(expiry_text)
+            if expiry < _now():
+                return False
+            payload = f"strategic:{expiry}"
+            expected = hmac.new(_cookie_secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(sig, expected)
+        except Exception:
+            return False
+
+    BASE_CSS = """
+:root{--gold:#c9a227;--gold2:#f0d878;--gold3:#806714;--black:#050505;--panel:#0b0b09;--panel2:#10100c;--line:#3b3219;--text:#f5f0df;--muted:#aaa48f;--danger:#8e2d27}
+*{box-sizing:border-box}html{background:var(--black)}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% -10%,#7e641527,transparent 32%),linear-gradient(180deg,#070705,#030303 58%,#050504);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}
+a{color:inherit}.topbar{min-height:106px;border-bottom:1px solid #4a3c1b;background:#050504ef;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:12px 5vw;position:sticky;top:0;z-index:20;backdrop-filter:blur(15px)}.brand{grid-column:2;display:flex;align-items:center;gap:17px}.brand img{width:72px;height:72px;object-fit:contain;filter:drop-shadow(0 0 20px #c9a2271d)}.brand h1{font-family:Georgia,serif;font-size:20px;letter-spacing:2px;margin:0}.brand small{display:block;color:var(--gold);letter-spacing:1.7px;font-size:10px;margin-top:5px}.top-right{justify-self:end;color:#8f8974;font-size:10px;letter-spacing:1.3px}.wrap{max-width:1360px;margin:0 auto;padding:54px 24px 76px}.eyebrow{font-size:10px;letter-spacing:2.4px;color:var(--gold)}.hero{text-align:center;max-width:950px;margin:6px auto 48px}.hero h2{font-family:Georgia,serif;font-size:50px;line-height:1.05;margin:12px 0 14px;font-weight:600}.hero h2 span{color:var(--gold2)}.hero p{color:#bbb49f;line-height:1.65;font-size:16px}.gold-rule{width:96px;height:2px;background:linear-gradient(90deg,transparent,var(--gold2),transparent);margin:22px auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.module{min-height:230px;padding:27px 27px 25px;border:1px solid #373018;border-radius:18px;background:linear-gradient(150deg,#11110d,#090906);position:relative;overflow:hidden;transition:.18s}.module:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(var(--gold2),#7f6414)}.module:hover{transform:translateY(-3px);border-color:#6e5719;box-shadow:0 18px 50px #0009}.module .icon{font-size:26px}.module h3{font-family:Georgia,serif;font-size:22px;margin:19px 0 8px}.module p{color:#a9a28f;line-height:1.55;min-height:70px}.badge{position:absolute;right:15px;top:15px;border:1px solid #5c4a1c;border-radius:99px;padding:5px 8px;color:#d8c26d;font-size:8px;letter-spacing:1.2px}.btn{display:inline-flex;align-items:center;gap:8px;border:1px solid #a9841c;background:linear-gradient(135deg,#f0d878,#c79c22);color:#0b0a05;text-decoration:none;padding:11px 15px;border-radius:9px;font-weight:900}.btn.dark{background:#14130c;color:#f0d878;border-color:#70591b}.section{margin-top:48px}.section-title{font-family:Georgia,serif;font-size:30px;margin:0 0 20px}.search{width:100%;background:#0b0b08;border:1px solid #4d401c;border-radius:11px;padding:13px 15px;color:#fff;font-size:15px;outline:none}.search:focus{border-color:var(--gold)}.empty{border:1px dashed #4a3d1a;border-radius:18px;padding:55px;text-align:center;color:#8e8875}.back{display:inline-flex;margin-bottom:24px;color:#d9c46f;text-decoration:none;font-size:13px}.form-shell{max-width:560px;margin:55px auto;padding:0 20px}.form-card{border:1px solid #493a18;border-radius:22px;background:linear-gradient(155deg,#11110d,#090906);padding:34px;box-shadow:0 30px 90px #000a}.form-card .seal{width:82px;height:82px;margin:0 auto 22px;display:grid;place-items:center}.form-card .seal img{width:100%;height:100%;object-fit:contain}.form-card h2{font-family:Georgia,serif;font-size:30px;text-align:center;margin:5px 0}.form-card>p{text-align:center;color:#aaa38e;line-height:1.55}.field{margin-top:15px}.field label{display:block;color:#c7b46a;font-size:10px;letter-spacing:1.4px;margin-bottom:7px}.field input,.field textarea{width:100%;background:#050504;border:1px solid #3d341c;color:#fff;border-radius:9px;padding:13px 14px;font-size:15px;outline:none}.field textarea{min-height:95px;resize:vertical}.field input:focus,.field textarea:focus{border-color:var(--gold)}button.btn{cursor:pointer;font-size:14px;margin-top:20px}.notice{border:1px solid #4f421d;background:#151208;border-radius:11px;padding:13px;margin:18px 0;color:#d9cfac;line-height:1.5}.notice.danger{border-color:#73332f;background:#1f0e0c;color:#f2c3bf}.notice.ok{border-color:#4c5a2b;background:#11180c;color:#d3e6b9}.cards-2{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+@media(max-width:950px){.grid{grid-template-columns:1fr 1fr}.top-right{display:none}.cards-2{grid-template-columns:1fr}}@media(max-width:620px){.topbar{grid-template-columns:1fr}.brand{grid-column:1}.grid{grid-template-columns:1fr}.hero h2{font-size:36px}.wrap{padding:38px 15px}.form-card{padding:25px}.brand img{width:58px;height:58px}}
+"""
+
+    def _shell(title: str, body: str, *, top_right: str = "SISTEMA OPERACIONAL") -> str:
+        return f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)}</title><style>{BASE_CSS}</style></head><body>
+<header class="topbar"><div></div><div class="brand"><img src="/central/brasao-dicor.png" alt="Brasão DICOR"><div><h1>POLÍCIA FEDERAL — DICOR</h1><small>CENTRAL DE INTELIGÊNCIA</small></div></div><div class="top-right">{_escape(top_right)}</div></header>{body}</body></html>'''
+
+    async def central_portal_http(request):
+        wanted_count = len(_active_wanted())
+        cards = [
+            ("🎯", "Procurados", f"{wanted_count} registro(s) confirmado(s) no canal oficial.", "/catalogo", "Consultar procurados", "PÚBLICO"),
+            ("🗃️", "Banco de Dados", "Fichas, veículos, organizações, evidências e histórico investigativo.", "/fichas", "Acessar banco", "SENHA RESERVADA"),
+            ("🧬", "Árvore de Inteligência", "Conexões entre indivíduos, veículos, ocorrências e organizações.", "/arvore", "Abrir inteligência", "SENHA RESERVADA"),
+            ("📋", "Boletins", "Consulta interna dos boletins e anexos operacionais.", "/boletins", "Solicitar acesso", "AUTORIZAÇÃO"),
+            ("🧪", "Perícias", "Relatórios, laudos e fotografias vinculadas às perícias.", "/pericias", "Solicitar acesso", "AUTORIZAÇÃO"),
+        ]
+        rendered = "".join(
+            f'''<article class="module"><span class="badge">{badge}</span><div class="icon">{icon}</div><h3>{_escape(name)}</h3><p>{_escape(desc)}</p><a class="btn" href="{link}">{_escape(button)}</a></article>'''
+            for icon, name, desc, link, button, badge in cards
+        )
+        body = f'''<main class="wrap"><section class="hero"><div class="eyebrow">DEPARTAMENTO DE INTELIGÊNCIA E COMBATE AO CRIME ORGANIZADO</div><h2>Central Operacional <span>DICOR</span></h2><div class="gold-rule"></div><p>Ambiente unificado da Polícia Federal — DICOR, com acesso separado de acordo com o nível de sensibilidade de cada módulo.</p></section><section class="grid">{rendered}</section></main>'''
+        return web.Response(text=_shell("Central DICOR", body), content_type="text/html", charset="utf-8")
+
+    def _catalog_card(record: Dict[str, Any]) -> str:
+        images = list(record.get("_v163_images") or [])
+        photo = images[0] if len(images) > 0 else ""
+        doc = images[1] if len(images) > 1 else ""
+        nome = _first(record, ("nome", "nome_completo", "procurado"), "Não informado")
+        rg = _first(record, ("rg", "passaporte", "registro_geral"), "Não informado")
+        crimes = _first(record, ("crimes", "crime", "infracoes", "infrações"), "Não informado")
+        last = _first(record, ("ultimo_avistamento", "informacoes", "localizacao"), "Não informado")
+        case = _first(record, ("numero_caso", "caso", "id", "codigo"), "—")
+        bo_number, bo_link = _find_boletim(record)
+        photo_html = f'<img src="{_escape(photo)}" alt="Foto de {_escape(nome)}" loading="lazy">' if photo else '<div class="no-photo">SEM IMAGEM<br><small>FOTO DO INDIVÍDUO</small></div>'
+        doc_html = f'<img src="{_escape(doc)}" alt="Documento de {_escape(nome)}" loading="lazy">' if doc else '<div class="no-photo">SEM IMAGEM<br><small>DOCUMENTO / RG</small></div>'
+        bo_html = f'<a class="bo-link" href="{_escape(bo_link)}" target="_blank" rel="noopener">📋 {_escape(bo_number or "Abrir boletim vinculado")}</a>' if bo_link else f'<span class="bo-missing">📋 {_escape(bo_number or "Boletim não localizado")}</span>'
+        search = _escape(_norm(" ".join((nome, rg, crimes, last, bo_number))))
+        return f'''<article class="wanted" data-search="{search}"><div class="case"><div><small>NÚMERO DO CASO</small><b>{_escape(case)}</b></div><span>A PROCURAR</span></div><div class="wanted-grid"><div class="media"><figure><figcaption>01 • FOTO DO INDIVÍDUO</figcaption>{photo_html}</figure><figure><figcaption>02 • DOCUMENTO / RG</figcaption>{doc_html}</figure></div><div class="wanted-info"><small>IDENTIFICAÇÃO DO PROCURADO</small><h2>{_escape(nome)}</h2><strong class="rg">RG • {_escape(rg)}</strong><div class="danger-box"><small>CRIMES REGISTRADOS</small><p>{_escape(crimes)}</p>{bo_html}</div><div class="info-box"><small>ÚLTIMO AVISTAMENTO</small><p>{_escape(last)}</p></div></div></div></article>'''
+
+    async def pagina_inicial(request):
+        records = _active_wanted()
+        cards = "".join(_catalog_card(x) for x in records) or '<div class="empty">Nenhum procurado ativo no canal oficial.</div>'
+        extra = """
+<style>.catalog-head{display:flex;gap:16px;align-items:end;justify-content:space-between;margin-bottom:22px}.catalog-head h2{font-family:Georgia,serif;font-size:38px;margin:5px 0}.wanted-list{display:grid;gap:22px}.wanted{border:1px solid #393019;border-radius:18px;overflow:hidden;background:#0a0a07}.case{display:flex;justify-content:space-between;align-items:center;padding:15px 20px;border-bottom:1px solid #3c3218;background:#0d0d09}.case small,.wanted-info>small,.danger-box small,.info-box small{display:block;color:#d7a93d;font-size:9px;letter-spacing:1.6px}.case b{font-size:13px}.case>span{font-size:9px;letter-spacing:1.4px;border:1px solid #763d33;background:#24100e;color:#f1c0b8;border-radius:99px;padding:7px 10px}.wanted-grid{display:grid;grid-template-columns:1.7fr .8fr}.media{display:grid;grid-template-columns:1fr 1fr;min-height:480px;border-right:1px solid #393019}.media figure{margin:0;position:relative;background:#030303;min-width:0;overflow:hidden;border-right:1px solid #393019}.media figure:last-child{border-right:0}.media figcaption{position:absolute;top:14px;left:14px;z-index:3;background:#0b0a06e8;border:1px solid #5d4a1d;border-radius:7px;padding:7px 9px;color:#e7cf73;font-size:9px;letter-spacing:1.2px}.media img{width:100%;height:100%;object-fit:cover}.media figure:nth-child(2) img{object-fit:contain}.no-photo{height:100%;display:grid;place-items:center;text-align:center;color:#716b5c;font-size:12px;letter-spacing:2px}.no-photo small{font-size:8px}.wanted-info{padding:28px}.wanted-info h2{font-family:Georgia,serif;font-size:34px;margin:7px 0 10px}.rg{display:inline-block;border:1px solid #6b551d;background:#171207;color:#f0d878;padding:8px 10px;border-radius:8px}.danger-box,.info-box{margin-top:17px;border:1px solid #4d2520;border-radius:12px;background:#1b0c0a;padding:15px}.info-box{border-color:#393019;background:#10100c}.danger-box p,.info-box p{color:#d9d2bd;line-height:1.55}.bo-link,.bo-missing{display:block;margin-top:13px;color:#f0d878;text-decoration:none}.bo-link:hover{text-decoration:underline}.bo-missing{color:#8f8874}@media(max-width:950px){.wanted-grid{grid-template-columns:1fr}.media{border-right:0;border-bottom:1px solid #393019}}@media(max-width:620px){.media{grid-template-columns:1fr;min-height:760px}.catalog-head{display:block}.media figure{min-height:380px;border-right:0;border-bottom:1px solid #393019}}</style>
+<script>document.addEventListener('DOMContentLoaded',()=>{const q=document.getElementById('q');q.addEventListener('input',()=>{const v=q.value.toLowerCase();document.querySelectorAll('.wanted').forEach(c=>c.style.display=c.dataset.search.includes(v)?'block':'none')})})</script>"""
+        body = f'''<main class="wrap"><a class="back" href="/">← Voltar à Central</a><div class="catalog-head"><div><div class="eyebrow">CONSULTA PÚBLICA OFICIAL</div><h2>Procurados</h2><p style="color:#aaa38e">Somente indivíduos presentes no canal oficial ativo.</p></div><div style="min-width:min(430px,100%)"><input id="q" class="search" placeholder="Pesquisar por nome, RG, crime ou boletim"></div></div><section class="wanted-list">{cards}</section></main>{extra}'''
+        return web.Response(text=_shell("Procurados • DICOR", body), content_type="text/html", charset="utf-8")
+
+    def _boletim_card(record: Dict[str, Any]) -> str:
+        numero = _boletim_number(record) or "Boletim"
+        status = _first(record, ("status", "situacao", "estado"), "EM ACOMPANHAMENTO")
+        summary = _first(record, ("resumo", "descricao", "texto", "relato", "conteudo"), "Sem resumo disponível.")
+        link = _discord_link_from_record(record)
+        open_link = f'<a class="btn dark" href="{_escape(link)}" target="_blank" rel="noopener">Abrir no Discord</a>' if link else ''
+        return f'''<article class="module" style="min-height:250px"><span class="badge">{_escape(status)}</span><div class="icon">📋</div><h3>{_escape(numero)}</h3><p>{_escape(summary[:650])}</p>{open_link}</article>'''
+
+    async def central_boletins_http(request):
+        records = _boletim_records()
+        useful = []
+        seen = set()
+        for item in records:
+            number = _boletim_number(item)
+            link = _discord_link_from_record(item)
+            summary = _first(item, ("resumo", "descricao", "texto", "relato", "conteudo"))
+            key = (_norm(number), link)
+            if key in seen or (not number and not summary and not link):
+                continue
+            seen.add(key)
+            useful.append(item)
+        cards = "".join(_boletim_card(x) for x in useful[:60]) or '<div class="empty">Nenhum boletim disponível.</div>'
+        body = f'''<main class="wrap"><a class="back" href="/">← Voltar à Central</a><section class="hero" style="margin-bottom:30px"><div class="eyebrow">ÁREA AUTORIZADA</div><h2>Boletins <span>Operacionais</span></h2><p>Consulta interna dos registros e links oficiais no Discord.</p></section><section class="grid">{cards}</section></main>'''
+        return web.Response(text=_shell("Boletins • DICOR", body), content_type="text/html", charset="utf-8")
+
+    def _pericia_card(item: Dict[str, Any]) -> str:
+        title = str(item.get("title") or "Perícia")
+        content = str(item.get("content") or "Sem descrição disponível.")
+        images = list(item.get("images") or [])[:8]
+        link = str(item.get("jump_url") or "")
+        gallery = "".join(f'<button class="photo" type="button" onclick="openImg(this.dataset.src)" data-src="{_escape(url)}"><img src="{_escape(url)}" loading="lazy" alt="Anexo de perícia"></button>' for url in images)
+        if not gallery:
+            gallery = '<div class="no-media">Nenhuma foto vinculada a esta perícia.</div>'
+        open_link = f'<a class="btn dark" href="{_escape(link)}" target="_blank" rel="noopener">Abrir perícia no Discord</a>' if link else ''
+        return f'''<article class="pericia-card"><div class="pericia-text"><small>RELATÓRIO DE PERÍCIA</small><h2>{_escape(title)}</h2><div class="pericia-body">{_escape(content)}</div>{open_link}</div><div class="gallery">{gallery}</div></article>'''
+
+    async def central_pericias_http(request):
+        if not state["pericias_ready"]:
+            await _refresh_pericias()
+        cards = "".join(_pericia_card(x) for x in state["pericias"]) or '<div class="empty">Nenhuma perícia localizada no canal oficial.</div>'
+        extra = """
+<style>.pericia-list{display:grid;gap:20px}.pericia-card{display:grid;grid-template-columns:.9fr 1.1fr;border:1px solid #393019;border-radius:18px;background:#0b0b08;overflow:hidden}.pericia-text{padding:24px}.pericia-text small{color:#d7a93d;letter-spacing:1.5px;font-size:9px}.pericia-text h2{font-family:Georgia,serif;font-size:25px}.pericia-body{white-space:pre-wrap;color:#d1cab5;line-height:1.55;max-height:420px;overflow:auto;margin-bottom:18px}.gallery{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;padding:15px;background:#050504}.photo{padding:0;border:1px solid #4c401f;border-radius:10px;overflow:hidden;background:#030303;min-height:190px;cursor:zoom-in}.photo img{width:100%;height:100%;object-fit:cover;display:block}.no-media{grid-column:1/-1;min-height:220px;display:grid;place-items:center;color:#77705e;border:1px dashed #3c3219;border-radius:10px}.lightbox{position:fixed;inset:0;background:#000e;display:none;place-items:center;z-index:100;padding:25px}.lightbox.open{display:grid}.lightbox img{max-width:95vw;max-height:92vh;border:1px solid #7b611b;border-radius:10px}.lightbox button{position:absolute;top:20px;right:25px;background:#11100b;color:#f0d878;border:1px solid #6c551a;padding:9px 12px;border-radius:8px}@media(max-width:900px){.pericia-card{grid-template-columns:1fr}}@media(max-width:620px){.gallery{grid-template-columns:1fr}}</style>
+<div id="lb" class="lightbox" onclick="closeImg()"><button>FECHAR</button><img id="lbimg"></div><script>function openImg(src){document.getElementById('lbimg').src=src;document.getElementById('lb').classList.add('open')}function closeImg(){document.getElementById('lb').classList.remove('open')}</script>"""
+        body = f'''<main class="wrap"><a class="back" href="/">← Voltar à Central</a><section class="hero" style="margin-bottom:30px"><div class="eyebrow">ÁREA AUTORIZADA</div><h2>Perícias <span>Operacionais</span></h2><p>Laudos, registros e fotografias recuperadas diretamente do canal oficial.</p></section><section class="pericia-list">{cards}</section></main>{extra}'''
+        return web.Response(text=_shell("Perícias • DICOR", body), content_type="text/html", charset="utf-8")
+
+    async def central_dossies_http(request):
+        return web.Response(status=404, text="Módulo removido da Central DICOR.")
+
+    def _target_module(next_path: str) -> Tuple[str, str]:
+        clean = str(next_path or "/").split("?", 1)[0]
+        if clean.startswith("/boletins"):
+            return "approval", "boletins"
+        if clean.startswith("/pericias"):
+            return "approval", "pericias"
+        if clean.startswith("/fichas"):
+            return "strategic", "fichas"
+        if clean.startswith("/arvore"):
+            return "strategic", "arvore"
+        return "public", ""
+
+    async def central_login_get(request):
+        next_path = str(request.query.get("next") or "/")
+        mode, module = _target_module(next_path)
+        if mode == "public":
+            raise web.HTTPFound(next_path)
+
+        if mode == "strategic":
+            if _valid_strategic_cookie(request.cookies.get("dicor_strategic", "")):
+                raise web.HTTPFound(next_path)
+            error = _escape(request.query.get("erro") or "")
+            alert = f'<div class="notice danger">{error}</div>' if error else ''
+            body = f'''<div class="form-shell"><a class="back" href="/">← Voltar à Central</a><form class="form-card" method="post" action="/acesso"><div class="seal"><img src="/central/brasao-dicor.png"></div><div class="eyebrow" style="text-align:center">COFRE ESTRATÉGICO</div><h2>Acesso reservado</h2><p>Este módulo não utiliza solicitação pública. Digite a senha estratégica fornecida exclusivamente aos operadores autorizados.</p>{alert}<input type="hidden" name="mode" value="strategic"><input type="hidden" name="next" value="{_escape(next_path)}"><div class="field"><label>SENHA ESTRATÉGICA</label><input name="senha" type="password" autocomplete="current-password" required autofocus></div><button class="btn" type="submit">AUTORIZAR ACESSO</button></form></div>'''
+            return web.Response(text=_shell("Acesso estratégico • DICOR", body, top_right="NÍVEL RESERVADO"), content_type="text/html", charset="utf-8")
+
+        request_id = str(request.query.get("request") or "")
+        if request_id:
+            item = await _find_access_by_id(request_id)
+            token = request.cookies.get("dicor_approval", "")
+            if item and token and item.get("token_hash") == _token_hash(token):
+                status = item.get("status")
+                if status == "approved":
+                    raise web.HTTPFound(next_path)
+                if status == "denied":
+                    body = f'''<div class="form-shell"><div class="form-card"><div class="seal"><img src="/central/brasao-dicor.png"></div><div class="notice danger">⛔ Seu acesso a {_escape(_module_label(module))} foi negado.</div><a class="btn" href="/">Voltar à Central</a></div></div>'''
+                    return web.Response(text=_shell("Acesso negado • DICOR", body), content_type="text/html", charset="utf-8")
+                body = f'''<div class="form-shell"><div class="form-card"><div class="seal"><img src="/central/brasao-dicor.png"></div><div class="eyebrow" style="text-align:center">SOLICITAÇÃO ENVIADA</div><h2>Aguardando autorização</h2><p>O pedido de acesso a <b>{_escape(_module_label(module))}</b> foi enviado para a área de aprovação no Discord.</p><div class="notice">A página verifica automaticamente a decisão. Não é necessário enviar outro pedido.</div><a class="btn dark" href="/">Voltar à Central</a><script>setTimeout(()=>location.reload(),3000)</script></div></div>'''
+                return web.Response(text=_shell("Aguardando aprovação • DICOR", body), content_type="text/html", charset="utf-8")
+
+        body = f'''<div class="form-shell"><a class="back" href="/">← Voltar à Central</a><form class="form-card" method="post" action="/acesso"><div class="seal"><img src="/central/brasao-dicor.png"></div><div class="eyebrow" style="text-align:center">CONTROLE DE ACESSO</div><h2>Solicitar {_escape(_module_label(module))}</h2><p>Informe seus dados. A solicitação será enviada para aprovação no Discord e somente após a liberação este navegador poderá entrar.</p><input type="hidden" name="mode" value="approval"><input type="hidden" name="module" value="{_escape(module)}"><input type="hidden" name="next" value="{_escape(next_path)}"><div class="field"><label>QRA / NOME</label><input name="qra" maxlength="100" required></div><div class="field"><label>PASSAPORTE / RG FUNCIONAL</label><input name="passaporte" maxlength="50" required></div><div class="field"><label>USUÁRIO DO DISCORD</label><input name="discord" maxlength="100" placeholder="Ex.: baiano"></div><div class="field"><label>MOTIVO DO ACESSO</label><textarea name="motivo" maxlength="500" required></textarea></div><button class="btn" type="submit">ENVIAR PARA APROVAÇÃO</button></form></div>'''
+        return web.Response(text=_shell("Solicitar acesso • DICOR", body), content_type="text/html", charset="utf-8")
+
+    async def central_login_post(request):
+        data = await request.post()
+        mode = str(data.get("mode") or "")
+        next_path = str(data.get("next") or "/")
+        target_mode, module = _target_module(next_path)
+        if mode == "strategic" and target_mode == "strategic":
+            expected = _strategic_password()
+            supplied = str(data.get("senha") or "")
+            if not expected or not hmac.compare_digest(supplied, expected):
+                raise web.HTTPFound(f"/acesso?next={quote(next_path, safe='/')}&erro={quote('Senha estratégica inválida.')}")
+            response = web.HTTPFound(next_path)
+            response.set_cookie("dicor_strategic", _make_strategic_cookie(), max_age=12 * 3600, httponly=True, secure=True, samesite="Lax", path="/")
+            raise response
+
+        if mode == "approval" and target_mode == "approval":
+            token = secrets.token_urlsafe(32)
+            request_id = secrets.token_hex(5).upper()
+            record = {
+                "id": request_id,
+                "module": module,
+                "status": "pending",
+                "qra": str(data.get("qra") or "").strip()[:100],
+                "passaporte": str(data.get("passaporte") or "").strip()[:50],
+                "discord": str(data.get("discord") or "").strip()[:100],
+                "motivo": str(data.get("motivo") or "").strip()[:500],
+                "created_at": _now(),
+                "expires_at": _now() + 12 * 3600,
+                "token_hash": _token_hash(token),
+            }
+            async with access_lock:
+                items = [x for x in _load_access() if int(x.get("expires_at") or 0) > _now() - 86400]
+                items.append(record)
+                _save_access(items)
+            sent = await _send_approval(record)
+            if not sent:
+                await _update_access(request_id, "error", "sistema")
+                body = '<div class="form-shell"><div class="form-card"><div class="notice danger">Não foi possível entregar a solicitação ao canal de aprovação. Tente novamente em instantes.</div><a class="btn" href="/">Voltar</a></div></div>'
+                return web.Response(text=_shell("Falha de aprovação • DICOR", body), content_type="text/html", charset="utf-8")
+            response = web.HTTPFound(f"/acesso?next={quote(next_path, safe='/')}&request={request_id}")
+            response.set_cookie("dicor_approval", token, max_age=12 * 3600, httponly=True, secure=True, samesite="Lax", path="/")
+            raise response
+
+        raise web.HTTPFound("/")
+
+    async def central_logout_http(request):
+        response = web.HTTPFound("/")
+        response.del_cookie("dicor_approval", path="/")
+        response.del_cookie("dicor_strategic", path="/")
+        raise response
+
+    @web.middleware
+    async def central_auth_middleware(request, handler):
+        path = str(request.path or "/")
+        if path in {"/", "/index.html", "/catalogo", "/acesso", "/sair"} or path.startswith(PUBLIC_PREFIXES):
+            return await handler(request)
+        if path.startswith("/dossies-central"):
+            return web.Response(status=404, text="Módulo removido da Central DICOR.")
+
+        mode, module = _target_module(path)
+        if mode == "strategic":
+            if _valid_strategic_cookie(request.cookies.get("dicor_strategic", "")):
+                return await handler(request)
+            raise web.HTTPFound(f"/acesso?next={quote(path, safe='/')}")
+        if mode == "approval":
+            token = request.cookies.get("dicor_approval", "")
+            if await _find_approved_token(token, module):
+                return await handler(request)
+            raise web.HTTPFound(f"/acesso?next={quote(path, safe='/')}")
+
+        if path.startswith("/api/"):
+            low = path.casefold()
+            approval_module = "pericias" if "pericia" in low else ("boletins" if "bolet" in low else "")
+            if approval_module:
+                if await _find_approved_token(request.cookies.get("dicor_approval", ""), approval_module):
+                    return await handler(request)
+                return web.json_response({"ok": False, "erro": "Acesso aguardando autorização."}, status=401)
+            if _valid_strategic_cookie(request.cookies.get("dicor_strategic", "")):
+                return await handler(request)
+            return web.json_response({"ok": False, "erro": "Senha estratégica necessária."}, status=401)
+
+        return await handler(request)
+
+    async def _restore_pending_views() -> None:
+        if state["pending_views_restored"]:
+            return
+        state["pending_views_restored"] = True
+        for item in _load_access():
+            if item.get("status") != "pending" or int(item.get("expires_at") or 0) < _now():
+                continue
+            message_id = int(item.get("discord_message_id") or 0)
+            if not message_id:
+                continue
+            try:
+                client.add_view(ApprovalView(str(item["id"])), message_id=message_id)
+            except Exception:
+                pass
+
+    async def _on_ready() -> None:
+        await _restore_pending_views()
+        await _refresh_all("on_ready")
+        task = state.get("loop_task")
+        if task is None or task.done():
+            state["loop_task"] = asyncio.create_task(_refresh_loop())
+
+    async def _on_message(message) -> None:
+        channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        watched = {
+            int(getattr(bot_module, "PROCURADOS_CHANNEL_ID", 0) or 0),
+            int(getattr(bot_module, "PERICIAS_CHANNEL_ID", 0) or 0),
+            int(getattr(bot_module, "BOLETINS_CHANNEL_ID", 0) or 0),
+        }
+        if channel_id in watched:
+            task = state.get("refresh_task")
+            if task is None or task.done():
+                async def delayed():
+                    await asyncio.sleep(1)
+                    await _refresh_all("discord_update")
+                state["refresh_task"] = asyncio.create_task(delayed())
+
+    if hasattr(client, "add_listener"):
+        client.add_listener(_on_ready, "on_ready")
+        client.add_listener(_on_message, "on_message")
+
+    bot_module.central_portal_http = central_portal_http
+    bot_module.pagina_inicial = pagina_inicial
+    bot_module.central_login_get = central_login_get
+    bot_module.central_login_post = central_login_post
+    bot_module.central_logout_http = central_logout_http
+    bot_module.central_auth_middleware = central_auth_middleware
+    bot_module.central_boletins_http = central_boletins_http
+    bot_module.central_pericias_http = central_pericias_http
+    bot_module.central_dossies_http = central_dossies_http
+
+    for name in ("boletins_pagina_http", "central_boletins_pagina_http"):
+        if hasattr(bot_module, name):
+            setattr(bot_module, name, central_boletins_http)
+    for name in ("pericias_pagina_http", "central_pericias_pagina_http"):
+        if hasattr(bot_module, name):
+            setattr(bot_module, name, central_pericias_http)
+
+    print("✅ V163 Central PF: preto/dourado, fotos ao vivo, boletins vinculados, aprovação e senha estratégica ativos; Dossiês removidos da Central.", flush=True)
