@@ -622,26 +622,86 @@ def _motivation_page(sections: Dict[str,Dict[str,Any]], styles) -> List[Any]:
 
 
 def _signature_page(meta: Dict[str,Any], styles) -> List[Any]:
+    """Página final com três blocos de assinatura sempre visíveis.
+
+    Mantém o visual V161, mas evita depender de uma tabela de três colunas
+    apertada. Os dois delegados ficam lado a lado e o agente responsável fica
+    centralizado abaixo, garantindo que nenhum bloco seja empurrado para fora
+    da área útil da página.
+    """
     pedido=_sanitize_text(meta.get('pedido_numero') or meta.get('numero') or 'Não informado')
     local=_sanitize_text(meta.get('pedido_local') or meta.get('comunidade') or 'área indicada no procedimento')
+    responsavel=_sanitize_text(
+        meta.get('agente_responsavel')
+        or meta.get('responsavel_nome')
+        or meta.get('responsavel')
+        or meta.get('criador_nome')
+        or meta.get('autor_nome')
+        or meta.get('autor')
+        or 'Agente responsável'
+    )
     try:
         from zoneinfo import ZoneInfo
         hoje=datetime.now(ZoneInfo('America/Sao_Paulo')).strftime('%d/%m/%Y')
     except Exception:
         hoje=datetime.now().strftime('%d/%m/%Y')
+
     flow=[Paragraph('PROVAS E DOCUMENTAÇÕES',styles['section'])]
-    flow += [_bullet(f'Com base nas provas apresentadas e nas informações consolidadas no processo, solicita-se a manutenção do Pedido de Pacificação {pedido} e a adoção das medidas necessárias à segurança operacional na área indicada como “{local}”.',styles)]
-    flow += [Spacer(1,10),Paragraph('<b>RESPONSÁVEIS PELO PROCEDIMENTO</b>',styles['tiny']),Spacer(1,3),Paragraph('Buiu Gomes - Delegado Geral',styles['tiny']),Paragraph('Polícia Federal - DICOR',styles['tiny']),Paragraph(f'Capital Morada do Valley - {hoje}',styles['tiny']),Spacer(1,150)]
-    left=[Paragraph('Buiu Gomes',styles['sig_name']),Spacer(1,5),Paragraph('BUIU GOMES',styles['sig_caps']),Paragraph('DELEGADO GERAL',styles['sig_caps']),Paragraph('POLÍCIA FEDERAL - DICOR',styles['sig_caps'])]
-    right=[Paragraph('Arthur Fleker',styles['sig_name']),Spacer(1,5),Paragraph('ARTHUR FLEKER',styles['sig_caps']),Paragraph('DELEGADO DICOR',styles['sig_caps']),Paragraph('POLÍCIA FEDERAL - DICOR',styles['sig_caps'])]
-    t=Table([[left,'',right]],colWidths=[8.0*cm,0.9*cm,8.0*cm],hAlign='CENTER')
-    t.setStyle(TableStyle([
-        ('VALIGN',(0,0),(-1,-1),'TOP'),('ALIGN',(0,0),(-1,-1),'CENTER'),
+    flow += [_bullet(
+        f'Com base nas provas apresentadas e nas informações consolidadas no processo, solicita-se a manutenção do Pedido de Pacificação {pedido} e a adoção das medidas necessárias à segurança operacional na área indicada como “{local}”.',
+        styles,
+    )]
+    flow += [
+        Spacer(1,8),
+        Paragraph('<b>RESPONSÁVEIS PELO PROCEDIMENTO</b>',styles['tiny']),
+        Spacer(1,3),
+        Paragraph('Buiu Gomes - Delegado Geral',styles['tiny']),
+        Paragraph('Arthur Fleker - Delegado DICOR',styles['tiny']),
+        Paragraph(f'Capital Morada do Valley - {hoje}',styles['tiny']),
+        Spacer(1,36),
+    ]
+
+    def _sig_block(nome: str, cargo: str):
+        nome_limpo=_sanitize_text(nome)
+        return [
+            Paragraph(nome_limpo,styles['sig_name']),
+            Spacer(1,4),
+            Paragraph(nome_limpo.upper(),styles['sig_caps']),
+            Paragraph(cargo,styles['sig_caps']),
+            Paragraph('POLÍCIA FEDERAL - DICOR',styles['sig_caps']),
+        ]
+
+    delegados=Table(
+        [[_sig_block('Buiu Gomes','DELEGADO GERAL'), _sig_block('Arthur Fleker','DELEGADO DICOR')]],
+        colWidths=[8.05*cm,8.05*cm],
+        hAlign='CENTER',
+    )
+    delegados.setStyle(TableStyle([
+        ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),
         ('LINEABOVE',(0,0),(0,0),0.85,HexColor('#444444')),
-        ('LINEABOVE',(2,0),(2,0),0.85,HexColor('#444444')),
-        ('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),
+        ('LINEABOVE',(1,0),(1,0),0.85,HexColor('#444444')),
+        ('LEFTPADDING',(0,0),(-1,-1),5),
+        ('RIGHTPADDING',(0,0),(-1,-1),5),
+        ('TOPPADDING',(0,0),(-1,-1),8),
     ]))
-    flow.append(t)
+    flow.append(KeepTogether([delegados]))
+
+    flow.append(Spacer(1,52))
+    agente=Table(
+        [[_sig_block(responsavel,'AGENTE RESPONSÁVEL')]],
+        colWidths=[8.05*cm],
+        hAlign='CENTER',
+    )
+    agente.setStyle(TableStyle([
+        ('VALIGN',(0,0),(0,0),'TOP'),
+        ('ALIGN',(0,0),(0,0),'CENTER'),
+        ('LINEABOVE',(0,0),(0,0),0.85,HexColor('#444444')),
+        ('LEFTPADDING',(0,0),(0,0),5),
+        ('RIGHTPADDING',(0,0),(0,0),5),
+        ('TOPPADDING',(0,0),(0,0),8),
+    ]))
+    flow.append(KeepTogether([agente]))
     return flow
 
 
@@ -689,7 +749,7 @@ def _preflight(path: Path) -> None:
         raise RuntimeError('V161: termo DENARC ainda apareceu no PDF.')
     if re.search(r'(?i)\bDIC\b',text):
         raise RuntimeError('V161: termo DIC isolado ainda apareceu no PDF.')
-    required=('POLÍCIA FEDERAL - DICOR','Buiu Gomes','Arthur Fleker','DELEGADO GERAL','DELEGADO DICOR','INGREDIENTES','PRODUTO FINAL')
+    required=('POLÍCIA FEDERAL - DICOR','Buiu Gomes','Arthur Fleker','DELEGADO GERAL','DELEGADO DICOR','AGENTE RESPONSÁVEL','INGREDIENTES','PRODUTO FINAL')
     miss=[x for x in required if x not in text]
     if miss:
         raise RuntimeError('V161: preflight ausente: '+', '.join(miss))
