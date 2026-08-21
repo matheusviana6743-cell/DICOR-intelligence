@@ -1,2 +1,0 @@
-Teste temporário de integração ChatGPT ↔ GitHub.
-Criado em 2026-08-21 apenas para validar criação e exclusão de arquivos.
