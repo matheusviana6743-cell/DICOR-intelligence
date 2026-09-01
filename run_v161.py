@@ -8,12 +8,11 @@ import central_pf_v163
 import central_auth_v164
 import central_auth_v165
 import discord_migration_once_v166
+import central_migration_v167
 
 
 def _instalar_renderer_visual_v161() -> None:
     """Conecta o layout V161 ao fluxo real de fechamento V159/V160."""
-    # Regra oficial: a página final possui somente as assinaturas dos dois delegados.
-    # Passamos o módulo do bot para o renderer conseguir usar as imagens reais cadastradas.
     dossie_v161_signatures.install(dossie_v161, bot)
     dossie_v161.install(bot)
 
@@ -23,11 +22,8 @@ def _instalar_renderer_visual_v161() -> None:
             dados = preparador(dados)
         return dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
 
-    # O fechamento atual (V159/V160) chama este renderer diretamente.
     if hasattr(bot, '_V159_RENDER_PDF_APROVADO'):
         bot._V159_RENDER_PDF_APROVADO = _render_v161
-
-    # Mantem tambem o caminho legado/watchdog apontando para o mesmo layout.
     if hasattr(bot, '_V155_GERAR_PDF_BASE'):
         bot._V155_GERAR_PDF_BASE = _render_v161
 
@@ -35,12 +31,13 @@ def _instalar_renderer_visual_v161() -> None:
 
 
 def _instalar_correcao_procurados_e_central() -> None:
-    """Mantém filtro estrito, Central PF e aplica as camadas de autenticação por último."""
+    """Mantém filtro estrito, Central PF, autenticação e integração da migração."""
     procurados_central_v162.install(bot)
     central_pf_v163.install(bot)
     central_auth_v164.install(bot)
     central_auth_v165.install(bot)
     discord_migration_once_v166.install(bot)
+    central_migration_v167.install(bot)
 
 
 if __name__ == '__main__':
