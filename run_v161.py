@@ -11,6 +11,7 @@ import central_auth_v165
 import central_migration_v167
 
 
+
 def _instalar_renderer_visual_v161() -> None:
     """Conecta o layout V161 ao fluxo real de fechamento V159/V160."""
     dossie_v161_signatures.install(dossie_v161, bot)
@@ -27,30 +28,64 @@ def _instalar_renderer_visual_v161() -> None:
     if hasattr(bot, '_V155_GERAR_PDF_BASE'):
         bot._V155_GERAR_PDF_BASE = _render_v161
 
-    print('✅ V165 visual conectado ao fechamento real V159/V160.', flush=True)
+    print('V161 visual conectado.', flush=True)
 
 
-def _instalar_correcao_procurados_e_central() -> None:
-    """Mantém o bot principal independente da migração pesada do Discord."""
-    procurados_central_v162.install(bot)
-    central_pf_v163.install(bot)
-    central_auth_v164.install(bot)
-    central_auth_v165.install(bot)
+def _instalar_extensoes_central() -> None:
+    """Instala a Central somente depois que o Discord estiver conectado.
 
-    # V166 foi retirado do boot principal porque sua rotina de histórico pode
-    # consumir o loop de eventos por muito tempo e fazer os botões do Discord
-    # expirarem sem resposta. A Central V167 continua disponível e usa o
-    # arquivo de migração já existente quando houver um.
+    A inicializacao do bot nao pode depender de leitura de historico, scans de
+    canais ou inicializacao de paginas web. Se uma extensao falhar, o Discord
+    continua online e o erro fica isolado no log.
+    """
     try:
-        central_migration_v167.install(bot)
-        print('✅ V167 integração da migração instalada sem bloquear o Discord.', flush=True)
+        procurados_central_v162.install(bot)
+        print('V162 Procurados instalado.', flush=True)
     except Exception as exc:
-        print(
-            f'⚠️ V167 integração não instalada; bot principal preservado: '
-            f'{type(exc).__name__}: {exc}',
-            flush=True,
-        )
+        print(f'V162 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
         traceback.print_exc()
+
+    for nome, modulo in (
+        ('V163 Central PF', central_pf_v163),
+        ('V164 autenticação Central', central_auth_v164),
+        ('V165 autenticação Central', central_auth_v165),
+        ('V167 migração Central', central_migration_v167),
+    ):
+        try:
+            modulo.install(bot)
+            print(f'{nome} instalado.', flush=True)
+        except Exception as exc:
+            print(f'{nome} falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+            traceback.print_exc()
+
+
+async def _instalar_extensoes_depois_do_ready():
+    """Espera o READY do Discord e só entao instala os modulos da Central."""
+    await asyncio.sleep(3)
+    await asyncio.to_thread(_instalar_extensoes_central)
+
+
+
+def _registrar_boot_seguro() -> None:
+    """Registra extensoes pesadas como listener de READY, sem bloquear o boot."""
+    client = getattr(bot, 'bot', None)
+    if client is None:
+        print('AVISO: objeto Discord nao encontrado; seguindo com bot principal.', flush=True)
+        return
+
+    async def _on_ready_extensions():
+        # Cada reconexao pode disparar READY novamente. O lock evita instalar
+        # os mesmos patches varias vezes.
+        if getattr(bot, '_dicor_extensions_started', False):
+            return
+        bot._dicor_extensions_started = True
+        print('Discord READY — iniciando extensoes da Central em segundo plano.', flush=True)
+        asyncio.create_task(_instalar_extensoes_depois_do_ready())
+
+    try:
+        client.add_listener(_on_ready_extensions, 'on_ready')
+    except Exception as exc:
+        print(f'AVISO: nao foi possivel registrar extensoes pos-READY: {exc}', flush=True)
 
 
 if __name__ == '__main__':
@@ -60,6 +95,9 @@ if __name__ == '__main__':
     except Exception:
         pass
 
+    # Tudo que for necessario para o Discord iniciar fica fora da Central.
+    # Assim, uma falha de web/migracao nao pode deixar o bot offline.
     _instalar_renderer_visual_v161()
-    _instalar_correcao_procurados_e_central()
+    _registrar_boot_seguro()
+
     asyncio.run(bot._runtime_lifecycle_entrypoint())
