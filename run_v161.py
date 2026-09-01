@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import traceback
 import bot
 import dossie_v161
 import dossie_v161_signatures
@@ -36,8 +37,31 @@ def _instalar_correcao_procurados_e_central() -> None:
     central_pf_v163.install(bot)
     central_auth_v164.install(bot)
     central_auth_v165.install(bot)
-    discord_migration_once_v166.install(bot)
-    central_migration_v167.install(bot)
+
+    # A migração é complementar à operação do bot. Se houver qualquer erro
+    # isolado nesses módulos, o bot principal não pode ficar offline por causa
+    # deles: registramos o erro e deixamos o runtime iniciar normalmente.
+    try:
+        discord_migration_once_v166.install(bot)
+        print('✅ V166 migração Discord instalada sem bloquear o bot.', flush=True)
+    except Exception as exc:
+        print(
+            f'⚠️ V166 migração não instalada; bot principal preservado: '
+            f'{type(exc).__name__}: {exc}',
+            flush=True,
+        )
+        traceback.print_exc()
+
+    try:
+        central_migration_v167.install(bot)
+        print('✅ V167 integração da migração instalada sem bloquear o bot.', flush=True)
+    except Exception as exc:
+        print(
+            f'⚠️ V167 integração não instalada; bot principal preservado: '
+            f'{type(exc).__name__}: {exc}',
+            flush=True,
+        )
+        traceback.print_exc()
 
 
 if __name__ == '__main__':
