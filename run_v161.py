@@ -7,6 +7,7 @@ import procurados_central_v162
 import central_pf_v163
 import central_auth_v164
 import central_auth_v165
+import discord_migration_once_v166
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -39,6 +40,7 @@ def _instalar_correcao_procurados_e_central() -> None:
     central_pf_v163.install(bot)
     central_auth_v164.install(bot)
     central_auth_v165.install(bot)
+    discord_migration_once_v166.install(bot)
 
 
 if __name__ == '__main__':
