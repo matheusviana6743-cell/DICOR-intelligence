@@ -8,7 +8,6 @@ import procurados_central_v162
 import central_pf_v163
 import central_auth_v164
 import central_auth_v165
-import discord_migration_once_v166
 import central_migration_v167
 
 
@@ -32,29 +31,19 @@ def _instalar_renderer_visual_v161() -> None:
 
 
 def _instalar_correcao_procurados_e_central() -> None:
-    """Mantém filtro estrito, Central PF, autenticação e integração da migração."""
+    """Mantém o bot principal independente da migração pesada do Discord."""
     procurados_central_v162.install(bot)
     central_pf_v163.install(bot)
     central_auth_v164.install(bot)
     central_auth_v165.install(bot)
 
-    # A migração é complementar à operação do bot. Se houver qualquer erro
-    # isolado nesses módulos, o bot principal não pode ficar offline por causa
-    # deles: registramos o erro e deixamos o runtime iniciar normalmente.
-    try:
-        discord_migration_once_v166.install(bot)
-        print('✅ V166 migração Discord instalada sem bloquear o bot.', flush=True)
-    except Exception as exc:
-        print(
-            f'⚠️ V166 migração não instalada; bot principal preservado: '
-            f'{type(exc).__name__}: {exc}',
-            flush=True,
-        )
-        traceback.print_exc()
-
+    # V166 foi retirado do boot principal porque sua rotina de histórico pode
+    # consumir o loop de eventos por muito tempo e fazer os botões do Discord
+    # expirarem sem resposta. A Central V167 continua disponível e usa o
+    # arquivo de migração já existente quando houver um.
     try:
         central_migration_v167.install(bot)
-        print('✅ V167 integração da migração instalada sem bloquear o bot.', flush=True)
+        print('✅ V167 integração da migração instalada sem bloquear o Discord.', flush=True)
     except Exception as exc:
         print(
             f'⚠️ V167 integração não instalada; bot principal preservado: '
