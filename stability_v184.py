@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """V184 — estabilidade antes do Gateway.
 
-Aplica correções ANTES do on_ready/V13. Isso é importante para Views persistentes:
-o Discord registra os objetos das Views durante o bootstrap, então patches feitos
-somente depois do READY podem não atingir os callbacks já registrados.
+Correção da seleção de responsável da Perícia: o atendimento pode estar
+vinculado ao tópico, à mensagem do painel ou ao canal pai. O resolvedor tenta
+primeiro o resolvedor oficial já instalado e depois aplica fallbacks seguros.
 """
 from __future__ import annotations
 
@@ -54,6 +54,23 @@ def _number_from_message(message: Any) -> str:
     return ""
 
 
+def _candidate_channel_ids(interaction: Any) -> list[str]:
+    ids = []
+    message = getattr(interaction, "message", None)
+    channel = getattr(message, "channel", None)
+    for value in (
+        getattr(interaction, "channel_id", None),
+        getattr(channel, "id", None),
+        getattr(channel, "parent_id", None),
+        getattr(getattr(channel, "parent", None), "id", None),
+        getattr(message, "channel_id", None),
+    ):
+        sid = _sid(value)
+        if sid and sid not in ids:
+            ids.append(sid)
+    return ids
+
+
 def install(bot_module) -> bool:
     discord = getattr(bot_module, "discord", None)
     cls = getattr(bot_module, "PericiaSelecionarAgente", None)
@@ -65,13 +82,28 @@ def install(bot_module) -> bool:
     def resolve(interaction: Any) -> Optional[dict]:
         message = getattr(interaction, "message", None)
         mid = _sid(getattr(message, "id", None))
-        cid = _sid(getattr(interaction, "channel_id", None))
+        channel_ids = _candidate_channel_ids(interaction)
+
+        # 0. Usa o resolvedor oficial/mais recente se algum patch anterior já o instalou.
+        # Isso evita manter dois critérios diferentes para o mesmo atendimento.
+        official = getattr(bot_module, "_pericia_por_topico", None)
+        if callable(official):
+            for cid in channel_ids:
+                try:
+                    record = official(cid)
+                    if isinstance(record, dict):
+                        return record
+                except Exception:
+                    pass
 
         try:
             records = carregar()
         except Exception:
             traceback.print_exc()
             records = []
+        if isinstance(records, dict):
+            # Alguns formatos antigos podem retornar {id: registro}.
+            records = list(records.values())
         if not isinstance(records, list):
             records = []
 
@@ -79,15 +111,18 @@ def install(bot_module) -> bool:
         if mid:
             keys = {
                 "painel_msg_id", "mensagem_painel_id", "mensagem_tarefa_id",
-                "mensagem_abertura_id", "mensagem_original_id",
+                "mensagem_abertura_id", "mensagem_original_id", "painel_id",
             }
             for record in reversed(records):
                 if isinstance(record, dict) and any(_sid(record.get(key)) == mid for key in keys):
                     return record
 
-        # 2. Tópico/thread/canal do atendimento.
-        if cid:
-            keys = {"topico_id", "thread_id", "canal_atendimento_id", "canal_id"}
+        # 2. Tópico/thread/canal do atendimento e seus pais.
+        keys = {
+            "topico_id", "thread_id", "canal_atendimento_id", "canal_id",
+            "canal_pai_id", "parent_id", "thread_parent_id", "atendimento_canal_id",
+        }
+        for cid in channel_ids:
             for record in reversed(records):
                 if isinstance(record, dict) and any(_sid(record.get(key)) == cid for key in keys):
                     return record
@@ -108,12 +143,17 @@ def install(bot_module) -> bool:
             if len(matches) == 1:
                 return matches[0]
 
-        # 4. Último recurso seguro: único atendimento ativo no canal pai.
-        if cid:
+        # 4. Se houver um único atendimento ativo relacionado a algum canal pai.
+        pais = set(channel_ids)
+        if pais:
             matches = [
                 r for r in records
                 if isinstance(r, dict) and _active(r)
-                and cid in {_sid(r.get("canal_pai_id")), _sid(r.get("parent_id"))}
+                and pais.intersection({
+                    _sid(r.get("canal_pai_id")),
+                    _sid(r.get("parent_id")),
+                    _sid(r.get("thread_parent_id")),
+                })
             ]
             if len(matches) == 1:
                 return matches[0]
@@ -138,6 +178,8 @@ def install(bot_module) -> bool:
 
             registro = resolve(interaction)
             if not registro:
+                ids = ",".join(_candidate_channel_ids(interaction)) or "sem-id"
+                print(f"⚠️ V184 Perícia: atendimento não localizado; canais={ids}; mensagem={_sid(getattr(getattr(interaction, 'message', None), 'id', None))}", flush=True)
                 return await reply("❌ Não foi possível localizar o atendimento desta perícia. Abra uma nova atualização do painel para continuar.")
 
             finais = getattr(bot_module, "_PERICIA_STATUS_FINAIS", set())
@@ -204,7 +246,6 @@ def install(bot_module) -> bool:
             traceback.print_exc()
             await reply("❌ Não foi possível concluir a atribuição desta perícia. O bot continua online.")
 
-    # Patch de classe ANTES da criação das Views persistentes.
     cls.callback = callback
 
     view_cls = getattr(bot_module, "PericiaAtendimentoView", None)
@@ -213,8 +254,6 @@ def install(bot_module) -> bool:
             original = getattr(view_cls, name, None)
             if original is None:
                 continue
-            # Esses handlers continuam usando o resolvedor global, agora robusto.
-            # Apenas sinalizamos a classe para que V184 não seja aplicado duas vezes.
             try:
                 setattr(original, "_dicor_v184_safe", True)
             except Exception:
