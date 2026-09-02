@@ -101,7 +101,7 @@ def _build_lookup(bot_module, original_lookup, carregar):
 
 
 def _wrap_callback(original_callback):
-    if getattr(original_callback, "_dicor_v181_wrapper", False):
+    if not callable(original_callback) or getattr(original_callback, "_dicor_v181_wrapper", False):
         return original_callback
 
     async def callback_wrapper(self, interaction):
@@ -123,30 +123,30 @@ def install(bot_module):
         print("⚠️ V181: funções da Perícia não encontradas; patch não aplicado.", flush=True)
         return False
 
-    # Não encadeia indefinidamente patches anteriores; usa o resolvedor atual
-    # como fallback e instala uma única camada robusta.
     bot_module._pericia_por_topico = _build_lookup(bot_module, atual, carregar)
 
-    # 1) Views novas.
+    # Views novas.
     cls = getattr(bot_module, "PericiaSelecionarAgente", None)
     if cls is not None and hasattr(cls, "callback"):
         cls.callback = _wrap_callback(cls.callback)
 
-    # 2) Views persistentes que já foram criadas antes do patch.
-    # Esse é o ponto crítico: alterar a classe não altera callbacks já ligados
-    # aos objetos UserSelect existentes no Client.
+    # Views persistentes já existentes. Patching apenas a classe não basta:
+    # cada item já criado guarda seu callback bound, portanto substituímos o
+    # callback no objeto real que está registrado no Client.
     client = getattr(bot_module, "bot", None)
     corrigidos = 0
     try:
         for view in list(getattr(client, "persistent_views", []) or []):
             for item in list(getattr(view, "children", []) or []):
                 cid = str(getattr(item, "custom_id", "") or "")
-                if cid == "dicor_pericia_selecionar_agente_v1":
-                    item.callback = _wrap_callback(getattr(item, "callback", None))
-                    corrigidos += 1
+                if cid.startswith("dicor_pericia_"):
+                    wrapped = _wrap_callback(getattr(item, "callback", None))
+                    if wrapped is not None:
+                        item.callback = wrapped
+                        corrigidos += 1
     except Exception:
         traceback.print_exc()
 
     bot_module._V181_PERICIA_PATCHED = True
-    print(f"✅ V181 Perícia ativo: {corrigidos} View(s) persistente(s) corrigida(s) + lookup pelo painel.", flush=True)
+    print(f"✅ V181 Perícia: {corrigidos} controles persistentes corrigidos; vínculo por mensagem do painel ativo.", flush=True)
     return True
