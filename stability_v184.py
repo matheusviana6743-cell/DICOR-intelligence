@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V184 — estabilidade antes do Gateway.
-
-Correção da seleção de responsável da Perícia: o atendimento pode estar
-vinculado ao tópico, à mensagem do painel ou ao canal pai. O resolvedor tenta
-primeiro o resolvedor oficial já instalado e depois aplica fallbacks seguros.
-"""
+"""V184 — vínculo robusto das Views de Perícia ao registro correto."""
 from __future__ import annotations
 
 import asyncio
@@ -37,27 +32,29 @@ def _number_from_message(message: Any) -> str:
                 str(getattr(embed, "description", "") or ""),
             ])
             for field in list(getattr(embed, "fields", []) or []):
-                parts.extend([str(getattr(field, "name", "") or ""), str(getattr(field, "value", "") or "")])
+                parts.extend([
+                    str(getattr(field, "name", "") or ""),
+                    str(getattr(field, "value", "") or ""),
+                ])
         channel = getattr(message, "channel", None)
         parts.append(str(getattr(channel, "name", "") or ""))
     except Exception:
         pass
     text = " ".join(parts)
-    patterns = (
+    for pattern in (
         r"PER[IÍ]CIA(?:\s+EXTERNA)?\s*(?:N[º°O.]|NÚMERO|NUMERO)?\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
         r"N[º°O.]?\s*(?:DA\s+)?PER[IÍ]CIA\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
-    )
-    for pattern in patterns:
+    ):
         match = re.search(pattern, text, flags=re.I)
         if match:
             return re.sub(r"\s+", "", match.group(1)).strip("-/: ")
     return ""
 
 
-def _candidate_channel_ids(interaction: Any) -> list[str]:
-    ids = []
+def _channel_ids(interaction: Any) -> list[str]:
     message = getattr(interaction, "message", None)
     channel = getattr(message, "channel", None)
+    result = []
     for value in (
         getattr(interaction, "channel_id", None),
         getattr(channel, "id", None),
@@ -66,26 +63,50 @@ def _candidate_channel_ids(interaction: Any) -> list[str]:
         getattr(message, "channel_id", None),
     ):
         sid = _sid(value)
-        if sid and sid not in ids:
-            ids.append(sid)
-    return ids
+        if sid and sid not in result:
+            result.append(sid)
+    return result
 
 
 def install(bot_module) -> bool:
     discord = getattr(bot_module, "discord", None)
     cls = getattr(bot_module, "PericiaSelecionarAgente", None)
+    view_cls = getattr(bot_module, "PericiaAtendimentoView", None)
     carregar = getattr(bot_module, "_pericia_carregar", None)
     if discord is None or cls is None or not callable(carregar):
         print("⚠️ V184: componentes da Perícia indisponíveis; patch não aplicado.", flush=True)
         return False
 
-    def resolve(interaction: Any) -> Optional[dict]:
+    def records() -> list[dict]:
+        try:
+            data = carregar()
+        except Exception:
+            traceback.print_exc()
+            return []
+        if isinstance(data, dict):
+            data = list(data.values())
+        return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+
+    def find_by_id(record_id: Any) -> Optional[dict]:
+        wanted = str(record_id or "").strip()
+        if not wanted:
+            return None
+        for record in reversed(records()):
+            if str(record.get("id") or "").strip() == wanted:
+                return record
+        return None
+
+    def resolve(interaction: Any, bound_id: Any = None) -> Optional[dict]:
+        # 0. Registro vinculado diretamente à View/Select. Este é o caminho
+        # principal para painéis novos e elimina a dependência do channel_id.
+        record = find_by_id(bound_id)
+        if record:
+            return record
+
         message = getattr(interaction, "message", None)
         mid = _sid(getattr(message, "id", None))
-        channel_ids = _candidate_channel_ids(interaction)
+        channel_ids = _channel_ids(interaction)
 
-        # 0. Usa o resolvedor oficial/mais recente se algum patch anterior já o instalou.
-        # Isso evita manter dois critérios diferentes para o mesmo atendimento.
         official = getattr(bot_module, "_pericia_por_topico", None)
         if callable(official):
             for cid in channel_ids:
@@ -96,45 +117,36 @@ def install(bot_module) -> bool:
                 except Exception:
                     pass
 
-        try:
-            records = carregar()
-        except Exception:
-            traceback.print_exc()
-            records = []
-        if isinstance(records, dict):
-            # Alguns formatos antigos podem retornar {id: registro}.
-            records = list(records.values())
-        if not isinstance(records, list):
-            records = []
+        data = records()
 
-        # 1. Mensagem do painel: identidade inequívoca.
+        # 1. IDs de mensagens salvos no atendimento.
         if mid:
             keys = {
                 "painel_msg_id", "mensagem_painel_id", "mensagem_tarefa_id",
                 "mensagem_abertura_id", "mensagem_original_id", "painel_id",
             }
-            for record in reversed(records):
-                if isinstance(record, dict) and any(_sid(record.get(key)) == mid for key in keys):
+            for record in reversed(data):
+                if any(_sid(record.get(key)) == mid for key in keys):
                     return record
 
-        # 2. Tópico/thread/canal do atendimento e seus pais.
+        # 2. Canal/tópico e pais.
         keys = {
             "topico_id", "thread_id", "canal_atendimento_id", "canal_id",
             "canal_pai_id", "parent_id", "thread_parent_id", "atendimento_canal_id",
         }
         for cid in channel_ids:
-            for record in reversed(records):
-                if isinstance(record, dict) and any(_sid(record.get(key)) == cid for key in keys):
+            for record in reversed(data):
+                if any(_sid(record.get(key)) == cid for key in keys):
                     return record
 
-        # 3. Número mostrado no painel.
+        # 3. Número exibido no painel.
         number = _number_from_message(message)
         if number:
             normalize = getattr(bot_module, "_pericia_numero_chave", None)
             wanted = normalize(number) if callable(normalize) else number
             matches = []
-            for record in records:
-                if not isinstance(record, dict) or not _active(record):
+            for record in data:
+                if not _active(record):
                     continue
                 value = record.get("numero_chave") or record.get("numero") or ""
                 value = normalize(value) if callable(normalize) else str(value)
@@ -143,20 +155,6 @@ def install(bot_module) -> bool:
             if len(matches) == 1:
                 return matches[0]
 
-        # 4. Se houver um único atendimento ativo relacionado a algum canal pai.
-        pais = set(channel_ids)
-        if pais:
-            matches = [
-                r for r in records
-                if isinstance(r, dict) and _active(r)
-                and pais.intersection({
-                    _sid(r.get("canal_pai_id")),
-                    _sid(r.get("parent_id")),
-                    _sid(r.get("thread_parent_id")),
-                })
-            ]
-            if len(matches) == 1:
-                return matches[0]
         return None
 
     async def callback(self, interaction):
@@ -176,10 +174,15 @@ def install(bot_module) -> bool:
             if not isinstance(getattr(interaction, "user", None), discord.Member) or not callable(membro_check) or not membro_check(interaction.user):
                 return await reply("❌ Apenas Inspetor+ pode escolher o responsável pela perícia.")
 
-            registro = resolve(interaction)
+            bound_id = getattr(self, "_dicor_pericia_registro_id", "")
+            registro = resolve(interaction, bound_id)
             if not registro:
-                ids = ",".join(_candidate_channel_ids(interaction)) or "sem-id"
-                print(f"⚠️ V184 Perícia: atendimento não localizado; canais={ids}; mensagem={_sid(getattr(getattr(interaction, 'message', None), 'id', None))}", flush=True)
+                ids = ",".join(_channel_ids(interaction)) or "sem-id"
+                print(
+                    f"⚠️ V184 Perícia: atendimento não localizado; registro={bound_id or 'sem-vinculo'}; "
+                    f"canais={ids}; mensagem={_sid(getattr(getattr(interaction, 'message', None), 'id', None))}",
+                    flush=True,
+                )
                 return await reply("❌ Não foi possível localizar o atendimento desta perícia. Abra uma nova atualização do painel para continuar.")
 
             finais = getattr(bot_module, "_PERICIA_STATUS_FINAIS", set())
@@ -196,8 +199,7 @@ def install(bot_module) -> bool:
                 return await reply("❌ Selecione um agente válido.")
 
             equipe = getattr(bot_module, "usuario_tem_equipe", None)
-            inspetor = getattr(bot_module, "_membro_inspetor_mais", None)
-            if (callable(equipe) and callable(inspetor)) and not equipe(escolhido) and not inspetor(escolhido):
+            if callable(equipe) and callable(membro_check) and not equipe(escolhido) and not membro_check(escolhido):
                 return await reply("❌ O membro selecionado não possui cargo da equipe DICOR.")
 
             registro.update({
@@ -242,23 +244,56 @@ def install(bot_module) -> bool:
                     await log(f"👤 Responsável da Perícia `{registro.get('numero')}` definido: {escolhido.mention} por {interaction.user.mention}.")
                 except Exception:
                     pass
-        except Exception as exc:
+        except Exception:
             traceback.print_exc()
             await reply("❌ Não foi possível concluir a atribuição desta perícia. O bot continua online.")
 
     cls.callback = callback
 
-    view_cls = getattr(bot_module, "PericiaAtendimentoView", None)
-    if view_cls is not None:
-        for name in ("pego", "nao_pego", "informar_bo"):
-            original = getattr(view_cls, name, None)
-            if original is None:
+    # Cada painel novo recebe o registro no próprio objeto da View/Select.
+    # Assim, mesmo que o canal/thread tenha sido alterado, o dropdown sabe
+    # exatamente qual atendimento deve atualizar.
+    if view_cls is not None and not getattr(view_cls, "_dicor_v184_init_patched", False):
+        original_init = view_cls.__init__
+
+        def patched_init(self, registro=None, *args, **kwargs):
+            original_init(self, registro, *args, **kwargs)
+            rid = str((registro or {}).get("id") or "")
+            for item in list(getattr(self, "children", []) or []):
+                if isinstance(item, cls):
+                    item._dicor_pericia_registro_id = rid
+                    break
+
+        view_cls.__init__ = patched_init
+        view_cls._dicor_v184_init_patched = True
+
+    # Corrige Views persistentes que já estavam registradas.
+    client = getattr(bot_module, "bot", None)
+    corrigidos = 0
+    try:
+        stores = [getattr(client, "persistent_views", None)]
+        connection = getattr(client, "_connection", None)
+        stores.append(getattr(connection, "_view_store", None))
+        stores.append(getattr(client, "_view_store", None))
+        seen = set()
+        for store in stores:
+            if store is None:
                 continue
-            try:
-                setattr(original, "_dicor_v184_safe", True)
-            except Exception:
-                pass
+            views = getattr(store, "_views", store if isinstance(store, (list, tuple, set)) else [])
+            candidates = list(views.values()) if isinstance(views, dict) else list(views or [])
+            for view in candidates:
+                if id(view) in seen:
+                    continue
+                seen.add(id(view))
+                for item in list(getattr(view, "children", []) or []):
+                    if isinstance(item, cls) or str(getattr(item, "custom_id", "") or "").startswith("dicor_pericia_selecionar_agente"):
+                        wrapped = getattr(item, "callback", None)
+                        if callable(wrapped):
+                            item.callback = wrapped
+                        corrigidos += 1
+    except Exception:
+        traceback.print_exc()
 
     bot_module._V184_STABILITY_INSTALLED = True
-    print("✅ V184 estabilidade aplicada ANTES do Gateway — seleção de Perícia vinculada à mensagem/painel.", flush=True)
+    print(f"✅ V184 Perícia: vínculo direto registro→dropdown ativo; {corrigidos} controles persistentes verificados.", flush=True)
     return True
