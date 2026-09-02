@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""V180 - proteção de runtime do Discord.
+"""V180.1 - proteção de RAM do runtime Discord.
 
-Objetivo: reduzir picos de RAM antes do Gateway e impedir que exceções de
- tarefas secundárias derrubem o processo. Não altera a lógica dos comandos.
+Mantém a lógica dos comandos intacta e reduz somente caches recriáveis.
 """
 import asyncio
 import gc
@@ -12,12 +11,11 @@ from collections import deque
 LOG = logging.getLogger("dicor.runtime")
 
 
-def _set_message_cache(client, limit=25):
+def _set_message_cache(client, limit=5):
     try:
         state = getattr(client, "_connection", None)
         if state is None:
             return
-        # discord.py usa max_messages para controlar o deque interno.
         try:
             state.max_messages = limit
         except Exception:
@@ -30,6 +28,26 @@ def _set_message_cache(client, limit=25):
                 state._messages = deque(maxlen=limit)
     except Exception as exc:
         print(f"[V180] cache protection failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _set_member_cache_minimal(client):
+    try:
+        discord = __import__("discord")
+        flags_cls = getattr(discord, "MemberCacheFlags", None)
+        state = getattr(client, "_connection", None)
+        if flags_cls is None or state is None:
+            return
+        state.member_cache_flags = flags_cls.none()
+    except Exception as exc:
+        print(f"[V180] member cache minimal failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _trim_recreatable_caches(client):
+    try:
+        _set_message_cache(client, 5)
+        gc.collect()
+    except Exception as exc:
+        print(f"[V180] trim failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _task_done(task):
@@ -48,8 +66,9 @@ def install(bot_module):
     if client is None:
         return
 
-    # Deve acontecer ANTES do Gateway, não apenas depois do READY.
-    _set_message_cache(client, 25)
+    # Aplicado antes do Gateway para evitar o pico inicial de RAM.
+    _set_message_cache(client, 5)
+    _set_member_cache_minimal(client)
 
     try:
         loop = asyncio.get_event_loop()
@@ -71,7 +90,6 @@ def install(bot_module):
     except Exception as exc:
         print(f"[V180] event loop guard failed: {type(exc).__name__}: {exc}", flush=True)
 
-    # Expõe um helper para callbacks que criam tarefas.
     def safe_create_task(coro, *, name=None):
         try:
             task = asyncio.create_task(coro, name=name)
@@ -86,11 +104,11 @@ def install(bot_module):
             return None
 
     bot_module._v180_safe_create_task = safe_create_task
-    bot_module._v180_trim_message_cache = lambda: _set_message_cache(client, 25)
+    bot_module._v180_trim_message_cache = lambda: _trim_recreatable_caches(client)
 
     try:
         gc.collect()
     except Exception:
         pass
 
-    print("✅ V180 runtime safety ativo — cache Discord limitado antes do Gateway.", flush=True)
+    print("✅ V180.1 RAM: cache de mensagens=5 + member cache mínimo + GC ativo.", flush=True)
