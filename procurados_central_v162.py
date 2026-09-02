@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""V171 - sincronização persistente Discord -> Procurados -> Central DICOR.
+"""V171 — sincronização leve Discord -> Procurados -> Central DICOR.
 
-Fonte de verdade: canal oficial de Procurados no Discord.
-O snapshot local serve para persistência entre reinícios do Railway.
+A sincronização é limitada para não consumir toda a memória do Railway.
+O Discord continua sendo a fonte de verdade; o snapshot local mantém os
+registros já conhecidos entre reinícios.
 """
 from __future__ import annotations
 
@@ -10,9 +11,12 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List
 
 ACTIVE_WANTED_CHANNEL_ID = 1490200533980545097
+# Limite deliberadamente baixo: evita OOM em canais muito grandes.
+SYNC_LIMIT = 150
+SYNC_INTERVAL = 120
 
 
 def install(bot_module) -> None:
@@ -20,19 +24,11 @@ def install(bot_module) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = data_dir / "procurados_discord.json"
 
-    state = {
-        "message_ids": set(),
-        "records": {},
-        "ready": False,
-        "sync_task": None,
-        "loop_task": None,
-        "last_error": "",
-    }
+    state = {"message_ids": set(), "records": {}, "ready": False, "sync_task": None, "loop_task": None, "last_error": ""}
 
     def _load_snapshot() -> None:
         try:
-            if not snapshot_path.exists():
-                return
+            if not snapshot_path.exists(): return
             raw = json.loads(snapshot_path.read_text(encoding="utf-8"))
             registros = raw.get("records", raw) if isinstance(raw, dict) else raw
             if isinstance(registros, list):
@@ -45,10 +41,12 @@ def install(bot_module) -> None:
             print(f"⚠️ V171: snapshot não carregado: {exc}", flush=True)
 
     def _save_snapshot() -> None:
-        tmp = snapshot_path.with_suffix(".tmp")
-        payload = {"version": 171, "records": state["records"]}
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(snapshot_path)
+        try:
+            tmp = snapshot_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 171, "records": state["records"]}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(snapshot_path)
+        except Exception as exc:
+            print(f"⚠️ V171: falha ao salvar snapshot: {exc}", flush=True)
 
     def _extract_fields(message) -> Dict[str, Any]:
         text = str(getattr(message, "content", "") or "").strip()
@@ -71,30 +69,28 @@ def install(bot_module) -> None:
                 if m: return m.group(1).strip()
             return ""
 
-        attachments = []
+        fotos = []
         for a in getattr(message, "attachments", []) or []:
             url = str(getattr(a, "url", "") or "")
-            if url: attachments.append(url)
+            if url: fotos.append(url)
         for embed in embeds:
             image = getattr(embed, "image", None)
             url = str(getattr(image, "url", "") or "") if image else ""
-            if url: attachments.append(url)
+            if url: fotos.append(url)
 
-        nome = pick("nome", "nome completo", "indivíduo", "individuo")
-        rg = pick("rg", "passaporte", "id")
-        descricao = pick("descrição", "descricao")
-        crime = pick("crime", "crimes", "acusação", "acusacao")
+        author = getattr(message, "author", None)
+        created = getattr(message, "created_at", None)
         return {
             "mensagem_id": int(message.id),
             "mensagem_url": str(getattr(message, "jump_url", "") or ""),
-            "nome": nome or str(getattr(getattr(message, "author", None), "display_name", "") or "") or "Não informado",
-            "rg": rg,
-            "descricao": descricao,
-            "crime": crime,
+            "nome": pick("nome", "nome completo", "indivíduo", "individuo") or str(getattr(author, "display_name", "") or "") or "Não informado",
+            "rg": pick("rg", "passaporte", "id"),
+            "descricao": pick("descrição", "descricao"),
+            "crime": pick("crime", "crimes", "acusação", "acusacao"),
             "texto_discord": blob,
-            "fotos": list(dict.fromkeys(attachments)),
-            "autor_id": int(getattr(getattr(message, "author", None), "id", 0) or 0),
-            "data_discord": getattr(getattr(message, "created_at", None), "isoformat", lambda: "")(),
+            "fotos": list(dict.fromkeys(fotos))[:4],
+            "autor_id": int(getattr(author, "id", 0) or 0),
+            "data_discord": created.isoformat() if created else "",
         }
 
     async def _resolve_channel():
@@ -103,7 +99,9 @@ def install(bot_module) -> None:
         channel = client.get_channel(ACTIVE_WANTED_CHANNEL_ID)
         if channel is not None: return channel
         try: return await client.fetch_channel(ACTIVE_WANTED_CHANNEL_ID)
-        except Exception: return None
+        except Exception as exc:
+            state["last_error"] = f"canal: {type(exc).__name__}: {exc}"
+            return None
 
     async def _sync_full(reason=""):
         channel = await _resolve_channel()
@@ -112,41 +110,48 @@ def install(bot_module) -> None:
             return
         try:
             fresh = {}
-            async for message in channel.history(limit=None, oldest_first=True):
-                # Mensagens sem conteúdo/embeds/anexos não são registros úteis.
+            # Somente as publicações mais recentes. Nunca usar limit=None.
+            async for message in channel.history(limit=SYNC_LIMIT, oldest_first=False):
                 if not (getattr(message, "content", "") or getattr(message, "embeds", None) or getattr(message, "attachments", None)):
                     continue
                 registro = _extract_fields(message)
                 fresh[str(message.id)] = registro
-            state["records"] = fresh
-            state["message_ids"] = {int(k) for k in fresh if k.isdigit()}
+
+            # Mantém registros antigos do snapshot, mas limita o total em memória.
+            old = state["records"]
+            merged = dict(old)
+            merged.update(fresh)
+            if len(merged) > 500:
+                ordered = sorted(merged.values(), key=lambda r: int(r.get("mensagem_id", 0) or 0), reverse=True)[:500]
+                merged = {str(r.get("mensagem_id")): r for r in ordered if r.get("mensagem_id")}
+
+            state["records"] = merged
+            state["message_ids"] = {int(k) for k in merged if k.isdigit()}
             state["ready"] = True
             state["last_error"] = ""
             _save_snapshot()
             _invalidate_cache()
-            print(f"✅ V171 Procurados: Discord → snapshot atualizado com {len(fresh)} registros ({reason}).", flush=True)
+            print(f"✅ V171 Procurados: {len(fresh)} lidos / {len(merged)} mantidos ({reason}).", flush=True)
         except Exception as exc:
             state["last_error"] = f"{type(exc).__name__}: {exc}"
             print(f"⚠️ V171 Procurados: sincronização falhou: {type(exc).__name__}: {exc}", flush=True)
 
     def _invalidate_cache():
-        for name, value in (("_V17_CATALOGO_CACHE_HTML", ""), ("_V17_CATALOGO_CACHE_KEY", None)):
-            try: setattr(bot_module, name, value)
-            except Exception: pass
+        try: bot_module._V17_CATALOGO_CACHE_HTML = ""
+        except Exception: pass
+        try: bot_module._V17_CATALOGO_CACHE_KEY = None
+        except Exception: pass
 
-    def _records() -> List[Dict[str, Any]]:
-        return list(state["records"].values())
-
+    def _records() -> List[Dict[str, Any]]: return list(state["records"].values())
     async def _refresh(reason):
         task = state.get("sync_task")
         if task is not None and not task.done(): return
         async def run():
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
             await _sync_full(reason)
         state["sync_task"] = asyncio.create_task(run())
 
     async def _on_ready():
-        # Carrega primeiro para a Central nunca ficar permanentemente vazia após restart.
         _load_snapshot()
         _invalidate_cache()
         await _sync_full("on_ready")
@@ -166,16 +171,13 @@ def install(bot_module) -> None:
     async def _loop():
         while True:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(SYNC_INTERVAL)
                 await _sync_full("sincronização periódica")
             except asyncio.CancelledError: raise
             except Exception as exc:
                 print(f"⚠️ V171 loop: {exc}", flush=True)
 
-    def _active_records():
-        # Compatibilidade com o restante do bot: a Central passa a usar o snapshot Discord.
-        return _records()
-
+    def _active_records(): return _records()
     def _is_active(registro):
         try: return int(registro.get("mensagem_id") or 0) in state["message_ids"]
         except Exception: return False
@@ -193,16 +195,5 @@ def install(bot_module) -> None:
         client.add_listener(_on_message, "on_message")
         client.add_listener(_on_raw_message_delete, "on_raw_message_delete")
 
-    async def _central_normal_http(request):
-        registros = _active_records()
-        # Reaproveita a página visual do V162, mas com a contagem real do snapshot Discord.
-        qtd = len(registros)
-        cards = f'''<article class="card"><div class="ico">🎯</div><h3>Procurados</h3><p>{qtd} indivíduo(s) sincronizado(s) diretamente do Discord.</p><a href="/catalogo">Abrir catálogo</a></article>'''
-        cards += '''<article class="card private"><div class="ico">🗃️</div><h3>Banco de Dados</h3><p>Fichas e registros investigativos.</p><a href="/fichas">Acessar banco</a></article>'''
-        cards += '''<article class="card private"><div class="ico">🧬</div><h3>Árvore de Inteligência</h3><p>Conexões e vínculos.</p><a href="/arvore">Abrir vínculos</a></article>'''
-        page = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Central DICOR</title><style>body{{margin:0;background:#070806;color:#f7f1db;font-family:Arial,sans-serif}}main{{max-width:1100px;margin:auto;padding:60px 25px}}h1{{letter-spacing:3px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px}}.card{{padding:28px;border:1px solid #4a3c1d;border-radius:18px;background:#11130e}}.ico{{font-size:30px}}h3{{font-size:23px}}p{{color:#aaa58f;line-height:1.5}}a{{display:inline-block;padding:11px 16px;background:#d7a93d;color:#111;text-decoration:none;border-radius:8px;font-weight:bold}}</style></head><body><main><small>DICOR • CENTRAL DE INTELIGÊNCIA</small><h1>Central DICOR</h1><p>Dados sincronizados diretamente do canal oficial de Procurados do Discord.</p><section class="grid">{cards}</section></main></body></html>'''
-        return bot_module.web.Response(text=page, content_type="text/html", charset="utf-8")
-
-    bot_module.central_portal_http = _central_normal_http
     _load_snapshot()
-    print(f"✅ V171 Procurados: fonte Discord + persistência em {snapshot_path}.", flush=True)
+    print(f"✅ V171 Procurados: sincronização limitada a {SYNC_LIMIT} mensagens; intervalo {SYNC_INTERVAL}s.", flush=True)
