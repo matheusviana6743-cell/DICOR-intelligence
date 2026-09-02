@@ -9,6 +9,7 @@ import central_pf_v163
 import central_auth_v164
 import central_auth_v165
 import central_migration_v167
+import central_buttons_rescue_v168
 
 
 
@@ -94,6 +95,14 @@ if __name__ == '__main__':
             bot._v70_iniciar_health_bootstrap()
     except Exception:
         pass
+
+    # O restaurador de Views precisa ser armado antes do READY para recuperar
+    # os botoes dos paineis antigos assim que o gateway ficar online.
+    try:
+        central_buttons_rescue_v168.install(bot)
+    except Exception as exc:
+        print(f'V168 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
 
     # Tudo que for necessario para o Discord iniciar fica fora da Central.
     # Assim, uma falha de web/migracao nao pode deixar o bot offline.
