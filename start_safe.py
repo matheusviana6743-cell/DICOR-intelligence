@@ -133,6 +133,12 @@ def lazy_install_secondary():
         print("✅ V181 Perícia aplicado.", flush=True)
     except Exception as exc:
         diagnostic("lazy_v181", exc)
+    try:
+        import pericia_fix_v186
+        pericia_fix_v186.install(bot)
+        print("✅ V186 Perícia instalado.", flush=True)
+    except Exception as exc:
+        diagnostic("lazy_v186", exc)
 
 
 async def lazy_install_central():
@@ -184,6 +190,14 @@ async def after_ready():
         pericia_fix_v185.install(bot)
     except Exception as exc:
         diagnostic("post_central_v185", exc)
+    try:
+        import pericia_fix_v186
+        pericia_fix_v186.install(bot)
+        repair = getattr(bot, "_V186_REPAIR_EXISTING_PERICIA", None)
+        if callable(repair):
+            await repair()
+    except Exception as exc:
+        diagnostic("post_v186_repair", exc)
     trim_cache()
 
 
