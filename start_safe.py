@@ -228,6 +228,15 @@ async def main():
         pericia_fix_v185.install(bot)
     except Exception as exc:
         diagnostic("pre_gateway_v185", exc)
+    # V186 precisa ser instalado ANTES do Gateway/on_ready. Assim, quando as
+    # Views persistentes antigas forem registradas, elas já recebem o callback
+    # corrigido em vez de continuarem presas ao callback legado.
+    try:
+        import pericia_fix_v186
+        pericia_fix_v186.install(bot)
+        print("✅ V186 Perícia pré-Gateway — callback corrigido antes das Views persistentes.", flush=True)
+    except Exception as exc:
+        diagnostic("pre_gateway_v186", exc)
     ready_once = False
     async def ready_listener():
         nonlocal ready_once
