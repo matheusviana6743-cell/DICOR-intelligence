@@ -96,6 +96,13 @@ def install_guards():
 
 
 def lazy_install_secondary():
+    # Perícia primeiro: o lookup precisa estar ativo antes das Views persistentes.
+    try:
+        import pericia_fix_v181
+        pericia_fix_v181.install(bot)
+    except Exception as exc:
+        diagnostic("lazy_v181_pericia", exc)
+
     try:
         import dossie_v161
         import dossie_v161_signatures
@@ -104,6 +111,13 @@ def lazy_install_secondary():
         print("✅ PDF/Dossiê carregado após READY.", flush=True)
     except Exception as exc:
         diagnostic("lazy_dossie", exc)
+
+    try:
+        import procurados_central_v162
+        procurados_central_v162.install(bot)
+        print("✅ Procurados V162 carregado após READY.", flush=True)
+    except Exception as exc:
+        diagnostic("lazy_procurados", exc)
 
     try:
         import interaction_fix_v169
@@ -118,10 +132,16 @@ def lazy_install_secondary():
         diagnostic("lazy_v168", exc)
 
     try:
-        import pericia_fix_v181
-        pericia_fix_v181.install(bot)
+        renderer = getattr(bot, "_V159_RENDER_PDF_APROVADO", None)
+        import dossie_v161
+        if renderer is None and hasattr(bot, "_V159_RENDER_PDF_APROVADO"):
+            bot._V159_RENDER_PDF_APROVADO = lambda dados, caminho: dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
+        renderer2 = getattr(bot, "_V155_GERAR_PDF_BASE", None)
+        if renderer2 is None and hasattr(bot, "_V155_GERAR_PDF_BASE"):
+            bot._V155_GERAR_PDF_BASE = lambda dados, caminho: dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
+        print("✅ Renderer V161 conectado após READY.", flush=True)
     except Exception as exc:
-        diagnostic("lazy_v181_pericia", exc)
+        diagnostic("lazy_v161_renderer", exc)
 
 
 async def lazy_install_central():
@@ -139,6 +159,18 @@ async def lazy_install_central():
             try:
                 module.install(bot)
                 print(f"✅ {name} Central carregado.", flush=True)
+            except Exception as exc:
+                diagnostic(f"central_{name}", exc)
+
+        # Módulos de dados antigos continuam sendo carregados isoladamente para
+        # não perder funcionalidades já existentes no bot.
+        for name, module_name in (("V172", "central_data_v172"), ("V173", "central_data_v173")):
+            try:
+                module = __import__(module_name)
+                installer = getattr(module, "install", None)
+                if callable(installer):
+                    installer(bot)
+                    print(f"✅ {name} Central carregado.", flush=True)
             except Exception as exc:
                 diagnostic(f"central_{name}", exc)
     except Exception as exc:
