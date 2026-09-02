@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V181 - correção definitiva do vínculo das Views de Perícia.
-
-A View persistente é acionada a partir de uma mensagem específica. O callback
-antigo tentava descobrir o atendimento somente pelo channel_id. Quando o ID
-salvo e o canal da interação divergem, o callback devolve "Atendimento não
-encontrado" mesmo existindo um registro válido.
-"""
+"""V181 - correção definitiva do vínculo das Views de Perícia."""
 
 import contextvars
 import re
@@ -38,24 +32,15 @@ def _numero_do_texto(texto):
     return ""
 
 
-def install(bot_module):
-    original_lookup = getattr(bot_module, "_pericia_por_topico", None)
-    carregar = getattr(bot_module, "_pericia_carregar", None)
-    if not callable(original_lookup) or not callable(carregar):
-        print("⚠️ V181: funções da Perícia não encontradas; patch não aplicado.", flush=True)
-        return False
-
+def _build_lookup(bot_module, original_lookup, carregar):
     def robust_lookup(topico_id):
-        # Se estamos dentro de uma View, o ID da mensagem do painel é a chave
-        # mais confiável e não depende do canal em que o Discord entregou a
-        # interação.
         contexto = _CTX.get()
-        candidatos_ids = []
+        ids = []
         if contexto:
-            candidatos_ids.append(contexto)
+            ids.append(contexto)
         alvo = _sid(topico_id)
         if alvo:
-            candidatos_ids.append(alvo)
+            ids.append(alvo)
 
         try:
             lista = carregar()
@@ -71,12 +56,11 @@ def install(bot_module):
             "canal_atendimento_id", "canal_id", "canal_pai_id", "parent_id",
             "thread_parent_id",
         )
-        for chave_id in candidatos_ids:
+        for chave_id in ids:
             for item in reversed(lista):
                 if isinstance(item, dict) and any(_sid(item.get(chave)) == chave_id for chave in chaves_id):
                     return item
 
-        # Mantém compatibilidade com a função original.
         try:
             encontrado = original_lookup(topico_id)
             if encontrado:
@@ -84,8 +68,6 @@ def install(bot_module):
         except Exception:
             traceback.print_exc()
 
-        # Se a interação estiver no canal-pai e houver exatamente um atendimento
-        # ativo, não há ambiguidade para fazer a associação.
         if alvo:
             pais = [
                 item for item in lista
@@ -95,7 +77,6 @@ def install(bot_module):
             if len(pais) == 1:
                 return pais[0]
 
-        # Último fallback: número no nome do canal/thread.
         client = getattr(bot_module, "bot", None)
         channel = None
         try:
@@ -116,28 +97,56 @@ def install(bot_module):
             if len(encontrados) == 1:
                 return encontrados[0]
         return None
+    return robust_lookup
 
-    bot_module._pericia_por_topico = robust_lookup
 
-    # Patch direto do UserSelect. Isso torna o vínculo determinístico: antes de
-    # executar o callback original, passamos o ID exato da mensagem que contém
-    # o seletor. O contextvar evita interferência entre duas interações simultâneas.
+def _wrap_callback(original_callback):
+    if getattr(original_callback, "_dicor_v181_wrapper", False):
+        return original_callback
+
+    async def callback_wrapper(self, interaction):
+        message = getattr(interaction, "message", None)
+        token = _CTX.set(_sid(getattr(message, "id", 0)))
+        try:
+            return await original_callback(self, interaction)
+        finally:
+            _CTX.reset(token)
+
+    callback_wrapper._dicor_v181_wrapper = True
+    return callback_wrapper
+
+
+def install(bot_module):
+    carregar = getattr(bot_module, "_pericia_carregar", None)
+    atual = getattr(bot_module, "_pericia_por_topico", None)
+    if not callable(carregar) or not callable(atual):
+        print("⚠️ V181: funções da Perícia não encontradas; patch não aplicado.", flush=True)
+        return False
+
+    # Não encadeia indefinidamente patches anteriores; usa o resolvedor atual
+    # como fallback e instala uma única camada robusta.
+    bot_module._pericia_por_topico = _build_lookup(bot_module, atual, carregar)
+
+    # 1) Views novas.
     cls = getattr(bot_module, "PericiaSelecionarAgente", None)
     if cls is not None and hasattr(cls, "callback"):
-        current = getattr(cls, "callback")
-        if not getattr(current, "_dicor_v181_wrapper", False):
-            async def callback_wrapper(self, interaction):
-                message = getattr(interaction, "message", None)
-                message_id = _sid(getattr(message, "id", 0))
-                token = _CTX.set(message_id)
-                try:
-                    return await current(self, interaction)
-                finally:
-                    _CTX.reset(token)
-            callback_wrapper._dicor_v181_wrapper = True
-            cls.callback = callback_wrapper
-            print("✅ V181 Perícia: callback do UserSelect vinculado ao ID da mensagem.", flush=True)
+        cls.callback = _wrap_callback(cls.callback)
+
+    # 2) Views persistentes que já foram criadas antes do patch.
+    # Esse é o ponto crítico: alterar a classe não altera callbacks já ligados
+    # aos objetos UserSelect existentes no Client.
+    client = getattr(bot_module, "bot", None)
+    corrigidos = 0
+    try:
+        for view in list(getattr(client, "persistent_views", []) or []):
+            for item in list(getattr(view, "children", []) or []):
+                cid = str(getattr(item, "custom_id", "") or "")
+                if cid == "dicor_pericia_selecionar_agente_v1":
+                    item.callback = _wrap_callback(getattr(item, "callback", None))
+                    corrigidos += 1
+    except Exception:
+        traceback.print_exc()
 
     bot_module._V181_PERICIA_PATCHED = True
-    print("✅ V181 Perícia ativo: tópico + thread + painel + tarefa + canal-pai + número.", flush=True)
+    print(f"✅ V181 Perícia ativo: {corrigidos} View(s) persistente(s) corrigida(s) + lookup pelo painel.", flush=True)
     return True
