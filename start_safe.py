@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Entrada de produção segura do DICOR.
-
-O Gateway do Discord sobe com o mínimo possível de imports. Componentes
-pesados (PDF/Central) só são carregados depois do READY e nunca podem derrubar
-ou reiniciar o processo do Discord.
-"""
+"""Entrada de produção segura do DICOR."""
 import asyncio
 import gc
 import json
@@ -31,13 +26,7 @@ def diagnostic(context, exc):
         data_dir = Path(str(getattr(bot, "DATA_DIR", Path(__file__).parent / "data")))
         data_dir.mkdir(parents=True, exist_ok=True)
         with (data_dir / "diagnostico_erros.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "contexto": context,
-                "tipo": type(exc).__name__,
-                "erro": str(exc),
-                "traceback": traceback.format_exc(),
-            }, ensure_ascii=False) + "\n")
+            fh.write(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "contexto": context, "tipo": type(exc).__name__, "erro": str(exc), "traceback": traceback.format_exc()}, ensure_ascii=False) + "\n")
     except Exception:
         pass
     print(f"[SAFE] {context}: {type(exc).__name__}: {exc}", flush=True)
@@ -65,7 +54,6 @@ def install_guards():
     if client is None:
         return
     tree = getattr(client, "tree", None)
-
     async def tree_error(interaction, error):
         diagnostic("slash_command", error)
         try:
@@ -75,20 +63,17 @@ def install_guards():
                 await interaction.followup.send("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
         except Exception as exc:
             diagnostic("slash_error_response", exc)
-
     if tree is not None:
         try:
             tree.on_error = tree_error
         except Exception as exc:
             diagnostic("tree_guard", exc)
-
     async def prefix_error(ctx, error):
         diagnostic("prefix_command", error)
         try:
             await ctx.send("❌ Ocorreu um erro interno. O sistema continua online.")
         except Exception as exc:
             diagnostic("prefix_error_response", exc)
-
     try:
         client.on_command_error = prefix_error
     except Exception as exc:
@@ -96,6 +81,12 @@ def install_guards():
 
 
 def lazy_install_secondary():
+    modules = (
+        ("dossie", "dossie_v161", "dossie_v161_signatures"),
+        ("procurados", "procurados_central_v162", None),
+        ("v169", "interaction_fix_v169", None),
+        ("v168", "central_buttons_rescue_v168", None),
+    )
     try:
         import dossie_v161
         import dossie_v161_signatures
@@ -104,26 +95,22 @@ def lazy_install_secondary():
         print("✅ PDF/Dossiê carregado após READY.", flush=True)
     except Exception as exc:
         diagnostic("lazy_dossie", exc)
-
     try:
         import procurados_central_v162
         procurados_central_v162.install(bot)
         print("✅ Procurados V162 carregado após READY.", flush=True)
     except Exception as exc:
         diagnostic("lazy_procurados", exc)
-
     try:
         import interaction_fix_v169
         interaction_fix_v169.install(bot)
     except Exception as exc:
         diagnostic("lazy_v169", exc)
-
     try:
         import central_buttons_rescue_v168
         central_buttons_rescue_v168.install(bot)
     except Exception as exc:
         diagnostic("lazy_v168", exc)
-
     try:
         renderer = getattr(bot, "_V159_RENDER_PDF_APROVADO", None)
         import dossie_v161
@@ -135,15 +122,12 @@ def lazy_install_secondary():
         print("✅ Renderer V161 conectado após READY.", flush=True)
     except Exception as exc:
         diagnostic("lazy_v161_renderer", exc)
-
-    # V181 precisa ser o ÚLTIMO patch da Perícia: módulos legados podem
-    # reinstalar funções durante o bootstrap. O painel usa painel_msg_id.
     try:
         import pericia_fix_v181
         pericia_fix_v181.install(bot)
-        print("✅ V181 Perícia reaplicado após todos os módulos legados.", flush=True)
+        print("✅ V181 Perícia aplicado.", flush=True)
     except Exception as exc:
-        diagnostic("lazy_v181_pericia_final", exc)
+        diagnostic("lazy_v181", exc)
 
 
 async def lazy_install_central():
@@ -152,18 +136,12 @@ async def lazy_install_central():
         import central_auth_v164
         import central_auth_v165
         import central_migration_v167
-        for name, module in (
-            ("V163", central_pf_v163),
-            ("V164", central_auth_v164),
-            ("V165", central_auth_v165),
-            ("V167", central_migration_v167),
-        ):
+        for name, module in (("V163", central_pf_v163), ("V164", central_auth_v164), ("V165", central_auth_v165), ("V167", central_migration_v167)):
             try:
                 module.install(bot)
                 print(f"✅ {name} Central carregado.", flush=True)
             except Exception as exc:
                 diagnostic(f"central_{name}", exc)
-
         for name, module_name in (("V172", "central_data_v172"), ("V173", "central_data_v173")):
             try:
                 module = __import__(module_name)
@@ -175,7 +153,6 @@ async def lazy_install_central():
                 diagnostic(f"central_{name}", exc)
     except Exception as exc:
         diagnostic("central_imports", exc)
-
     try:
         start = getattr(bot, "start_web_server", None)
         if callable(start):
@@ -192,13 +169,24 @@ async def after_ready():
     lazy_install_secondary()
     await asyncio.sleep(2)
     await lazy_install_central()
-    # O Central também pode carregar extensões legadas; garanta que o lookup
-    # continue sendo o último patch executado no ciclo de bootstrap.
+    # V183 é aplicado por último, depois de TODAS as extensões que podem
+    # substituir o callback da Perícia.
     try:
         import pericia_fix_v181
         pericia_fix_v181.install(bot)
     except Exception as exc:
-        diagnostic("lazy_v181_pericia_post_central", exc)
+        diagnostic("pericia_reapply_v181", exc)
+    try:
+        import pericia_fix_v182
+        pericia_fix_v182.install(bot)
+    except Exception as exc:
+        diagnostic("pericia_v182", exc)
+    try:
+        import pericia_fix_v183
+        pericia_fix_v183.install(bot)
+        print("✅ V183 Perícia aplicado por último — resolução pelo painel/interação ativa.", flush=True)
+    except Exception as exc:
+        diagnostic("pericia_v183", exc)
     trim_cache()
 
 
@@ -207,23 +195,19 @@ async def main():
     token = str(os.getenv("DISCORD_TOKEN") or getattr(bot, "DISCORD_TOKEN", "")).strip()
     if client is None or not token:
         raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
-
     try:
         runtime_safety_v180.install(bot)
     except Exception as exc:
         diagnostic("V180", exc)
     install_guards()
     trim_cache()
-
     try:
         starter = getattr(bot, "_v70_iniciar_health_bootstrap", None)
         if callable(starter):
             starter()
     except Exception as exc:
         diagnostic("V70", exc)
-
     ready_once = False
-
     async def ready_listener():
         nonlocal ready_once
         if ready_once:
@@ -232,10 +216,8 @@ async def main():
         print("✅ DISCORD READY — modo protegido ativo.", flush=True)
         trim_cache()
         asyncio.create_task(after_ready())
-
     client.add_listener(ready_listener, "on_ready")
     await client.start(token, reconnect=True)
-
 
 if __name__ == "__main__":
     try:
