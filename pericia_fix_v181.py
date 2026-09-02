@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """V181 - recuperação robusta dos atendimentos de Perícia.
 
-O fluxo antigo dependia exclusivamente de topico_id/thread_id. Views persistentes
-ou tópicos recriados podem continuar válidos no Discord enquanto o registro salvo
-mantém outro identificador. Este módulo amplia a resolução sem substituir a
-lógica original da perícia.
+Resolve atendimentos tanto pelo tópico/thread quanto pela mensagem do painel,
+que é onde o UserSelect persistente realmente recebe a interação.
 """
 
 import re
 import traceback
-
 
 _FINAL = {"CONCLUIDA_PEGO", "CONCLUIDA_COM_BO", "CONCLUIDA", "FINALIZADA"}
 
@@ -45,15 +42,13 @@ def install(bot_module):
         print("⚠️ V181: funções da Perícia não encontradas; patch não aplicado.", flush=True)
         return False
 
-    if getattr(bot_module, "_V181_PERICIA_PATCHED", False):
-        return True
-
+    # Reaplica sempre a versão atual para sobreviver a módulos legados que
+    # possam ter reinstalado a função depois de uma atualização do processo.
     def robust_lookup(topico_id):
         alvo = _sid(topico_id)
         if not alvo:
             return None
 
-        # 1) Mantém exatamente a resolução original.
         try:
             encontrado = original(topico_id)
             if encontrado:
@@ -69,10 +64,13 @@ def install(bot_module):
         if not isinstance(lista, list):
             return None
 
-        # 2) Tolerância para registros legados que guardaram o ID em outra chave.
+        # O UserSelect é enviado dentro de uma mensagem. Em muitos casos a
+        # interação chega com o ID da mensagem/painel, não com o ID da thread.
         chaves_id = (
-            "topico_id", "thread_id", "atendimento_id", "canal_atendimento_id",
-            "canal_id", "canal_pai_id", "parent_id", "thread_parent_id",
+            "topico_id", "thread_id", "painel_msg_id", "mensagem_painel_id",
+            "mensagem_abertura_id", "mensagem_tarefa_id", "atendimento_id",
+            "canal_atendimento_id", "canal_id", "canal_pai_id", "parent_id",
+            "thread_parent_id",
         )
         for item in reversed(lista):
             if not isinstance(item, dict):
@@ -81,8 +79,8 @@ def install(bot_module):
                 if _sid(item.get(chave)) == alvo:
                     return item
 
-        # 3) Se a interação caiu no canal-pai, só aceita a associação quando
-        # existe um único atendimento ativo naquele pai (evita cruzar perícias).
+        # Se a interação ocorreu no canal-pai, só associa quando há um único
+        # atendimento ativo naquele canal.
         candidatos = []
         for item in lista:
             if not isinstance(item, dict) or not _active(item):
@@ -94,12 +92,11 @@ def install(bot_module):
         if len(candidatos) == 1:
             return candidatos[0]
 
-        # 4) Último recurso: o canal/thread normalmente contém o número da perícia
-        # no nome. Isso recupera views antigas mesmo quando o ID do tópico mudou.
-        guild = getattr(bot_module, "bot", None)
+        # Recuperação por nome do canal/thread + número da perícia.
+        client = getattr(bot_module, "bot", None)
         channel = None
         try:
-            channel = guild.get_channel(int(alvo)) if guild is not None else None
+            channel = client.get_channel(int(alvo)) if client is not None else None
         except Exception:
             channel = None
         numero = _numero_do_texto(getattr(channel, "name", ""))
@@ -120,5 +117,5 @@ def install(bot_module):
 
     bot_module._pericia_por_topico = robust_lookup
     bot_module._V181_PERICIA_PATCHED = True
-    print("✅ V181 Perícia: lookup de atendimento robusto ativo (tópico/thread/pai/número).", flush=True)
+    print("✅ V181 Perícia: lookup por tópico, painel, tarefa, canal-pai e número ativo.", flush=True)
     return True
