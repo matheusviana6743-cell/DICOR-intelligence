@@ -96,13 +96,6 @@ def install_guards():
 
 
 def lazy_install_secondary():
-    # Perícia primeiro: o lookup precisa estar ativo antes das Views persistentes.
-    try:
-        import pericia_fix_v181
-        pericia_fix_v181.install(bot)
-    except Exception as exc:
-        diagnostic("lazy_v181_pericia", exc)
-
     try:
         import dossie_v161
         import dossie_v161_signatures
@@ -143,6 +136,15 @@ def lazy_install_secondary():
     except Exception as exc:
         diagnostic("lazy_v161_renderer", exc)
 
+    # V181 precisa ser o ÚLTIMO patch da Perícia: módulos legados podem
+    # reinstalar funções durante o bootstrap. O painel usa painel_msg_id.
+    try:
+        import pericia_fix_v181
+        pericia_fix_v181.install(bot)
+        print("✅ V181 Perícia reaplicado após todos os módulos legados.", flush=True)
+    except Exception as exc:
+        diagnostic("lazy_v181_pericia_final", exc)
+
 
 async def lazy_install_central():
     try:
@@ -162,8 +164,6 @@ async def lazy_install_central():
             except Exception as exc:
                 diagnostic(f"central_{name}", exc)
 
-        # Módulos de dados antigos continuam sendo carregados isoladamente para
-        # não perder funcionalidades já existentes no bot.
         for name, module_name in (("V172", "central_data_v172"), ("V173", "central_data_v173")):
             try:
                 module = __import__(module_name)
@@ -192,6 +192,13 @@ async def after_ready():
     lazy_install_secondary()
     await asyncio.sleep(2)
     await lazy_install_central()
+    # O Central também pode carregar extensões legadas; garanta que o lookup
+    # continue sendo o último patch executado no ciclo de bootstrap.
+    try:
+        import pericia_fix_v181
+        pericia_fix_v181.install(bot)
+    except Exception as exc:
+        diagnostic("lazy_v181_pericia_post_central", exc)
     trim_cache()
 
 
