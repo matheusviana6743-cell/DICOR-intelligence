@@ -82,11 +82,15 @@ def install_guards():
 
 def lazy_install_secondary():
     try:
-        # V184 precisa entrar ANTES de qualquer reconstrução/registro de Views.
         import stability_v184
         stability_v184.install(bot)
     except Exception as exc:
         diagnostic("pre_ready_v184", exc)
+    try:
+        import pericia_fix_v185
+        pericia_fix_v185.install(bot)
+    except Exception as exc:
+        diagnostic("pre_ready_v185", exc)
 
     try:
         import dossie_v161
@@ -170,12 +174,16 @@ async def after_ready():
     lazy_install_secondary()
     await asyncio.sleep(2)
     await lazy_install_central()
-    # V184 permanece como camada final de contingência após módulos legados.
     try:
         import stability_v184
         stability_v184.install(bot)
     except Exception as exc:
         diagnostic("post_central_v184", exc)
+    try:
+        import pericia_fix_v185
+        pericia_fix_v185.install(bot)
+    except Exception as exc:
+        diagnostic("post_central_v185", exc)
     trim_cache()
 
 
@@ -196,12 +204,16 @@ async def main():
             starter()
     except Exception as exc:
         diagnostic("V70", exc)
-    # CRÍTICO: patch de estabilidade ANTES do primeiro on_ready/V13.
     try:
         import stability_v184
         stability_v184.install(bot)
     except Exception as exc:
         diagnostic("pre_gateway_v184", exc)
+    try:
+        import pericia_fix_v185
+        pericia_fix_v185.install(bot)
+    except Exception as exc:
+        diagnostic("pre_gateway_v185", exc)
     ready_once = False
     async def ready_listener():
         nonlocal ready_once
