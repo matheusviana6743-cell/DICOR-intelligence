@@ -12,6 +12,7 @@ import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
 import interaction_fix_v169
+import central_http_v170
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -47,7 +48,7 @@ def _liberar_porta_http_antes_da_central() -> None:
 
 
 def _instalar_central_web() -> None:
-    """Instala a camada HTTP da Central no contexto do event loop do Discord."""
+    """Instala as camadas da Central sem deixar erro de módulo derrubar o bot."""
     _liberar_porta_http_antes_da_central()
 
     for nome, modulo in (
@@ -64,6 +65,16 @@ def _instalar_central_web() -> None:
             traceback.print_exc()
 
 
+async def _publicar_central_http() -> None:
+    """Publica a aplicação aiohttp registrada pelas camadas V163+ na PORT da Railway."""
+    try:
+        await central_http_v170.start(bot)
+    except Exception as exc:
+        # Falha HTTP nunca pode derrubar o Gateway Discord.
+        print(f'⚠️ V170 boot HTTP isolado: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+
+
 def _instalar_procurados_background() -> None:
     """Instala o módulo de Procurados fora do caminho crítico da porta HTTP."""
     try:
@@ -77,15 +88,16 @@ def _instalar_procurados_background() -> None:
 async def _instalar_extensoes_depois_do_ready():
     await asyncio.sleep(3)
 
-    # A Central precisa nascer no mesmo event loop do Discord. O V162 de
-    # Procurados pode continuar isolado em thread, pois não deve bloquear o
-    # bind da PORT pública da Railway.
     try:
         _instalar_central_web()
     except Exception as exc:
-        print(f'⚠️ Boot HTTP da Central falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+        print(f'⚠️ Boot das camadas da Central falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
         traceback.print_exc()
 
+    # O servidor HTTP precisa estar no mesmo event loop do Discord.
+    await _publicar_central_http()
+
+    # Procurados continua isolado para não bloquear o bind público da Central.
     asyncio.create_task(asyncio.to_thread(_instalar_procurados_background))
 
 
@@ -131,7 +143,6 @@ async def _main() -> None:
     except Exception:
         pass
 
-    # V169 precisa ser aplicado antes de qualquer View persistente ser criada.
     try:
         interaction_fix_v169.install(bot)
     except Exception as exc:
