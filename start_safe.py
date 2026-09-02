@@ -117,6 +117,12 @@ def lazy_install_secondary():
     except Exception as exc:
         diagnostic("lazy_v168", exc)
 
+    try:
+        import pericia_fix_v181
+        pericia_fix_v181.install(bot)
+    except Exception as exc:
+        diagnostic("lazy_v181_pericia", exc)
+
 
 async def lazy_install_central():
     try:
