@@ -1,8 +1,27 @@
 # -*- coding: utf-8 -*-
-import asyncio
-import json
+"""Bootstrap estável do DICOR.
+
+Objetivo: o Gateway do Discord nunca deve cair por causa de módulos web,
+cache excessivo ou tarefas secundárias. A Central é iniciada depois do READY
+em uma etapa isolada.
+"""
 import os
+
+# Reduz fragmentação de memória nativa e paralelismo excessivo de bibliotecas
+# pesadas antes de qualquer import que possa carregar numpy/onnx/opencv.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("ORT_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import asyncio
+import gc
+import json
 import traceback
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,7 +41,13 @@ def _diagnostico_erro(contexto, error):
         data_dir = Path(str(getattr(bot, 'DATA_DIR', Path(__file__).parent / 'data')))
         data_dir.mkdir(parents=True, exist_ok=True)
         caminho = data_dir / 'diagnostico_erros.jsonl'
-        registro = {'timestamp': datetime.now(timezone.utc).isoformat(), 'contexto': str(contexto), 'tipo': type(error).__name__, 'erro': str(error), 'traceback': traceback.format_exc()}
+        registro = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'contexto': str(contexto),
+            'tipo': type(error).__name__,
+            'erro': str(error),
+            'traceback': traceback.format_exc(),
+        }
         with caminho.open('a', encoding='utf-8') as arquivo:
             arquivo.write(json.dumps(registro, ensure_ascii=False) + '\n')
         print(f'🚨 [AUTO-DIAGNOSTICO] {contexto} | {type(error).__name__}: {error}', flush=True)
@@ -30,21 +55,66 @@ def _diagnostico_erro(contexto, error):
         print(f'⚠️ [AUTO-DIAGNOSTICO] falhou ao salvar erro: {type(log_error).__name__}: {log_error}', flush=True)
 
 
+def _limitar_cache_discord():
+    """Mantém somente uma pequena janela de mensagens em RAM.
+
+    O Discord continua funcionando normalmente; histórico completo deve ser
+    obtido sob demanda pelos canais/rotinas específicas, não mantido no cache
+    global do processo.
+    """
+    try:
+        client = getattr(bot, 'bot', None)
+        state = getattr(client, '_connection', None) if client else None
+        mensagens = getattr(state, '_messages', None) if state else None
+        if mensagens is not None:
+            limite = 50
+            state._messages = deque(list(mensagens)[-limite:], maxlen=limite)
+            print(f'✅ CACHE DISCORD limitado a {limite} mensagens.', flush=True)
+    except Exception as exc:
+        _diagnostico_erro('discord_cache_limit', exc)
+
+
+def _manutencao_memoria():
+    try:
+        gc.collect()
+        _limitar_cache_discord()
+    except Exception as exc:
+        _diagnostico_erro('memory_maintenance', exc)
+
+
+def _iniciar_manutenção_memoria():
+    async def _loop():
+        while True:
+            await asyncio.sleep(90)
+            _manutencao_memoria()
+    try:
+        asyncio.create_task(_loop())
+        print('✅ V90 memory governor ativo.', flush=True)
+    except Exception as exc:
+        _diagnostico_erro('memory_governor_start', exc)
+
+
 def _instalar_renderer_visual_v161():
     dossie_v161_signatures.install(dossie_v161, bot)
     dossie_v161.install(bot)
+
     def _render_v161(dados, caminho):
         preparador = getattr(bot, '_v160_preparar_dados_pdf', None)
-        if callable(preparador): dados = preparador(dados)
+        if callable(preparador):
+            dados = preparador(dados)
         return dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
-    if hasattr(bot, '_V159_RENDER_PDF_APROVADO'): bot._V159_RENDER_PDF_APROVADO = _render_v161
-    if hasattr(bot, '_V155_GERAR_PDF_BASE'): bot._V155_GERAR_PDF_BASE = _render_v161
+
+    if hasattr(bot, '_V159_RENDER_PDF_APROVADO'):
+        bot._V159_RENDER_PDF_APROVADO = _render_v161
+    if hasattr(bot, '_V155_GERAR_PDF_BASE'):
+        bot._V155_GERAR_PDF_BASE = _render_v161
     print('V161 visual conectado.', flush=True)
 
 
 def _instalar_guardas_discord():
     client = getattr(bot, 'bot', None)
     tree = getattr(client, 'tree', None) if client else None
+
     async def _tree_error(interaction, error):
         _diagnostico_erro('slash_command', error)
         try:
@@ -54,12 +124,14 @@ def _instalar_guardas_discord():
                 await interaction.followup.send('❌ Erro no comando. O sistema continua online.', ephemeral=True)
         except Exception as response_error:
             _diagnostico_erro('slash_command_response', response_error)
+
     if tree is not None:
         try:
             tree.on_error = _tree_error
             print('✅ COMMAND GUARD + AUTO-DIAGNOSTICO ativo.', flush=True)
         except Exception as exc:
             _diagnostico_erro('command_guard_install', exc)
+
     if client is not None:
         async def _prefix_error(context, error):
             _diagnostico_erro('prefix_command', error)
@@ -67,18 +139,22 @@ def _instalar_guardas_discord():
                 await context.send('❌ Erro no comando. O sistema continua online.')
             except Exception as response_error:
                 _diagnostico_erro('prefix_command_response', response_error)
+
         try:
             client.on_command_error = _prefix_error
         except Exception as exc:
             _diagnostico_erro('prefix_guard_install', exc)
+
         try:
             original_on_error = getattr(client, 'on_error', None)
+
             async def _safe_on_error(event_method, *args, **kwargs):
                 try:
                     if original_on_error is not None:
                         await original_on_error(event_method, *args, **kwargs)
                 except Exception as exc:
                     _diagnostico_erro(f'discord_event:{event_method}', exc)
+
             client.on_error = _safe_on_error
         except Exception as exc:
             _diagnostico_erro('event_guard_install', exc)
@@ -129,7 +205,9 @@ async def _publicar_central_http():
 
 
 async def _instalar_extensoes_depois_do_ready():
-    await asyncio.sleep(3)
+    # Dá tempo para o Gateway estabilizar e para o governor reduzir o cache.
+    await asyncio.sleep(8)
+    _manutencao_memoria()
     try:
         _instalar_central_web()
     except Exception as exc:
@@ -141,12 +219,16 @@ def _registrar_boot_seguro():
     client = getattr(bot, 'bot', None)
     if client is None:
         return
+
     async def _on_ready_extensions():
         if getattr(bot, '_dicor_extensions_started', False):
             return
         bot._dicor_extensions_started = True
-        print('Discord READY — iniciando somente componentes web isolados.', flush=True)
+        print('Discord READY — Gateway protegido; iniciando componentes web isolados.', flush=True)
+        _limitar_cache_discord()
+        _iniciar_manutenção_memoria()
         asyncio.create_task(_instalar_extensoes_depois_do_ready())
+
     try:
         client.add_listener(_on_ready_extensions, 'on_ready')
     except Exception as exc:
@@ -170,17 +252,23 @@ async def _main():
             bot._v70_iniciar_health_bootstrap()
     except Exception as exc:
         _diagnostico_erro('health_bootstrap', exc)
+
     _instalar_guardas_discord()
+
     for nome, modulo in (('V169', interaction_fix_v169), ('V168', central_buttons_rescue_v168)):
         try:
             modulo.install(bot)
         except Exception as exc:
             _diagnostico_erro(nome, exc)
+
     try:
         _instalar_renderer_visual_v161()
     except Exception as exc:
         _diagnostico_erro('V161', exc)
+
     _registrar_boot_seguro()
+    _manutencao_memoria()
+
     client = getattr(bot, 'bot', None)
     token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
     if client is not None and token:
