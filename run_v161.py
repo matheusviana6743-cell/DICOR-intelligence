@@ -46,16 +46,9 @@ def _liberar_porta_http_antes_da_central() -> None:
         traceback.print_exc()
 
 
-def _instalar_extensoes_central() -> None:
-    """Instala a Central somente depois que o Discord estiver conectado."""
+def _instalar_central_web() -> None:
+    """Instala a camada HTTP da Central no contexto do event loop do Discord."""
     _liberar_porta_http_antes_da_central()
-
-    try:
-        procurados_central_v162.install(bot)
-        print('V162 Procurados instalado.', flush=True)
-    except Exception as exc:
-        print(f'V162 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
-        traceback.print_exc()
 
     for nome, modulo in (
         ('V163 Central PF', central_pf_v163),
@@ -71,9 +64,29 @@ def _instalar_extensoes_central() -> None:
             traceback.print_exc()
 
 
+def _instalar_procurados_background() -> None:
+    """Instala o módulo de Procurados fora do caminho crítico da porta HTTP."""
+    try:
+        procurados_central_v162.install(bot)
+        print('V162 Procurados instalado.', flush=True)
+    except Exception as exc:
+        print(f'V162 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+
+
 async def _instalar_extensoes_depois_do_ready():
     await asyncio.sleep(3)
-    await asyncio.to_thread(_instalar_extensoes_central)
+
+    # A Central precisa nascer no mesmo event loop do Discord. O V162 de
+    # Procurados pode continuar isolado em thread, pois não deve bloquear o
+    # bind da PORT pública da Railway.
+    try:
+        _instalar_central_web()
+    except Exception as exc:
+        print(f'⚠️ Boot HTTP da Central falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+
+    asyncio.create_task(asyncio.to_thread(_instalar_procurados_background))
 
 
 def _registrar_boot_seguro() -> None:
@@ -97,7 +110,7 @@ def _registrar_boot_seguro() -> None:
 
 
 async def _bootstrap_discord_direto() -> None:
-    """Bootstrap enxuto: conecta o Gateway diretamente, sem o supervisor legado."""
+    """Bootstrap enxuto: conecta o Gateway Discord diretamente."""
     client = getattr(bot, 'bot', None)
     token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
 
