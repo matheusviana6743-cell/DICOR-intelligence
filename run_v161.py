@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import os
 import traceback
 import bot
 import dossie_v161
@@ -10,7 +11,6 @@ import central_auth_v164
 import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
-
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -33,12 +33,7 @@ def _instalar_renderer_visual_v161() -> None:
 
 
 def _instalar_extensoes_central() -> None:
-    """Instala a Central somente depois que o Discord estiver conectado.
-
-    A inicializacao do bot nao pode depender de leitura de historico, scans de
-    canais ou inicializacao de paginas web. Se uma extensao falhar, o Discord
-    continua online e o erro fica isolado no log.
-    """
+    """Instala a Central somente depois que o Discord estiver conectado."""
     try:
         procurados_central_v162.install(bot)
         print('V162 Procurados instalado.', flush=True)
@@ -61,22 +56,18 @@ def _instalar_extensoes_central() -> None:
 
 
 async def _instalar_extensoes_depois_do_ready():
-    """Espera o READY do Discord e só entao instala os modulos da Central."""
     await asyncio.sleep(3)
     await asyncio.to_thread(_instalar_extensoes_central)
 
 
-
 def _registrar_boot_seguro() -> None:
-    """Registra extensoes pesadas como listener de READY, sem bloquear o boot."""
+    """Registra extensoes pesadas como listener de READY, sem bloquear o gateway."""
     client = getattr(bot, 'bot', None)
     if client is None:
         print('AVISO: objeto Discord nao encontrado; seguindo com bot principal.', flush=True)
         return
 
     async def _on_ready_extensions():
-        # Cada reconexao pode disparar READY novamente. O lock evita instalar
-        # os mesmos patches varias vezes.
         if getattr(bot, '_dicor_extensions_started', False):
             return
         bot._dicor_extensions_started = True
@@ -89,24 +80,60 @@ def _registrar_boot_seguro() -> None:
         print(f'AVISO: nao foi possivel registrar extensoes pos-READY: {exc}', flush=True)
 
 
-if __name__ == '__main__':
+async def _bootstrap_discord_direto() -> None:
+    """Bootstrap enxuto: conecta o Gateway diretamente, sem o supervisor legado.
+
+    O supervisor/runtime antigo podia ficar preso antes do primeiro READY.
+    Para o Discord, o caminho mais seguro e deterministico e usar o Client.start
+    diretamente; as extensoes pesadas continuam isoladas no listener de READY.
+    """
+    client = getattr(bot, 'bot', None)
+    token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
+
+    if client is None:
+        raise RuntimeError('cliente Discord (bot.bot) nao foi encontrado')
+    if not token:
+        raise RuntimeError('DISCORD_TOKEN nao encontrado no ambiente')
+
+    print('[BOOT] cliente Discord encontrado; iniciando Gateway diretamente.', flush=True)
+    print('[BOOT] token presente; aguardando READY do Discord.', flush=True)
+    await client.start(token, reconnect=True)
+
+
+async def _main() -> None:
     try:
         if hasattr(bot, '_v70_iniciar_health_bootstrap'):
             bot._v70_iniciar_health_bootstrap()
     except Exception:
         pass
 
-    # O restaurador de Views precisa ser armado antes do READY para recuperar
-    # os botoes dos paineis antigos assim que o gateway ficar online.
     try:
         central_buttons_rescue_v168.install(bot)
     except Exception as exc:
         print(f'V168 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
         traceback.print_exc()
 
-    # Tudo que for necessario para o Discord iniciar fica fora da Central.
-    # Assim, uma falha de web/migracao nao pode deixar o bot offline.
     _instalar_renderer_visual_v161()
     _registrar_boot_seguro()
 
-    asyncio.run(bot._runtime_lifecycle_entrypoint())
+    # Preferimos o gateway direto. O runtime legado fica apenas como fallback
+    # caso o objeto Client nao exponha start/token de forma compatível.
+    client = getattr(bot, 'bot', None)
+    token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
+    if client is not None and token and callable(getattr(client, 'start', None)):
+        await _bootstrap_discord_direto()
+        return
+
+    print('[BOOT] fallback para runtime_lifecycle_entrypoint.', flush=True)
+    await bot._runtime_lifecycle_entrypoint()
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        print(f'[FATAL] bootstrap do Discord encerrou: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+        raise
