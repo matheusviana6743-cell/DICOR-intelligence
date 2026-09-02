@@ -16,6 +16,7 @@ import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
 import interaction_fix_v169
+import central_data_v172
 
 
 def _diagnostico_erro(contexto, error):
@@ -81,7 +82,7 @@ def _liberar_porta_http_antes_da_central():
 
 def _instalar_central_web():
     _liberar_porta_http_antes_da_central()
-    for nome, modulo in (('V163 Central PF', central_pf_v163), ('V164 autenticação Central', central_auth_v164), ('V165 autenticação Central', central_auth_v165), ('V167 migração Central', central_migration_v167)):
+    for nome, modulo in (('V163 Central PF', central_pf_v163), ('V164 autenticação Central', central_auth_v164), ('V165 autenticação Central', central_auth_v165), ('V167 migração Central', central_migration_v167), ('V172 dados completos da Central', central_data_v172)):
         try:
             modulo.install(bot); print(f'{nome} instalado.', flush=True)
         except Exception as exc:
