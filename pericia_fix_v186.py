@@ -3,8 +3,6 @@
 
 Reassocia o painel existente ao registro e, quando o registro foi perdido,
 reconstrói um registro mínimo a partir do próprio tópico/mensagem do painel.
-O objetivo é permitir que uma Perícia já existente volte a aceitar a escolha
- do responsável sem exigir uma nova Perícia.
 """
 from __future__ import annotations
 
@@ -12,8 +10,6 @@ import re
 import traceback
 from typing import Any, Optional
 
-# Evidência fornecida pelo runtime desta instalação:
-# tópico da Perícia 0026 e mensagem do painel.
 TARGET_TOPIC_ID = 1541978969035771916
 TARGET_PANEL_MESSAGE_ID = 1541979014372139050
 TARGET_NUMBER = "0026"
@@ -112,9 +108,8 @@ def _rebuild_record(bot_module, channel: Any, panel_message: Any, topic_id: str,
     original_id = 0
     try:
         refs = []
-        for msg in [panel_message]:
-            refs.append(getattr(getattr(msg, "reference", None), "message_id", None))
-            original_id = next((int(x) for x in refs if x), 0)
+        refs.append(getattr(getattr(panel_message, "reference", None), "message_id", None))
+        original_id = next((int(x) for x in refs if x), 0)
     except Exception:
         pass
     record = {
@@ -155,15 +150,32 @@ def _resolve_sync(bot_module, interaction: Any, bound_id: str = "") -> Optional[
         rec = _find_record(bot_module, "", "", bound_id)
         if rec:
             return rec
-
     rec = _find_record(bot_module, topic_id, panel_id, number)
     if rec:
         return rec
-
-    # Reparo explícito do atendimento que o usuário informou.
     if topic_id == _sid(TARGET_TOPIC_ID) or panel_id == _sid(TARGET_PANEL_MESSAGE_ID) or _normalize_number(number) == TARGET_NUMBER:
         return _rebuild_record(bot_module, channel, message, topic_id or _sid(TARGET_TOPIC_ID), panel_id or _sid(TARGET_PANEL_MESSAGE_ID))
     return None
+
+
+def _role_name_is_dicor(member: Any) -> bool:
+    """Fallback para instalações onde os IDs de cargo não estão sincronizados.
+    O nome do cargo continua sendo validado estritamente contra a equipe DICOR.
+    """
+    allowed = {
+        "dicor", "estagiario", "estagiário", "investigador", "inspetor",
+        "agente", "agente 1 classe", "agente 2 classe", "agente 3 classe",
+        "escrivao", "escrivão", "delegado", "coordenador",
+    }
+    try:
+        for role in list(getattr(member, "roles", []) or []):
+            name = re.sub(r"\s+", " ", str(getattr(role, "name", "") or "").strip().lower())
+            name = name.replace("º", "").replace("°", "")
+            if name in allowed or ("dicor" in name and "estagi" in name):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def install(bot_module) -> bool:
@@ -172,6 +184,20 @@ def install(bot_module) -> bool:
     if discord is None or cls is None:
         print("⚠️ V186: componentes da Perícia indisponíveis.", flush=True)
         return False
+
+    # Corrige a validação global de equipe para instalações antigas onde os IDs
+    # dos cargos não acompanham os cargos reais do servidor.
+    original_equipe = getattr(bot_module, "usuario_tem_equipe", None)
+    if callable(original_equipe) and not getattr(bot_module, "_V186_EQUIP_PATCHED", False):
+        def usuario_tem_equipe_compat(member):
+            try:
+                if original_equipe(member):
+                    return True
+            except Exception:
+                pass
+            return _role_name_is_dicor(member)
+        bot_module.usuario_tem_equipe = usuario_tem_equipe_compat
+        bot_module._V186_EQUIP_PATCHED = True
 
     async def callback(self, interaction):
         try:
@@ -285,8 +311,7 @@ def install(bot_module) -> bool:
         except Exception as exc:
             print(f"⚠️ V186 reparo automático: {type(exc).__name__}: {exc}", flush=True)
 
-    # exposto para o start_safe disparar após READY
     bot_module._V186_REPAIR_EXISTING_PERICIA = repair_existing
     bot_module._V186_PERICIA_INSTALLED = True
-    print("✅ V186 Perícia instalado — reparo do painel existente 0026 armado.", flush=True)
+    print("✅ V186 Perícia instalado — equipe aceita por ID ou nome de cargo (inclui Estagiário).", flush=True)
     return True
