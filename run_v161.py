@@ -32,8 +32,26 @@ def _instalar_renderer_visual_v161() -> None:
     print('V161 visual conectado.', flush=True)
 
 
+def _liberar_porta_http_antes_da_central() -> None:
+    """Libera o healthcheck provisório antes da Central assumir a PORT da Railway."""
+    parar = getattr(bot, '_v70_parar_health_bootstrap_sync', None)
+    if not callable(parar):
+        return
+    try:
+        parar()
+        print('✅ V70 healthcheck provisório encerrado; PORT liberada para a Central.', flush=True)
+    except Exception as exc:
+        print(f'⚠️ V70 não conseguiu liberar a PORT para a Central: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+
+
 def _instalar_extensoes_central() -> None:
     """Instala a Central somente depois que o Discord estiver conectado."""
+    # O V70 usa a mesma PORT pública da Railway como healthcheck de bootstrap.
+    # Antes do V163 iniciar o servidor aiohttp da Central, precisamos liberar
+    # essa porta para evitar "Address already in use" e o domínio ficar sem resposta.
+    _liberar_porta_http_antes_da_central()
+
     try:
         procurados_central_v162.install(bot)
         print('V162 Procurados instalado.', flush=True)
