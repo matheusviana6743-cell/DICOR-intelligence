@@ -11,6 +11,7 @@ import central_auth_v164
 import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
+import interaction_fix_v169
 
 
 def _instalar_renderer_visual_v161() -> None:
@@ -47,9 +48,6 @@ def _liberar_porta_http_antes_da_central() -> None:
 
 def _instalar_extensoes_central() -> None:
     """Instala a Central somente depois que o Discord estiver conectado."""
-    # O V70 usa a mesma PORT pública da Railway como healthcheck de bootstrap.
-    # Antes do V163 iniciar o servidor aiohttp da Central, precisamos liberar
-    # essa porta para evitar "Address already in use" e o domínio ficar sem resposta.
     _liberar_porta_http_antes_da_central()
 
     try:
@@ -99,12 +97,7 @@ def _registrar_boot_seguro() -> None:
 
 
 async def _bootstrap_discord_direto() -> None:
-    """Bootstrap enxuto: conecta o Gateway diretamente, sem o supervisor legado.
-
-    O supervisor/runtime antigo podia ficar preso antes do primeiro READY.
-    Para o Discord, o caminho mais seguro e deterministico e usar o Client.start
-    diretamente; as extensoes pesadas continuam isoladas no listener de READY.
-    """
+    """Bootstrap enxuto: conecta o Gateway diretamente, sem o supervisor legado."""
     client = getattr(bot, 'bot', None)
     token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
 
@@ -125,6 +118,13 @@ async def _main() -> None:
     except Exception:
         pass
 
+    # V169 precisa ser aplicado antes de qualquer View persistente ser criada.
+    try:
+        interaction_fix_v169.install(bot)
+    except Exception as exc:
+        print(f'⚠️ V169 falhou sem derrubar o Discord: {type(exc).__name__}: {exc}', flush=True)
+        traceback.print_exc()
+
     try:
         central_buttons_rescue_v168.install(bot)
     except Exception as exc:
@@ -134,8 +134,6 @@ async def _main() -> None:
     _instalar_renderer_visual_v161()
     _registrar_boot_seguro()
 
-    # Preferimos o gateway direto. O runtime legado fica apenas como fallback
-    # caso o objeto Client nao exponha start/token de forma compatível.
     client = getattr(bot, 'bot', None)
     token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
     if client is not None and token and callable(getattr(client, 'start', None)):
