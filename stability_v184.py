@@ -41,10 +41,14 @@ def _number_from_message(message: Any) -> str:
     except Exception:
         pass
     text = " ".join(parts)
-    for pattern in (
+    patterns = (
         r"PER[IÍ]CIA(?:\s+EXTERNA)?\s*(?:N[º°O.]|NÚMERO|NUMERO)?\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
         r"N[º°O.]?\s*(?:DA\s+)?PER[IÍ]CIA\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
-    ):
+        # Recuperação de painéis antigos cujo nome do canal era algo como
+        # pericia-123, pericia-externa-123 ou atendimento-pericia-123.
+        r"(?:PER[IÍ]CIA|PER[IÍ]CIA-EXTERNA|ATENDIMENTO[-_ ]?PER[IÍ]CIA)[^0-9]{0,20}([0-9]{1,8})",
+    )
+    for pattern in patterns:
         match = re.search(pattern, text, flags=re.I)
         if match:
             return re.sub(r"\s+", "", match.group(1)).strip("-/: ")
@@ -97,8 +101,7 @@ def install(bot_module) -> bool:
         return None
 
     def resolve(interaction: Any, bound_id: Any = None) -> Optional[dict]:
-        # 0. Registro vinculado diretamente à View/Select. Este é o caminho
-        # principal para painéis novos e elimina a dependência do channel_id.
+        # 0. Registro vinculado diretamente à View/Select.
         record = find_by_id(bound_id)
         if record:
             return record
@@ -106,20 +109,9 @@ def install(bot_module) -> bool:
         message = getattr(interaction, "message", None)
         mid = _sid(getattr(message, "id", None))
         channel_ids = _channel_ids(interaction)
-
-        official = getattr(bot_module, "_pericia_por_topico", None)
-        if callable(official):
-            for cid in channel_ids:
-                try:
-                    record = official(cid)
-                    if isinstance(record, dict):
-                        return record
-                except Exception:
-                    pass
-
         data = records()
 
-        # 1. IDs de mensagens salvos no atendimento.
+        # 1. Mensagem do painel/abertura/origem.
         if mid:
             keys = {
                 "painel_msg_id", "mensagem_painel_id", "mensagem_tarefa_id",
@@ -129,17 +121,17 @@ def install(bot_module) -> bool:
                 if any(_sid(record.get(key)) == mid for key in keys):
                     return record
 
-        # 2. Canal/tópico e pais.
+        # 2. Canal/tópico/thread e seus pais.
         keys = {
             "topico_id", "thread_id", "canal_atendimento_id", "canal_id",
-            "canal_pai_id", "parent_id", "thread_parent_id", "atendimento_canal_id",
+            "atendimento_canal_id",
         }
         for cid in channel_ids:
             for record in reversed(data):
                 if any(_sid(record.get(key)) == cid for key in keys):
                     return record
 
-        # 3. Número exibido no painel.
+        # 3. Número exibido no painel ou no nome do canal.
         number = _number_from_message(message)
         if number:
             normalize = getattr(bot_module, "_pericia_numero_chave", None)
@@ -155,6 +147,23 @@ def install(bot_module) -> bool:
             if len(matches) == 1:
                 return matches[0]
 
+        # 4. Recuperação de perícias antigas: se o tópico perdeu o topico_id,
+        # usa o canal pai + atendimento ativo. Só aceita quando for inequívoco.
+        parents = set(channel_ids[1:])
+        if parents:
+            matches = []
+            for record in data:
+                if not _active(record):
+                    continue
+                rel = {
+                    _sid(record.get("canal_pai_id")),
+                    _sid(record.get("parent_id")),
+                    _sid(record.get("thread_parent_id")),
+                }
+                if parents.intersection(rel):
+                    matches.append(record)
+            if len(matches) == 1:
+                return matches[0]
         return None
 
     async def callback(self, interaction):
@@ -180,7 +189,8 @@ def install(bot_module) -> bool:
                 ids = ",".join(_channel_ids(interaction)) or "sem-id"
                 print(
                     f"⚠️ V184 Perícia: atendimento não localizado; registro={bound_id or 'sem-vinculo'}; "
-                    f"canais={ids}; mensagem={_sid(getattr(getattr(interaction, 'message', None), 'id', None))}",
+                    f"canais={ids}; mensagem={_sid(getattr(getattr(interaction, 'message', None), 'id', None))}; "
+                    f"numero={_number_from_message(getattr(interaction, 'message', None)) or 'sem-numero'}",
                     flush=True,
                 )
                 return await reply("❌ Não foi possível localizar o atendimento desta perícia. Abra uma nova atualização do painel para continuar.")
@@ -248,11 +258,10 @@ def install(bot_module) -> bool:
             traceback.print_exc()
             await reply("❌ Não foi possível concluir a atribuição desta perícia. O bot continua online.")
 
+    # Painéis NOVOS usam este callback.
     cls.callback = callback
 
-    # Cada painel novo recebe o registro no próprio objeto da View/Select.
-    # Assim, mesmo que o canal/thread tenha sido alterado, o dropdown sabe
-    # exatamente qual atendimento deve atualizar.
+    # Cada painel novo recebe o registro no próprio Select.
     if view_cls is not None and not getattr(view_cls, "_dicor_v184_init_patched", False):
         original_init = view_cls.__init__
 
@@ -267,14 +276,17 @@ def install(bot_module) -> bool:
         view_cls.__init__ = patched_init
         view_cls._dicor_v184_init_patched = True
 
-    # Corrige Views persistentes que já estavam registradas.
+    # PAINÉIS ANTIGOS: o callback real do objeto persistente precisa ser
+    # substituído. Reatribuir item.callback para ele mesmo não faz nada.
     client = getattr(bot_module, "bot", None)
     corrigidos = 0
     try:
         stores = [getattr(client, "persistent_views", None)]
         connection = getattr(client, "_connection", None)
-        stores.append(getattr(connection, "_view_store", None))
-        stores.append(getattr(client, "_view_store", None))
+        stores.extend([
+            getattr(connection, "_view_store", None),
+            getattr(client, "_view_store", None),
+        ])
         seen = set()
         for store in stores:
             if store is None:
@@ -286,14 +298,13 @@ def install(bot_module) -> bool:
                     continue
                 seen.add(id(view))
                 for item in list(getattr(view, "children", []) or []):
-                    if isinstance(item, cls) or str(getattr(item, "custom_id", "") or "").startswith("dicor_pericia_selecionar_agente"):
-                        wrapped = getattr(item, "callback", None)
-                        if callable(wrapped):
-                            item.callback = wrapped
+                    cid = str(getattr(item, "custom_id", "") or "")
+                    if isinstance(item, cls) or cid.startswith("dicor_pericia_selecionar_agente"):
+                        item.callback = callback
                         corrigidos += 1
     except Exception:
         traceback.print_exc()
 
     bot_module._V184_STABILITY_INSTALLED = True
-    print(f"✅ V184 Perícia: vínculo direto registro→dropdown ativo; {corrigidos} controles persistentes verificados.", flush=True)
+    print(f"✅ V184 Perícia: vínculo direto + recuperação de painéis antigos ativo; {corrigidos} controles persistentes corrigidos.", flush=True)
     return True
