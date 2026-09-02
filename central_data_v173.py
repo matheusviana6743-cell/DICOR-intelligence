@@ -1,65 +1,77 @@
 # -*- coding: utf-8 -*-
-"""V173 - bridge leve entre os sincronizadores Discord e a Central V163."""
+"""V173 — ponte segura de dados para a Central oficial.
+
+Importante: este módulo NÃO inicializa tarefas, NÃO registra novas rotas e
+NÃO altera o layout/auth da Central. O Discord/bot deve continuar iniciando
+mesmo que os dados da Central estejam indisponíveis.
+"""
 from __future__ import annotations
-import asyncio
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+def _load_json(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"⚠️ V173: não foi possível ler {path.name}: {exc}", flush=True)
+        return None
+
+
+def _as_records(value: Any, kind: str) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        value = value.get(kind, value.get("records", []))
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def install(bot_module) -> None:
-    state = getattr(bot_module, "_v172_central_state", None)
-    if not isinstance(state, dict):
-        return
-
-    # Captura as fontes instaladas antes do bridge.
-    wanted_source = getattr(bot_module, "_v43_procurados_ativos", None)
-    boletins_source = getattr(bot_module, "_v44_boletins_ativos_snapshot", None)
-
-    def wanted():
-        # V171 e o snapshot V172 continuam sendo as fontes reais.
-        if callable(wanted_source):
-            try:
-                data = wanted_source() or []
-                if data:
-                    return list(data)
-            except Exception:
-                pass
-        data = state.get("procurados", [])
-        return list(data) if isinstance(data, list) else []
-
-    def boletins():
-        if callable(boletins_source):
-            try:
-                data = boletins_source() or []
-                if data:
-                    return list(data)
-            except Exception:
-                pass
-        data = state.get("boletins", [])
-        return list(data) if isinstance(data, list) else []
-
-    bot_module._v43_procurados_ativos = wanted
-    bot_module._v44_boletins_ativos_snapshot = boletins
-    bot_module._v173_central_bridge = True
-
-    async def refresh():
-        # Garante que o primeiro sync do Gateway tenha tempo de terminar.
-        for delay in (2, 5, 10, 20, 40):
-            await asyncio.sleep(delay)
-            try:
-                if callable(wanted_source):
-                    data = wanted_source() or []
-                    if data:
-                        state["procurados"] = list(data)
-                if callable(boletins_source):
-                    data = boletins_source() or []
-                    if data:
-                        state["boletins"] = list(data)
-            except Exception as exc:
-                print(f"⚠️ V173 bridge: {type(exc).__name__}: {exc}", flush=True)
-        print(f"✅ V173 bridge ativo: {len(wanted())} procurados / {len(boletins())} boletins.", flush=True)
-
+    """Expõe dados persistidos sem interferir no boot do bot."""
     try:
-        asyncio.create_task(refresh())
-    except Exception as exc:
-        print(f"⚠️ V173: refresh não iniciado: {type(exc).__name__}: {exc}", flush=True)
+        state = getattr(bot_module, "_v172_central_state", None)
+        if not isinstance(state, dict):
+            print("ℹ️ V173: estado V172 ainda indisponível; Central segue com fallback.", flush=True)
+            return
 
-    print("✅ V173 bridge instalado — Central V163 permanece como layout oficial.", flush=True)
+        data_dir = Path(str(getattr(bot_module, "DATA_DIR", Path(__file__).parent / "data")))
+        archive = _load_json(data_dir / "central_discord_archive.json") or {}
+        cache = _load_json(data_dir / "central_dados_v172.json") or {}
+
+        for kind in ("procurados", "boletins", "pericias"):
+            current = _as_records(state.get(kind, []), kind)
+            cached = _as_records(cache.get(kind, []), kind)
+            historical = _as_records(archive.get(kind, []), kind)
+
+            # Prioriza dados atuais; usa cache/histórico somente como complemento.
+            merged: List[Dict[str, Any]] = []
+            seen = set()
+            for item in current + cached + historical:
+                key = str(item.get("message_id") or item.get("id") or item.get("mensagem_url") or "")
+                if not key:
+                    key = repr(sorted(item.items()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+
+            state[kind] = merged
+
+        # Providers consumidos pela Central V163, sem substituir suas rotas.
+        bot_module._v43_procurados_ativos = lambda: list(state.get("procurados", []))
+        bot_module._v44_boletins_ativos_snapshot = lambda: list(state.get("boletins", []))
+        bot_module._v173_central_data_state = state
+        print(
+            "✅ V173: dados conectados à Central oficial "
+            f"(procurados={len(state.get('procurados', []))}, "
+            f"boletins={len(state.get('boletins', []))}, "
+            f"pericias={len(state.get('pericias', []))}).",
+            flush=True,
+        )
+    except Exception as exc:
+        # Falha da Central jamais pode derrubar o Discord.
+        print(f"⚠️ V173 desativado por segurança: {exc}", flush=True)
