@@ -44,8 +44,6 @@ def _number_from_message(message: Any) -> str:
     patterns = (
         r"PER[IÍ]CIA(?:\s+EXTERNA)?\s*(?:N[º°O.]|NÚMERO|NUMERO)?\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
         r"N[º°O.]?\s*(?:DA\s+)?PER[IÍ]CIA\s*[:#-]?\s*([0-9]{1,8}(?:\s*[-/]\s*[0-9]{2,4})?)",
-        # Recuperação de painéis antigos cujo nome do canal era algo como
-        # pericia-123, pericia-externa-123 ou atendimento-pericia-123.
         r"(?:PER[IÍ]CIA|PER[IÍ]CIA-EXTERNA|ATENDIMENTO[-_ ]?PER[IÍ]CIA)[^0-9]{0,20}([0-9]{1,8})",
     )
     for pattern in patterns:
@@ -101,7 +99,6 @@ def install(bot_module) -> bool:
         return None
 
     def resolve(interaction: Any, bound_id: Any = None) -> Optional[dict]:
-        # 0. Registro vinculado diretamente à View/Select.
         record = find_by_id(bound_id)
         if record:
             return record
@@ -111,7 +108,6 @@ def install(bot_module) -> bool:
         channel_ids = _channel_ids(interaction)
         data = records()
 
-        # 1. Mensagem do painel/abertura/origem.
         if mid:
             keys = {
                 "painel_msg_id", "mensagem_painel_id", "mensagem_tarefa_id",
@@ -121,7 +117,6 @@ def install(bot_module) -> bool:
                 if any(_sid(record.get(key)) == mid for key in keys):
                     return record
 
-        # 2. Canal/tópico/thread e seus pais.
         keys = {
             "topico_id", "thread_id", "canal_atendimento_id", "canal_id",
             "atendimento_canal_id",
@@ -131,7 +126,6 @@ def install(bot_module) -> bool:
                 if any(_sid(record.get(key)) == cid for key in keys):
                     return record
 
-        # 3. Número exibido no painel ou no nome do canal.
         number = _number_from_message(message)
         if number:
             normalize = getattr(bot_module, "_pericia_numero_chave", None)
@@ -147,8 +141,6 @@ def install(bot_module) -> bool:
             if len(matches) == 1:
                 return matches[0]
 
-        # 4. Recuperação de perícias antigas: se o tópico perdeu o topico_id,
-        # usa o canal pai + atendimento ativo. Só aceita quando for inequívoco.
         parents = set(channel_ids[1:])
         if parents:
             matches = []
@@ -193,14 +185,16 @@ def install(bot_module) -> bool:
                     f"numero={_number_from_message(getattr(interaction, 'message', None)) or 'sem-numero'}",
                     flush=True,
                 )
-                return await reply("❌ Não foi possível localizar o atendimento desta perícia. Abra uma nova atualização do painel para continuar.")
+                return await reply("❌ Não foi possível localizar o atendimento desta perícia.")
 
             finais = getattr(bot_module, "_PERICIA_STATUS_FINAIS", set())
             if str(registro.get("status") or "").upper() in finais:
                 return await reply("⚠️ Esta perícia já foi concluída.")
 
             escolhido = self.values[0] if self.values else None
-            if interaction.guild and escolhido is not None and not isinstance(escolhido, discord.Member):
+            if escolhido is None:
+                return await reply("❌ Selecione um agente válido.")
+            if interaction.guild and not isinstance(escolhido, discord.Member):
                 try:
                     escolhido = interaction.guild.get_member(int(escolhido.id)) or await interaction.guild.fetch_member(int(escolhido.id))
                 except Exception:
@@ -220,9 +214,12 @@ def install(bot_module) -> bool:
                 "agente_escolhido_em": getattr(bot_module, "agora_br", lambda: "")(),
                 "status": "AGUARDANDO_BO" if str(registro.get("status") or "").upper() == "AGUARDANDO_BO" else "PENDENTE",
             })
+
             atualizar = getattr(bot_module, "_pericia_atualizar", None)
             if callable(atualizar):
-                await asyncio.to_thread(atualizar, registro)
+                resultado = atualizar(registro)
+                if hasattr(resultado, "__await__"):
+                    await resultado
 
             obter_topico = getattr(bot_module, "_pericia_obter_topico", None)
             topico = await obter_topico(registro) if callable(obter_topico) else None
@@ -243,25 +240,27 @@ def install(bot_module) -> bool:
             atualizar_painel = getattr(bot_module, "_pericia_atualizar_painel", None)
             if callable(atualizar_painel):
                 try:
-                    await atualizar_painel(registro)
+                    resultado = atualizar_painel(registro)
+                    if hasattr(resultado, "__await__"):
+                        await resultado
                 except Exception:
-                    pass
+                    traceback.print_exc()
 
             await reply(f"✅ {escolhido.mention} foi definido como responsável pela Perícia Nº **{registro.get('numero')}**.")
             log = getattr(bot_module, "enviar_log", None)
             if callable(log):
                 try:
-                    await log(f"👤 Responsável da Perícia `{registro.get('numero')}` definido: {escolhido.mention} por {interaction.user.mention}.")
+                    resultado = log(f"👤 Responsável da Perícia `{registro.get('numero')}` definido: {escolhido.mention} por {interaction.user.mention}.")
+                    if hasattr(resultado, "__await__"):
+                        await resultado
                 except Exception:
                     pass
-        except Exception:
+        except Exception as exc:
             traceback.print_exc()
-            await reply("❌ Não foi possível concluir a atribuição desta perícia. O bot continua online.")
+            await reply(f"❌ Ocorreu um erro ao processar a perícia. ({type(exc).__name__})")
 
-    # Painéis NOVOS usam este callback.
     cls.callback = callback
 
-    # Cada painel novo recebe o registro no próprio Select.
     if view_cls is not None and not getattr(view_cls, "_dicor_v184_init_patched", False):
         original_init = view_cls.__init__
 
@@ -276,8 +275,6 @@ def install(bot_module) -> bool:
         view_cls.__init__ = patched_init
         view_cls._dicor_v184_init_patched = True
 
-    # PAINÉIS ANTIGOS: o callback real do objeto persistente precisa ser
-    # substituído. Reatribuir item.callback para ele mesmo não faz nada.
     client = getattr(bot_module, "bot", None)
     corrigidos = 0
     try:
@@ -300,7 +297,7 @@ def install(bot_module) -> bool:
                 for item in list(getattr(view, "children", []) or []):
                     cid = str(getattr(item, "custom_id", "") or "")
                     if isinstance(item, cls) or cid.startswith("dicor_pericia_selecionar_agente"):
-                        item.callback = callback
+                        item.callback = callback.__get__(item, item.__class__)
                         corrigidos += 1
     except Exception:
         traceback.print_exc()
