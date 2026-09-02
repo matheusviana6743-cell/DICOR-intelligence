@@ -81,12 +81,13 @@ def install_guards():
 
 
 def lazy_install_secondary():
-    modules = (
-        ("dossie", "dossie_v161", "dossie_v161_signatures"),
-        ("procurados", "procurados_central_v162", None),
-        ("v169", "interaction_fix_v169", None),
-        ("v168", "central_buttons_rescue_v168", None),
-    )
+    try:
+        # V184 precisa entrar ANTES de qualquer reconstrução/registro de Views.
+        import stability_v184
+        stability_v184.install(bot)
+    except Exception as exc:
+        diagnostic("pre_ready_v184", exc)
+
     try:
         import dossie_v161
         import dossie_v161_signatures
@@ -169,24 +170,12 @@ async def after_ready():
     lazy_install_secondary()
     await asyncio.sleep(2)
     await lazy_install_central()
-    # V183 é aplicado por último, depois de TODAS as extensões que podem
-    # substituir o callback da Perícia.
+    # V184 permanece como camada final de contingência após módulos legados.
     try:
-        import pericia_fix_v181
-        pericia_fix_v181.install(bot)
+        import stability_v184
+        stability_v184.install(bot)
     except Exception as exc:
-        diagnostic("pericia_reapply_v181", exc)
-    try:
-        import pericia_fix_v182
-        pericia_fix_v182.install(bot)
-    except Exception as exc:
-        diagnostic("pericia_v182", exc)
-    try:
-        import pericia_fix_v183
-        pericia_fix_v183.install(bot)
-        print("✅ V183 Perícia aplicado por último — resolução pelo painel/interação ativa.", flush=True)
-    except Exception as exc:
-        diagnostic("pericia_v183", exc)
+        diagnostic("post_central_v184", exc)
     trim_cache()
 
 
@@ -207,6 +196,12 @@ async def main():
             starter()
     except Exception as exc:
         diagnostic("V70", exc)
+    # CRÍTICO: patch de estabilidade ANTES do primeiro on_ready/V13.
+    try:
+        import stability_v184
+        stability_v184.install(bot)
+    except Exception as exc:
+        diagnostic("pre_gateway_v184", exc)
     ready_once = False
     async def ready_listener():
         nonlocal ready_once
