@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import json
 import os
 import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
 import bot
 import dossie_v161
 import dossie_v161_signatures
@@ -12,6 +16,26 @@ import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
 import interaction_fix_v169
+
+
+def _diagnostico_erro(contexto, error):
+    """Registra erros com contexto suficiente para análise posterior sem derrubar o bot."""
+    try:
+        data_dir = Path(str(getattr(bot, 'DATA_DIR', Path(__file__).parent / 'data')))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        caminho = data_dir / 'diagnostico_erros.jsonl'
+        registro = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'contexto': str(contexto),
+            'tipo': type(error).__name__,
+            'erro': str(error),
+            'traceback': traceback.format_exc(),
+        }
+        with caminho.open('a', encoding='utf-8') as arquivo:
+            arquivo.write(json.dumps(registro, ensure_ascii=False) + '\n')
+        print(f'🚨 [AUTO-DIAGNOSTICO] {contexto} | {type(error).__name__}: {error}', flush=True)
+    except Exception as log_error:
+        print(f'⚠️ [AUTO-DIAGNOSTICO] falhou ao salvar erro: {type(log_error).__name__}: {log_error}', flush=True)
 
 
 def _instalar_renderer_visual_v161():
@@ -32,32 +56,51 @@ def _instalar_renderer_visual_v161():
 def _instalar_guardas_discord():
     client = getattr(bot, 'bot', None)
     tree = getattr(client, 'tree', None) if client else None
+
     async def _tree_error(interaction, error):
-        print(f'⚠️ [COMMAND GUARD] {type(error).__name__}: {error}', flush=True)
+        _diagnostico_erro('slash_command', error)
         try:
             if interaction.response and not interaction.response.is_done():
                 await interaction.response.send_message('❌ Erro no comando. O sistema continua online.', ephemeral=True)
-            elif interaction.followup:
+            else:
                 await interaction.followup.send('❌ Erro no comando. O sistema continua online.', ephemeral=True)
-        except Exception:
-            pass
+        except Exception as response_error:
+            _diagnostico_erro('slash_command_response', response_error)
+
     if tree is not None:
         try:
             tree.on_error = _tree_error
-            print('✅ COMMAND GUARD ativo.', flush=True)
+            print('✅ COMMAND GUARD + AUTO-DIAGNOSTICO ativo.', flush=True)
         except Exception as exc:
-            print(f'⚠️ COMMAND GUARD: {type(exc).__name__}: {exc}', flush=True)
+            _diagnostico_erro('command_guard_install', exc)
+
     if client is not None:
         async def _prefix_error(context, error):
-            print(f'⚠️ [PREFIX GUARD] {type(error).__name__}: {error}', flush=True)
+            _diagnostico_erro('prefix_command', error)
             try:
                 await context.send('❌ Erro no comando. O sistema continua online.')
-            except Exception:
-                pass
+            except Exception as response_error:
+                _diagnostico_erro('prefix_command_response', response_error)
         try:
             client.on_command_error = _prefix_error
-        except Exception:
-            pass
+        except Exception as exc:
+            _diagnostico_erro('prefix_guard_install', exc)
+
+    if client is not None:
+        async def _event_error(event_method, *args, **kwargs):
+            _diagnostico_erro(f'event:{event_method}', kwargs.get('error') or RuntimeError('erro de evento não detalhado'))
+        try:
+            if hasattr(client, 'on_error'):
+                original_on_error = getattr(client, 'on_error', None)
+                async def _safe_on_error(event_method, *args, **kwargs):
+                    try:
+                        if original_on_error is not None:
+                            await original_on_error(event_method, *args, **kwargs)
+                    except Exception as exc:
+                        _diagnostico_erro(f'discord_event:{event_method}', exc)
+                client.on_error = _safe_on_error
+        except Exception as exc:
+            _diagnostico_erro('event_guard_install', exc)
 
 
 def _liberar_porta_http_antes_da_central():
@@ -67,7 +110,7 @@ def _liberar_porta_http_antes_da_central():
             parar()
             print('✅ V70 healthcheck provisório encerrado; PORT liberada para a Central.', flush=True)
         except Exception as exc:
-            print(f'⚠️ V70 não conseguiu liberar a PORT: {type(exc).__name__}: {exc}', flush=True)
+            _diagnostico_erro('release_health_port', exc)
 
 
 def _instalar_central_web():
@@ -82,27 +125,28 @@ def _instalar_central_web():
             modulo.install(bot)
             print(f'{nome} instalado.', flush=True)
         except Exception as exc:
+            _diagnostico_erro(nome, exc)
             print(f'⚠️ {nome} falhou isoladamente: {type(exc).__name__}: {exc}', flush=True)
-            traceback.print_exc()
 
 
 async def _publicar_central_http():
-    """Usa o servidor web consolidado do bot; não cria um segundo AppRunner."""
     start = getattr(bot, 'start_web_server', None)
     if not callable(start):
-        print('❌ CENTRAL: start_web_server ausente.', flush=True)
+        erro = RuntimeError('start_web_server ausente')
+        _diagnostico_erro('central_http_missing', erro)
         return False
     try:
         await start()
         runner = getattr(bot, '_WEB_RUNNER_DICOR', None)
         if runner is None:
-            print('⚠️ CENTRAL: servidor não registrou _WEB_RUNNER_DICOR.', flush=True)
+            erro = RuntimeError('Central iniciou sem registrar _WEB_RUNNER_DICOR')
+            _diagnostico_erro('central_http_runner_missing', erro)
             return False
         print(f'✅ CENTRAL DICOR REATIVADA — porta {getattr(bot, "PORT", os.getenv("PORT", "8000"))} — dados existentes preservados.', flush=True)
         return True
     except Exception as exc:
+        _diagnostico_erro('central_http', exc)
         print(f'❌ CENTRAL HTTP isolada: {type(exc).__name__}: {exc}', flush=True)
-        traceback.print_exc()
         return False
 
 
@@ -111,8 +155,8 @@ def _instalar_procurados_background():
         procurados_central_v162.install(bot)
         print('V162 Procurados instalado.', flush=True)
     except Exception as exc:
+        _diagnostico_erro('V162 Procurados', exc)
         print(f'V162 falhou isoladamente: {type(exc).__name__}: {exc}', flush=True)
-        traceback.print_exc()
 
 
 async def _instalar_extensoes_depois_do_ready():
@@ -120,8 +164,7 @@ async def _instalar_extensoes_depois_do_ready():
     try:
         _instalar_central_web()
     except Exception as exc:
-        print(f'⚠️ Boot Central isolado: {type(exc).__name__}: {exc}', flush=True)
-        traceback.print_exc()
+        _diagnostico_erro('boot_central', exc)
     await _publicar_central_http()
     asyncio.create_task(asyncio.to_thread(_instalar_procurados_background))
 
@@ -139,7 +182,7 @@ def _registrar_boot_seguro():
     try:
         client.add_listener(_on_ready_extensions, 'on_ready')
     except Exception as exc:
-        print(f'⚠️ Listener Central: {type(exc).__name__}: {exc}', flush=True)
+        _diagnostico_erro('ready_listener', exc)
 
 
 async def _bootstrap_discord_direto():
@@ -157,18 +200,21 @@ async def _main():
     try:
         if hasattr(bot, '_v70_iniciar_health_bootstrap'):
             bot._v70_iniciar_health_bootstrap()
-    except Exception:
-        pass
+    except Exception as exc:
+        _diagnostico_erro('health_bootstrap', exc)
     _instalar_guardas_discord()
     try:
         interaction_fix_v169.install(bot)
     except Exception as exc:
-        print(f'⚠️ V169 isolado: {type(exc).__name__}: {exc}', flush=True)
+        _diagnostico_erro('V169', exc)
     try:
         central_buttons_rescue_v168.install(bot)
     except Exception as exc:
-        print(f'⚠️ V168 isolado: {type(exc).__name__}: {exc}', flush=True)
-    _instalar_renderer_visual_v161()
+        _diagnostico_erro('V168', exc)
+    try:
+        _instalar_renderer_visual_v161()
+    except Exception as exc:
+        _diagnostico_erro('V161', exc)
     _registrar_boot_seguro()
     client = getattr(bot, 'bot', None)
     token = str(os.getenv('DISCORD_TOKEN') or getattr(bot, 'DISCORD_TOKEN', '') or '').strip()
@@ -185,6 +231,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     except Exception as exc:
+        _diagnostico_erro('fatal_bootstrap', exc)
         print(f'[FATAL] bootstrap encerrou: {type(exc).__name__}: {exc}', flush=True)
-        traceback.print_exc()
         raise
