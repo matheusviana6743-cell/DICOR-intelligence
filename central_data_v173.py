@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""V173 - enriquecimento final da Central usando o arquivo histórico migrado."""
+"""V173 — dados enriquecidos sem substituir o layout oficial da Central.
+
+V172 continua responsável pela coleta/indexação. Este módulo só enriquece os
+registros com o arquivo histórico e, no final, restaura a camada visual oficial
+V163 + autenticação V164/V165. Nada aqui cria mensagens ou altera o Discord.
+"""
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import re
 from pathlib import Path
@@ -14,16 +18,15 @@ def install(bot_module) -> None:
     state = getattr(bot_module, "_v172_central_state", None)
     if not isinstance(state, dict):
         return
+
     data_dir = Path(str(getattr(bot_module, "DATA_DIR", Path(__file__).parent / "data")))
     archive_path = data_dir / "central_discord_archive.json"
+    cache_path = data_dir / "central_dados_v172.json"
 
     def norm(v: Any) -> str:
         s = str(v or "").casefold()
         s = re.sub(r"[^a-z0-9áàâãéèêíìîóòôõúùûç]+", " ", s)
         return " ".join(s.split())
-
-    def esc(v: Any) -> str:
-        return html.escape(str(v or ""), quote=True)
 
     def archive() -> Dict[str, Any]:
         try:
@@ -51,14 +54,15 @@ def install(bot_module) -> None:
                 for key in ("title", "description"):
                     if e.get(key):
                         parts.append(str(e[key]))
-                fields = e.get("fields", [])
-                if isinstance(fields, list):
-                    for f in fields:
-                        if not isinstance(f, dict):
-                            continue
-                        n, v = str(f.get("name") or "").strip(), str(f.get("value") or "").strip()
-                        if n and v: parts.append(f"{n}: {v}")
-                        elif v: parts.append(v)
+                for f in e.get("fields", []) if isinstance(e.get("fields", []), list) else []:
+                    if not isinstance(f, dict):
+                        continue
+                    n = str(f.get("name") or "").strip()
+                    v = str(f.get("value") or "").strip()
+                    if n and v:
+                        parts.append(f"{n}: {v}")
+                    elif v:
+                        parts.append(v)
         return "\n".join(parts).strip()
 
     def field(r: Dict[str, Any], aliases: Iterable[str]) -> str:
@@ -66,43 +70,49 @@ def install(bot_module) -> None:
         embeds = r.get("embeds", [])
         if isinstance(embeds, list):
             for e in embeds:
-                if not isinstance(e, dict): continue
+                if not isinstance(e, dict):
+                    continue
                 fs = e.get("fields", [])
-                if isinstance(fs, list):
-                    for f in fs:
-                        if not isinstance(f, dict): continue
-                        name = norm(f.get("name")); value = str(f.get("value") or "").strip()
-                        if value and any(a in name or name in a for a in wanted): return value
+                if not isinstance(fs, list):
+                    continue
+                for f in fs:
+                    if not isinstance(f, dict):
+                        continue
+                    name = norm(f.get("name"))
+                    value = str(f.get("value") or "").strip()
+                    if value and any(a == name or a in name or name in a for a in wanted):
+                        return value
         for line in str(r.get("content") or "").splitlines():
-            if ":" not in line: continue
+            if ":" not in line:
+                continue
             n, v = line.split(":", 1)
             nn = norm(n)
-            if v.strip() and any(a in nn or nn in a for a in wanted): return v.strip()
+            if v.strip() and any(a == nn or a in nn or nn in a for a in wanted):
+                return v.strip()
         return ""
 
     def images(r: Dict[str, Any]) -> List[str]:
         out: List[str] = []
-        ats = r.get("attachments", [])
-        if isinstance(ats, list):
-            for a in ats:
-                if not isinstance(a, dict): continue
-                url = str(a.get("source_url") or a.get("url") or "").strip()
-                fn = str(a.get("filename") or "").lower()
-                ct = str(a.get("content_type") or "").lower()
-                if url and (ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))) and url not in out: out.append(url)
-        embeds = r.get("embeds", [])
-        if isinstance(embeds, list):
-            for e in embeds:
-                if not isinstance(e, dict): continue
-                for k in ("image", "thumbnail"):
-                    obj = e.get(k)
-                    if isinstance(obj, dict):
-                        url = str(obj.get("url") or "").strip()
-                        if url and url not in out: out.append(url)
+        for a in r.get("attachments", []) if isinstance(r.get("attachments", []), list) else []:
+            if not isinstance(a, dict):
+                continue
+            url = str(a.get("source_url") or a.get("url") or "").strip()
+            fn = str(a.get("filename") or "").lower()
+            ct = str(a.get("content_type") or "").lower()
+            if url and (ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))) and url not in out:
+                out.append(url)
+        for e in r.get("embeds", []) if isinstance(r.get("embeds", []), list) else []:
+            if not isinstance(e, dict):
+                continue
+            for key in ("image", "thumbnail"):
+                obj = e.get(key)
+                if isinstance(obj, dict):
+                    url = str(obj.get("url") or "").strip()
+                    if url and url not in out:
+                        out.append(url)
         return out
 
     def convert(r: Dict[str, Any], kind: str) -> Dict[str, Any]:
-        text = embed_text(r)
         return {
             "tipo": kind,
             "mensagem_id": int(r.get("message_id") or 0),
@@ -113,7 +123,7 @@ def install(bot_module) -> None:
             "descricao": field(r, ("descrição", "descricao", "detalhes", "observações", "observacoes", "resumo")),
             "local": field(r, ("local", "localização", "localizacao", "último avistamento", "ultimo avistamento", "endereço", "endereco")),
             "numero_boletim": field(r, ("número do boletim", "numero do boletim", "boletim", "protocolo", "bo", "nº")),
-            "texto_discord": text,
+            "texto_discord": embed_text(r),
             "fotos": images(r),
             "autor": str(r.get("author_name") or r.get("author") or "Não informado"),
             "autor_id": int(r.get("author_id") or 0),
@@ -121,40 +131,66 @@ def install(bot_module) -> None:
             "canal": str(r.get("channel_name") or ""),
         }
 
+    def merge(current: List[Dict[str, Any]], historical: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for x in historical + current:
+            if not isinstance(x, dict):
+                continue
+            mid = str(x.get("mensagem_id") or x.get("message_id") or "")
+            key = mid if mid and mid != "0" else str(hash(json.dumps(x, ensure_ascii=False, default=str)))
+            if key not in by_id:
+                by_id[key] = dict(x)
+            else:
+                old = by_id[key]
+                for k, v in x.items():
+                    if v not in ("", [], None, "Não informado"):
+                        old[k] = v
+        return list(by_id.values())
+
     def enrich() -> None:
         arc = archive()
-        if not arc: return
-        # Migração histórica: preserva dados ricos mesmo que o novo snapshot só tenha a foto.
-        hist_w = [convert(r, "procurado") for r in records("procurados")]
-        hist_b = [convert(r, "boletim") for r in records("boletins")]
-        hist_p = [convert(r, "pericia") for r in records("pericias")]
-
-        def merge(current: List[Dict[str, Any]], historical: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            by_id: Dict[str, Dict[str, Any]] = {}
-            for x in historical + current:
-                mid = str(x.get("mensagem_id") or "")
-                key = mid if mid and mid != "0" else str(hash(json.dumps(x, ensure_ascii=False, default=str)))
-                if key not in by_id: by_id[key] = dict(x)
-                else:
-                    old = by_id[key]; old.update({k:v for k,v in x.items() if v not in ("", [], None, "Não informado")})
-            return list(by_id.values())
-
-        state["procurados"] = merge(state.get("procurados", []), hist_w)
-        state["boletins"] = merge(state.get("boletins", []), hist_b)
-        state["pericias"] = merge(state.get("pericias", []), hist_p)
-        print(f"✅ V173 Central: histórico enriquecido — {len(state['procurados'])} procurados, {len(state['boletins'])} boletins, {len(state['pericias'])} perícias.", flush=True)
+        if arc:
+            state["procurados"] = merge(state.get("procurados", []), [convert(r, "procurado") for r in records("procurados")])
+            state["boletins"] = merge(state.get("boletins", []), [convert(r, "boletim") for r in records("boletins")])
+            state["pericias"] = merge(state.get("pericias", []), [convert(r, "pericia") for r in records("pericias")])
+        # V163 consulta estes providers. Assim os dados do V172 entram no layout oficial.
+        bot_module._v43_procurados_ativos = lambda: list(state.get("procurados", []))
+        bot_module._v44_boletins_ativos_snapshot = lambda: list(state.get("boletins", []))
+        try:
+            payload = {k: v for k, v in state.items() if k != "task"}
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            tmp.replace(cache_path)
+        except Exception:
+            pass
+        print(f"✅ V173 Central: {len(state.get('procurados', []))} procurados, {len(state.get('boletins', []))} boletins, {len(state.get('pericias', []))} perícias enriquecidos.", flush=True)
 
     enrich()
+
+    # V172 criou páginas experimentais e acabou substituindo o layout oficial V163.
+    # Restaura V163 no final do pipeline, sem mexer no Discord.
+    try:
+        import central_pf_v163
+        central_pf_v163.install(bot_module)
+        try:
+            import central_auth_v164
+            central_auth_v164.install(bot_module)
+        except Exception as exc:
+            print(f"⚠️ V173: autenticação V164 preservada parcialmente: {type(exc).__name__}: {exc}", flush=True)
+        try:
+            import central_auth_v165
+            central_auth_v165.install(bot_module)
+        except Exception as exc:
+            print(f"⚠️ V173: autenticação V165 preservada parcialmente: {type(exc).__name__}: {exc}", flush=True)
+        print("✅ V173: layout oficial V163 restaurado; dados V172/V173 conectados.", flush=True)
+    except Exception as exc:
+        print(f"❌ V173: não foi possível restaurar V163: {type(exc).__name__}: {exc}", flush=True)
+
     client = bot_module.bot
 
     async def on_ready():
-        await asyncio.sleep(1)
+        await asyncio.sleep(4)
         enrich()
 
     if hasattr(client, "add_listener"):
         client.add_listener(on_ready, "on_ready")
-
-    # Rotas estratégicas: caso versões anteriores não tenham exposto aliases, o V172 fornece as páginas.
-    for target, source in (("central_fichas_http", "central_fichas_http"), ("fichas_pagina_http", "central_fichas_http"), ("central_arvore_http", "central_arvore_http"), ("arvore_pagina_http", "central_arvore_http")):
-        if hasattr(bot_module, source):
-            setattr(bot_module, target, getattr(bot_module, source))
