@@ -15,6 +15,7 @@ API_KEY = os.getenv("FIVEMANAGE_API_KEY", "").strip()
 TIMEOUT = max(5, int(os.getenv("FIVEMANAGE_TIMEOUT_SECONDS", "20") or 20))
 MAX_BYTES = max(1, int(os.getenv("FIVEMANAGE_MAX_BYTES", str(25 * 1024 * 1024)) or 25 * 1024 * 1024))
 CONCURRENCY = max(1, min(4, int(os.getenv("FIVEMANAGE_CONCURRENCY", "2") or 2)))
+MEDIA_CHANNEL_ID = int(os.getenv("DICOR_MEDIA_CHANNEL_ID", "1529596208857878608") or 1529596208857878608)
 CACHE_NAME = "fivemanage_uploads_v1.json"
 LOCAL_DIR = "fivemanage_backup_local"
 _ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
@@ -163,29 +164,54 @@ async def install(bot_module: Any) -> None:
     async def worker(message: Any) -> None:
         if getattr(message.author, "bot", False):
             return
+
         channel = getattr(message, "channel", None)
-        name = str(getattr(channel, "name", "") or "").lower()
-        relevant_words = ("procurad", "boletim", "pericia", "perícia", "ficha", "evid", "mesa", "investig")
-        allowed_env = {x.strip() for x in os.getenv("DICOR_MEDIA_CHANNEL_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
-        channel_id = str(getattr(channel, "id", "") or "")
-        relevant = channel_id in allowed_env or any(word in name for word in relevant_words)
-        if not relevant:
+        channel_id = int(getattr(channel, "id", 0) or 0)
+
+        # ESTE É O ÚNICO CANAL QUE ATIVA O BACKUP AUTOMÁTICO.
+        if channel_id != MEDIA_CHANNEL_ID:
             return
-        for attachment in list(getattr(message, "attachments", []) or []):
-            if not _is_image(attachment):
-                continue
-            async with sem:
+
+        attachments = [a for a in list(getattr(message, "attachments", []) or []) if _is_image(a)]
+        if not attachments:
+            return
+
+        links: list[str] = []
+        falhas: list[str] = []
+        async with sem:
+            for attachment in attachments:
                 result = await upload_attachment(
                     bot_module,
                     attachment,
                     message_id=getattr(message, "id", None),
                     channel_id=channel_id,
-                    metadata={"guild_id": str(getattr(getattr(message, "guild", None), "id", "") or ""), "channel_name": name},
+                    metadata={
+                        "guild_id": str(getattr(getattr(message, "guild", None), "id", "") or ""),
+                        "channel_id": str(channel_id),
+                    },
                 )
-            if result.get("external_url"):
-                print(f"✅ [MEDIA] {result['filename']} -> Fivemanage", flush=True)
-            elif result.get("erro"):
-                print(f"⚠️ [MEDIA] {result['filename']}: {result['erro']}", flush=True)
+                if result.get("external_url"):
+                    links.append(str(result["external_url"]))
+                    print(f"✅ [MEDIA] {result['filename']} -> Fivemanage", flush=True)
+                elif result.get("erro"):
+                    falhas.append(f"{result['filename']}: {result['erro']}")
+                    print(f"⚠️ [MEDIA] {result['filename']}: {result['erro']}", flush=True)
+
+        if links:
+            texto = "✅ **Backup da(s) foto(s) concluído**\n\n" + "\n".join(f"🔗 {url}" for url in links)
+            try:
+                await message.reply(texto, mention_author=False)
+            except Exception:
+                try:
+                    await channel.send(texto)
+                except Exception:
+                    pass
+
+        if falhas and not links:
+            try:
+                await message.reply("⚠️ Não foi possível gerar o link permanente agora. A cópia local foi preservada e o erro foi registrado.", mention_author=False)
+            except Exception:
+                pass
 
     async def on_message(message: Any) -> None:
         try:
@@ -197,4 +223,4 @@ async def install(bot_module: Any) -> None:
     bot_module.enviar_para_fivemanage_v1 = upload_attachment
     bot_module.resolver_midia_v1 = resolver_midia
     bot_module._DICOR_FIVEMANAGE_INSTALLED = True
-    print("✅ [MEDIA] backup permanente de imagens ativo", flush=True)
+    print(f"✅ [MEDIA] backup permanente ativo no canal {MEDIA_CHANNEL_ID}", flush=True)
