@@ -172,6 +172,11 @@ async def install_new_integrations():
     except Exception as exc:
         diagnostic("gestao_movimentacoes", exc)
     try:
+        import gestao_v2
+        await gestao_v2.install(bot)
+    except Exception as exc:
+        diagnostic("gestao_v2", exc)
+    try:
         import fivemanage_media
         await fivemanage_media.install(bot)
     except Exception as exc:
@@ -201,7 +206,6 @@ async def after_ready():
         repair = getattr(bot, "_V186_REPAIR_EXISTING_PERICIA", None)
         client = getattr(bot, "bot", None)
         topic = client.get_channel(1541978969035771916) if client is not None else None
-        # Nunca tente editar uma thread arquivada automaticamente.
         if callable(repair) and not bool(getattr(topic, "archived", False)):
             await repair()
         elif topic is not None and bool(getattr(topic, "archived", False)):
