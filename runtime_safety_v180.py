@@ -1,114 +1,97 @@
 # -*- coding: utf-8 -*-
-"""V180.1 - proteção de RAM do runtime Discord.
-
-Mantém a lógica dos comandos intacta e reduz somente caches recriáveis.
-"""
-import asyncio
-import gc
-import logging
+"""V187 - estabilidade de RAM/event-loop sem alterar comandos."""
+from __future__ import annotations
+import asyncio, gc, os
 from collections import deque
 
-LOG = logging.getLogger("dicor.runtime")
+_MAX_RSS_MB=int(os.getenv('DICOR_MAX_RSS_MB','760') or 760)
+_watchdog=None
+_installed=False
 
-
-def _set_message_cache(client, limit=5):
+def _rss_mb():
     try:
-        state = getattr(client, "_connection", None)
-        if state is None:
-            return
-        try:
-            state.max_messages = limit
-        except Exception:
-            pass
-        messages = getattr(state, "_messages", None)
-        if messages is not None:
-            try:
-                state._messages = deque(list(messages)[-limit:], maxlen=limit)
-            except Exception:
-                state._messages = deque(maxlen=limit)
-    except Exception as exc:
-        print(f"[V180] cache protection failed: {type(exc).__name__}: {exc}", flush=True)
+        with open('/proc/self/status',encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('VmRSS:'): return float(line.split()[1])/1024
+    except Exception: pass
+    return 0.0
 
-
-def _set_member_cache_minimal(client):
+def _cache(client):
     try:
-        discord = __import__("discord")
-        flags_cls = getattr(discord, "MemberCacheFlags", None)
-        state = getattr(client, "_connection", None)
-        if flags_cls is None or state is None:
-            return
-        state.member_cache_flags = flags_cls.none()
-    except Exception as exc:
-        print(f"[V180] member cache minimal failed: {type(exc).__name__}: {exc}", flush=True)
+        state=getattr(client,'_connection',None)
+        if state is None:return
+        state.max_messages=5
+        msgs=getattr(state,'_messages',None)
+        if msgs is not None: state._messages=deque(list(msgs)[-5:],maxlen=5)
+    except Exception: pass
 
+def _heavy(name):
+    s=str(name or '').lower()
+    return any(x in s for x in ('snapshot','ocr','visual','catalog','catalogo','auditoria','prisional','background','v75-startup','startup-escalonado','sincroniza','reconcilia'))
 
-def _trim_recreatable_caches(client):
+async def _watch(client):
+    global _watchdog
     try:
-        _set_message_cache(client, 5)
-        gc.collect()
-    except Exception as exc:
-        print(f"[V180] trim failed: {type(exc).__name__}: {exc}", flush=True)
+        while True:
+            await asyncio.sleep(20)
+            _cache(client); gc.collect()
+            rss=_rss_mb()
+            if rss and rss>=_MAX_RSS_MB:
+                n=0; cur=asyncio.current_task()
+                for t in list(asyncio.all_tasks()):
+                    if t is cur or t.done() or t.cancelled(): continue
+                    try:name=t.get_name()
+                    except Exception:name=''
+                    if _heavy(name): t.cancel(); n+=1
+                gc.collect()
+                print(f'⚠️ V187 RAM alta: {rss:.1f} MB; {n} tarefa(s) pesada(s) interrompida(s).',flush=True)
+    except asyncio.CancelledError: raise
+    except Exception as e:
+        print(f'⚠️ V187 watchdog: {type(e).__name__}: {e}',flush=True)
+        _watchdog=None
 
-
-def _task_done(task):
-    try:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            print(f"[V180] tarefa secundária encerrada com erro: {type(exc).__name__}: {exc}", flush=True)
-    except Exception:
-        pass
-
+def _ready(client):
+    global _watchdog
+    if _watchdog is not None and not _watchdog.done(): return
+    try:_watchdog=asyncio.create_task(_watch(client),name='v187-memory-watchdog')
+    except Exception: pass
 
 def install(bot_module):
-    client = getattr(bot_module, "bot", None)
-    if client is None:
-        return
-
-    # Aplicado antes do Gateway para evitar o pico inicial de RAM.
-    _set_message_cache(client, 5)
-    _set_member_cache_minimal(client)
-
+    global _installed
+    client=getattr(bot_module,'bot',None)
+    if client is None:return
+    _cache(client)
     try:
-        loop = asyncio.get_event_loop()
-        old_handler = loop.get_exception_handler()
-
-        def _handler(current_loop, context):
-            exc = context.get("exception")
-            if exc is not None:
-                print(f"[V180] exceção assíncrona isolada: {type(exc).__name__}: {exc}", flush=True)
-            else:
-                print(f"[V180] evento assíncrono isolado: {context.get('message', 'sem mensagem')}", flush=True)
-            if old_handler is not None:
-                try:
-                    old_handler(current_loop, context)
-                except Exception:
-                    pass
-
-        loop.set_exception_handler(_handler)
-    except Exception as exc:
-        print(f"[V180] event loop guard failed: {type(exc).__name__}: {exc}", flush=True)
-
-    def safe_create_task(coro, *, name=None):
+        loop=asyncio.get_event_loop(); old=loop.get_exception_handler()
+        def handler(lp,ctx):
+            exc=ctx.get('exception')
+            if exc: print(f'⚠️ V187 async: {type(exc).__name__}: {exc}',flush=True)
+            if old:
+                try: old(lp,ctx)
+                except Exception: pass
+        loop.set_exception_handler(handler)
+    except Exception: pass
+    if not _installed:
+        try: client.add_listener(lambda:_ready(client),'on_ready')
+        except Exception: pass
+        _installed=True
+    def safe_create_task(coro,*,name=None):
         try:
-            task = asyncio.create_task(coro, name=name)
-            task.add_done_callback(_task_done)
-            return task
-        except Exception as exc:
-            print(f"[V180] create_task bloqueado: {type(exc).__name__}: {exc}", flush=True)
-            try:
-                coro.close()
-            except Exception:
-                pass
+            desired=str(name or '')
+            if desired and _heavy(desired):
+                for t in asyncio.all_tasks():
+                    if t.done() or t.cancelled(): continue
+                    try: tn=t.get_name()
+                    except Exception: tn=''
+                    if tn==desired:
+                        try:coro.close()
+                        except Exception:pass
+                        return t
+            return asyncio.create_task(coro,name=desired or None)
+        except Exception:
+            try:coro.close()
+            except Exception:pass
             return None
-
-    bot_module._v180_safe_create_task = safe_create_task
-    bot_module._v180_trim_message_cache = lambda: _trim_recreatable_caches(client)
-
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    print("✅ V180.1 RAM: cache de mensagens=5 + member cache mínimo + GC ativo.", flush=True)
+    bot_module._v180_safe_create_task=safe_create_task
+    bot_module._v180_trim_message_cache=lambda:_cache(client)
+    print(f'✅ V187 runtime safety ativo — RAM limite={_MAX_RSS_MB} MB, cache=5.',flush=True)
