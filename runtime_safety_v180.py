@@ -1,97 +1,139 @@
 # -*- coding: utf-8 -*-
-"""V187 - estabilidade de RAM/event-loop sem alterar comandos."""
+"""V188 — runtime minimo e estavel."""
 from __future__ import annotations
-import asyncio, gc, os
+import asyncio
+import gc
+import os
 from collections import deque
 
-_MAX_RSS_MB=int(os.getenv('DICOR_MAX_RSS_MB','760') or 760)
-_watchdog=None
-_installed=False
+MAX_RSS_MB = int(os.getenv("DICOR_MAX_RSS_MB", "640") or 640)
+_watchdog = None
+_installed = False
+_patched = False
+
 
 def _rss_mb():
     try:
-        with open('/proc/self/status',encoding='utf-8') as f:
-            for line in f:
-                if line.startswith('VmRSS:'): return float(line.split()[1])/1024
-    except Exception: pass
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
     return 0.0
 
-def _cache(client):
-    try:
-        state=getattr(client,'_connection',None)
-        if state is None:return
-        state.max_messages=5
-        msgs=getattr(state,'_messages',None)
-        if msgs is not None: state._messages=deque(list(msgs)[-5:],maxlen=5)
-    except Exception: pass
 
-def _heavy(name):
-    s=str(name or '').lower()
-    return any(x in s for x in ('snapshot','ocr','visual','catalog','catalogo','auditoria','prisional','background','v75-startup','startup-escalonado','sincroniza','reconcilia'))
+def _trim(client):
+    try:
+        state = getattr(client, "_connection", None)
+        if state is not None:
+            state.max_messages = 5
+            messages = getattr(state, "_messages", None)
+            if messages is not None:
+                state._messages = deque(list(messages)[-5:], maxlen=5)
+    except Exception:
+        pass
+
+
+def _is_heavy(name):
+    value = str(name or "").lower()
+    return any(key in value for key in (
+        "snapshot", "ocr", "visual", "catalog", "catalogo", "auditoria",
+        "prisional", "v75-startup", "startup-escalonado", "sincroniza", "reconcilia"
+    ))
+
+
+def _disable_v75(bot_module):
+    global _patched
+    if _patched:
+        return
+    original = getattr(bot_module, "_v75_startup_escalonado", None)
+    if not callable(original):
+        return
+
+    async def minimal_startup():
+        _trim(getattr(bot_module, "bot", None))
+        gc.collect()
+
+    bot_module._V75_STARTUP_ORIGINAL = original
+    bot_module._v75_startup_escalonado = minimal_startup
+    _patched = True
+
 
 async def _watch(client):
     global _watchdog
     try:
         while True:
-            await asyncio.sleep(20)
-            _cache(client); gc.collect()
-            rss=_rss_mb()
-            if rss and rss>=_MAX_RSS_MB:
-                n=0; cur=asyncio.current_task()
-                for t in list(asyncio.all_tasks()):
-                    if t is cur or t.done() or t.cancelled(): continue
-                    try:name=t.get_name()
-                    except Exception:name=''
-                    if _heavy(name): t.cancel(); n+=1
+            await asyncio.sleep(15)
+            _trim(client)
+            gc.collect()
+            rss = _rss_mb()
+            if rss and rss >= MAX_RSS_MB:
+                current = asyncio.current_task()
+                for task in list(asyncio.all_tasks()):
+                    if task is current or task.done() or task.cancelled():
+                        continue
+                    try:
+                        name = task.get_name()
+                    except Exception:
+                        name = ""
+                    if _is_heavy(name):
+                        task.cancel()
                 gc.collect()
-                print(f'⚠️ V187 RAM alta: {rss:.1f} MB; {n} tarefa(s) pesada(s) interrompida(s).',flush=True)
-    except asyncio.CancelledError: raise
-    except Exception as e:
-        print(f'⚠️ V187 watchdog: {type(e).__name__}: {e}',flush=True)
-        _watchdog=None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _watchdog = None
 
-def _ready(client):
+
+def _start_watchdog(client):
     global _watchdog
-    if _watchdog is not None and not _watchdog.done(): return
-    try:_watchdog=asyncio.create_task(_watch(client),name='v187-memory-watchdog')
-    except Exception: pass
+    if _watchdog is not None and not _watchdog.done():
+        return
+    try:
+        _watchdog = asyncio.create_task(_watch(client), name="v188-memory-watchdog")
+    except Exception:
+        pass
+
+
+def _safe_create_task(coro, *, name=None):
+    try:
+        wanted = str(name or "")
+        if wanted and _is_heavy(wanted):
+            for task in asyncio.all_tasks():
+                if task.done() or task.cancelled():
+                    continue
+                try:
+                    if task.get_name() == wanted:
+                        coro.close()
+                        return task
+                except Exception:
+                    pass
+        return asyncio.create_task(coro, name=wanted or None)
+    except Exception:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return None
+
 
 def install(bot_module):
     global _installed
-    client=getattr(bot_module,'bot',None)
-    if client is None:return
-    _cache(client)
-    try:
-        loop=asyncio.get_event_loop(); old=loop.get_exception_handler()
-        def handler(lp,ctx):
-            exc=ctx.get('exception')
-            if exc: print(f'⚠️ V187 async: {type(exc).__name__}: {exc}',flush=True)
-            if old:
-                try: old(lp,ctx)
-                except Exception: pass
-        loop.set_exception_handler(handler)
-    except Exception: pass
+    client = getattr(bot_module, "bot", None)
+    if client is None:
+        return
+
+    _trim(client)
+    _disable_v75(bot_module)
+
     if not _installed:
-        try: client.add_listener(lambda:_ready(client),'on_ready')
-        except Exception: pass
-        _installed=True
-    def safe_create_task(coro,*,name=None):
         try:
-            desired=str(name or '')
-            if desired and _heavy(desired):
-                for t in asyncio.all_tasks():
-                    if t.done() or t.cancelled(): continue
-                    try: tn=t.get_name()
-                    except Exception: tn=''
-                    if tn==desired:
-                        try:coro.close()
-                        except Exception:pass
-                        return t
-            return asyncio.create_task(coro,name=desired or None)
+            client.add_listener(lambda: _start_watchdog(client), "on_ready")
         except Exception:
-            try:coro.close()
-            except Exception:pass
-            return None
-    bot_module._v180_safe_create_task=safe_create_task
-    bot_module._v180_trim_message_cache=lambda:_cache(client)
-    print(f'✅ V187 runtime safety ativo — RAM limite={_MAX_RSS_MB} MB, cache=5.',flush=True)
+            pass
+        _installed = True
+
+    bot_module._v180_safe_create_task = _safe_create_task
+    bot_module._v188_runtime_minimal = True
+    print("✅ V188 runtime mínimo ativo — startup pesado V75 desativado.", flush=True)
