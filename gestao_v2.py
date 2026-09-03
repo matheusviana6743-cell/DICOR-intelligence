@@ -8,6 +8,8 @@ import re
 import unicodedata
 from typing import Any, Optional
 
+import discord
+
 PANEL_MARKER = "<!-- DICOR_GESTAO_V2 -->"
 PANEL_NAMES = {"criterios-de-up", "criterios de up", "gestao", "gestao-dicor", "gestão-dicor"}
 MANAGED_RANKS = ("estagiario", "investigador", "inspetor")
@@ -39,10 +41,7 @@ def _rank(role: Any) -> str:
 
 
 def _find_rank_role(guild: Any, rank: str) -> Optional[Any]:
-    candidates = []
-    for role in list(getattr(guild, "roles", []) or []):
-        if _rank(role) == rank:
-            candidates.append(role)
+    candidates = [role for role in list(getattr(guild, "roles", []) or []) if _rank(role) == rank]
     return max(candidates, key=lambda r: int(getattr(r, "position", 0) or 0), default=None)
 
 
@@ -67,13 +66,20 @@ def _managed_roles(member: Any) -> list[Any]:
 
 async def _refresh_hierarchy(bot_module: Any, guild: Any) -> None:
     try:
-        for name in ("enviar_hierarquia_substituindo_anterior", "atualizar_hierarquia", "publicar_hierarquia", "rebuild_hierarquia", "atualizar_painel_hierarquia"):
+        for name in (
+            "enviar_hierarquia_substituindo_anterior",
+            "atualizar_hierarquia",
+            "publicar_hierarquia",
+            "rebuild_hierarquia",
+            "atualizar_painel_hierarquia",
+        ):
             fn = getattr(bot_module, name, None)
             if not callable(fn):
                 continue
             result = fn()
             if inspect.isawaitable(result):
                 await result
+            print("✅ [HIERARQUIA] painel atualizado após alteração de cargo.", flush=True)
             return
     except Exception as exc:
         print(f"⚠️ [HIERARQUIA] atualização falhou: {type(exc).__name__}: {exc}", flush=True)
@@ -83,9 +89,11 @@ def _schedule_hierarchy_refresh(bot_module: Any, guild: Any) -> None:
     global _REFRESH_TASK
     if _REFRESH_TASK and not _REFRESH_TASK.done():
         return
+
     async def runner() -> None:
         await asyncio.sleep(0.4)
         await _refresh_hierarchy(bot_module, guild)
+
     _REFRESH_TASK = asyncio.create_task(runner(), name="dicor-hierarchy-refresh")
 
 
@@ -115,22 +123,36 @@ async def _do_change(interaction: Any, action: str, target_member: Any, bot_modu
     try:
         async with _CHANGE_LOCK:
             old_managed = _managed_roles(target_member)
-            new_roles = [r for r in list(getattr(target_member, "roles", []) or []) if r not in old_managed and getattr(r, "name", "") != "@everyone"]
+            new_roles = [
+                r for r in list(getattr(target_member, "roles", []) or [])
+                if r not in old_managed and getattr(r, "name", "") != "@everyone"
+            ]
             new_roles.append(after_role)
             await target_member.edit(roles=new_roles, reason=f"DICOR Gestão: {label} por {interaction.user}")
             _schedule_hierarchy_refresh(bot_module, guild)
-        await interaction.response.send_message(f"✅ {target_member.mention} atualizado: **{before_role.name} → {after_role.name}**.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ {target_member.mention} atualizado: **{before_role.name} → {after_role.name}**.",
+            ephemeral=True,
+        )
     except Exception as exc:
         try:
-            await interaction.response.send_message(f"❌ Não foi possível alterar o cargo: {type(exc).__name__}.", ephemeral=True)
+            await interaction.response.send_message(
+                f"❌ Não foi possível alterar o cargo: {type(exc).__name__}.",
+                ephemeral=True,
+            )
         except Exception:
             pass
         print(f"⚠️ [GESTAO V2] alteração falhou: {type(exc).__name__}: {exc}", flush=True)
 
 
-class _MemberSelect(__import__("discord").ui.UserSelect):
+class _MemberSelect(discord.ui.UserSelect):
     def __init__(self, action: str):
-        super().__init__(placeholder="Selecione o membro…", min_values=1, max_values=1, custom_id=f"dicor:gestao:v2:select:{action}")
+        super().__init__(
+            placeholder="Selecione o membro…",
+            min_values=1,
+            max_values=1,
+            custom_id=f"dicor:gestao:v2:select:{action}",
+        )
         self.action = action
 
     async def callback(self, interaction: Any) -> None:
@@ -150,13 +172,50 @@ class _MemberSelect(__import__("discord").ui.UserSelect):
             print(f"⚠️ [GESTAO V2] select: {type(exc).__name__}: {exc}", flush=True)
 
 
-class _SelectView(__import__("discord").ui.View):
+class _SelectView(discord.ui.View):
     def __init__(self, action: str):
         super().__init__(timeout=180)
         self.add_item(_MemberSelect(action))
 
 
-class GestaoV2Painel(__import__("discord").ui.View):
+class _RetirarView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(_RetirarSelect())
+
+
+class _RetirarSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Selecione o membro para retirar…",
+            min_values=1,
+            max_values=1,
+            custom_id="dicor:gestao:v2:select:retirar",
+        )
+
+    async def callback(self, interaction: Any) -> None:
+        try:
+            member = self.values[0]
+            old_view = getattr(_BOT_MODULE, "V141SelecionarMembroView", None)
+            if callable(old_view):
+                await interaction.response.edit_message(view=None)
+                await interaction.followup.send(
+                    "Selecione novamente para concluir a retirada pela rotina oficial da DICOR.",
+                    view=old_view("retirar"),
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message("❌ Rotina oficial de retirada não disponível.", ephemeral=True)
+        except Exception as exc:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Não foi possível abrir a retirada.", ephemeral=True)
+            except Exception:
+                pass
+            print(f"⚠️ [GESTAO V2] retirar select: {type(exc).__name__}: {exc}", flush=True)
+
+
+class GestaoV2Painel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -164,47 +223,115 @@ class GestaoV2Painel(__import__("discord").ui.View):
         if _manager(getattr(interaction, "user", None), _BOT_MODULE):
             return True
         try:
-            await interaction.response.send_message("❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.",
+                ephemeral=True,
+            )
         except Exception:
             pass
         return False
 
-    @__import__("discord").ui.button(label="Estagiário → Investigador", emoji="⬆️", style=__import__("discord").ButtonStyle.success, custom_id="dicor:gestao:v2:promover:estagiario", row=0)
+    @discord.ui.button(
+        label="Estagiário → Investigador",
+        emoji="⬆️",
+        style=discord.ButtonStyle.success,
+        custom_id="dicor:gestao:v2:promover:estagiario",
+        row=0,
+    )
     async def promover_estagiario(self, interaction: Any, _: Any) -> None:
-        await interaction.response.send_message("Selecione o **Estagiário** que será promovido:", view=_SelectView("promover_estagiario"), ephemeral=True)
+        await interaction.response.send_message(
+            "Selecione o **Estagiário** que será promovido:",
+            view=_SelectView("promover_estagiario"),
+            ephemeral=True,
+        )
 
-    @__import__("discord").ui.button(label="Investigador → Inspetor", emoji="⬆️", style=__import__("discord").ButtonStyle.success, custom_id="dicor:gestao:v2:promover:investigador", row=0)
+    @discord.ui.button(
+        label="Investigador → Inspetor",
+        emoji="⬆️",
+        style=discord.ButtonStyle.success,
+        custom_id="dicor:gestao:v2:promover:investigador",
+        row=0,
+    )
     async def promover_investigador(self, interaction: Any, _: Any) -> None:
-        await interaction.response.send_message("Selecione o **Investigador** que será promovido:", view=_SelectView("promover_investigador"), ephemeral=True)
+        await interaction.response.send_message(
+            "Selecione o **Investigador** que será promovido:",
+            view=_SelectView("promover_investigador"),
+            ephemeral=True,
+        )
 
-    @__import__("discord").ui.button(label="Inspetor → Investigador", emoji="⬇️", style=__import__("discord").ButtonStyle.secondary, custom_id="dicor:gestao:v2:rebaixar:inspetor", row=1)
+    @discord.ui.button(
+        label="Inspetor → Investigador",
+        emoji="⬇️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="dicor:gestao:v2:rebaixar:inspetor",
+        row=1,
+    )
     async def rebaixar_inspetor(self, interaction: Any, _: Any) -> None:
-        await interaction.response.send_message("Selecione o **Inspetor** que será rebaixado:", view=_SelectView("rebaixar_inspetor"), ephemeral=True)
+        await interaction.response.send_message(
+            "Selecione o **Inspetor** que será rebaixado:",
+            view=_SelectView("rebaixar_inspetor"),
+            ephemeral=True,
+        )
 
-    @__import__("discord").ui.button(label="Investigador → Estagiário", emoji="⬇️", style=__import__("discord").ButtonStyle.secondary, custom_id="dicor:gestao:v2:rebaixar:investigador", row=1)
+    @discord.ui.button(
+        label="Investigador → Estagiário",
+        emoji="⬇️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="dicor:gestao:v2:rebaixar:investigador",
+        row=1,
+    )
     async def rebaixar_investigador(self, interaction: Any, _: Any) -> None:
-        await interaction.response.send_message("Selecione o **Investigador** que será rebaixado:", view=_SelectView("rebaixar_investigador"), ephemeral=True)
+        await interaction.response.send_message(
+            "Selecione o **Investigador** que será rebaixado:",
+            view=_SelectView("rebaixar_investigador"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Retirar da DICOR",
+        emoji="🚫",
+        style=discord.ButtonStyle.danger,
+        custom_id="dicor:gestao:v2:retirar",
+        row=2,
+    )
+    async def retirar(self, interaction: Any, _: Any) -> None:
+        await interaction.response.send_message(
+            "Selecione o membro que será retirado da DICOR:",
+            view=_RetirarView(),
+            ephemeral=True,
+        )
 
 
 async def _upgrade_existing_panel(bot_module: Any) -> None:
     client = getattr(bot_module, "bot", None)
     if client is None:
         return
-    old_ids = {"dicor:gestao:subir:v72", "dicor:gestao:descer:v72", "dicor:gestao:retirar:v72"}
+    old_ids = {
+        "dicor:gestao:subir:v72",
+        "dicor:gestao:descer:v72",
+        "dicor:gestao:retirar:v72",
+    }
     content = (
         f"{PANEL_MARKER}\n"
         "🔐 **GESTÃO DICOR — MOVIMENTAÇÃO DE CARGOS**\n\n"
         "**Hierarquia operacional**\n"
         "🥉 Estagiário  →  🔹 Investigador  →  🛡️ Inspetor\n\n"
-        "**Ações disponíveis**\n"
-        "⬆️ Progressão de cargo\n"
-        "⬇️ Rebaixamento de cargo\n\n"
+        "**Progressão**\n"
+        "⬆️ Estagiário → Investigador\n"
+        "⬆️ Investigador → Inspetor\n\n"
+        "**Rebaixamento**\n"
+        "⬇️ Inspetor → Investigador\n"
+        "⬇️ Investigador → Estagiário\n\n"
+        "🚫 Retirar da DICOR\n\n"
         "👮 **Gestão autorizada:** Inspetor • Vice-Diretor • Diretor\n\n"
         "Selecione uma ação abaixo para continuar."
     )
     channels = []
+    normalized_names = {_norm(x) for x in PANEL_NAMES}
     for guild in list(getattr(client, "guilds", []) or []):
-        channels.extend([c for c in list(getattr(guild, "text_channels", []) or []) if _norm(getattr(c, "name", "")) in {_norm(x) for x in PANEL_NAMES}])
+        channels.extend(
+            [c for c in list(getattr(guild, "text_channels", []) or []) if _norm(getattr(c, "name", "")) in normalized_names]
+        )
     for channel in channels[:3]:
         try:
             async for message in channel.history(limit=40):
@@ -255,7 +382,11 @@ async def install(bot_module: Any) -> bool:
         print(f"⚠️ [GESTAO V2] View persistente: {type(exc).__name__}: {exc}", flush=True)
     _INSTALLED = True
     asyncio.create_task(_upgrade_existing_panel(bot_module), name="dicor-gestao-panel-upgrade")
-    print("✅ [GESTAO V2] painel ampliado: Estagiário, Investigador e Inspetor; gestão por Inspetor/Vice-Diretor/Diretor.", flush=True)
+    print(
+        "✅ [GESTAO V2] painel ampliado: Estagiário, Investigador, Inspetor e retirada; "
+        "gestão por Inspetor/Vice-Diretor/Diretor.",
+        flush=True,
+    )
     return True
 
 
