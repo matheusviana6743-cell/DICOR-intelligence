@@ -114,7 +114,12 @@ async def upload_attachment(bot_module: Any, attachment: Any, *, message_id: Any
     try:
         import aiohttp
         form = aiohttp.FormData()
-        form.add_field("file", data, filename=_safe_name(getattr(attachment, "filename", "arquivo")), content_type=str(getattr(attachment, "content_type", None) or "application/octet-stream"))
+        form.add_field(
+            "file",
+            data,
+            filename=_safe_name(getattr(attachment, "filename", "arquivo")),
+            content_type=str(getattr(attachment, "content_type", None) or "application/octet-stream"),
+        )
         if metadata:
             form.add_field("metadata", json.dumps(metadata, ensure_ascii=False))
         timeout = aiohttp.ClientTimeout(total=TIMEOUT)
@@ -168,7 +173,7 @@ async def install(bot_module: Any) -> None:
         channel = getattr(message, "channel", None)
         channel_id = int(getattr(channel, "id", 0) or 0)
 
-        # ESTE É O ÚNICO CANAL QUE ATIVA O BACKUP AUTOMÁTICO.
+        # Somente o canal configurado ativa o backup automático.
         if channel_id != MEDIA_CHANNEL_ID:
             return
 
@@ -177,7 +182,6 @@ async def install(bot_module: Any) -> None:
             return
 
         links: list[str] = []
-        falhas: list[str] = []
         async with sem:
             for attachment in attachments:
                 result = await upload_attachment(
@@ -194,11 +198,11 @@ async def install(bot_module: Any) -> None:
                     links.append(str(result["external_url"]))
                     print(f"✅ [MEDIA] {result['filename']} -> Fivemanage", flush=True)
                 elif result.get("erro"):
-                    falhas.append(f"{result['filename']}: {result['erro']}")
                     print(f"⚠️ [MEDIA] {result['filename']}: {result['erro']}", flush=True)
 
+        # No sucesso, responder somente com o(s) link(s), sem texto, emoji ou prefixo.
         if links:
-            texto = "✅ **Backup da(s) foto(s) concluído**\n\n" + "\n".join(f"🔗 {url}" for url in links)
+            texto = "\n".join(links)
             try:
                 await message.reply(texto, mention_author=False)
             except Exception:
@@ -206,12 +210,6 @@ async def install(bot_module: Any) -> None:
                     await channel.send(texto)
                 except Exception:
                     pass
-
-        if falhas and not links:
-            try:
-                await message.reply("⚠️ Não foi possível gerar o link permanente agora. A cópia local foi preservada e o erro foi registrado.", mention_author=False)
-            except Exception:
-                pass
 
     async def on_message(message: Any) -> None:
         try:
