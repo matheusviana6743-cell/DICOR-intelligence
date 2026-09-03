@@ -204,10 +204,10 @@ async def install(bot_module: Any) -> None:
         if links:
             texto = "\n".join(links)
             try:
-                await message.reply(texto, mention_author=False)
+                await message.reply(texto, mention_author=False, suppress_embeds=True)
             except Exception:
                 try:
-                    await channel.send(texto)
+                    await channel.send(texto, suppress_embeds=True)
                 except Exception:
                     pass
 
