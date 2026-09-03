@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""V188 — runtime minimo e estavel."""
+"""Runtime mínimo e estável do DICOR."""
 from __future__ import annotations
+
 import asyncio
 import gc
 import os
 from collections import deque
 
-MAX_RSS_MB = int(os.getenv("DICOR_MAX_RSS_MB", "640") or 640)
+MAX_RSS_MB = int(os.getenv("DICOR_MAX_RSS_MB", "760") or 760)
 _watchdog = None
 _installed = False
 _patched = False
@@ -28,9 +29,15 @@ def _trim(client):
         state = getattr(client, "_connection", None)
         if state is not None:
             state.max_messages = 5
+            try:
+                flags_cls = __import__("discord").MemberCacheFlags
+                state.member_cache_flags = flags_cls.none()
+            except Exception:
+                pass
             messages = getattr(state, "_messages", None)
             if messages is not None:
                 state._messages = deque(list(messages)[-5:], maxlen=5)
+        gc.collect()
     except Exception:
         pass
 
@@ -53,7 +60,7 @@ def _disable_v75(bot_module):
 
     async def minimal_startup():
         _trim(getattr(bot_module, "bot", None))
-        gc.collect()
+        return None
 
     bot_module._V75_STARTUP_ORIGINAL = original
     bot_module._v75_startup_escalonado = minimal_startup
@@ -64,12 +71,12 @@ async def _watch(client):
     global _watchdog
     try:
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(30)
             _trim(client)
-            gc.collect()
             rss = _rss_mb()
             if rss and rss >= MAX_RSS_MB:
                 current = asyncio.current_task()
+                cancelled = 0
                 for task in list(asyncio.all_tasks()):
                     if task is current or task.done() or task.cancelled():
                         continue
@@ -79,7 +86,9 @@ async def _watch(client):
                         name = ""
                     if _is_heavy(name):
                         task.cancel()
+                        cancelled += 1
                 gc.collect()
+                print(f"⚠️ [MEM] {rss:.1f} MB; {cancelled} tarefa(s) pesada(s) cancelada(s).", flush=True)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -91,7 +100,7 @@ def _start_watchdog(client):
     if _watchdog is not None and not _watchdog.done():
         return
     try:
-        _watchdog = asyncio.create_task(_watch(client), name="v188-memory-watchdog")
+        _watchdog = asyncio.create_task(_watch(client), name="dicor-memory-watchdog")
     except Exception:
         pass
 
@@ -123,17 +132,14 @@ def install(bot_module):
     client = getattr(bot_module, "bot", None)
     if client is None:
         return
-
     _trim(client)
     _disable_v75(bot_module)
-
     if not _installed:
         try:
             client.add_listener(lambda: _start_watchdog(client), "on_ready")
         except Exception:
             pass
         _installed = True
-
     bot_module._v180_safe_create_task = _safe_create_task
     bot_module._v188_runtime_minimal = True
-    print("✅ V188 runtime mínimo ativo — startup pesado V75 desativado.", flush=True)
+    print(f"✅ [MEM] proteção ativa — limite {MAX_RSS_MB} MB, cache 5.", flush=True)
