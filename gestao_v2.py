@@ -156,7 +156,7 @@ async def _send_movement(bot_module: Any, member: Any, before_role: Any, after_r
             return False
     qra = _qra(bot_module, member)
     mention = getattr(member, "mention", str(member))
-    actor_text = getattr(actor, "mention", None) or str(actor) if actor is not None else "Sistema DICOR"
+    actor_text = (getattr(actor, "mention", None) or str(actor)) if actor is not None else "Sistema DICOR"
     data = datetime.now().astimezone().strftime("%d/%m/%Y às %H:%M")
     promoted = action.startswith("promover")
     if promoted:
@@ -268,30 +268,12 @@ async def _refresh_hierarchy(bot_module: Any, guild: Any) -> None:
             if getattr(message.author, "id", None) == getattr(client.user, "id", None) and PANEL_MARKER in str(getattr(message, "content", "")):
                 await message.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
                 return
+    except Exception:
+        pass
+    try:
         await channel.send(content=content, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         print(f"⚠️ [HIERARQUIA] fallback: {type(exc).__name__}: {exc}", flush=True)
-
-
-async def _cleanup_wrong_panel(bot_module: Any) -> None:
-    client = getattr(bot_module, "bot", None)
-    if client is None:
-        return
-    try:
-        for guild in getattr(client, "guilds", []) or []:
-            for channel in getattr(guild, "text_channels", []) or []:
-                if _norm(getattr(channel, "name", "")) != "criterios de up":
-                    continue
-                async for message in channel.history(limit=50):
-                    if getattr(message.author, "id", None) != getattr(client.user, "id", None):
-                        continue
-                    if PANEL_MARKER in str(getattr(message, "content", "")) or any(PANEL_TITLE in str(getattr(embed, "title", "")) for embed in getattr(message, "embeds", []) or []):
-                        try:
-                            await message.delete()
-                        except Exception:
-                            pass
-    except Exception as exc:
-        print(f"⚠️ [GESTAO] limpeza painel antigo: {type(exc).__name__}: {exc}", flush=True)
 
 
 class MemberSelect(discord.ui.UserSelect):
@@ -300,7 +282,17 @@ class MemberSelect(discord.ui.UserSelect):
         self.action = action
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await _do_change(interaction, self.action, self.values[0], _BOT_MODULE)
+        try:
+            await _do_change(interaction, self.action, self.values[0], _BOT_MODULE)
+        except Exception as exc:
+            print(f"⚠️ [GESTAO V3] select callback: {type(exc).__name__}: {exc}", flush=True)
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ Não foi possível processar a seleção.", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Não foi possível processar a seleção.", ephemeral=True)
+            except Exception:
+                pass
 
 
 class SelectView(discord.ui.View):
@@ -353,7 +345,6 @@ async def _do_change(interaction: discord.Interaction, action: str, target: disc
     if guild is None:
         await interaction.response.send_message("❌ Ação disponível somente no servidor.", ephemeral=True)
         return
-    # ACK imediato para evitar 10062 durante operações Discord.
     await interaction.response.defer(ephemeral=True, thinking=True)
     if not _manager(interaction.user, bot_module):
         await interaction.followup.send("❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar a Gestão.", ephemeral=True)
@@ -419,35 +410,58 @@ async def _install_panel(bot_module: Any) -> None:
     client = getattr(bot_module, "bot", None)
     if client is None:
         return
-    await _cleanup_wrong_panel(bot_module)
     channel = client.get_channel(PANEL_CHANNEL_ID)
     if channel is None:
         try:
             channel = await client.fetch_channel(PANEL_CHANNEL_ID)
-        except Exception:
+        except Exception as exc:
+            print(f"⚠️ [GESTAO] canal do painel indisponível: {type(exc).__name__}", flush=True)
             return
+
     embed = discord.Embed(
         title="🔐 GESTÃO DICOR",
-        description="**Painel de controle do efetivo**\n\n🥉 Estagiário  →  🔹 Investigador  →  🛡️ Inspetor\n\nUse os comandos abaixo para movimentar o efetivo.",
+        description=(
+            "**Painel oficial de movimentação do efetivo**\n\n"
+            "🥉 **Estagiário**  →  🔹 **Investigador**  →  🛡️ **Inspetor**\n\n"
+            "Use os botões abaixo para realizar promoções ou rebaixamentos."
+        ),
         color=0xC9A227,
     )
-    embed.add_field(name="⬆️ PROMOÇÕES", value="Estagiário → Investigador\nInvestigador → Inspetor", inline=True)
-    embed.add_field(name="⬇️ REBAIXAMENTOS", value="Inspetor → Investigador\nInvestigador → Estagiário", inline=True)
-    embed.add_field(name="🔒 AUTORIZAÇÃO", value="Inspetor • Vice-Diretor • Diretor", inline=False)
+    embed.add_field(
+        name="⬆️ PROMOÇÕES",
+        value="Estagiário → Investigador\nInvestigador → Inspetor",
+        inline=True,
+    )
+    embed.add_field(
+        name="⬇️ REBAIXAMENTOS",
+        value="Inspetor → Investigador\nInvestigador → Estagiário",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔒 AUTORIZAÇÃO",
+        value="Inspetor • Vice-Diretor • Diretor",
+        inline=False,
+    )
     embed.set_footer(text="DICOR • Gestão de efetivo")
+
     try:
         found = None
-        async for message in channel.history(limit=50):
+        async for message in channel.history(limit=60):
             if getattr(message.author, "id", None) != getattr(client.user, "id", None):
                 continue
-            if PANEL_MARKER in str(getattr(message, "content", "")) or any(str(getattr(e, "title", "")) == "🔐 GESTÃO DICOR" for e in getattr(message, "embeds", []) or []):
+            title_match = any(str(getattr(e, "title", "")) == "🔐 GESTÃO DICOR" for e in getattr(message, "embeds", []) or [])
+            marker_match = PANEL_MARKER in str(getattr(message, "content", ""))
+            if title_match or marker_match:
                 found = message
                 break
+
         view = GestaoV3Panel()
         if found:
-            await found.edit(content=PANEL_MARKER, embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+            # O marcador serve somente para identificação interna e nunca deve
+            # aparecer no Discord.
+            await found.edit(content="", embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
         else:
-            await channel.send(content=PANEL_MARKER, embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+            await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         print(f"⚠️ [GESTAO] painel: {type(exc).__name__}: {exc}", flush=True)
 
