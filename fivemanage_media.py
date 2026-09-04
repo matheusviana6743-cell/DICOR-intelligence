@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ponte de mídia: Discord -> Fivemanage, com fallback local e dedupe."""
+"""Backup automático de imagens do Discord na Fivemanage."""
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +32,8 @@ def _cache_path(bot_module: Any) -> Path:
 
 
 def _load_cache(bot_module: Any) -> dict[str, dict[str, Any]]:
-    path = _cache_path(bot_module)
     try:
+        path = _cache_path(bot_module)
         if not path.exists():
             return {}
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -43,14 +43,14 @@ def _load_cache(bot_module: Any) -> dict[str, dict[str, Any]]:
 
 
 def _save_cache(bot_module: Any, data: dict[str, dict[str, Any]]) -> None:
-    path = _cache_path(bot_module)
     try:
+        path = _cache_path(bot_module)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
     except Exception as exc:
-        print(f"⚠️ [MEDIA] não foi possível salvar índice: {type(exc).__name__}: {exc}", flush=True)
+        print(f"⚠️ [MEDIA] índice não salvo: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _is_image(attachment: Any) -> bool:
@@ -75,8 +75,15 @@ def _key(message_id: Any, attachment_id: Any) -> str:
     return f"{message_id}:{attachment_id}"
 
 
-async def upload_attachment(bot_module: Any, attachment: Any, *, message_id: Any = None, channel_id: Any = None, metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Upload seguro. Nunca propaga exceções para o chamador."""
+async def upload_attachment(
+    bot_module: Any,
+    attachment: Any,
+    *,
+    message_id: Any = None,
+    channel_id: Any = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Faz o backup sem propagar exceções para o bot."""
     result = {
         "external_url": None,
         "discord_url": getattr(attachment, "url", None),
@@ -87,6 +94,7 @@ async def upload_attachment(bot_module: Any, attachment: Any, *, message_id: Any
         "filename": str(getattr(attachment, "filename", "") or "arquivo"),
         "erro": None,
     }
+
     key = _key(message_id, getattr(attachment, "id", None))
     cache = _load_cache(bot_module)
     cached = cache.get(key)
@@ -122,6 +130,7 @@ async def upload_attachment(bot_module: Any, attachment: Any, *, message_id: Any
         )
         if metadata:
             form.add_field("metadata", json.dumps(metadata, ensure_ascii=False))
+
         timeout = aiohttp.ClientTimeout(total=TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(UPLOAD_URL, data=form, headers={"Authorization": API_KEY}) as resp:
@@ -132,10 +141,12 @@ async def upload_attachment(bot_module: Any, attachment: Any, *, message_id: Any
                 if resp.status != 200 or not isinstance(body, dict) or body.get("status") != "ok":
                     result["erro"] = f"Fivemanage HTTP {resp.status}: {body.get('error', '') if isinstance(body, dict) else body}"
                     return result
+
                 url = str(((body.get("data") or {}).get("url")) or "").strip()
                 if not url:
                     result["erro"] = "Fivemanage respondeu sem URL"
                     return result
+
                 result["external_url"] = url
                 cache[key] = {
                     "url": url,
@@ -164,16 +175,15 @@ async def install(bot_module: Any) -> None:
     bot = getattr(bot_module, "bot", None)
     if bot is None or getattr(bot_module, "_DICOR_FIVEMANAGE_INSTALLED", False):
         return
+
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def worker(message: Any) -> None:
-        if getattr(message.author, "bot", False):
+        if getattr(getattr(message, "author", None), "bot", False):
             return
 
         channel = getattr(message, "channel", None)
         channel_id = int(getattr(channel, "id", 0) or 0)
-
-        # Somente o canal configurado ativa o backup automático.
         if channel_id != MEDIA_CHANNEL_ID:
             return
 
@@ -200,16 +210,20 @@ async def install(bot_module: Any) -> None:
                 elif result.get("erro"):
                     print(f"⚠️ [MEDIA] {result['filename']}: {result['erro']}", flush=True)
 
-        # No sucesso, responder somente com o(s) link(s), sem texto, emoji ou prefixo.
-        if links:
-            texto = "\n".join(links)
+        if not links:
+            return
+
+        # <URL> impede o preview automático do Discord.
+        # O usuário vê somente o link, sem imagem, texto ou emoji adicional.
+        texto = "\n".join(f"<{url}>" for url in links)
+        try:
+            await message.reply(texto, mention_author=False, suppress_embeds=True)
+        except Exception as exc:
+            print(f"⚠️ [MEDIA] reply falhou: {type(exc).__name__}", flush=True)
             try:
-                await message.reply(texto, mention_author=False, suppress_embeds=True)
-            except Exception:
-                try:
-                    await channel.send(texto, suppress_embeds=True)
-                except Exception:
-                    pass
+                await channel.send(texto, suppress_embeds=True)
+            except Exception as exc2:
+                print(f"⚠️ [MEDIA] envio do link falhou: {type(exc2).__name__}", flush=True)
 
     async def on_message(message: Any) -> None:
         try:
