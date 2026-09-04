@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Painel único de Gestão DICOR."""
+"""Painel de Gestão DICOR."""
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +11,7 @@ from typing import Any, Optional
 import discord
 
 PANEL_TITLE = "GESTÃO DICOR"
-PANEL_CHANNEL_NAME = "criterios-de-up"
+PANEL_CHANNEL_ID = 1529596208857878608
 MANAGED_RANKS = ("estagiario", "investigador", "inspetor")
 ACTIONS = {
     "promover_estagiario": ("estagiario", "investigador", "⬆️ Estagiário → Investigador"),
@@ -222,33 +222,21 @@ class GestaoV2Painel(discord.ui.View):
 
 
 async def _manage_panel_location(bot_module: Any) -> None:
-    """Mantém um único painel visual no canal #critérios-de-up."""
+    """Publica/atualiza o painel somente no canal definido por ID."""
     client = getattr(bot_module, "bot", None)
     if client is None:
         return
 
-    target_channels = []
-    for guild in list(getattr(client, "guilds", []) or []):
-        target_channels.extend(
-            c for c in list(getattr(guild, "text_channels", []) or [])
-            if _norm(getattr(c, "name", "")) == PANEL_CHANNEL_NAME
-        )
+    channel = client.get_channel(PANEL_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(PANEL_CHANNEL_ID)
+        except Exception as exc:
+            print(f"⚠️ [GESTAO V2] canal {PANEL_CHANNEL_ID} indisponível: {type(exc).__name__}: {exc}", flush=True)
+            return
 
-        for channel in list(getattr(guild, "text_channels", []) or []):
-            if _norm(getattr(channel, "name", "")) == PANEL_CHANNEL_NAME:
-                continue
-            try:
-                async for message in channel.history(limit=40):
-                    if getattr(getattr(message, "author", None), "id", None) != getattr(getattr(client, "user", None), "id", None):
-                        continue
-                    embeds = list(getattr(message, "embeds", []) or [])
-                    if any(str(getattr(embed, "title", "") or "").strip() in {PANEL_TITLE, "🔐 GESTÃO DICOR"} for embed in embeds):
-                        await message.delete()
-            except Exception:
-                pass
-
-    if not target_channels:
-        print("⚠️ [GESTAO V2] #critérios-de-up não encontrado.", flush=True)
+    if not hasattr(channel, "history") or not hasattr(channel, "send"):
+        print(f"⚠️ [GESTAO V2] ID {PANEL_CHANNEL_ID} não é um canal de texto utilizável.", flush=True)
         return
 
     embed = discord.Embed(
@@ -265,25 +253,24 @@ async def _manage_panel_location(bot_module: Any) -> None:
     embed.add_field(name="👮 AUTORIZADOS", value="Inspetor • Vice-Diretor • Diretor", inline=False)
     embed.set_footer(text="DICOR • Gestão de efetivo")
 
-    for channel in target_channels[:1]:
-        try:
-            found = None
-            async for message in channel.history(limit=80):
-                if getattr(getattr(message, "author", None), "id", None) != getattr(getattr(client, "user", None), "id", None):
-                    continue
-                embeds = list(getattr(message, "embeds", []) or [])
-                if any(str(getattr(e, "title", "") or "").strip() in {PANEL_TITLE, "🔐 GESTÃO DICOR"} for e in embeds):
-                    found = message
-                    break
+    try:
+        found = None
+        async for message in channel.history(limit=80):
+            if getattr(getattr(message, "author", None), "id", None) != getattr(getattr(client, "user", None), "id", None):
+                continue
+            embeds = list(getattr(message, "embeds", []) or [])
+            if any(str(getattr(e, "title", "") or "").strip() in {PANEL_TITLE, "🔐 GESTÃO DICOR"} for e in embeds):
+                found = message
+                break
 
-            view = GestaoV2Painel()
-            if found:
-                await found.edit(content=None, embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
-            else:
-                await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
-            return
-        except Exception as exc:
-            print(f"⚠️ [GESTAO V2] painel: {type(exc).__name__}: {exc}", flush=True)
+        view = GestaoV2Painel()
+        if found:
+            await found.edit(content=None, embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        print(f"✅ [GESTAO V2] painel publicado no canal {PANEL_CHANNEL_ID}.", flush=True)
+    except Exception as exc:
+        print(f"⚠️ [GESTAO V2] painel: {type(exc).__name__}: {exc}", flush=True)
 
 
 async def _on_member_update(before: Any, after: Any) -> None:
@@ -315,5 +302,5 @@ async def install(bot_module: Any) -> bool:
     await _manage_panel_location(bot_module)
     guild = getattr(client, "guilds", [None])[0] if getattr(client, "guilds", None) else None
     await _refresh_hierarchy(bot_module, guild)
-    print("✅ [GESTAO V2] painel único em #critérios-de-up; hierarquia sincronizada.", flush=True)
+    print(f"✅ [GESTAO V2] painel único no canal {PANEL_CHANNEL_ID}; hierarquia sincronizada.", flush=True)
     return True
