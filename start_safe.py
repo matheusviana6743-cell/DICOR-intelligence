@@ -166,11 +166,12 @@ async def lazy_install_central():
 
 
 async def install_new_integrations():
-    try:
-        import gestao_v2
-        await gestao_v2.install(bot)
-    except Exception as exc:
-        diagnostic("gestao_v2", exc)
+    for module_name, context in (("gestao_v2", "gestao_v2"), ("gestao_v3", "gestao_v3")):
+        try:
+            module = __import__(module_name)
+            await module.install(bot)
+        except Exception as exc:
+            diagnostic(context, exc)
     try:
         import fivemanage_media
         await fivemanage_media.install(bot)
