@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Bootstrap estável do DICOR.
-
-Objetivo: o Gateway do Discord nunca deve cair por causa de módulos web,
-cache excessivo ou tarefas secundárias. A Central é iniciada depois do READY
-em uma etapa isolada.
-"""
+"""Bootstrap estável do DICOR."""
 import os
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
@@ -181,10 +176,10 @@ def _instalar_central_web():
 
 
 async def _instalar_discord_dicor():
-    """Instala somente componentes Discord que devem ficar ativos após READY.
+    """Instala Gestão V3 e a hierarquia após o READY.
 
-    Gestão V3 não publica painel automaticamente. A hierarquia é a única
-    mensagem automática desta área e é atualizada na própria sala HIERARQUIA.
+    A Gestão V3 não publica painel automaticamente. A hierarquia é mantida
+    somente no canal próprio de HIERARQUIA.
     """
     try:
         await gestao_v3.install(bot)
@@ -268,7 +263,10 @@ async def _main():
 
     _instalar_guardas_discord()
 
-    for nome, modulo in (('V169', interaction_fix_v169), ('V168', central_buttons_rescue_v168):
+    for nome, modulo in (
+        ('V169', interaction_fix_v169),
+        ('V168', central_buttons_rescue_v168),
+    ):
         try:
             modulo.install(bot)
         except Exception as exc:
