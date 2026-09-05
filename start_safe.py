@@ -172,6 +172,11 @@ async def install_new_integrations():
     except Exception as exc:
         diagnostic("gestao_v3", exc)
     try:
+        import gestao_panel_fix
+        await gestao_panel_fix.install(bot)
+    except Exception as exc:
+        diagnostic("gestao_panel_fix", exc)
+    try:
         import fivemanage_media
         await fivemanage_media.install(bot)
     except Exception as exc:
