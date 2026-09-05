@@ -176,6 +176,15 @@ async def install_new_integrations():
         await gestao_panel_fix.install(bot)
     except Exception as exc:
         diagnostic("gestao_panel_fix", exc)
+
+    # Hierarquia oficial: publica/edita somente #hierarquia e nunca #criterios-de-up.
+    try:
+        import hierarquia_dicor
+        await hierarquia_dicor.install(bot)
+        print("✅ [HIERARQUIA] instalada no boot real do bot.", flush=True)
+    except Exception as exc:
+        diagnostic("hierarquia_dicor", exc)
+
     try:
         import fivemanage_media
         await fivemanage_media.install(bot)
@@ -258,13 +267,3 @@ async def main():
 
     client.add_listener(ready_listener, "on_ready")
     await client.start(token, reconnect=True)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        diagnostic("fatal_boot", exc)
-        raise
