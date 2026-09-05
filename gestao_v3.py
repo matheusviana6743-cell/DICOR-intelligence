@@ -158,12 +158,11 @@ def _hierarchy_embed(guild: Any) -> discord.Embed:
 
 async def _get_hierarchy_channel(client: Any, guild: Any) -> Optional[Any]:
     configured = int(getattr(_BOT_MODULE, "HIERARQUIA_CHANNEL_ID", 0) or 0)
-    candidates = [c for c in (configured,) if c]
-    for channel_id in candidates:
-        channel = client.get_channel(channel_id)
+    if configured:
+        channel = client.get_channel(configured)
         if channel is None:
             try:
-                channel = await client.fetch_channel(channel_id)
+                channel = await client.fetch_channel(configured)
             except Exception:
                 channel = None
         if channel is not None:
@@ -183,7 +182,6 @@ async def refresh_hierarchy(guild: Any) -> None:
     if channel is None:
         print("⚠️ [HIERARQUIA] canal não encontrado.", flush=True)
         return
-
     embed = _hierarchy_embed(guild)
     try:
         async for message in channel.history(limit=100):
@@ -251,51 +249,35 @@ async def _cleanup_unwanted_panels(bot_module: Any) -> None:
 async def _change(interaction: Any, action: str, member: Any) -> None:
     bot_module = _BOT_MODULE
     if not _manager(getattr(interaction, "user", None), bot_module):
-        await interaction.response.send_message(
-            "❌ Apenas **Inspetor, Vice-Diretor ou Diretor** pode usar a Gestão.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("❌ Apenas **Inspetor, Vice-Diretor ou Diretor** pode usar a Gestão.", ephemeral=True)
         return
     guild = getattr(interaction, "guild", None)
     if guild is None:
         await interaction.response.send_message("❌ Ação disponível somente dentro do servidor.", ephemeral=True)
         return
-
     before_name, after_name, label = ACTIONS[action]
     before_role = _find_rank_role(guild, before_name)
     after_role = _find_rank_role(guild, after_name)
     if before_role is None or after_role is None:
         await interaction.response.send_message(f"❌ Não encontrei os cargos necessários para **{label}**.", ephemeral=True)
         return
-
     current = _highest_managed_role(member)
     if current is None or _rank(current) != before_name:
-        await interaction.response.send_message(
-            f"❌ O membro selecionado precisa estar como **{before_role.name}**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"❌ O membro selecionado precisa estar como **{before_role.name}**.", ephemeral=True)
         return
-
     bot_member = getattr(guild, "me", None)
     bot_top = getattr(bot_member, "top_role", None) if bot_member else None
     if bot_top is not None and int(getattr(after_role, "position", 0) or 0) >= int(getattr(bot_top, "position", 0) or 0):
         await interaction.response.send_message("❌ O bot não pode atribuir esse cargo pela hierarquia do servidor.", ephemeral=True)
         return
-
     try:
         async with _CHANGE_LOCK:
             old_managed = _managed_roles(member)
-            new_roles = [
-                role for role in list(getattr(member, "roles", []) or [])
-                if role not in old_managed and getattr(role, "name", "") != "@everyone"
-            ]
+            new_roles = [role for role in list(getattr(member, "roles", []) or []) if role not in old_managed and getattr(role, "name", "") != "@everyone"]
             new_roles.append(after_role)
             await member.edit(roles=new_roles, reason=f"DICOR Gestão: {label} por {interaction.user}")
             _schedule_refresh(guild)
-        await interaction.response.send_message(
-            f"✅ {member.mention} atualizado: **{before_role.name} → {after_role.name}**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ {member.mention} atualizado: **{before_role.name} → {after_role.name}**.", ephemeral=True)
     except Exception as exc:
         print(f"⚠️ [GESTAO] alteração de cargo: {type(exc).__name__}: {exc}", flush=True)
         try:
@@ -306,12 +288,7 @@ async def _change(interaction: Any, action: str, member: Any) -> None:
 
 class _MemberSelect(discord.ui.UserSelect):
     def __init__(self, action: str):
-        super().__init__(
-            placeholder="Selecione o membro…",
-            min_values=1,
-            max_values=1,
-            custom_id=f"dicor:gestao:v3:select:{action}",
-        )
+        super().__init__(placeholder="Selecione o membro…", min_values=1, max_values=1, custom_id=f"dicor:gestao:v3:select:{action}")
         self.action = action
 
     async def callback(self, interaction: Any) -> None:
@@ -347,10 +324,7 @@ class GestaoV3Painel(discord.ui.View):
         if _manager(getattr(interaction, "user", None), _BOT_MODULE):
             return True
         try:
-            await interaction.response.send_message(
-                "❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.", ephemeral=True)
         except Exception:
             pass
         return False
@@ -399,7 +373,6 @@ async def _cleanup_delayed() -> None:
 
 
 async def _install_v2_safety(bot_module: Any) -> None:
-    """Impede que a implementação V2 volte a publicar o painel automaticamente."""
     try:
         import gestao_v2
         async def _noop_upgrade(*_args: Any, **_kwargs: Any) -> None:
@@ -418,29 +391,25 @@ async def install(bot_module: Any) -> bool:
         return False
     if _INSTALLED:
         return True
-
     await _install_v2_safety(bot_module)
-
     try:
         client.add_view(GestaoV3Painel())
     except Exception as exc:
         print(f"⚠️ [GESTAO V3] View persistente: {type(exc).__name__}: {exc}", flush=True)
-
     try:
         client.add_listener(_on_member_update, "on_member_update")
         client.add_listener(_on_ready_once, "on_ready")
     except Exception as exc:
         print(f"⚠️ [GESTAO V3] listener: {type(exc).__name__}: {exc}", flush=True)
-
     _INSTALLED = True
+    for guild in list(getattr(client, "guilds", []) or []):
+        _schedule_refresh(guild, delay=0.8)
     if _CLEANUP_TASK is None or _CLEANUP_TASK.done():
         _CLEANUP_TASK = asyncio.create_task(_cleanup_delayed(), name="dicor-gestao-cleanup")
-
     print("✅ [GESTAO V3] gestão ativa sem publicação automática de painel; hierarquia dinâmica por membros e cargos reais.", flush=True)
     return True
 
 
-# Compatibilidade com chamadas antigas que esperavam estes nomes.
 V72GestaoModal = None
 V72SelecionarMembro = _MemberSelect
 V72SelecionarMembroView = _SelectView
