@@ -25,14 +25,12 @@ CURRENT_USER_IDS = {
 
 
 def _user_mention(guild: discord.Guild, user_id: int) -> str:
-    # O ID é de usuário: a marcação correta é <@ID>.
     member = guild.get_member(user_id)
     return f"<@{member.id if member is not None else user_id}>"
 
 
 def _vice_diretor_mention(guild: discord.Guild) -> str:
-    # Aqui usamos o ID do CARGO somente para descobrir quem o possui.
-    # Nunca retornamos <@cargo_id>.
+    # O ID do cargo serve apenas para localizar o ocupante.
     role = guild.get_role(VICE_DIRETOR_ROLE_ID)
     if role is not None:
         members = list(getattr(role, "members", []) or [])
@@ -88,10 +86,23 @@ async def install(bot_module) -> None:
             return
         await interaction.response.send_message(embed=_embed(guild))
 
+    async def prefix_hierarchy_callback(ctx):
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            return
+        await ctx.send(embed=_embed(guild))
+
+    # Primeiro tenta substituir o comando de prefixo existente, se houver.
+    prefix_command = client.get_command("hierarquia") if hasattr(client, "get_command") else None
+    if prefix_command is not None:
+        prefix_command.callback = prefix_hierarchy_callback
+        print("✅ Hierarquia DICOR atualizada no comando de prefixo existente.", flush=True)
+
+    # Depois reaproveita o slash command existente, evitando duplicação.
     existing = tree.get_command("hierarquia")
     if existing is not None:
         existing.callback = hierarchy_callback
-        print("✅ Hierarquia DICOR atualizada no comando existente.", flush=True)
+        print("✅ Hierarquia DICOR atualizada no comando slash existente.", flush=True)
         return
 
     command = app_commands.Command(
