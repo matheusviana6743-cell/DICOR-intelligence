@@ -167,11 +167,6 @@ async def lazy_install_central():
 
 async def install_new_integrations():
     try:
-        import gestao_movimentacoes
-        await gestao_movimentacoes.install(bot)
-    except Exception as exc:
-        diagnostic("gestao_movimentacoes", exc)
-    try:
         import gestao_v2
         await gestao_v2.install(bot)
     except Exception as exc:
