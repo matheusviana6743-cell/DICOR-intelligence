@@ -7,8 +7,6 @@ em uma etapa isolada.
 """
 import os
 
-# Reduz fragmentação de memória nativa e paralelismo excessivo de bibliotecas
-# pesadas antes de qualquer import que possa carregar numpy/onnx/opencv.
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -34,6 +32,8 @@ import central_auth_v165
 import central_migration_v167
 import central_buttons_rescue_v168
 import interaction_fix_v169
+import gestao_v3
+import hierarquia_dicor
 
 
 def _diagnostico_erro(contexto, error):
@@ -56,12 +56,6 @@ def _diagnostico_erro(contexto, error):
 
 
 def _limitar_cache_discord():
-    """Mantém somente uma pequena janela de mensagens em RAM.
-
-    O Discord continua funcionando normalmente; histórico completo deve ser
-    obtido sob demanda pelos canais/rotinas específicas, não mantido no cache
-    global do processo.
-    """
     try:
         client = getattr(bot, 'bot', None)
         state = getattr(client, '_connection', None) if client else None
@@ -186,6 +180,25 @@ def _instalar_central_web():
             print(f'⚠️ {nome} falhou isoladamente: {type(exc).__name__}: {exc}', flush=True)
 
 
+async def _instalar_discord_dicor():
+    """Instala somente componentes Discord que devem ficar ativos após READY.
+
+    Gestão V3 não publica painel automaticamente. A hierarquia é a única
+    mensagem automática desta área e é atualizada na própria sala HIERARQUIA.
+    """
+    try:
+        await gestao_v3.install(bot)
+        print('✅ Gestão DICOR V3 instalada — sem publicação automática de painel.', flush=True)
+    except Exception as exc:
+        _diagnostico_erro('gestao_v3', exc)
+
+    try:
+        await hierarquia_dicor.install(bot)
+        print('✅ Hierarquia DICOR instalada.', flush=True)
+    except Exception as exc:
+        _diagnostico_erro('hierarquia_dicor', exc)
+
+
 async def _publicar_central_http():
     start = getattr(bot, 'start_web_server', None)
     if not callable(start):
@@ -205,9 +218,9 @@ async def _publicar_central_http():
 
 
 async def _instalar_extensoes_depois_do_ready():
-    # Dá tempo para o Gateway estabilizar e para o governor reduzir o cache.
     await asyncio.sleep(8)
     _manutencao_memoria()
+    await _instalar_discord_dicor()
     try:
         _instalar_central_web()
     except Exception as exc:
@@ -224,7 +237,7 @@ def _registrar_boot_seguro():
         if getattr(bot, '_dicor_extensions_started', False):
             return
         bot._dicor_extensions_started = True
-        print('Discord READY — Gateway protegido; iniciando componentes web isolados.', flush=True)
+        print('Discord READY — Gateway protegido; iniciando componentes web/Discord isolados.', flush=True)
         _limitar_cache_discord()
         _iniciar_manutenção_memoria()
         asyncio.create_task(_instalar_extensoes_depois_do_ready())
@@ -255,7 +268,7 @@ async def _main():
 
     _instalar_guardas_discord()
 
-    for nome, modulo in (('V169', interaction_fix_v169), ('V168', central_buttons_rescue_v168)):
+    for nome, modulo in (('V169', interaction_fix_v169), ('V168', central_buttons_rescue_v168):
         try:
             modulo.install(bot)
         except Exception as exc:
