@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Entrada de produção segura do DICOR."""
+"""Entrypoint de produção do DICOR com boot protegido."""
 import asyncio
 import gc
 import json
@@ -37,10 +37,7 @@ def trim_cache():
         client = getattr(bot, "bot", None)
         state = getattr(client, "_connection", None) if client else None
         if state is not None:
-            try:
-                state.max_messages = 5
-            except Exception:
-                pass
+            state.max_messages = 5
             messages = getattr(state, "_messages", None)
             if messages is not None:
                 state._messages = deque(list(messages)[-5:], maxlen=5)
@@ -84,11 +81,27 @@ def install_guards():
         diagnostic("prefix_guard", exc)
 
 
+def install_compat():
+    client = getattr(bot, "bot", None)
+    if client is None or hasattr(client, "remove_view"):
+        return
+    def remove_view(view):
+        try:
+            store = getattr(getattr(client, "_connection", None), "_view_store", None)
+            remover = getattr(store, "remove_view", None)
+            if callable(remover):
+                return remover(view)
+        except Exception as exc:
+            diagnostic("remove_view_compat", exc)
+        return None
+    try:
+        client.remove_view = remove_view
+    except Exception as exc:
+        diagnostic("remove_view_install", exc)
+
+
 def lazy_install_secondary():
-    for module_name, context in (
-        ("stability_v184", "pre_ready_v184"),
-        ("pericia_fix_v185", "pre_ready_v185"),
-    ):
+    for module_name, context in (("stability_v184", "pre_ready_v184"), ("pericia_fix_v185", "pre_ready_v185")):
         try:
             module = __import__(module_name)
             module.install(bot)
@@ -110,24 +123,16 @@ def lazy_install_secondary():
                 companion_module = __import__(companion)
                 companion_module.install(module, bot)
             module.install(bot)
-            if module_name == "dossie_v161":
-                print("✅ PDF/Dossiê carregado após READY.", flush=True)
-            elif module_name == "procurados_central_v162":
-                print("✅ Procurados V162 carregado após READY.", flush=True)
-            elif module_name == "pericia_fix_v181":
-                print("✅ V181 Perícia aplicado.", flush=True)
-            elif module_name == "pericia_fix_v186":
-                print("✅ V186 Perícia instalado.", flush=True)
+            print(f"✅ {module_name} carregado após READY.", flush=True)
         except Exception as exc:
             diagnostic(context, exc)
 
     try:
         import dossie_v161
-        if getattr(bot, "_V159_RENDER_PDF_APROVADO", None) is None and hasattr(bot, "_V159_RENDER_PDF_APROVADO"):
+        if hasattr(bot, "_V159_RENDER_PDF_APROVADO") and getattr(bot, "_V159_RENDER_PDF_APROVADO", None) is None:
             bot._V159_RENDER_PDF_APROVADO = lambda dados, caminho: dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
-        if getattr(bot, "_V155_GERAR_PDF_BASE", None) is None and hasattr(bot, "_V155_GERAR_PDF_BASE"):
+        if hasattr(bot, "_V155_GERAR_PDF_BASE") and getattr(bot, "_V155_GERAR_PDF_BASE", None) is None:
             bot._V155_GERAR_PDF_BASE = lambda dados, caminho: dossie_v161.gerar_pdf_dossie(bot, dados, caminho)
-        print("✅ Renderer V161 conectado após READY.", flush=True)
     except Exception as exc:
         diagnostic("lazy_v161_renderer", exc)
 
@@ -138,21 +143,19 @@ async def lazy_install_central():
         import central_auth_v164
         import central_auth_v165
         import central_migration_v167
-        for name, module in (("V163", central_pf_v163), ("V164", central_auth_v164), ("V165", central_auth_v165), ("V167", central_migration_v167)):
+        for module in (central_pf_v163, central_auth_v164, central_auth_v165, central_migration_v167):
             try:
                 module.install(bot)
-                print(f"✅ {name} Central carregado.", flush=True)
             except Exception as exc:
-                diagnostic(f"central_{name}", exc)
-        for name, module_name in (("V172", "central_data_v172"), ("V173", "central_data_v173")):
+                diagnostic(f"central_{module.__name__}", exc)
+        for module_name in ("central_data_v172", "central_data_v173"):
             try:
                 module = __import__(module_name)
                 installer = getattr(module, "install", None)
                 if callable(installer):
                     installer(bot)
-                    print(f"✅ {name} Central carregado.", flush=True)
             except Exception as exc:
-                diagnostic(f"central_{name}", exc)
+                diagnostic(module_name, exc)
     except Exception as exc:
         diagnostic("central_imports", exc)
     try:
@@ -167,24 +170,15 @@ async def lazy_install_central():
 
 async def install_new_integrations():
     try:
-        import gestao_v3
-        await gestao_v3.install(bot)
+        import gestao_v4
+        await gestao_v4.install(bot)
     except Exception as exc:
-        diagnostic("gestao_v3", exc)
+        diagnostic("gestao_v4", exc)
     try:
-        import gestao_panel_fix
-        await gestao_panel_fix.install(bot)
+        import hierarquia_v7
+        await hierarquia_v7.install(bot)
     except Exception as exc:
-        diagnostic("gestao_panel_fix", exc)
-
-    # Hierarquia oficial: publica/edita somente #hierarquia e nunca #criterios-de-up.
-    try:
-        import hierarquia_dicor
-        await hierarquia_dicor.install(bot)
-        print("✅ [HIERARQUIA] instalada no boot real do bot.", flush=True)
-    except Exception as exc:
-        diagnostic("hierarquia_dicor", exc)
-
+        diagnostic("hierarquia_v7", exc)
     try:
         import fivemanage_media
         await fivemanage_media.install(bot)
@@ -193,22 +187,18 @@ async def install_new_integrations():
 
 
 async def after_ready():
-    await asyncio.sleep(6)
+    await asyncio.sleep(3)
     trim_cache()
     lazy_install_secondary()
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     await install_new_integrations()
     await lazy_install_central()
-    try:
-        import stability_v184
-        stability_v184.install(bot)
-    except Exception as exc:
-        diagnostic("post_central_v184", exc)
-    try:
-        import pericia_fix_v185
-        pericia_fix_v185.install(bot)
-    except Exception as exc:
-        diagnostic("post_central_v185", exc)
+    for module_name, context in (("stability_v184", "post_v184"), ("pericia_fix_v185", "post_v185")):
+        try:
+            module = __import__(module_name)
+            module.install(bot)
+        except Exception as exc:
+            diagnostic(context, exc)
     try:
         import pericia_fix_v186
         pericia_fix_v186.install(bot)
@@ -217,8 +207,6 @@ async def after_ready():
         topic = client.get_channel(1541978969035771916) if client is not None else None
         if callable(repair) and not bool(getattr(topic, "archived", False)):
             await repair()
-        elif topic is not None and bool(getattr(topic, "archived", False)):
-            print("ℹ️ [PERICIA] painel antigo arquivado; reparo automático de edição ignorado.", flush=True)
     except Exception as exc:
         diagnostic("post_v186_repair", exc)
     trim_cache()
@@ -229,30 +217,35 @@ async def main():
     token = str(os.getenv("DISCORD_TOKEN") or getattr(bot, "DISCORD_TOKEN", "")).strip()
     if client is None or not token:
         raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
+
     try:
         runtime_safety_v180.install(bot)
     except Exception as exc:
         diagnostic("V180", exc)
     install_guards()
+    install_compat()
     trim_cache()
-    try:
-        starter = getattr(bot, "_v70_iniciar_health_bootstrap", None)
-        if callable(starter):
-            starter()
-    except Exception as exc:
-        diagnostic("V70", exc)
+
     for module_name, context in (("stability_v184", "pre_gateway_v184"), ("pericia_fix_v185", "pre_gateway_v185")):
         try:
             module = __import__(module_name)
             module.install(bot)
         except Exception as exc:
             diagnostic(context, exc)
+
     try:
         import pericia_fix_v186
         pericia_fix_v186.install(bot)
-        print("✅ V186 Perícia pré-Gateway — callback corrigido antes das Views persistentes.", flush=True)
     except Exception as exc:
         diagnostic("pre_gateway_v186", exc)
+
+    # V4 registra seus IDs antes do setup_hook legado para que os painéis antigos
+    # não recuperem uma implementação V2/V3 no boot.
+    try:
+        import gestao_v4
+        await gestao_v4.install(bot)
+    except Exception as exc:
+        diagnostic("pre_gateway_gestao_v4", exc)
 
     ready_once = False
 
@@ -267,3 +260,13 @@ async def main():
 
     client.add_listener(ready_listener, "on_ready")
     await client.start(token, reconnect=True)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        diagnostic("fatal_boot", exc)
+        raise
