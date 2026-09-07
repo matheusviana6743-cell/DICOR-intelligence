@@ -7058,6 +7058,10 @@ async def finalizar_boletim_atendimento(interaction: discord.Interaction, result
 async def atendimento_boletim_automatico(message: discord.Message):
     numero_lock = None
     try:
+        # V164: somente boletins que CHEGAM no canal oficial configurado.
+        # Não processa mensagens de outros canais, mesmo que tenham formato de BO.
+        if int(getattr(message.channel, 'id', 0) or 0) != int(BOLETINS_CHANNEL_ID or 0):
+            return
         if message.id in boletins_processando:
             return
         if not eh_boletim_valido_para_atendimento(message):
@@ -68248,26 +68252,129 @@ print(
 
 
 # =====================================================
-# V163 — RECUPERAÇÃO DE BOLETINS SEM TÓPICO (A PARTIR DO BO 21)
-# - Varre o canal oficial de BO após o boot.
-# - Para cada BO válido sem atendimento registrado, recria o tópico em
-#   #boletins-em-aberto usando o fluxo oficial já existente.
-# - Não duplica atendimentos, não altera BOs já abertos e preserva o número oficial.
 # =====================================================
-_V162_BO_RECOVERY_STARTED = False
-_V162_BO_RECOVERY_LOCK = asyncio.Lock()
+# V164 — BOLETINS: ORIGEM EXCLUSIVA + ABERTURA SOMENTE SE FALTAR
+# - Origem: canal 1490200514837745754 (BOLETINS_CHANNEL_ID).
+# - Destino/categoria: 1525762770253910136 (BOLETIM_ATENDIMENTO_CHANNEL_ID).
+# - Ao chegar um BO, procura primeiro pelo registro oficial (mensagem/número).
+# - Também confere a categoria/canal de atendimento para impedir duplicação
+#   mesmo se o JSON de atendimentos estiver atrasado ou tiver sido perdido.
+# - Se não existir atendimento, abre uma nova área pelo fluxo oficial.
+# - Recuperação inicial considera somente BOs a partir do 21.
+# =====================================================
+_V164_BO_RECOVERY_STARTED = False
+_V164_BO_LOCK = asyncio.Lock()
+_V164_SOURCE_CHANNEL_ID = 1490200514837745754
+_V164_TARGET_CHANNEL_ID = 1525762770253910136
 
-async def _v162_recuperar_boletins_sem_atendimento() -> Dict[str, int]:
-    stats = {'mensagens_analisadas': 0, 'boletins_recuperados': 0, 'ja_abertos': 0, 'falhas': 0}
-    async with _V162_BO_RECOVERY_LOCK:
+
+def _v164_bo_numero_inteiro(numero: str) -> int:
+    m = re.search(r'(\d+)$', str(numero or ''))
+    return int(m.group(1)) if m else 0
+
+
+async def _v164_alvo_tem_bo(guild: discord.Guild, numero: str) -> bool:
+    """Confere se a área do BO já existe fisicamente no destino."""
+    curto = numero_curto_boletim(numero)
+    nome_esperado = f'boletim-{curto}'.lower()
+    try:
+        alvo = guild.get_channel(_V164_TARGET_CHANNEL_ID)
+        if alvo is None:
+            alvo = await bot.fetch_channel(_V164_TARGET_CHANNEL_ID)
+        if alvo is None:
+            return False
+
+        # Quando o ID aponta para uma categoria, os atendimentos são canais filhos.
+        canais = list(getattr(alvo, 'channels', []) or [])
+        for canal in canais:
+            if str(getattr(canal, 'name', '') or '').lower() == nome_esperado:
+                return True
+
+        # Compatibilidade caso o ID apontado seja um canal de texto/fórum.
+        if str(getattr(alvo, 'name', '') or '').lower() == nome_esperado:
+            return True
+        return False
+    except Exception as erro:
+        print(f'⚠️ V164: não consegui conferir destino do BO {numero}: {type(erro).__name__}: {erro}', flush=True)
+        return False
+
+
+async def _v164_processar_bo(message: discord.Message, *, exigir_minimo_21: bool = False) -> bool:
+    """Abre somente o BO recebido que ainda não possui atendimento."""
+    if int(getattr(message.channel, 'id', 0) or 0) != _V164_SOURCE_CHANNEL_ID:
+        return False
+    if not eh_boletim_valido_para_atendimento(message):
+        return False
+
+    numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(message))
+    if not numero:
+        return False
+    numero_int = _v164_bo_numero_inteiro(numero)
+    if exigir_minimo_21 and numero_int < 21:
+        return False
+
+    # Ordem de segurança: mensagem -> número oficial -> existência física no destino.
+    if buscar_atendimento_por_mensagem(int(message.id)) is not None:
+        return False
+    if buscar_atendimento_por_numero(numero) is not None:
+        return False
+    if message.guild and await _v164_alvo_tem_bo(message.guild, numero):
+        return False
+
+    lock_key = int(message.id)
+    if lock_key in boletins_processando:
+        return False
+    boletins_processando.add(lock_key)
+    try:
+        # Reconfere imediatamente antes da criação para reduzir corrida entre listeners.
+        if buscar_atendimento_por_mensagem(int(message.id)) is not None:
+            return False
+        if buscar_atendimento_por_numero(numero) is not None:
+            return False
+        if message.guild and await _v164_alvo_tem_bo(message.guild, numero):
+            return False
+
+        atendimento = await criar_area_atendimento_boletim(message)
+        if atendimento:
+            print(
+                f'🛟 V164: BO sem atendimento aberto | BO={numero} | '
+                f'origem={message.id} | destino={atendimento.get("thread_id") or atendimento.get("area_id")}',
+                flush=True,
+            )
+            return True
+        return False
+    finally:
+        boletins_processando.discard(lock_key)
+
+
+@bot.listen('on_message')
+async def _v164_boletim_que_chega_no_canal_oficial(message: discord.Message) -> None:
+    """Gatilho principal: só reage a BOs que chegam no canal oficial 1490200514837745754."""
+    try:
+        if int(getattr(message.channel, 'id', 0) or 0) != _V164_SOURCE_CHANNEL_ID:
+            return
+        if getattr(getattr(message, 'author', None), 'bot', False):
+            return
+        await _v164_processar_bo(message, exigir_minimo_21=False)
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(
+            f'❌ V164 erro ao abrir BO recebido no canal {_V164_SOURCE_CHANNEL_ID}: '
+            f'{type(erro).__name__}: {erro}'
+        )
+
+
+async def _v164_recuperar_boletins_sem_atendimento() -> Dict[str, int]:
+    stats = {'analisados': 0, 'ja_abertos': 0, 'abertos': 0, 'falhas': 0}
+    async with _V164_BO_LOCK:
         try:
-            canal = bot.get_channel(int(BOLETINS_CHANNEL_ID or 0))
+            canal = bot.get_channel(_V164_SOURCE_CHANNEL_ID)
             if canal is None:
-                canal = await bot.fetch_channel(int(BOLETINS_CHANNEL_ID or 0))
+                canal = await bot.fetch_channel(_V164_SOURCE_CHANNEL_ID)
             if canal is None or not hasattr(canal, 'history'):
                 return stats
 
-            processados: set[str] = set()
+            vistos: set[str] = set()
             async for message in canal.history(limit=3000, oldest_first=True):
                 try:
                     if not eh_boletim_valido_para_atendimento(message):
@@ -68275,78 +68382,66 @@ async def _v162_recuperar_boletins_sem_atendimento() -> Dict[str, int]:
                     numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(message))
                     if not numero:
                         continue
-                    chave = numero_curto_boletim(numero) or str(numero)
-                    # V163: recuperação somente a partir do BO 21.
-                    # BOs anteriores não devem ser reprocessados pelo recuperador.
-                    try:
-                        numero_inteiro = int(re.search(r'(\d+)$', str(numero)).group(1))
-                    except Exception:
+                    if _v164_bo_numero_inteiro(numero) < 21:
                         continue
-                    if numero_inteiro < 21:
+                    chave = numero_curto_boletim(numero)
+                    if chave in vistos:
                         continue
-                    if chave in processados:
-                        continue
-                    processados.add(chave)
-                    stats['mensagens_analisadas'] += 1
+                    vistos.add(chave)
+                    stats['analisados'] += 1
 
-                    # Primeiro verifica a mensagem de origem e depois o número oficial.
-                    # Só cria quando realmente não existe atendimento registrado.
-                    atendimento = buscar_atendimento_por_mensagem(int(message.id))
-                    if atendimento is None:
-                        atendimento = buscar_atendimento_por_numero(numero)
-                    if atendimento is not None:
+                    if (
+                        buscar_atendimento_por_mensagem(int(message.id)) is not None
+                        or buscar_atendimento_por_numero(numero) is not None
+                        or (message.guild and await _v164_alvo_tem_bo(message.guild, numero))
+                    ):
                         stats['ja_abertos'] += 1
                         continue
 
-                    recuperado = await criar_area_atendimento_boletim(message)
-                    if recuperado:
-                        stats['boletins_recuperados'] += 1
-                        print(
-                            f'🛟 V162: BO recuperado sem tópico | numero={numero} | '
-                            f'origem={message.id} | topico={recuperado.get("thread_id") or recuperado.get("area_id")}',
-                            flush=True,
-                        )
+                    if await _v164_processar_bo(message, exigir_minimo_21=True):
+                        stats['abertos'] += 1
                     else:
-                        # Pode ter sido criado por outra rotina entre a checagem e a criação.
-                        if buscar_atendimento_por_mensagem(int(message.id)) or buscar_atendimento_por_numero(numero):
-                            stats['ja_abertos'] += 1
-                        else:
-                            stats['falhas'] += 1
+                        stats['falhas'] += 1
                 except Exception as erro:
                     stats['falhas'] += 1
                     await enviar_log(
-                        f'⚠️ V162 falha ao recuperar BO `{getattr(message, "id", 0)}`: '
+                        f'⚠️ V164 falha recuperando BO `{getattr(message, "id", 0)}`: '
                         f'{type(erro).__name__}: {erro}'
                     )
         except Exception as erro:
             stats['falhas'] += 1
-            await enviar_log(f'⚠️ V162 recuperação de boletins: {type(erro).__name__}: {erro}')
+            await enviar_log(f'⚠️ V164 recuperação de BOs: {type(erro).__name__}: {erro}')
     return stats
 
 
 @bot.listen('on_ready')
-async def _v162_iniciar_recuperacao_boletins() -> None:
-    global _V162_BO_RECOVERY_STARTED
-    if _V162_BO_RECOVERY_STARTED:
+async def _v164_iniciar_recuperacao_boletins() -> None:
+    global _V164_RECOVERY_STARTED
+    if _V164_RECOVERY_STARTED:
         return
-    _V162_BO_RECOVERY_STARTED = True
+    _V164_RECOVERY_STARTED = True
     await asyncio.sleep(8)
     try:
-        resultado = await _v162_recuperar_boletins_sem_atendimento()
+        resultado = await _v164_recuperar_boletins_sem_atendimento()
         print(
-            '✅ V162 boletins: '
-            f'analisados={resultado["mensagens_analisadas"]} | '
+            '✅ V164 BO: '
+            f'analisados={resultado["analisados"]} | '
             f'já abertos={resultado["ja_abertos"]} | '
-            f'recuperados={resultado["boletins_recuperados"]} | '
+            f'abertos agora={resultado["abertos"]} | '
             f'falhas={resultado["falhas"]}',
             flush=True,
         )
     except Exception as erro:
         traceback.print_exc()
-        await enviar_log(f'❌ V162 recuperação automática de BOs falhou: {type(erro).__name__}: {erro}')
+        await enviar_log(f'❌ V164 recuperação automática falhou: {type(erro).__name__}: {erro}')
 
 
-print('✅ V163 carregada — recupera somente BOs a partir do 21 que ainda não possuem atendimento, sem reabrir os anteriores.', flush=True)
+print(
+    '✅ V164 carregada — lê somente o canal 1490200514837745754 e abre no destino 1525762770253910136 '
+    'apenas quando o BO ainda não existe; recuperação histórica somente a partir do BO 21.',
+    flush=True,
+)
+
 
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
