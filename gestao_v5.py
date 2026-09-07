@@ -16,6 +16,11 @@ import discord
 
 PANEL_MARKER = "DICOR_GESTAO_V5"
 PANEL_NAMES = {"criterios-de-up", "criterios de up"}
+ROLE_IDS = {
+    "estagiario": 1490200391239864352,
+    "investigador": 1490200390426165290,
+    "vice_diretor": 1490200383614615725,
+}
 PROMOCOES_CHANNEL_ID = 1545160616522813520
 REBAIXAMENTOS_CHANNEL_ID = 1545160585216532530
 HISTORY_FILE = "historico_movimentacoes_cargo.json"
@@ -60,6 +65,11 @@ def _rank(role: Any) -> str:
 
 
 def _role(guild: Any, rank: str) -> Optional[Any]:
+    fixed_id = int(ROLE_IDS.get(rank, 0) or 0)
+    if fixed_id:
+        fixed = getattr(guild, "get_role", lambda _id: None)(fixed_id)
+        if fixed is not None:
+            return fixed
     roles = [r for r in getattr(guild, "roles", []) or [] if _rank(r) == rank]
     dicor = [r for r in roles if "dicor" in _norm(getattr(r, "name", ""))]
     return max(dicor or roles, key=lambda r: int(getattr(r, "position", 0) or 0), default=None)
@@ -132,19 +142,58 @@ def _panel_embed() -> discord.Embed:
     return e
 
 
+class MovementConfirmView(discord.ui.View):
+    def __init__(self, action: str, member: Any):
+        super().__init__(timeout=120)
+        self.action = action
+        self.member_id = int(getattr(member, "id", 0) or 0)
+
+    @discord.ui.button(label="Confirmar alteração", emoji="✅", style=discord.ButtonStyle.success, custom_id="dicor:gestao:v5:confirmar")
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not _manager(interaction.user):
+            await interaction.response.send_message("❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.", ephemeral=True)
+            return
+        guild = interaction.guild
+        member = guild.get_member(self.member_id) if guild else None
+        if member is None:
+            await interaction.response.send_message("❌ O membro não está mais no servidor.", ephemeral=True)
+            return
+        await _change(interaction, self.action, member)
+
+    @discord.ui.button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary, custom_id="dicor:gestao:v5:cancelar")
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="❌ Alteração cancelada.", embed=None, view=None)
+
+
 class MemberSelect(discord.ui.UserSelect):
     def __init__(self, action: str):
         self.action = action
         super().__init__(placeholder="Selecione o membro…", min_values=1, max_values=1, custom_id=f"dicor:gestao:v5:select:{action}")
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not _manager(interaction.user):
+            await interaction.response.send_message("❌ Apenas Inspetor, Vice-Diretor ou Diretor pode usar este painel.", ephemeral=True)
+            return
         member = self.values[0]
         if not isinstance(member, discord.Member):
             member = interaction.guild.get_member(int(getattr(member, "id", 0))) if interaction.guild else None
         if member is None:
             await interaction.response.send_message("❌ Membro não encontrado.", ephemeral=True)
             return
-        await _change(interaction, self.action, member)
+        current = _highest(member)
+        if current is None:
+            await interaction.response.send_message("❌ O membro selecionado não possui um cargo DICOR reconhecido.", ephemeral=True)
+            return
+        before_name, after_name, label = ACTIONS[self.action]
+        if _rank(current) != before_name:
+            await interaction.response.send_message(f"❌ O membro está como **{current.name}**. Esta ação exige **{before_name.replace('_', ' ').title()}**.", ephemeral=True)
+            return
+        embed = discord.Embed(title="🔎 CONFIRMAÇÃO DE MOVIMENTAÇÃO", description="Confira os dados antes de aplicar a alteração.", color=discord.Color.gold())
+        embed.add_field(name="👤 Membro", value=f"{member.mention}\n`{member.display_name}`", inline=False)
+        embed.add_field(name="📋 QRA", value=f"`{_qra(member)}`", inline=True)
+        embed.add_field(name="📌 Cargo atual", value=f"**{current.name}**", inline=True)
+        embed.add_field(name="🔄 Movimentação", value=f"**{label}**", inline=False)
+        await interaction.response.send_message(embed=embed, view=MovementConfirmView(self.action, member), ephemeral=True)
 
 
 class SelectView(discord.ui.View):
@@ -276,7 +325,20 @@ async def _cleanup_and_panel(bot_module: Any) -> None:
                     ids = {str(getattr(c, "custom_id", "")) for row in getattr(message, "components", []) or [] for c in getattr(row, "children", []) or []}
                     footer = " ".join(str(getattr(getattr(e, "footer", None), "text", "")) for e in getattr(message, "embeds", []) or [])
                     if PANEL_MARKER in footer or any(i.startswith("dicor:gestao:v5:") for i in ids): found = message; break
-                    if any(x in (getattr(message, "content", "") or "") for x in ("DICOR_GESTAO_V2", "DICOR_GESTAO_V4")):
+                    legacy = ("DICOR_GESTAO_V2" in (getattr(message, "content", "") or "")
+                              or "DICOR_GESTAO_V4" in footer
+                              or any(i.startswith(("dicor:gestao:v2:", "dicor:gestao:v3:", "dicor:gestao:v4:", "dicor:gestao:")) for i in ids))
+                    if legacy:
+                        try: await message.delete()
+                        except Exception: pass
+                        continue
+                    # Remove somente mensagens soltas enviadas pelo próprio bot no canal
+                    # de gestão; mensagens humanas permanecem intactas.
+                    loose = _norm(getattr(message, "content", ""))
+                    if any(marker in loose for marker in (
+                        "fluxo ativo", "selecione o membro", "selecione o estagiario",
+                        "selecione o investigador", "gestao dicor", "criterios de up",
+                    )):
                         try: await message.delete()
                         except Exception: pass
                 if found is None:

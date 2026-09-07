@@ -170,10 +170,10 @@ async def lazy_install_central():
 
 async def install_new_integrations():
     try:
-        import gestao_v4
-        await gestao_v4.install(bot)
+        import gestao_v5
+        await gestao_v5.install(bot)
     except Exception as exc:
-        diagnostic("gestao_v4", exc)
+        diagnostic("gestao_v5", exc)
     try:
         import hierarquia_v7
         await hierarquia_v7.install(bot)
@@ -239,13 +239,13 @@ async def main():
     except Exception as exc:
         diagnostic("pre_gateway_v186", exc)
 
-    # V4 registra seus IDs antes do setup_hook legado para que os painéis antigos
-    # não recuperem uma implementação V2/V3 no boot.
+    # V5 registra seus IDs antes do gateway para que os painéis antigos
+    # não recuperem uma implementação V2/V3/V4 no boot.
     try:
-        import gestao_v4
-        await gestao_v4.install(bot)
+        import gestao_v5
+        await gestao_v5.install(bot)
     except Exception as exc:
-        diagnostic("pre_gateway_gestao_v4", exc)
+        diagnostic("pre_gateway_gestao_v5", exc)
 
     ready_once = False
 

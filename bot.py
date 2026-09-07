@@ -68246,6 +68246,98 @@ print(
     flush=True,
 )
 
+
+# =====================================================
+# V162 — RECUPERAÇÃO DE BOLETINS SEM TÓPICO
+# - Varre o canal oficial de BO após o boot.
+# - Para cada BO válido sem atendimento registrado, recria o tópico em
+#   #boletins-em-aberto usando o fluxo oficial já existente.
+# - Não duplica atendimentos, não altera BOs já abertos e preserva o número oficial.
+# =====================================================
+_V162_BO_RECOVERY_STARTED = False
+_V162_BO_RECOVERY_LOCK = asyncio.Lock()
+
+async def _v162_recuperar_boletins_sem_atendimento() -> Dict[str, int]:
+    stats = {'mensagens_analisadas': 0, 'boletins_recuperados': 0, 'ja_abertos': 0, 'falhas': 0}
+    async with _V162_BO_RECOVERY_LOCK:
+        try:
+            canal = bot.get_channel(int(BOLETINS_CHANNEL_ID or 0))
+            if canal is None:
+                canal = await bot.fetch_channel(int(BOLETINS_CHANNEL_ID or 0))
+            if canal is None or not hasattr(canal, 'history'):
+                return stats
+
+            processados: set[str] = set()
+            async for message in canal.history(limit=3000, oldest_first=True):
+                try:
+                    if not eh_boletim_valido_para_atendimento(message):
+                        continue
+                    numero = extrair_numero_boletim_seguro(_pericia_texto_mensagem(message))
+                    if not numero:
+                        continue
+                    chave = numero_curto_boletim(numero) or str(numero)
+                    if chave in processados:
+                        continue
+                    processados.add(chave)
+                    stats['mensagens_analisadas'] += 1
+
+                    atendimento = buscar_atendimento_por_mensagem(int(message.id))
+                    if atendimento is None:
+                        atendimento = buscar_atendimento_por_numero(numero)
+                    if atendimento is not None:
+                        stats['ja_abertos'] += 1
+                        continue
+
+                    recuperado = await criar_area_atendimento_boletim(message)
+                    if recuperado:
+                        stats['boletins_recuperados'] += 1
+                        print(
+                            f'🛟 V162: BO recuperado sem tópico | numero={numero} | '
+                            f'origem={message.id} | topico={recuperado.get("thread_id") or recuperado.get("area_id")}',
+                            flush=True,
+                        )
+                    else:
+                        # Pode ter sido criado por outra rotina entre a checagem e a criação.
+                        if buscar_atendimento_por_mensagem(int(message.id)) or buscar_atendimento_por_numero(numero):
+                            stats['ja_abertos'] += 1
+                        else:
+                            stats['falhas'] += 1
+                except Exception as erro:
+                    stats['falhas'] += 1
+                    await enviar_log(
+                        f'⚠️ V162 falha ao recuperar BO `{getattr(message, "id", 0)}`: '
+                        f'{type(erro).__name__}: {erro}'
+                    )
+        except Exception as erro:
+            stats['falhas'] += 1
+            await enviar_log(f'⚠️ V162 recuperação de boletins: {type(erro).__name__}: {erro}')
+    return stats
+
+
+@bot.listen('on_ready')
+async def _v162_iniciar_recuperacao_boletins() -> None:
+    global _V162_BO_RECOVERY_STARTED
+    if _V162_BO_RECOVERY_STARTED:
+        return
+    _V162_BO_RECOVERY_STARTED = True
+    await asyncio.sleep(8)
+    try:
+        resultado = await _v162_recuperar_boletins_sem_atendimento()
+        print(
+            '✅ V162 boletins: '
+            f'analisados={resultado["mensagens_analisadas"]} | '
+            f'já abertos={resultado["ja_abertos"]} | '
+            f'recuperados={resultado["boletins_recuperados"]} | '
+            f'falhas={resultado["falhas"]}',
+            flush=True,
+        )
+    except Exception as erro:
+        traceback.print_exc()
+        await enviar_log(f'❌ V162 recuperação automática de BOs falhou: {type(erro).__name__}: {erro}')
+
+
+print('✅ V162 carregada — boletins oficiais sem atendimento serão recuperados automaticamente após o boot, sem duplicar registros existentes.', flush=True)
+
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
     asyncio.run(_runtime_lifecycle_entrypoint())
