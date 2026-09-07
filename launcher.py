@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher de produção.
-
-Garante que o boot não publique automaticamente o painel de Gestão DICOR.
-O painel pode continuar existindo e seus botões continuam registrados para
-mensagens já existentes; o boot apenas não cria uma nova mensagem.
-"""
+"""Launcher de produção do DICOR."""
 import asyncio
 
 import bot
@@ -12,21 +7,28 @@ import hierarquia_dicor
 import start_safe
 
 
+def install_gestao_v5() -> None:
+    """Substitui implementações legadas pelo painel V5."""
+    try:
+        import gestao_v4
+        import gestao_v5
+        gestao_v4.install = gestao_v5.install
+        print("✅ [GESTAO] V5 registrada como implementação principal.", flush=True)
+    except Exception as exc:
+        print(f"⚠️ [GESTAO] não foi possível registrar V5: {type(exc).__name__}: {exc}", flush=True)
+
+
 def disable_gestao_auto_publish() -> None:
-    """Impede qualquer instalador legado de enviar o painel durante o boot."""
+    """Impede implementações antigas de recriarem o painel."""
     try:
         import gestao_v3
 
         async def _install_without_publish(*_args, **_kwargs):
-            # O painel não é criado/enviado automaticamente.
-            # gestao_panel_fix.py continua responsável por registrar a View
-            # persistente dos botões das mensagens que já existem.
             return True
 
         gestao_v3.install = _install_without_publish
-        print("✅ [GESTAO] publicação automática bloqueada no launcher.", flush=True)
     except Exception as exc:
-        print(f"⚠️ [GESTAO] não foi possível bloquear publicação automática: {type(exc).__name__}: {exc}", flush=True)
+        print(f"⚠️ [GESTAO] legado V3: {type(exc).__name__}: {exc}", flush=True)
 
 
 async def main():
@@ -34,6 +36,7 @@ async def main():
     if client is None:
         raise RuntimeError("cliente Discord não encontrado")
 
+    install_gestao_v5()
     disable_gestao_auto_publish()
     installed = False
 
@@ -48,8 +51,6 @@ async def main():
             installed = False
             print(f"⚠️ Hierarquia DICOR: {type(exc).__name__}: {exc}", flush=True)
 
-    # Registrado antes do listener do start_safe para a hierarquia aplicar seus
-    # patches antes de qualquer integração de pós-READY.
     client.add_listener(install_hierarchy_once, "on_ready")
     await start_safe.main()
 
