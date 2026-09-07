@@ -219,6 +219,13 @@ async def main():
     if client is None or not token:
         raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
 
+    # V166 precisa ser instalado antes do gateway para registrar o on_message
+    # e o on_ready de recuperação automática dos BOs.
+    try:
+        bo_mensal_v166.install(bot)
+    except Exception as exc:
+        diagnostic("V166_bo_mensal", exc)
+
     try:
         runtime_safety_v180.install(bot)
     except Exception as exc:
