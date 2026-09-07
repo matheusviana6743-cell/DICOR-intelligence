@@ -68248,7 +68248,7 @@ print(
 
 
 # =====================================================
-# V162 — RECUPERAÇÃO DE BOLETINS SEM TÓPICO
+# V163 — RECUPERAÇÃO DE BOLETINS SEM TÓPICO (A PARTIR DO BO 21)
 # - Varre o canal oficial de BO após o boot.
 # - Para cada BO válido sem atendimento registrado, recria o tópico em
 #   #boletins-em-aberto usando o fluxo oficial já existente.
@@ -68276,11 +68276,21 @@ async def _v162_recuperar_boletins_sem_atendimento() -> Dict[str, int]:
                     if not numero:
                         continue
                     chave = numero_curto_boletim(numero) or str(numero)
+                    # V163: recuperação somente a partir do BO 21.
+                    # BOs anteriores não devem ser reprocessados pelo recuperador.
+                    try:
+                        numero_inteiro = int(re.search(r'(\d+)$', str(numero)).group(1))
+                    except Exception:
+                        continue
+                    if numero_inteiro < 21:
+                        continue
                     if chave in processados:
                         continue
                     processados.add(chave)
                     stats['mensagens_analisadas'] += 1
 
+                    # Primeiro verifica a mensagem de origem e depois o número oficial.
+                    # Só cria quando realmente não existe atendimento registrado.
                     atendimento = buscar_atendimento_por_mensagem(int(message.id))
                     if atendimento is None:
                         atendimento = buscar_atendimento_por_numero(numero)
@@ -68336,7 +68346,7 @@ async def _v162_iniciar_recuperacao_boletins() -> None:
         await enviar_log(f'❌ V162 recuperação automática de BOs falhou: {type(erro).__name__}: {erro}')
 
 
-print('✅ V162 carregada — boletins oficiais sem atendimento serão recuperados automaticamente após o boot, sem duplicar registros existentes.', flush=True)
+print('✅ V163 carregada — recupera somente BOs a partir do 21 que ainda não possuem atendimento, sem reabrir os anteriores.', flush=True)
 
 # RUNTIME ÚNICO E FINAL — nada pode ser declarado depois deste bloco.
 if __name__ == '__main__':
