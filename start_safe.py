@@ -18,7 +18,6 @@ os.environ.setdefault("ORT_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import bot
-import bo_mensal_v166  # BO mensal: origem fixa + reset mensal
 import bo_sistema_v200
 import runtime_safety_v180
 
@@ -60,8 +59,7 @@ def install_guards():
                 await interaction.response.send_message("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
             else:
                 await interaction.followup.send("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
-        except Exception as exc:
-            diagnostic("slash_error_response", exc)
+        except Exception as exc: diagnostic("slash_error_response", exc)
     if tree is not None:
         try: tree.on_error = tree_error
         except Exception as exc: diagnostic("tree_guard", exc)
@@ -75,8 +73,7 @@ def install_guards():
 
 def install_compat():
     client = getattr(bot, "bot", None)
-    if client is None or hasattr(client, "remove_view"):
-        return
+    if client is None or hasattr(client, "remove_view"): return
     def remove_view(view):
         try:
             store = getattr(getattr(client, "_connection", None), "_view_store", None)
