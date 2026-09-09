@@ -18,7 +18,6 @@ os.environ.setdefault("ORT_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import bot
-import bo_mensal_v166  # BO mensal: origem fixa + reset mensal
 import bo_sistema_v200
 import runtime_safety_v180
 
