@@ -19,6 +19,7 @@ import bo_sistema_v200
 import bo_painel_fix_v202
 import bo_nome_guard_v203
 import dossie_v210
+import dossie_runtime_v212
 import runtime_safety_v180
 
 
@@ -84,8 +85,8 @@ def install_secondary():
         except Exception as exc: diagnostic(name,exc)
     try:
         dossie_v210.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v210.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v210.gerar_pdf_dossie(bot,dados,caminho)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_runtime_v212.gerar_pdf_seguro(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_runtime_v212.gerar_pdf_seguro(bot,dados,caminho)
     except Exception as exc: diagnostic("dossie_v210",exc)
 
 
@@ -105,8 +106,9 @@ async def main():
     try:
         bo_legacy_guard_v201.install(bot); bo_sistema_v200.install(bot); bo_painel_fix_v202.install(bot); bo_nome_guard_v203.install(bot)
         dossie_v210.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v210.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v210.gerar_pdf_dossie(bot,dados,caminho)
+        dossie_runtime_v212.install(bot)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_runtime_v212.gerar_pdf_seguro(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_runtime_v212.gerar_pdf_seguro(bot,dados,caminho)
     except Exception as exc: diagnostic("discord_modules",exc)
     try: runtime_safety_v180.install(bot)
     except Exception as exc: diagnostic("runtime_safety",exc)
