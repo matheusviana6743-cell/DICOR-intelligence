@@ -18,7 +18,7 @@ os.environ.setdefault("ORT_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import bot
-import bo_mensal_v166  # BO mensal: origem fixa + reset mensal
+import bo_legacy_guard_v201
 import bo_sistema_v200
 import runtime_safety_v180
 
@@ -44,22 +44,18 @@ def trim_cache():
             if messages is not None:
                 state._messages = deque(list(messages)[-5:], maxlen=5)
         gc.collect()
-    except Exception as exc:
-        diagnostic("cache_trim", exc)
+    except Exception as exc: diagnostic("cache_trim", exc)
 
 
 def install_guards():
     client = getattr(bot, "bot", None)
-    if client is None:
-        return
+    if client is None: return
     tree = getattr(client, "tree", None)
     async def tree_error(interaction, error):
         diagnostic("slash_command", error)
         try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
-            else:
-                await interaction.followup.send("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
+            if not interaction.response.is_done(): await interaction.response.send_message("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
+            else: await interaction.followup.send("❌ Ocorreu um erro interno. O sistema continua online.", ephemeral=True)
         except Exception as exc: diagnostic("slash_error_response", exc)
     if tree is not None:
         try: tree.on_error = tree_error
@@ -150,7 +146,9 @@ async def after_ready():
 async def main():
     client = getattr(bot, "bot", None); token = str(os.getenv("DISCORD_TOKEN") or getattr(bot, "DISCORD_TOKEN", "")).strip()
     if client is None or not token: raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
-    try: bo_sistema_v200.install(bot)
+    try:
+        bo_legacy_guard_v201.install(bot)
+        bo_sistema_v200.install(bot)
     except Exception as exc: diagnostic("V200_bo_sistema", exc)
     try: runtime_safety_v180.install(bot)
     except Exception as exc: diagnostic("V180", exc)
