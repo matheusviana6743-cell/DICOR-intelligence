@@ -29,7 +29,7 @@ LOG_ID=int(os.getenv('LOGS_CHANNEL_ID','1490205503228477610'))
 DATA_DIR=Path(os.getenv('DICOR_DATA_DIR','data')); DATA_DIR.mkdir(parents=True,exist_ok=True)
 STATE=DATA_DIR/'core_v600_state.json'; MEDIA=DATA_DIR/'core_v600_media'; DOCS=DATA_DIR/'dossies_v600'
 MEDIA.mkdir(exist_ok=True); DOCS.mkdir(exist_ok=True)
-TEMPLATE_B64=Path(__file__).with_name('dicor_template_v301.b64'); TEMPLATE=DATA_DIR/'core_v600_template.png'
+TEMPLATE_B64=Path(__file__).with_name('dicor_template_v600.b64'); TEMPLATE=DATA_DIR/'core_v600_template.png'
 AUTH_ROLE_IDS={int(x) for x in os.getenv('DICOR_AUTH_ROLE_IDS','1490200388912156692,1490200383614615725,1490200382776021132').replace(';',',').split(',') if x.strip().isdigit()}
 TEAM_ROLE_IDS={int(x) for x in os.getenv('DICOR_TEAM_ROLE_IDS','1490200391239864352,1490200390426165290').replace(';',',').split(',') if x.strip().isdigit()}
 
@@ -39,8 +39,10 @@ def load_state():
             d=json.loads(STATE.read_text(encoding='utf-8')); return d if isinstance(d,dict) else {}
     except Exception: traceback.print_exc()
     return {}
+
 def save_state(d):
     tmp=STATE.with_suffix('.tmp'); tmp.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8'); tmp.replace(STATE)
+
 def now(): return datetime.now().strftime('%d/%m/%Y %H:%M')
 def month(dt): return dt.strftime('%m/%Y')
 def norm(s): return ' '.join(re.sub(r'[^0-9a-zA-ZÀ-ÿ]+',' ',str(s or '').casefold()).split())
@@ -52,7 +54,8 @@ def text_of(m):
         if e.description:p.append(str(e.description))
         for f in getattr(e,'fields',[]) or []: p.extend([str(f.name or ''),str(f.value or '')])
     return '\n'.join(x for x in p if x).strip()
-def authorized(m): return any(getattr(r,'id',0) in AUTH_ROLE_IDS for r in getattr(m,'roles',[])) or any('inspetor' in norm(getattr(r,'name','')) or 'diretor' in norm(getattr(r,'name','')) for r in getattr(m,'roles',[]))
+def authorized(m):
+    return any(getattr(r,'id',0) in AUTH_ROLE_IDS for r in getattr(m,'roles',[])) or any('inspetor' in norm(getattr(r,'name','')) or 'diretor' in norm(getattr(r,'name','')) for r in getattr(m,'roles',[]))
 def team_member(m):
     if any(getattr(r,'id',0) in TEAM_ROLE_IDS for r in getattr(m,'roles',[])): return True
     return any(any(k in norm(getattr(r,'name','')) for k in ('estagi','investigador','inspetor','agente','delegado','dicor','escriv')) for r in getattr(m,'roles',[]))
@@ -83,14 +86,14 @@ async def respond(i,text,view=None):
         if i.response.is_done(): await i.followup.send(text,view=view,ephemeral=True)
         else: await i.response.send_message(text,view=view,ephemeral=True)
     except Exception: pass
-async def log(bot,text):
+async def log(client,text):
     try:
-        ch=bot.get_channel(LOG_ID)
+        ch=client.get_channel(LOG_ID)
         if ch: await ch.send(str(text)[:1900])
     except Exception: pass
 
 class Core:
-    def __init__(self,bot): self.bot=bot; self.bo_lock=set(); self.per_lock=set(); self.recovered=False
+    def __init__(self,mod): self.mod=mod; self.client=mod.bot; self.bo_lock=set(); self.per_lock=set(); self.recovered=False
     async def channel(self,guild,cid):
         c=guild.get_channel(cid)
         if c is None:
@@ -125,7 +128,11 @@ class Core:
                 try: await th.send(file=await a.to_file(use_cached=True))
                 except Exception: await th.send(a.url)
             rid=f'BO-{msg.id}'; append_record('bo',{'id':rid,'number':num,'month':mo,'source_message_id':msg.id,'source_channel_id':SOURCE_BO_ID,'thread_id':th.id,'agent_id':agent.id if agent else None,'agent_name':str(agent) if agent else '','status':'EM_ATENDIMENTO' if agent else 'SEM_AGENTE','created_at':now()})
-            await th.send(view=BOView(self,rid)); await log(self.bot,f'✅ V600 BO criado | {num} | tópico {th.id}')
+            await th.send(view=BOView(self,rid)); await log(self.client,f'✅ V600 BO criado | {num} | tópico {th.id}')
+        except Exception:
+            traceback.print_exc()
+            try: await log(self.client,f'❌ V600 falha BO | origem {msg.id}\n{traceback.format_exc()[-1400:]}')
+            except Exception: pass
         finally:self.bo_lock.discard(msg.id)
     async def create_pericia(self,msg):
         if not msg.guild or msg.author.bot or msg.channel.id!=SOURCE_PERICIA_ID or msg.id in self.per_lock:return
@@ -140,12 +147,16 @@ class Core:
                 try: await th.send(file=await a.to_file(use_cached=True))
                 except Exception: await th.send(a.url)
             rid=f'PERICIA-{msg.id}'; append_record('pericia',{'id':rid,'number':num,'month':mo,'source_message_id':msg.id,'source_channel_id':SOURCE_PERICIA_ID,'thread_id':th.id,'agent_id':None,'status':'AGUARDANDO_AGENTE','attachments':len(msg.attachments or []),'created_at':now()})
-            await th.send(embed=discord.Embed(title=f'🔬 CONTROLE DA PERÍCIA EXTERNA — Nº {num}',description='Um Inspetor+ deve selecionar o agente responsável abaixo.'),view=PericiaView(self,rid)); await log(self.bot,f'✅ V600 Perícia criada | {num} | tópico {th.id}')
+            await th.send(embed=discord.Embed(title=f'🔬 CONTROLE DA PERÍCIA EXTERNA — Nº {num}',description='Um Inspetor+ deve selecionar o agente responsável abaixo.'),view=PericiaView(self,rid)); await log(self.client,f'✅ V600 Perícia criada | {num} | tópico {th.id}')
+        except Exception:
+            traceback.print_exc()
+            try: await log(self.client,f'❌ V600 falha Perícia | origem {msg.id}\n{traceback.format_exc()[-1400:]}')
+            except Exception: pass
         finally:self.per_lock.discard(msg.id)
     async def recover(self):
         if self.recovered:return
         self.recovered=True; await asyncio.sleep(3)
-        for g in self.bot.guilds:
+        for g in self.client.guilds:
             for cid,fn in ((SOURCE_BO_ID,self.create_bo),(SOURCE_PERICIA_ID,self.create_pericia)):
                 ch=g.get_channel(cid)
                 if isinstance(ch,discord.TextChannel):
@@ -175,7 +186,7 @@ class BOView(View):
     async def done(self,i):
         if not await ack(i):return
         if not isinstance(i.user,discord.Member) or not authorized(i.user):return await respond(i,'❌ Apenas Inspetor+ pode finalizar.')
-        r=self.core.by_thread('bo',getattr(i.channel,'id',0));
+        r=self.core.by_thread('bo',getattr(i.channel,'id',0))
         if r:update_record('bo',r['id'],{'status':'FINALIZADO','closed_at':now()}); await respond(i,'✅ BO finalizado.')
 class PericiaAgentSelect(UserSelect):
     def __init__(self,core): super().__init__(placeholder='Inspetor+: selecione o agente responsável',min_values=1,max_values=1,custom_id='dicor_v600_pericia_agent'); self.core=core
@@ -255,17 +266,23 @@ async def generate_doc(channel):
     c.save(); return out
 
 def install(bot):
-    core=Core(bot); bot.add_listener(core.on_message,'on_message')
-    try: bot.add_view(BOView(core,'')); bot.add_view(PericiaView(core,''))
-    except Exception: pass
+    core=Core(bot)
+    client=bot.bot
+    client.add_listener(core.on_message,'on_message')
+    try:
+        client.add_view(BOView(core,''))
+        client.add_view(PericiaView(core,''))
+    except Exception:
+        traceback.print_exc()
     async def ready():
         if not core.recovered: asyncio.create_task(core.recover(),name='dicor-v600-recover')
-    bot.add_listener(ready,'on_ready')
+    client.add_listener(ready,'on_ready')
     async def dossie(i):
         if not await ack(i):return
         try:
             p=await generate_doc(i.channel); await respond(i,f'✅ Dossiê V600 gerado: `{p.name}`')
             if isinstance(i.channel,(discord.TextChannel,discord.Thread)): await i.channel.send(file=discord.File(str(p)))
-        except Exception as e: traceback.print_exc(); await respond(i,f'❌ Falha no dossiê: {type(e).__name__}: {e}')
-    try: bot.tree.add_command(app_commands.Command(name='dossiev600',description='Gera o dossiê operacional da mesa atual',callback=dossie))
-    except Exception: pass
+        except Exception as e:
+            traceback.print_exc(); await respond(i,f'❌ Falha no dossiê: {type(e).__name__}: {e}')
+    try: client.tree.add_command(app_commands.Command(name='dossiev600',description='Gera o dossiê operacional da mesa atual',callback=dossie))
+    except Exception as e: print(f'⚠️ V600 comando dossiev600: {type(e).__name__}: {e}',flush=True)
