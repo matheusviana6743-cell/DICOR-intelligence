@@ -10,7 +10,7 @@ import bo_legacy_guard_v201
 import bo_sistema_v200
 import bo_painel_fix_v202
 import bo_nome_guard_v203
-import dossie_v307
+import dossie_v401
 import runtime_safety_v180
 
 def diagnostic(context,exc):
@@ -68,8 +68,11 @@ def install_secondary():
   try:
    mod=__import__(name);mod.install(bot);print(f"✅ {name} carregado após READY.",flush=True)
   except Exception as exc:diagnostic(name,exc)
- try:dossie_v307.install(bot);bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho:dossie_v307.gerar_pdf_dossie(bot,dados,caminho);bot._V155_GERAR_PDF_BASE=lambda dados,caminho:dossie_v307.gerar_pdf_dossie(bot,dados,caminho)
- except Exception as exc:diagnostic("dossie_v307",exc)
+ try:
+  dossie_v401.install(bot)
+  bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho:dossie_v401.gerar_pdf_dossie(bot,dados,caminho)
+  bot._V155_GERAR_PDF_BASE=lambda dados,caminho:dossie_v401.gerar_pdf_dossie(bot,dados,caminho)
+ except Exception as exc:diagnostic("dossie_v401",exc)
 
 async def install_integrations():
  for name in ("gestao_v5","hierarquia_v7","fivemanage_media"):
@@ -83,9 +86,9 @@ async def main():
  client=getattr(bot,"bot",None);token=str(os.getenv("DISCORD_TOKEN") or getattr(bot,"DISCORD_TOKEN","")).strip()
  if client is None or not token:raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
  try:
-  bo_legacy_guard_v201.install(bot);bo_sistema_v200.install(bot);bo_painel_fix_v202.install(bot);bo_nome_guard_v203.install(bot);dossie_v307.install(bot)
-  bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho:dossie_v307.gerar_pdf_dossie(bot,dados,caminho)
-  bot._V155_GERAR_PDF_BASE=lambda dados,caminho:dossie_v307.gerar_pdf_dossie(bot,dados,caminho)
+  bo_legacy_guard_v201.install(bot);bo_sistema_v200.install(bot);bo_painel_fix_v202.install(bot);bo_nome_guard_v203.install(bot);dossie_v401.install(bot)
+  bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho:dossie_v401.gerar_pdf_dossie(bot,dados,caminho)
+  bot._V155_GERAR_PDF_BASE=lambda dados,caminho:dossie_v401.gerar_pdf_dossie(bot,dados,caminho)
  except Exception as exc:diagnostic("discord_modules",exc)
  try:runtime_safety_v180.install(bot)
  except Exception as exc:diagnostic("runtime_safety",exc)
@@ -99,7 +102,7 @@ async def main():
  async def ready_listener():
   nonlocal ready_once
   if ready_once:return
-  ready_once=True;print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V307 ativo.",flush=True);trim_cache();asyncio.create_task(after_ready(),name="dicor-after-ready")
+  ready_once=True;print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V401 ativo.",flush=True);trim_cache();asyncio.create_task(after_ready(),name="dicor-after-ready")
  client.add_listener(ready_listener,"on_ready")
  await client.start(token,reconnect=True)
 
