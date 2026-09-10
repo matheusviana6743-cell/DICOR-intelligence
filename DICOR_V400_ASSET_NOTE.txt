@@ -1,0 +1,1 @@
+O V400 requer o arquivo dicor_template_clean3.png junto ao módulo dossie_v400.py. O asset é a arte-base limpa PF/DICOR (moldura, cabeçalho, brasões e marca d'água) usada para preservar o layout do modelo.
