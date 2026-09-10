@@ -18,8 +18,7 @@ import bo_legacy_guard_v201
 import bo_sistema_v200
 import bo_painel_fix_v202
 import bo_nome_guard_v203
-import dossie_v210
-import dossie_runtime_v212
+import dossie_v302
 import runtime_safety_v180
 
 
@@ -75,20 +74,6 @@ def install_compat():
     except Exception: pass
 
 
-def _wire_dossie_pdf():
-    """Porta única e protegida para geração do PDF."""
-    def _safe(dados, caminho):
-        return dossie_runtime_v212.gerar_pdf_seguro(bot, dados, caminho)
-    bot._V159_RENDER_PDF_APROVADO = _safe
-    bot._V155_GERAR_PDF_BASE = _safe
-    # Algumas versões antigas do bot chamam helpers diretamente; expomos a mesma
-    # porta segura nesses aliases para evitar que uma rotina bypass o fallback.
-    try:
-        bot._V212_GERAR_PDF_SEGURO = _safe
-    except Exception:
-        pass
-
-
 def install_secondary():
     for name in ("stability_v184","pericia_fix_v185"):
         try: __import__(name).install(bot)
@@ -98,11 +83,10 @@ def install_secondary():
             mod=__import__(name); mod.install(bot); print(f"✅ {name} carregado após READY.",flush=True)
         except Exception as exc: diagnostic(name,exc)
     try:
-        dossie_v210.install(bot)
-        dossie_runtime_v212.install(bot)
-        _wire_dossie_pdf()
-        print("✅ Dossiê V212 ativo: qualquer falha de renderização entra em contingência e não trava o encerramento.",flush=True)
-    except Exception as exc: diagnostic("dossie_runtime_v212",exc)
+        dossie_v302.install(bot)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
+    except Exception as exc: diagnostic("dossie_v302",exc)
 
 
 async def install_integrations():
@@ -120,9 +104,9 @@ async def main():
     if client is None or not token: raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
     try:
         bo_legacy_guard_v201.install(bot); bo_sistema_v200.install(bot); bo_painel_fix_v202.install(bot); bo_nome_guard_v203.install(bot)
-        dossie_v210.install(bot)
-        dossie_runtime_v212.install(bot)
-        _wire_dossie_pdf()
+        dossie_v302.install(bot)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
     except Exception as exc: diagnostic("discord_modules",exc)
     try: runtime_safety_v180.install(bot)
     except Exception as exc: diagnostic("runtime_safety",exc)
@@ -136,7 +120,7 @@ async def main():
     async def ready_listener():
         nonlocal ready_once
         if ready_once: return
-        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
+        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V302 ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
     client.add_listener(ready_listener,"on_ready")
     await client.start(token,reconnect=True)
 
