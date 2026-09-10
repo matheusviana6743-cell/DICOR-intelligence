@@ -1,0 +1,1 @@
+Use the local template file dicor_template_clean3.png when packaging the Railway deployment.
