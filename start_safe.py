@@ -5,31 +5,23 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("ORT_NUM_THREADS", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+for k,v in {"MALLOC_ARENA_MAX":"2","OMP_NUM_THREADS":"1","OPENBLAS_NUM_THREADS":"1","MKL_NUM_THREADS":"1","NUMEXPR_NUM_THREADS":"1","ORT_NUM_THREADS":"1","TOKENIZERS_PARALLELISM":"false"}.items(): os.environ.setdefault(k,v)
 
 import bot
 import bo_legacy_guard_v201
 import bo_sistema_v200
 import bo_painel_fix_v202
 import bo_nome_guard_v203
-import dossie_v304
+import dossie_v305
+import dossie_v306_patch
 import runtime_safety_v180
-
 
 def diagnostic(context, exc):
     try:
         data_dir=Path(str(getattr(bot,"DATA_DIR",Path(__file__).parent/"data"))); data_dir.mkdir(parents=True,exist_ok=True)
-        with (data_dir/"diagnostico_erros.jsonl").open("a",encoding="utf-8") as fh:
-            fh.write(json.dumps({"timestamp":datetime.now(timezone.utc).isoformat(),"contexto":context,"tipo":type(exc).__name__,"erro":str(exc),"traceback":traceback.format_exc()},ensure_ascii=False)+"\n")
+        with (data_dir/"diagnostico_erros.jsonl").open("a",encoding="utf-8") as fh: fh.write(json.dumps({"timestamp":datetime.now(timezone.utc).isoformat(),"contexto":context,"tipo":type(exc).__name__,"erro":str(exc),"traceback":traceback.format_exc()},ensure_ascii=False)+"\n")
     except Exception: pass
     print(f"[SAFE] {context}: {type(exc).__name__}: {exc}",flush=True)
-
 
 def trim_cache():
     try:
@@ -40,10 +32,9 @@ def trim_cache():
         gc.collect()
     except Exception as exc: diagnostic("cache_trim",exc)
 
-
 def install_guards():
     client=getattr(bot,"bot",None)
-    if client is None: return
+    if client is None:return
     tree=getattr(client,"tree",None)
     async def tree_error(interaction,error):
         diagnostic("slash_command",error)
@@ -61,7 +52,6 @@ def install_guards():
     try: client.on_command_error=prefix_error
     except Exception as exc: diagnostic("prefix_guard",exc)
 
-
 def install_compat():
     client=getattr(bot,"bot",None)
     if client is None or hasattr(client,"remove_view"): return
@@ -69,10 +59,9 @@ def install_compat():
         try:
             store=getattr(getattr(client,"_connection",None),"_view_store",None); remover=getattr(store,"remove_view",None)
             return remover(view) if callable(remover) else None
-        except Exception: return None
+        except Exception:return None
     try: client.remove_view=remove_view
     except Exception: pass
-
 
 def install_secondary():
     for name in ("stability_v184","pericia_fix_v185"):
@@ -83,30 +72,24 @@ def install_secondary():
             mod=__import__(name); mod.install(bot); print(f"✅ {name} carregado após READY.",flush=True)
         except Exception as exc: diagnostic(name,exc)
     try:
-        dossie_v304.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v304.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v304.gerar_pdf_dossie(bot,dados,caminho)
-    except Exception as exc: diagnostic("dossie_v304",exc)
-
+        dossie_v305.install(bot)
+        dossie_v306_patch.install(bot)
+    except Exception as exc: diagnostic("dossie_v305",exc)
 
 async def install_integrations():
     for name in ("gestao_v5","hierarquia_v7","fivemanage_media"):
         try: await __import__(name).install(bot)
         except Exception as exc: diagnostic(name,exc)
 
-
 async def after_ready():
     await asyncio.sleep(3); trim_cache(); install_secondary(); await asyncio.sleep(.5); await install_integrations(); trim_cache()
-
 
 async def main():
     client=getattr(bot,"bot",None); token=str(os.getenv("DISCORD_TOKEN") or getattr(bot,"DISCORD_TOKEN","")).strip()
     if client is None or not token: raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
     try:
         bo_legacy_guard_v201.install(bot); bo_sistema_v200.install(bot); bo_painel_fix_v202.install(bot); bo_nome_guard_v203.install(bot)
-        dossie_v304.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v304.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v304.gerar_pdf_dossie(bot,dados,caminho)
+        dossie_v305.install(bot); dossie_v306_patch.install(bot)
     except Exception as exc: diagnostic("discord_modules",exc)
     try: runtime_safety_v180.install(bot)
     except Exception as exc: diagnostic("runtime_safety",exc)
@@ -119,8 +102,8 @@ async def main():
     ready_once=False
     async def ready_listener():
         nonlocal ready_once
-        if ready_once: return
-        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V304 ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
+        if ready_once:return
+        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V305 ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
     client.add_listener(ready_listener,"on_ready")
     await client.start(token,reconnect=True)
 
