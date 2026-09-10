@@ -1,0 +1,1 @@
+A imagem-base do template PF/DICOR deve ser versionada como asset binário. O gerador V400 aponta para dicor_template_clean3.png.
