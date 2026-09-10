@@ -1,0 +1,1 @@
+Asset local: /mnt/data/dicor_template_clean3.png
