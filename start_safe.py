@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V600.
+"""Launcher oficial do DICOR Core V602.
 
-Somente o núcleo V600 é instalado para BO, Perícia Externa e Dossiê.
-Os patches legados não são carregados neste processo para evitar listeners,
-Views e handlers duplicados.
+Somente o núcleo V602 é instalado para BO, Perícia Externa e Dossiê.
+Os patches legados não são carregados neste processo.
 """
 import asyncio
 import os
 import traceback
 
 import bot
-import dicor_core_v600
+import dicor_core_v602
 
 
 async def main():
@@ -21,8 +20,8 @@ async def main():
     if not token:
         raise RuntimeError('DISCORD_TOKEN ausente')
 
-    dicor_core_v600.install(bot)
-    print('✅ DICOR Core V600 ativo: BO + Perícia + Dossiê. Nenhum patch legado carregado.', flush=True)
+    dicor_core_v602.install(bot)
+    print('✅ DICOR Core V602 ativo: BO + Perícia + Dossiê. Scanner automático contínuo ativo.', flush=True)
     await client.start(token, reconnect=True)
 
 
