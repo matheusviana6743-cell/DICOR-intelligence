@@ -18,7 +18,7 @@ import bo_legacy_guard_v201
 import bo_sistema_v200
 import bo_painel_fix_v202
 import bo_nome_guard_v203
-import dossie_v302
+import dossie_v303
 import runtime_safety_v180
 
 
@@ -83,10 +83,10 @@ def install_secondary():
             mod=__import__(name); mod.install(bot); print(f"✅ {name} carregado após READY.",flush=True)
         except Exception as exc: diagnostic(name,exc)
     try:
-        dossie_v302.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
-    except Exception as exc: diagnostic("dossie_v302",exc)
+        dossie_v303.install(bot)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v303.gerar_pdf_dossie(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v303.gerar_pdf_dossie(bot,dados,caminho)
+    except Exception as exc: diagnostic("dossie_v303",exc)
 
 
 async def install_integrations():
@@ -104,9 +104,9 @@ async def main():
     if client is None or not token: raise RuntimeError("cliente Discord ou DISCORD_TOKEN ausente")
     try:
         bo_legacy_guard_v201.install(bot); bo_sistema_v200.install(bot); bo_painel_fix_v202.install(bot); bo_nome_guard_v203.install(bot)
-        dossie_v302.install(bot)
-        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
-        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v302.gerar_pdf_dossie(bot,dados,caminho)
+        dossie_v303.install(bot)
+        bot._V159_RENDER_PDF_APROVADO=lambda dados,caminho: dossie_v303.gerar_pdf_dossie(bot,dados,caminho)
+        bot._V155_GERAR_PDF_BASE=lambda dados,caminho: dossie_v303.gerar_pdf_dossie(bot,dados,caminho)
     except Exception as exc: diagnostic("discord_modules",exc)
     try: runtime_safety_v180.install(bot)
     except Exception as exc: diagnostic("runtime_safety",exc)
@@ -120,7 +120,7 @@ async def main():
     async def ready_listener():
         nonlocal ready_once
         if ready_once: return
-        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V302 ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
+        ready_once=True; print("✅ DISCORD READY — DICOR Discord-only ativo. Dossiê V303 ativo.",flush=True); trim_cache(); asyncio.create_task(after_ready(),name="dicor-after-ready")
     client.add_listener(ready_listener,"on_ready")
     await client.start(token,reconnect=True)
 
