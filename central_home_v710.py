@@ -17,40 +17,39 @@ import central_home_v700 as v700
 import central_home_v708 as v708
 
 
-def iframe_security(req, handler):
-    async def run():
-        try:
-            response = await handler(req)
-        except web.HTTPException as exc:
-            response = exc
-        response.headers.pop("X-Frame-Options", None)
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "img-src 'self' data: https:; "
-            "connect-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "frame-ancestors *; "
-            "base-uri 'self'; form-action 'self'; object-src 'none'"
-        )
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = "camera=(),microphone=(),geolocation=()"
-        response.headers["Cache-Control"] = "no-store"
-        return response
-    return run()
+async def iframe_security(req, handler):
+    try:
+        response = await handler(req)
+    except web.HTTPException as exc:
+        response = exc
+    response.headers.pop("X-Frame-Options", None)
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "frame-ancestors *; "
+        "base-uri 'self'; form-action 'self'; object-src 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(),microphone=(),geolocation=()"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 async def iframe_login_route(req):
     response = await v700.login_route(req)
-    # login_route returns HTTP 302 on successful POST; replace its session
-    # cookie attributes so browsers/CEF permit the session inside an iframe.
     if getattr(response, "headers", None) is not None:
-        raw = list(response.headers.getall("Set-Cookie", []))
-        if raw:
-            response.headers.popall("Set-Cookie", ())
-            for cookie in raw:
-                cookie = cookie.replace("; Path=/; SameSite=Lax", "; Path=/; SameSite=None; Secure")
+        cookies = list(response.headers.getall("Set-Cookie", []))
+        if cookies:
+            response.headers.popall("Set-Cookie")
+            for cookie in cookies:
+                cookie = cookie.replace(
+                    "; Path=/; SameSite=Lax",
+                    "; Path=/; SameSite=None; Secure",
+                )
                 response.headers.add("Set-Cookie", cookie)
     return response
 
