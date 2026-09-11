@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V608."""
+"""Launcher oficial do DICOR Core V606 + Central V609."""
 import asyncio
 import os
 import traceback
@@ -8,7 +8,7 @@ import bot
 import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
-import central_discord_v608
+import central_discord_v609
 
 
 async def main():
@@ -23,12 +23,10 @@ async def main():
     core = dicor_core_v605.install(bot)
     dicor_recovery_guard_v606.install(core)
 
-    # Central clássica restaurada: dashboard, identificação QRA/passaporte
-    # e dados consultados diretamente dos canais/tópicos do Discord.
-    central = central_discord_v608.install(bot)
+    central = central_discord_v609.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V608 clássica", flush=True)
+    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V609 clássica", flush=True)
     await client.start(token, reconnect=True)
 
 
