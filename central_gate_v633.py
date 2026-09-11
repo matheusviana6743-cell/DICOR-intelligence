@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """DICOR Central V633 - camada de autorização, perfis, cargos e auditoria."""
 from __future__ import annotations
 import json, os
@@ -6,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import central_visual_v632 as visual
 import central_discord_v613 as base
-import central_procurados_v625 as v625
+import central_procurados_v626 as v625
 try:
     import discord
 except Exception:
@@ -22,8 +21,7 @@ def esc(v):
     import html
     return html.escape(str(v or ""), quote=True)
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def accounts():
     data = base.load_accounts(); changed = False
@@ -39,8 +37,7 @@ def current(req):
     session = base.read_session(req)
     if not session: return "", "", None
     qra, passport = session; data = accounts(); key = base.account_key(qra, passport); user = data.get(key)
-    if isinstance(user, dict):
-        user.update(qra=qra, passaporte=passport); data[key] = user; base.save_accounts(data)
+    if isinstance(user, dict): user.update(qra=qra, passaporte=passport); data[key] = user; base.save_accounts(data)
     return qra, passport, user if isinstance(user, dict) else None
 
 def is_admin(qra, passport, user):
@@ -75,8 +72,7 @@ if discord:
         async def approve(self, interaction, button):
             if not interaction.user.guild_permissions.manage_guild: return await interaction.response.send_message("Sem permissão para aprovar.", ephemeral=True)
             data = accounts(); user = data.get(self.key)
-            if isinstance(user, dict):
-                user["authorized"] = True; user["access_request_pending"] = False; user["authorized_at"] = now(); data[self.key] = user; base.save_accounts(data); audit(user.get("qra", ""), user.get("passaporte", ""), "AUTORIZACAO_APROVADA", "/admin", str(interaction.user))
+            if isinstance(user, dict): user["authorized"] = True; user["access_request_pending"] = False; user["authorized_at"] = now(); data[self.key] = user; base.save_accounts(data); audit(user.get("qra", ""), user.get("passaporte", ""), "AUTORIZACAO_APROVADA", "/admin", str(interaction.user))
             await interaction.response.edit_message(content="✅ Acesso aprovado.", embed=None, view=None)
         @discord.ui.button(label="RECUSAR", style=discord.ButtonStyle.danger, custom_id="dicor_v633_reject")
         async def reject(self, interaction, button):
@@ -120,48 +116,48 @@ async def profile_upload(req):
 async def admin_page(req):
     qra, passport, user = current(req)
     if not user or not is_admin(qra, passport, user): raise base.web.HTTPForbidden(text="Acesso administrativo restrito.")
-    users = []
-    for key, item in accounts().items():
-        if not isinstance(item, dict): continue
-        opts = ''.join(f"<option {'selected' if item.get('role') == role else ''}>{esc(role)}</option>" for role in ROLES)
+    users=[]
+    for key,item in accounts().items():
+        if not isinstance(item,dict): continue
+        opts=''.join(f"<option {'selected' if item.get('role')==role else ''}>{esc(role)}</option>" for role in ROLES)
         users.append(f"<div class='module'><b>{esc(item.get('qra'))}</b><p>Passaporte {esc(item.get('passaporte'))} • {esc(item.get('role'))}</p><form method='post' action='/admin/role'><input type='hidden' name='key' value='{esc(key)}'><select name='role'>{opts}</select><button class='primary gold' type='submit'>SALVAR CARGO</button></form></div>")
-    try: logs = json.loads(LOG_FILE.read_text(encoding='utf-8')) if LOG_FILE.exists() else []
-    except Exception: logs = []
-    log_html = ''.join(f"<div class='module'><b>{esc(x.get('action'))}</b><p>{esc(x.get('time'))} • {esc(x.get('qra'))} • Passaporte {esc(x.get('passaporte'))}</p></div>" for x in logs[-300:][::-1])
-    body = f"<main class='auth' style='width:min(1100px,calc(100% - 28px))'><h1>PAINEL ADMIN</h1><p class='sub'>Usuários, cargos, autorizações e logs.</p><div class='module-grid'>{''.join(users)}</div><h2 style='margin-top:25px'>LOGS</h2><div class='module-grid'>{log_html or '<p>Nenhum log.</p>'}</div></main>"
-    audit(qra, passport, "ABRIU_PAINEL_ADMIN", req.path)
-    return base.web.Response(text=base.page("DICOR • Admin", body, base.AUTH_CSS), content_type="text/html")
+    try: logs=json.loads(LOG_FILE.read_text(encoding='utf-8')) if LOG_FILE.exists() else []
+    except Exception: logs=[]
+    log_html=''.join(f"<div class='module'><b>{esc(x.get('action'))}</b><p>{esc(x.get('time'))} • {esc(x.get('qra'))} • Passaporte {esc(x.get('passaporte'))}</p></div>" for x in logs[-300:][::-1])
+    body=f"<main class='auth' style='width:min(1100px,calc(100% - 28px))'><h1>PAINEL ADMIN</h1><p class='sub'>Usuários, cargos, autorizações e logs.</p><div class='module-grid'>{''.join(users)}</div><h2 style='margin-top:25px'>LOGS</h2><div class='module-grid'>{log_html or '<p>Nenhum log.</p>'}</div></main>"
+    audit(qra,passport,"ABRIU_PAINEL_ADMIN",req.path)
+    return base.web.Response(text=base.page("DICOR • Admin",body,base.AUTH_CSS),content_type="text/html")
 
 async def admin_role(req):
     qra, passport, user = current(req)
     if not user or not is_admin(qra, passport, user): raise base.web.HTTPForbidden(text="Acesso administrativo restrito.")
-    post = await req.post(); data = accounts(); target = data.get(str(post.get("key", ""))); role = str(post.get("role", ""))
-    if not isinstance(target, dict) or role not in ROLES: raise base.web.HTTPBadRequest(text="Dados inválidos.")
-    target["role"] = role; data[str(post.get("key"))] = target; base.save_accounts(data); audit(qra, passport, "CARGO_ALTERADO", "/admin", role); raise base.web.HTTPFound("/admin")
+    post=await req.post(); data=accounts(); target=data.get(str(post.get("key",""))); role=str(post.get("role",""))
+    if not isinstance(target,dict) or role not in ROLES: raise base.web.HTTPBadRequest(text="Dados inválidos.")
+    target["role"]=role; data[str(post.get("key"))]=target; base.save_accounts(data); audit(qra,passport,"CARGO_ALTERADO","/admin",role); raise base.web.HTTPFound("/admin")
 
 async def operations(req):
     qra, passport, user = current(req)
-    if not user or not user.get("authorized"): return base.web.Response(text=guarded_functions(qra), status=403, content_type="text/html")
-    body = f"<main class='auth'><h1>OPERAÇÕES</h1><p class='sub'>Acesso autorizado para {esc(qra)}.</p><span>ACESSO LIBERADO</span></main>"
-    audit(qra, passport, "ABRIU_OPERACOES", req.path)
-    return base.web.Response(text=base.page("DICOR • Operações", body, base.AUTH_CSS), content_type="text/html")
+    if not user or not user.get("authorized"): return base.web.Response(text=guarded_functions(qra),status=403,content_type="text/html")
+    body=f"<main class='auth'><h1>OPERAÇÕES</h1><p class='sub'>Acesso autorizado para {esc(qra)}.</p><span>ACESSO LIBERADO</span></main>"
+    audit(qra,passport,"ABRIU_OPERACOES",req.path)
+    return base.web.Response(text=base.page("DICOR • Operações",body,base.AUTH_CSS),content_type="text/html")
 
 def install(bot_module):
     global _CLIENT
-    central = visual.install(bot_module); base.functionalities = guarded_functions
+    central=visual.install(bot_module); base.functionalities=guarded_functions
     async def start(client):
         global _CLIENT
-        _CLIENT = client; v625._CLIENT = client
-        original_init = v625.ApplicationPatch.__init__
-        def init(self, *args, **kwargs):
-            kwargs["client_max_size"] = 12 * 1024 * 1024; original_init(self, *args, **kwargs)
-            self.router.add_get("/solicitar-acesso", request_access, name="v633_access")
-            self.router.add_get("/perfil", profile, name="v633_profile")
-            self.router.add_post("/perfil/upload", profile_upload, name="v633_profile_upload")
-            self.router.add_get("/admin", admin_page, name="v633_admin")
-            self.router.add_post("/admin/role", admin_role, name="v633_role")
-            self.router.add_get("/operacoes", operations, name="v633_operations")
-        v625.ApplicationPatch.__init__ = init
-        return await v625.start_server_v625(client)
-    base.start_server = start
+        _CLIENT=client; v625._CLIENT=client; v625.v625._CLIENT=client
+        original_init=v625.ApplicationPatch.__init__
+        def init(self,*args,**kwargs):
+            kwargs["client_max_size"]=12*1024*1024; original_init(self,*args,**kwargs)
+            self.router.add_get("/solicitar-acesso",request_access,name="v633_access")
+            self.router.add_get("/perfil",profile,name="v633_profile")
+            self.router.add_post("/perfil/upload",profile_upload,name="v633_profile_upload")
+            self.router.add_get("/admin",admin_page,name="v633_admin")
+            self.router.add_post("/admin/role",admin_role,name="v633_role")
+            self.router.add_get("/operacoes",operations,name="v633_operations")
+        v625.ApplicationPatch.__init__=init
+        return await v625.start_server_v626(client)
+    base.start_server=start
     return central
