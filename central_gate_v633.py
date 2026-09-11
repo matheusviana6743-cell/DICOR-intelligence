@@ -109,7 +109,7 @@ async def profile_upload(req):
     reader = await req.multipart(); part = await reader.next(); data = await part.read(decode=False) if part else b""; filename = os.path.basename(part.filename or "perfil.png") if part else "perfil.png"
     if not part or len(data) > 10 * 1024 * 1024: raise base.web.HTTPBadRequest(text="Imagem inválida.")
     try:
-        url = await v625.v625.upload_to_fivemanage(data, filename); data = accounts(); data[base.account_key(qra, passport)]["profile_photo"] = url; base.save_accounts(data); audit(qra, passport, "ALTEROU_FOTO_PERFIL", req.path); raise base.web.HTTPFound("/perfil")
+        url = await v625.upload_to_fivemanage(data, filename); data = accounts(); data[base.account_key(qra, passport)]["profile_photo"] = url; base.save_accounts(data); audit(qra, passport, "ALTEROU_FOTO_PERFIL", req.path); raise base.web.HTTPFound("/perfil")
     except base.web.HTTPException: raise
     except Exception: raise base.web.HTTPBadGateway(text="Não foi possível atualizar a foto.")
 
