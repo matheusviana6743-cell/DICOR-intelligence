@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V710 iframe."""
+"""Launcher oficial do DICOR Core V606 + Central iframe FiveM."""
 import asyncio
 import os
 import traceback
@@ -9,7 +9,7 @@ import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
-import central_home_v710
+import central_iframe_v709
 
 async def start_discord_with_retry(client, token):
     attempt = 0
@@ -53,14 +53,14 @@ async def main():
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
 
-    central = central_home_v710.install(bot)
+    central = central_iframe_v709.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | Central V710", flush=True)
+    print("✅ DICOR Core V606 ativo | Central iframe FiveM", flush=True)
     print("🔎 Central integrada | Procurados + Boletins + Perícias + Operações + FiveM + E-mail", flush=True)
     print("📝 Auditoria da Central -> /data/central_access_logs_v700.json", flush=True)
     print("🔐 Autorização da Central -> canal 1548072610447884399", flush=True)
-    print("🖼️ Central compatível com iframe FiveM/NUI", flush=True)
+    print("🖼️ Central preparada para iframe/NUI do FiveM", flush=True)
     print("🌐 Central HTTP iniciada antes do gateway Discord", flush=True)
     await start_discord_with_retry(client, token)
 
