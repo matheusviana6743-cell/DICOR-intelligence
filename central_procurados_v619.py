@@ -1,24 +1,31 @@
 # -*- coding: utf-8 -*-
 """Central DICOR V619 - correção de estabilidade da V618.
 
-A V617/V618 sobrescrevia a própria função de coleta ao instalar o patch,
-causando recursão infinita durante o refresh da Central. Esta camada mantém o
-visual e as rotas da V617, mas fornece uma coleta independente e segura.
+Mantém o layout da V617/V618, mas corrige dois pontos que podiam derrubar o
+processo: a coleta não entra mais em recursão e install() devolve o objeto
+Central com .start(), como a Central original.
 """
 from __future__ import annotations
 
+import html
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import central_procurados_v617 as v617
 import central_discord_v613 as base
 
 SCAN_LIMIT = 1000
+base.web.URLEncode = quote
+base.quote = quote
 
 
 def clean(v: Any) -> str:
-    return " ".join(str(v or "").split())
+    s = str(v or "")
+    s = re.sub(r"[*_~`]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" |•-—:;\t\r\n")
 
 
 def text_of(m: Any) -> str:
@@ -57,19 +64,24 @@ def extract_label(text: str, labels: tuple[str, ...], default: str = "Não infor
     return clean(m.group(1))[:180] if m else default
 
 
+def normalize_name(value: Any) -> str:
+    s = clean(value)
+    s = re.sub(r"^(?:nome\s*(?:completo)?|indiv[ií]duo|procurado)\s*[:=-]\s*", "", s, flags=re.I)
+    s = re.sub(r"^(?:n[ºo]|registro)\s*[:#-]?\s*\d+\s*[-|•:]\s*", "", s, flags=re.I)
+    if "|" in s:
+        s = s.split("|", 1)[0].strip()
+    return s[:90] or "Indivíduo não identificado"
+
+
 def is_closed(text: str) -> bool:
     s = clean(text).casefold()
-    return any(x in s for x in (
-        "capturado", "capturada", "preso", "presa", "encerrado", "encerrada",
-        "cancelado", "cancelada", "finalizado", "finalizada",
-    ))
+    return any(x in s for x in ("capturado", "capturada", "preso", "presa", "encerrado", "encerrada", "cancelado", "cancelada", "finalizado", "finalizada"))
 
 
 async def collect_procurados(client: Any) -> list[dict[str, Any]]:
     channel = await base.get_channel(client, base.PROCURADOS_ID)
     if channel is None:
         return []
-
     rows: list[dict[str, Any]] = []
     try:
         async for m in channel.history(limit=SCAN_LIMIT, oldest_first=False):
@@ -79,9 +91,9 @@ async def collect_procurados(client: Any) -> list[dict[str, Any]]:
             created = getattr(m, "created_at", None) or datetime.now(timezone.utc)
             rows.append({
                 "number": base.number_from(text),
-                "name": extract_label(text, ("nome completo", "nome", "indivíduo", "individuo", "procurado"), "Indivíduo não identificado"),
+                "name": normalize_name(extract_label(text, ("nome completo", "nome", "indivíduo", "individuo", "procurado"), "Indivíduo não identificado")),
                 "rg": extract_label(text, ("rg", "registro geral", "passaporte", "identidade", "id")),
-                "crime": extract_label(text, ("crime", "crimes", "acusação", "acusacao")),
+                "crime": extract_label(text, ("crimes", "crime", "acusação", "acusacao")),
                 "status": extract_label(text, ("status", "situação", "situacao"), "ATIVO"),
                 "created": created,
                 "url": getattr(m, "jump_url", "#"),
@@ -92,7 +104,6 @@ async def collect_procurados(client: Any) -> list[dict[str, Any]]:
     except Exception as exc:
         print(f"⚠️ Central V619 Procurados: {type(exc).__name__}: {exc}", flush=True)
         return []
-
     unique: dict[int | str, dict[str, Any]] = {}
     for row in rows:
         key = row.get("source_id") or row.get("url") or f"{row.get('name')}|{row.get('rg')}"
@@ -100,10 +111,18 @@ async def collect_procurados(client: Any) -> list[dict[str, Any]]:
     return sorted(unique.values(), key=lambda r: r.get("created") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
 
-# Corrige o ponto de recursão criado pela V617 e mantém todo o layout/rotas.
+# Substitui os coletores mutados pela V617 e mantém o dashboard/detalhes já aprovados.
+base.collect_procurados = collect_procurados
 v617.collect_procurados = collect_procurados
 v617.v616.collect_procurados = collect_procurados
-base.collect_procurados = collect_procurados
+base.dashboard = v617.dashboard_v617
+v617.v616.dashboard = v617.dashboard_v617
 
-install = v617.install
-start_server_v617 = v617.start_server_v617
+# start_server_v617 já registra a página individual e usa o servidor V616.
+# O helper URLEncode acima corrige a autenticação da V616.
+base.start_server = v617.start_server_v617
+
+
+def install(bot_module: Any):
+    """Contrato igual ao CentralV613: retorna objeto com .start()."""
+    return base.install(bot_module)
