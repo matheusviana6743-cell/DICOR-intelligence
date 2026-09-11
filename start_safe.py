@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V629 + Rate Guards V615."""
+"""Launcher oficial do DICOR Core V606 + Central V630 + Rate Guards V615."""
 import asyncio
 import os
 import traceback
@@ -9,7 +9,7 @@ import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
-import central_visual_v629
+import central_visual_v630
 import central_rate_guard_v615
 
 async def start_discord_with_retry(client, token):
@@ -54,11 +54,11 @@ async def main():
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
 
-    central = central_visual_v629.install(bot)
+    central = central_visual_v630.install(bot)
     central_rate_guard_v615.install(central)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | Central V629 | logs Central", flush=True)
+    print("✅ DICOR Core V606 ativo | BO + Perícia | Central V630 | logs Central", flush=True)
     print("🔎 Central integrada ao Discord | Boletins + Perícias + Procurados + Fotos", flush=True)
     print("📝 Auditoria da Central -> canal 1515054190215430406", flush=True)
     print("🌐 Central HTTP iniciada antes do gateway Discord", flush=True)
