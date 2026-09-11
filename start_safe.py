@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V607.
-
-BO e Perícia continuam com gatilho imediato. A recuperação após restart fica
-limitada a uma janela curta para nunca reabrir BOs muito antigos. A Central é
-somente leitura e consulta os dados diretamente do Discord.
-"""
+"""Launcher oficial do DICOR Core V606 + Central V608."""
 import asyncio
 import os
 import traceback
@@ -13,7 +8,7 @@ import bot
 import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
-import central_discord_v607
+import central_discord_v608
 
 
 async def main():
@@ -24,21 +19,16 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN ausente")
 
-    # Remove somente listeners automáticos antigos.
     dicor_legacy_guard_v605.install(bot)
-
-    # Mantém o núcleo V605 (incluindo a seleção de agentes) e troca somente
-    # a recuperação histórica por uma janela curta e segura.
     core = dicor_core_v605.install(bot)
     dicor_recovery_guard_v606.install(core)
 
-    # Central restaurada: leitura direta dos canais/tópicos do Discord.
-    # O servidor HTTP sobe ANTES do login do Discord, evitando depender do
-    # primeiro on_ready para que a porta pública do Railway fique disponível.
-    central = central_discord_v607.install(bot)
+    # Central clássica restaurada: dashboard, identificação QRA/passaporte
+    # e dados consultados diretamente dos canais/tópicos do Discord.
+    central = central_discord_v608.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V607 Discord", flush=True)
+    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V608 clássica", flush=True)
     await client.start(token, reconnect=True)
 
 
