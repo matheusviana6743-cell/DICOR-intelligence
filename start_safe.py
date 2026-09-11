@@ -9,7 +9,7 @@ import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
-import central_gate_v633
+import central_home_v633
 import central_rate_guard_v615
 
 async def start_discord_with_retry(client, token):
@@ -54,7 +54,7 @@ async def main():
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
 
-    central = central_gate_v633.install(bot)
+    central = central_home_v633.install(bot)
     central_rate_guard_v615.install(central)
     await central.start()
 
