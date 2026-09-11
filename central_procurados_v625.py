@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Central DICOR V625 - upload maior + Procurados completos."""
+"""Central DICOR V625 - upload maior + Procurados completos + Fivemanage."""
 from __future__ import annotations
 import html, os, re
 from typing import Any
 from urllib.parse import quote
+import aiohttp
 import central_discord_v613 as base
 import central_procurados_v624 as v624
 
 MAX_BODY = 12 * 1024 * 1024
+MAX_IMAGE = 10 * 1024 * 1024
+FIVEMANAGE_API = "https://api.fivemanage.com/api/v3/file"
 _ORIGINAL_START = v624._ORIGINAL_START_SERVER
 _CLIENT = None
 
-# Reaproveita o coletor já corrigido.
 collect_procurados = v624.collect_procurados if hasattr(v624, "collect_procurados") else getattr(base, "collect_procurados")
 
 
@@ -46,9 +48,56 @@ async def all_procurados(req: Any):
     return base.web.Response(text=base.page("DICOR • Procurados", body, css), content_type="text/html")
 
 
+async def upload_to_fivemanage(data: bytes, filename: str) -> str:
+    api_key = os.getenv("FIVEMANAGE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("FIVEMANAGE_API_KEY não configurada no ambiente")
+    form = aiohttp.FormData()
+    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+    form.add_field("filename", filename)
+    form.add_field("path", "dicor-central")
+    form.add_field("retentionExempt", "true")
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(FIVEMANAGE_API, headers={"Authorization": api_key}, data=form) as resp:
+            text = await resp.text()
+            if resp.status < 200 or resp.status >= 300:
+                raise RuntimeError(f"Fivemanage HTTP {resp.status}: {text[:500]}")
+            try:
+                payload = await resp.json(content_type=None)
+            except Exception as exc:
+                raise RuntimeError(f"Resposta inválida do Fivemanage: {text[:500]}") from exc
+            url = (((payload or {}).get("data") or {}).get("url") or ((payload or {}).get("data") or {}).get("originalUrl") or "").strip()
+            if not url:
+                raise RuntimeError(f"Fivemanage não retornou URL: {text[:500]}")
+            return url
+
+
+async def upload_photo(req: Any):
+    session = base.read_session(req)
+    if not session:
+        raise base.web.HTTPFound("/cadastro-operador?next=/fotos")
+    reader = await req.multipart()
+    part = await reader.next()
+    if part is None or part.name != "foto":
+        raise base.web.HTTPBadRequest(text="Imagem não enviada.")
+    filename = os.path.basename(part.filename or "foto.png")
+    if not re.search(r"\.(?:png|jpe?g|webp|gif)$", filename, re.I):
+        raise base.web.HTTPBadRequest(text="Use PNG, JPG, WEBP ou GIF.")
+    data = await part.read(decode=False)
+    if not data or len(data) > MAX_IMAGE:
+        raise base.web.HTTPBadRequest(text="A imagem deve ter até 10 MB.")
+    try:
+        direct_url = await upload_to_fivemanage(data, filename)
+        body = f'''<main class="auth"><div class="eyebrow">CENTRAL DICOR • ARQUIVO VISUAL</div><h1>FOTO ENVIADA</h1><p class="sub">A imagem foi enviada para o Fivemanage e recebeu um link direto, pronto para colar no FiveM.</p><div class="photo-msg"><img src="{esc(direct_url)}" style="max-width:100%;max-height:420px;border-radius:12px;object-fit:contain;margin:10px 0 18px"><b>LINK DIRETO DA IMAGEM</b><div class="stable-link" style="word-break:break-all">{esc(direct_url)}</div><button class="upload-btn" onclick="navigator.clipboard.writeText('{esc(direct_url)}');return false;">COPIAR LINK DIRETO</button></div><a class="primary gold" style="display:block;text-decoration:none;padding-top:16px" href="/fotos">VOLTAR AO BANCO DE FOTOS</a></main>'''
+        return base.web.Response(text=base.page("DICOR • Foto", body, base.AUTH_CSS), content_type="text/html")
+    except Exception as exc:
+        print(f"⚠️ V625 Fivemanage upload: {type(exc).__name__}: {exc}", flush=True)
+        raise base.web.HTTPBadGateway(text="Não foi possível enviar a imagem para o Fivemanage. Verifique a chave FIVEMANAGE_API_KEY.")
+
+
 class ApplicationPatch(base.web.Application):
     def __init__(self, *args: Any, **kwargs: Any):
-        # aiohttp default = 1 MiB. O banco aceita imagens de até 10 MiB.
         kwargs["client_max_size"] = MAX_BODY
         super().__init__(*args, **kwargs)
         self.router.add_get("/procurados", all_procurados, name="v625_all_procurados")
@@ -56,7 +105,7 @@ class ApplicationPatch(base.web.Application):
         self.router.add_get("/imagem-procurado/{message_id}", v624.v622.procurado_photo, name="v625_wanted_photo")
         self.router.add_get("/fotos", v624.v622.photos_page, name="v625_photos")
         self.router.add_get("/foto/{message_id}", v624.v622.stable_photo, name="v625_stable_photo")
-        self.router.add_post("/fotos/upload", v624.v622.upload_photo, name="v625_upload")
+        self.router.add_post("/fotos/upload", upload_photo, name="v625_upload")
 
 
 async def start_server_v625(client: Any):
@@ -72,6 +121,7 @@ async def start_server_v625(client: Any):
 
 base.start_server = start_server_v625
 base.collect_procurados = collect_procurados
+
 
 def install(bot_module: Any):
     return base.install(bot_module)
