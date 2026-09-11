@@ -1,13 +1,9 @@
 # -*- coding: utf-8 -*-
-"""DICOR Central V710 - modo iframe compatível com FiveM NUI.
+"""DICOR Central V710 - compatibilidade com iframe/NUI do FiveM.
 
-Mantém a Central V708 e altera apenas a camada de incorporação:
-- permite execução dentro de iframe sem exigir domínio pai específico;
-- remove X-Frame-Options que bloquearia a NUI;
-- usa frame-ancestors * na CSP HTML;
-- ajusta o cookie de sessão para SameSite=None + Secure, necessário para
-  sessões em contexto incorporado;
-- preserva autenticação, CSRF, autorização e todas as funcionalidades da V708.
+Corrige o middleware do aiohttp: o app principal registra `security` como
+middleware e, por isso, ele precisa usar a assinatura (request, handler).
+Mantém a Central V708 intacta e altera apenas os headers/cookie de iframe.
 """
 from __future__ import annotations
 
@@ -17,21 +13,30 @@ import central_home_v700 as v700
 import central_home_v708 as v708
 
 
-async def iframe_security(req, handler):
+@web.middleware
+async def iframe_security(request, handler):
     try:
-        response = await handler(req)
+        response = await handler(request)
     except web.HTTPException as exc:
         response = exc
+
     response.headers.pop("X-Frame-Options", None)
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "img-src 'self' data: https:; "
-        "connect-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "frame-ancestors *; "
-        "base-uri 'self'; form-action 'self'; object-src 'none'"
-    )
+
+    csp = str(response.headers.get("Content-Security-Policy", "")).strip()
+    parts = []
+    found = False
+    for part in csp.split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        if item.lower().startswith("frame-ancestors "):
+            parts.append("frame-ancestors *")
+            found = True
+        else:
+            parts.append(item)
+    if not found:
+        parts.append("frame-ancestors *")
+    response.headers["Content-Security-Policy"] = "; ".join(parts)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(),microphone=(),geolocation=()"
@@ -39,18 +44,17 @@ async def iframe_security(req, handler):
     return response
 
 
-async def iframe_login_route(req):
-    response = await v700.login_route(req)
-    if getattr(response, "headers", None) is not None:
-        cookies = list(response.headers.getall("Set-Cookie", []))
-        if cookies:
-            response.headers.popall("Set-Cookie")
-            for cookie in cookies:
-                cookie = cookie.replace(
-                    "; Path=/; SameSite=Lax",
-                    "; Path=/; SameSite=None; Secure",
-                )
-                response.headers.add("Set-Cookie", cookie)
+_original_login_route = v700.login_route
+
+
+async def iframe_login_route(request):
+    response = await _original_login_route(request)
+    cookies = list(response.headers.getall("Set-Cookie", [])) if getattr(response, "headers", None) else []
+    if cookies:
+        response.headers.popall("Set-Cookie")
+        for cookie in cookies:
+            cookie = cookie.replace("; Path=/; SameSite=Lax", "; Path=/; SameSite=None; Secure")
+            response.headers.add("Set-Cookie", cookie)
     return response
 
 
