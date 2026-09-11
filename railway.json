@@ -5,7 +5,7 @@
   },
   "deploy": {
     "startCommand": "python start_safe.py",
-    "healthcheckPath": "/health",
+    "healthcheckPath": "/",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE"
   }
