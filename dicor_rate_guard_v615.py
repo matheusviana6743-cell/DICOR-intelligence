@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
 """DICOR Rate Guard V615.
 
-Evita rajadas de chamadas à API do Discord causadas pelo scanner V605.
-
-Regras:
-- não varre todos os tópicos arquivados a cada BO/perícia;
-- mantém um índice curto em cache por 30s;
-- a recuperação de restart roda uma vez e depois fica em baixa frequência;
-- o gatilho on_message continua imediato;
-- não altera nomes, seleção de agentes ou deduplicação do atendimento.
+Reduz chamadas à API do Discord causadas pelo scanner V605 sem alterar o
+fluxo normal de BO/perícia, seleção de agente ou nomes dos tópicos.
 """
 from __future__ import annotations
 
 import asyncio
+import re
 import types
 from typing import Any
 
@@ -28,7 +23,6 @@ def install(core: Any) -> Any:
     if getattr(core, "_dicor_rate_guard_v615", False):
         return core
 
-    original_target_threads = core.target_threads
     original_recover = core.recover_channel
 
     async def safe_target_threads(self: Any, kind: str, refresh: bool = False):
@@ -37,12 +31,8 @@ def install(core: Any) -> Any:
         if cached and now - cached[0] < TARGET_CACHE_SECONDS:
             return cached[1], cached[2]
 
-        target_id = self.__class__.__dict__.get("_unused", None)
-        target_id = 0
-        # IDs são obtidos das constantes do módulo original através do método
-        # original; para evitar a varredura ilimitada, reconstruímos apenas o
-        # índice dos tópicos ativos e dos últimos arquivados.
-        from dicor_core_v605 import BO_TARGET_ID, PERICIA_TARGET_ID, month_of_thread, extract_number
+        from dicor_core_v605 import BO_TARGET_ID, PERICIA_TARGET_ID, extract_number, month_of_thread
+
         target_id = BO_TARGET_ID if kind == "bo" else PERICIA_TARGET_ID
         parent = await self.channel(target_id)
         if not isinstance(parent, discord.TextChannel):
@@ -60,6 +50,10 @@ def install(core: Any) -> Any:
 
         keys: set[tuple[str, str, str]] = set()
         source_ids: set[int] = set()
+        marker_re = re.compile(
+            r"DICOR-AUTO\|kind=(bo|pericia)\|source=(\d+)\|month=([^|]+)\|number=(\d{4,8})"
+        )
+
         for thread in threads:
             name = str(getattr(thread, "name", "") or "")
             month = month_of_thread(thread)
@@ -70,11 +64,10 @@ def install(core: Any) -> Any:
                 async for msg in thread.history(limit=THREAD_HISTORY_LIMIT, oldest_first=True):
                     for embed in msg.embeds or []:
                         footer = str(getattr(embed.footer, "text", "") or "")
-                        import re
-                        m = re.search(r"DICOR-AUTO\\|kind=(bo|pericia)\\|source=(\\d+)\\|month=([^|]+)\\|number=(\\d{4,8})", footer)
-                        if m:
-                            source_ids.add(int(m.group(2)))
-                            keys.add((m.group(1), m.group(3), f"{int(m.group(4)):04d}"))
+                        match = marker_re.search(footer)
+                        if match:
+                            source_ids.add(int(match.group(2)))
+                            keys.add((match.group(1), match.group(3), f"{int(match.group(4)):04d}"))
             except Exception:
                 pass
 
@@ -82,27 +75,20 @@ def install(core: Any) -> Any:
         return keys, source_ids
 
     async def safe_scanner(self: Any) -> None:
-        # Uma recuperação curta após o READY é suficiente para mensagens que
-        # chegaram durante deploy/restart. Depois, on_message trata o fluxo
-        # normal e uma recuperação espaçada cobre eventual falha de evento.
         await asyncio.sleep(5)
-        first = True
         while True:
             try:
-                await original_recover("bo", self.__class__.__dict__.get("_unused_channel", 0) or 1490200514837745754)
+                await original_recover("bo", 1490200514837745754)
             except Exception:
                 pass
             try:
                 await original_recover("pericia", 1490200524367200297)
             except Exception:
                 pass
-            first = False
             await asyncio.sleep(RECOVERY_INTERVAL_SECONDS)
 
-    # A recuperação original já foi limitada pelo V606. O wrapper do índice
-    # reduz drasticamente as chamadas dentro dela.
     core.target_threads = types.MethodType(safe_target_threads, core)
     core.scanner = types.MethodType(safe_scanner, core)
     core._dicor_rate_guard_v615 = True
-    print("🛡️ DICOR Rate Guard V615 ativo | cache Discord=30s | recuperação=10min", flush=True)
+    print("🛡️ DICOR Rate Guard V615 ativo | índice limitado + recuperação a cada 10min", flush=True)
     return core
