@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import central_discord_v613
+import central_discord_v615
 
 REFRESH_SECONDS = 300.0
 
@@ -21,12 +21,13 @@ def install(central: Any) -> Any:
 
         while True:
             try:
-                await central_discord_v613.refresh(client)
+                # Nesta etapa a Central consulta somente Procurados.
+                await central_discord_v615.refresh(client)
             except Exception as exc:
                 print(f"⚠️ Central refresh: {type(exc).__name__}: {exc}", flush=True)
             await asyncio.sleep(REFRESH_SECONDS)
 
-    central_discord_v613.refresh_loop = safe_refresh_loop
+    central_discord_v615.refresh_loop = safe_refresh_loop
     central._central_rate_guard_v615 = True
-    print("🛡️ Central Rate Guard V615 ativo | refresh=300s | somente após READY", flush=True)
+    print("🛡️ Central Rate Guard V615 ativo | refresh=300s | somente Procurados | após READY", flush=True)
     return central
