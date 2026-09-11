@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V633 + Rate Guards V615."""
+"""Launcher oficial do DICOR Core V606 + Central V700."""
 import asyncio
 import os
 import traceback
@@ -9,8 +9,7 @@ import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
-import central_home_v633
-import central_rate_guard_v615
+import central_home_v700
 
 async def start_discord_with_retry(client, token):
     attempt = 0
@@ -54,13 +53,12 @@ async def main():
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
 
-    central = central_home_v633.install(bot)
-    central_rate_guard_v615.install(central)
+    central = central_home_v700.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | Central V633 PCPT/PF", flush=True)
-    print("🔎 Central integrada ao Discord | Boletins + Perícias + Procurados + Fotos", flush=True)
-    print("📝 Auditoria da Central -> arquivo central_access_logs_v633.json", flush=True)
+    print("✅ DICOR Core V606 ativo | BO + Perícia | Central V700", flush=True)
+    print("🔎 Central integrada | Procurados + Boletins + Perícias + Operações + FiveM + E-mail", flush=True)
+    print("📝 Auditoria da Central -> /data/central_access_logs_v700.json", flush=True)
     print("🔐 Autorização da Central -> canal 1548072610447884399", flush=True)
     print("🌐 Central HTTP iniciada antes do gateway Discord", flush=True)
     await start_discord_with_retry(client, token)
