@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V605.
+"""Launcher oficial do DICOR Core V606 + Central V607.
 
-BO e Perícia usam um único núcleo automático. O scanner recupera mensagens
-que chegaram durante deploy/restart e a deduplicação usa os próprios tópicos
-existentes no Discord como fonte de verdade.
+BO e Perícia continuam com gatilho imediato. A recuperação após restart fica
+limitada a uma janela curta para nunca reabrir BOs muito antigos. A Central é
+somente leitura e consulta os dados diretamente do Discord.
 """
 import asyncio
 import os
@@ -12,6 +12,8 @@ import traceback
 import bot
 import dicor_legacy_guard_v605
 import dicor_core_v605
+import dicor_recovery_guard_v606
+import central_discord_v607
 
 
 async def main():
@@ -22,11 +24,18 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN ausente")
 
-    # Primeiro elimina somente os listeners automáticos antigos.
+    # Remove somente listeners automáticos antigos.
     dicor_legacy_guard_v605.install(bot)
-    # Depois instala UM único núcleo para BO + Perícia.
-    dicor_core_v605.install(bot)
-    print("✅ DICOR Core V605 ativo | BO + Perícia | gatilho imediato + recuperação de deploy + dedupe real", flush=True)
+
+    # Mantém o núcleo V605 (incluindo a seleção de agentes) e troca somente
+    # a recuperação histórica por uma janela curta e segura.
+    core = dicor_core_v605.install(bot)
+    dicor_recovery_guard_v606.install(core)
+
+    # Central restaurada: leitura direta dos canais/tópicos do Discord.
+    central_discord_v607.install(bot)
+
+    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V607 Discord", flush=True)
     await client.start(token, reconnect=True)
 
 
