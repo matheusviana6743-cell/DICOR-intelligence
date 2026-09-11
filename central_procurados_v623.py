@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """Central DICOR V623.
 
-Restaura a home completa da Central V613/PCPT e mantém os recursos
-novos de Procurados e Banco de Fotos da V622.
+Restaura a home PCPT/DICOR da Central base e mantém Procurados/Fotos da V622.
 """
 from __future__ import annotations
 
@@ -12,28 +11,40 @@ from urllib.parse import quote
 import central_discord_v613 as base
 import central_procurados_v622 as v622
 
-# V622 substituiu a home da Central pela tela focada em Procurados.
-# Recarregamos apenas o módulo-base para recuperar a home completa,
-# preservando login, funcionalidades, BO, Perícias e o visual PCPT/DICOR.
+# Recarrega somente o módulo-base para recuperar exatamente a home/login,
+# sem deixar V616/V622 substituírem a apresentação principal.
 importlib.reload(base)
 base.web.URLEncode = quote
 
-# Reaplica a coleta robusta de Procurados da V622 depois do reload do módulo-base.
-base.collect_procurados = v622.collect_procurados
+# O servidor V622 adiciona as rotas novas e usa o servidor V616 por baixo.
+# Todas as referências compartilhadas passam a apontar para o base recarregado.
 v622.base = base
 v622.v621.base = base
+v622.v621.v620.base = base
+v622.v621.v620.v616.base = base
+
+# Mantém o coletor robusto de Procurados da V622.
+base.collect_procurados = v622.collect_procurados
 v622.v621.collect_procurados = v622.collect_procurados
 v622.v621.v620.collect_procurados = v622.collect_procurados
 v622.v621.v620.v616.collect_procurados = v622.collect_procurados
 
-# O servidor V616 continua sendo usado para preservar todas as rotas da
-# Central, mas sua home passa a usar a dashboard original V613.
-v622.v621.v620.v616.base = base
+# A rota / da camada V616 chama dashboard_v616 diretamente.
+# Substituímos apenas essa função pelo dashboard original do base.
 v622.v621.v620.v616.dashboard_v616 = base.dashboard
 
-# V622 continua registrando internamente /procurado, /imagem-procurado,
-# /fotos e /foto através do ApplicationPatch.
-base.start_server = v622.start_server_v622
+# A CentralV613 original captura a função global start_server no módulo base.
+# Por isso o atributo base.start_server sozinho não basta: substituímos o
+# método start da classe para chamar explicitamente o servidor V622.
+_original_start = base.CentralV613.start
+
+async def _start_v623(self):
+    if self.runner is not None:
+        return
+    self.runner = await v622.start_server_v622(self.client)
+    self.task = __import__("asyncio").create_task(base.refresh_loop(self.client))
+
+base.CentralV613.start = _start_v623
 
 
 def install(bot_module):
