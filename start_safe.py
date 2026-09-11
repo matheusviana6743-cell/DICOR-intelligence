@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central V611."""
+"""Launcher oficial do DICOR Core V606 + Central V612."""
 import asyncio
 import os
 import traceback
@@ -8,7 +8,7 @@ import bot
 import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
-import central_discord_v611
+import central_discord_v612
 
 
 async def main():
@@ -23,10 +23,10 @@ async def main():
     core = dicor_core_v605.install(bot)
     dicor_recovery_guard_v606.install(core)
 
-    central = central_discord_v611.install(bot)
+    central = central_discord_v612.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V611 rápida", flush=True)
+    print("DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V612", flush=True)
     await client.start(token, reconnect=True)
 
 
