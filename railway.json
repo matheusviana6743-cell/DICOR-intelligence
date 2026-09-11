@@ -3,7 +3,7 @@
   "build": {"builder": "RAILPACK"},
   "deploy": {
     "startCommand": "python start_safe.py",
-    "healthcheckPath": "/",
+    "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE"
   }
