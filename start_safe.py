@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V603.
+"""Launcher oficial do DICOR Core V604.
 
-O fluxo novo de BO, Perícia Externa e Dossiê é instalado como um único núcleo.
-Nenhum patch legado de BO/Perícia/Dossiê é carregado por este launcher.
+BO e Perícia usam um único núcleo automático. O scanner também recupera
+mensagens que chegaram durante deploy/restart. O Dossiê é gerado pelo
+renderer local do V604, sem depender de template/base64 externo.
 """
 import asyncio
 import os
 import traceback
 
 import bot
-import dicor_core_v603
+import dicor_legacy_guard_v604
+import dicor_core_v604
 
 
 async def main():
@@ -20,8 +22,9 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN ausente")
 
-    dicor_core_v603.install(bot)
-    print("✅ DICOR Core V603 ativo | BO + Perícia + Dossiê | scanner automático contínuo", flush=True)
+    dicor_legacy_guard_v604.install(bot)
+    dicor_core_v604.install(bot)
+    print("✅ DICOR Core V604 ativo | BO + Perícia + Dossiê | gatilho por canal + scanner contínuo", flush=True)
     await client.start(token, reconnect=True)
 
 
