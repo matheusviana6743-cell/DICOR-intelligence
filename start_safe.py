@@ -33,7 +33,10 @@ async def main():
     dicor_recovery_guard_v606.install(core)
 
     # Central restaurada: leitura direta dos canais/tópicos do Discord.
-    central_discord_v607.install(bot)
+    # O servidor HTTP sobe ANTES do login do Discord, evitando depender do
+    # primeiro on_ready para que a porta pública do Railway fique disponível.
+    central = central_discord_v607.install(bot)
+    await central.start()
 
     print("✅ DICOR Core V606 ativo | BO + Perícia | recuperação limitada | Central V607 Discord", flush=True)
     await client.start(token, reconnect=True)
