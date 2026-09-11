@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import html
 import json
-from urllib.parse import quote
 
 from aiohttp import web
 
@@ -49,8 +48,9 @@ async def _scan_named_channels(client, keywords, kind):
             for m in msgs:
                 text=_msg_text(m)
                 if not text: continue
-                if kind=="boletins" and not any(x in text.casefold() for x in ("boletim","b.o.","ocorrência","ocorrencia")): continue
-                if kind=="pericias" and not any(x in text.casefold() for x in ("perícia","pericia","laudo")): continue
+                low=text.casefold()
+                if kind=="boletins" and not any(x in low for x in ("boletim","b.o.","ocorrência","ocorrencia")): continue
+                if kind=="pericias" and not any(x in low for x in ("perícia","pericia","laudo")): continue
                 mid=str(getattr(m,"id","") or "")
                 row={"id":mid or v706.hashlib.sha256((nm+text).encode()).hexdigest()[:20],"number":"S/N","name":v706.clean_text(text.split("\n",1)[0])[:100] or kind.title(),"kind":kind,"source":"DISCORD","subject":"","date":str(getattr(m,"created_at","")),"image":"","url":str(getattr(m,"jump_url","")),"fields":{"Canal":getattr(ch,"name","") or "","Número do registro":"S/N"},"full_text":text}
                 out.append(row)
@@ -71,6 +71,7 @@ async def refresh_data_v707():
 
 
 def install(bot_module):
+    central=v706.install(bot_module)
     v700.login=login
     v700.refresh_data=refresh_data_v707
-    return v706.install(bot_module)
+    return central
