@@ -14,4 +14,12 @@ def dashboard(rows,qra,passport):
 def install(bot_module):
     central=gate.install(bot_module)
     base.dashboard=dashboard
+    original_listing=base.listing
+    def guarded_listing(title,subtitle,rows,qra,kind):
+        user,passport=gate.user_by_qra(qra)
+        if not user.get('authorized'):
+            return gate.guarded_functions(qra)
+        complete=[r for r in (rows or []) if str(r.get('number','S/N')).upper() not in ('S/N','')]
+        return original_listing(title,subtitle,complete,qra,kind)
+    base.listing=guarded_listing
     return central
