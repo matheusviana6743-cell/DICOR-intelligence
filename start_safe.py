@@ -10,6 +10,7 @@ import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
 import central_iframe_v711
+import central_mail_purge_v1
 
 async def start_discord_with_retry(client, token):
     attempt = 0
@@ -52,6 +53,7 @@ async def main():
     core = dicor_core_v605.install(bot)
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
+    central_mail_purge_v1.install()
 
     central = central_iframe_v711.install(bot)
     await central.start()
@@ -61,6 +63,7 @@ async def main():
     print("📝 Auditoria da Central -> /data/central_access_logs_v700.json", flush=True)
     print("🔐 Autorização da Central -> canal 1548072610447884399", flush=True)
     print("🖼️ Central preparada para iframe/NUI do FiveM", flush=True)
+    print("🧹 Limpeza única de todos os e-mails IMAP agendada", flush=True)
     print("🌐 Central HTTP iniciada antes do gateway Discord", flush=True)
     await start_discord_with_retry(client, token)
 
