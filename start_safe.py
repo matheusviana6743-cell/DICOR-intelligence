@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Launcher oficial do DICOR Core V606 + Central iframe FiveM."""
+"""Launcher oficial do DICOR Core V606 + Central iframe FiveM V711."""
 import asyncio
 import os
 import traceback
@@ -56,7 +56,7 @@ async def main():
     central = central_iframe_v711.install(bot)
     await central.start()
 
-    print("✅ DICOR Core V606 ativo | Central iframe FiveM", flush=True)
+    print("✅ DICOR Core V606 ativo | Central iframe FiveM V711", flush=True)
     print("🔎 Central integrada | Procurados + Boletins + Perícias + Operações + FiveM + E-mail", flush=True)
     print("📝 Auditoria da Central -> /data/central_access_logs_v700.json", flush=True)
     print("🔐 Autorização da Central -> canal 1548072610447884399", flush=True)
