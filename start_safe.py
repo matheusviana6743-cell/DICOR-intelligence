@@ -9,7 +9,7 @@ import dicor_legacy_guard_v605
 import dicor_core_v605
 import dicor_recovery_guard_v606
 import dicor_rate_guard_v615
-import central_iframe_v709
+import central_iframe_v711
 
 async def start_discord_with_retry(client, token):
     attempt = 0
@@ -53,7 +53,7 @@ async def main():
     dicor_recovery_guard_v606.install(core)
     dicor_rate_guard_v615.install(core)
 
-    central = central_iframe_v709.install(bot)
+    central = central_iframe_v711.install(bot)
     await central.start()
 
     print("✅ DICOR Core V606 ativo | Central iframe FiveM", flush=True)
