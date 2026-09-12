@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Compatibilidade dedicada da Central DICOR com iframe/NUI do FiveM.
+"""DICOR Central - iframe/NUI FiveM.
 
-A camada de iframe é aplicada antes da criação da Application do aiohttp.
-Não usa X-Frame-Options e não injeta uma CSP frame-ancestors restritiva.
-A autenticação, CSRF e autorização continuam sendo as mesmas do núcleo.
+Mantém a Central V708 e corrige a sessão dentro do iframe. O CEF do FiveM
+pode tratar a sessão como contexto incorporado; por isso o cookie é alterado
+no objeto Set-Cookie do aiohttp, e não por substituição textual do header.
 """
 from __future__ import annotations
 
@@ -20,42 +20,44 @@ async def iframe_security(request, handler):
     except web.HTTPException as exc:
         response = exc
 
-    # Compatibilidade com o navegador embutido do FiveM/NUI.
     response.headers.pop("X-Frame-Options", None)
     response.headers.pop("Content-Security-Policy", None)
-
-    # Evita cache de sessão/páginas da Central dentro do CEF.
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(),microphone=(),geolocation=()"
     return response
 
 
-_original_login_route = v700.login_route
-
-
 async def iframe_login_route(request):
-    response = await _original_login_route(request)
-
-    # A sessão em iframe precisa aceitar contexto incorporado.
-    cookies = list(response.headers.getall("Set-Cookie", []))
-    if cookies:
-        response.headers.popall("Set-Cookie")
-        for cookie in cookies:
-            cookie = cookie.replace(
-                "; Path=/; SameSite=Lax",
-                "; Path=/; SameSite=None; Secure",
-            )
-            if "SameSite=" not in cookie:
-                cookie += "; SameSite=None; Secure"
-            response.headers.add("Set-Cookie", cookie)
+    response = await v700._central_original_login_route(request)
+    try:
+        cookie = response.cookies.get(v700.COOKIE)
+        if cookie is not None:
+            cookie["samesite"] = "None"
+            cookie["secure"] = True
+            cookie["httponly"] = True
+            cookie["path"] = "/"
+    except Exception:
+        # Fallback para versões do aiohttp que não expõem o cookie por nome.
+        headers = list(response.headers.getall("Set-Cookie", []))
+        if headers:
+            response.headers.popall("Set-Cookie")
+            for header in headers:
+                if "SameSite=Lax" in header:
+                    header = header.replace("SameSite=Lax", "SameSite=None")
+                elif "SameSite=" not in header:
+                    header += "; SameSite=None"
+                if "Secure" not in header:
+                    header += "; Secure"
+                response.headers.add("Set-Cookie", header)
     return response
 
 
 def install(bot_module):
-    # IMPORTANTE: os patches precisam ocorrer antes de v708 criar a aiohttp.Application.
+    central = v708.install(bot_module)
+    if not hasattr(v700, "_central_original_login_route"):
+        v700._central_original_login_route = v700.login_route
     v700.security = iframe_security
     v700.login_route = iframe_login_route
-    return v708.install(bot_module)
+    return central
