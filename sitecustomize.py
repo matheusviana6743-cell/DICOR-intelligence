@@ -11,7 +11,7 @@ def _render(*a,**k):
 
 flask.render_template_string=_render
 
-# Corrige o middleware de login e a renderização da página de ação antes do import.
+# Correções de compatibilidade antes do import do app.
 p=Path('app_lastro.py')
 if p.exists():
     s=p.read_text()
@@ -19,6 +19,11 @@ if p.exists():
     new="if request.method=='POST' and request.endpoint != 'login' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
     if old in s:
         s=s.replace(old,new,1)
+
+    # A rota é registrada com endpoint singular 'action'.
+    s=s.replace("url_for('actions')", "url_for('action')")
+    s=s.replace('url_for("actions")', 'url_for("action")')
+
     lines=s.splitlines()
     for i,line in enumerate(lines):
         if line.startswith(" return lay(a['name'],f'<div class=\"card\"><span class=\"pill\">Frequência:"):
