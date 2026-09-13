@@ -94,7 +94,7 @@ def productions():
 def chests():
  if request.method=='POST':ex('INSERT INTO chests(member_id,item,reason,proof,created_by,created_at) VALUES(?,?,?,?,?,?)',(request.form['member_id'],request.form['item'],request.form['reason'],proof(request.files.get('proof')),session['uid'],now()));flash('Baú registrado.');return redirect(url_for('chests'))
  return lay('Baú','<div class="card"><form class="form" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="'+csrf()+'"><div class="field full"><label>Quem retirou</label><select class="select" name="member_id">'+''.join(f'<option value="{x["id"]}">{x["name"]}</option>' for x in q('SELECT * FROM members WHERE active=1 ORDER BY name'))+'</select></div><div class="field"><label>Item</label><input class="input" name="item" required></div><div class="field"><label>Motivo</label><input class="input" name="reason" required></div><button class="btn full">Registrar</button></form></div>')
-@app.route('/actions/<int:action_id>',methods=['GET','POST'])
+@app.route('/actions/<int:action_id>',methods=['GET','POST'],endpoint='actions')
 @req
 def action(action_id):
  a=q('SELECT * FROM actions WHERE id=?',(action_id,));
