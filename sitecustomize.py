@@ -1,30 +1,26 @@
 import flask
 from pathlib import Path
-import re
+
 _GOLD_THEME=r'''<style id="lastro-gold-theme">:root{--bg:#050505!important;--panel:#0d0d0d!important;--line:#2b2414!important;--text:#f7f3e8!important;--muted:#a79b82!important;--accent:#d4af37!important;--accent2:#f0d477!important}body{background:radial-gradient(circle at 80% -10%,rgba(212,175,55,.16),transparent 32%),linear-gradient(135deg,#030303,#0a0906 55%,#030303)!important;color:#f7f3e8!important}.side{background:#080808f7!important;border-right:1px solid #4a3b17!important}.brand b{color:#d4af37!important}.nav a:hover{background:rgba(212,175,55,.09)!important;color:#f5df91!important;border-color:#4b3b16!important}.top h1,.section h2{color:#f0df9b!important}.card{background:linear-gradient(180deg,#12110e,#0b0b0a)!important;border-color:#332a17!important}.metric{color:#d4af37!important}.table th{color:#d4af37!important}.btn{background:linear-gradient(135deg,#d4af37,#b88a14)!important;color:#090805!important}.btn.secondary{background:#17150f!important;color:#d8c98e!important;border-color:#4a3a18!important}.input,.select,.textarea{background:#070706!important;border-color:#3a301b!important;color:#f7f3e8!important}.input:focus,.select:focus,.textarea:focus{border-color:#d4af37!important}.muted{color:#a79b82!important}.pill{background:#211b0d!important;color:#e4cf82!important;border-color:#493a17!important}.flash{background:#16150e!important;border-color:#55451d!important}.login{background:radial-gradient(circle at center,rgba(212,175,55,.12),transparent 42%)!important}.mobile{background:#090806f5!important;border-top-color:#4a3b17!important}</style>'''
+
 _original=flask.render_template_string
 def _render(*a,**k):
- h=_original(*a,**k);return h.replace('</head>',_GOLD_THEME+'</head>',1)
+    h=_original(*a,**k)
+    return h.replace('</head>',_GOLD_THEME+'</head>',1)
 flask.render_template_string=_render
-# Runtime safety patches for the standalone Lastro app.
+
+# Fix the login middleware: the public login POST must reach the login route.
 p=Path('/app/app_lastro.py')
 if p.exists():
- s=p.read_text()
- # Allow the login form POST to reach the login route; keep CSRF protection on authenticated POSTs.
- old="if request.method=='POST' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
- new="if request.method=='POST' and request.endpoint != 'login' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
- if old in s and "request.endpoint != 'login'" not in s:
-  s=s.replace(old,new,1)
- # If ADMIN_INITIAL_PASSWORD is configured, also reset the existing Lastro admin password instead of only creating a missing user.
- old_init="if pw and not c.execute('SELECT 1 FROM users WHERE username=?',('Marcelo Correia',)).fetchone():c.execute('INSERT INTO users(name,username,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
- new_init="if pw:\n  if c.execute('SELECT 1 FROM users WHERE username=?',('Marcelo Correia',)).fetchone():c.execute('UPDATE users SET password_hash=?,active=1,role=? WHERE username=?',(generate_password_hash(pw),'ADMINISTRADOR','Marcelo Correia'))\n  else:c.execute('INSERT INTO users(name,username,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
- if old_init in s and "UPDATE users SET password_hash" not in s:
-  s=s.replace(old_init,new_init,1)
- marker="\n@app.get('/actions/result/<int:record_id>')"
- if marker in s and "temporarily_lastro_action_patch" not in s:
-  start=s.find("\n return lay(a['name'],f'",s.find("def action(action_id):"))
-  end=s.find(marker,start)
-  if start!=-1 and end!=-1:
-   new='''\n # temporarily_lastro_action_patch\n body = '<div class="card"><span class="pill">Frequência: '+str(n)+'/'+str(l if l is not None else '∞')+'</span><p class="muted">Valor: '+(money(a["action_value"]) if a["action_value"] else 'Ainda não definido')+'</p><div class="rules">'+rh+'</div></div>'\n body += '<form class="section" method="post"><input type="hidden" name="csrf" value="'+csrf()+'"><div class="card"><h2>Participantes da família</h2><div id="ms"></div><button class="btn secondary" type="button" onclick="addM()">+ Selecionar membro</button></div><div class="card section"><h3>Participante externo</h3><div id="es"></div><button class="btn secondary" type="button" onclick="addE()">+ Adicionar participante externo</button></div><button class="btn section" type="submit">Finalizar ação</button></form>'\n body += '<template id="mt"><div class="member"><select class="select" name="member_ids" onchange="sync(this)">'+opts+'</select><select class="select" data-s><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" data-w><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button></div></template>'\n body += '<script>function sync(x){let c=x.closest(\\'.member\\');c.querySelector(\\'[data-s]\\').name=\\'side_\\'+x.value;c.querySelector(\\'[data-w]\\').name=\\'weapon_\\'+x.value}function addM(){let x=document.getElementById(\\'mt\\').content.cloneNode(true);document.getElementById(\\'ms\\').appendChild(x);sync(document.querySelector(\\'#ms .member:last-child select[name=member_ids]\\'))}let ei=0;function addE(){let i=ei++,d=document.createElement(\\'div\\');d.className=\\'member\\';d.innerHTML=\\'<input class="input" name="ext_name" placeholder="Nome" required><input class="input" name="ext_pass" placeholder="Passaporte"><input class="input" name="ext_family" placeholder="Família" required><select class="select" name="ext_side_\\'+i+\\'"><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" name="ext_weapon_\\'+i+\\'"><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button>\\';document.getElementById(\\'es\\').appendChild(d)}</script>'\n return lay(a['name'],body)\n'''
-   s=s[:start]+new+s[end:]
- p.write_text(s)
+    s=p.read_text()
+    old="if request.method=='POST' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
+    new="if request.method=='POST' and request.endpoint != 'login' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
+    if old in s:
+        s=s.replace(old,new,1)
+
+    # Always synchronize the initial Lastro administrator with ADMIN_INITIAL_PASSWORD.
+    old_init="if pw and not c.execute('SELECT 1 FROM users WHERE username=?',('Marcelo Correia',)).fetchone():c.execute('INSERT INTO users(name,username,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
+    new_init="if pw:\n  existing=c.execute('SELECT id FROM users WHERE username=?',('Marcelo Correia',)).fetchone()\n  if existing:c.execute('UPDATE users SET password_hash=?,active=1,role=? WHERE id=?',(generate_password_hash(pw),'ADMINISTRADOR',existing[0]))\n  else:c.execute('INSERT INTO users(name,username,password_hash,role,created_at,active) VALUES(?,?,?,?,?,1)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
+    if old_init in s:
+        s=s.replace(old_init,new_init,1)
+    p.write_text(s)
