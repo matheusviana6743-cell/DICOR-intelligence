@@ -15,5 +15,5 @@ if start != -1 and end != -1 and start < end:
     s = s[:start] + replacement + s[end:]
 
 p.write_text(s, encoding='utf-8')
-compile(compile(s, 'app_lastro.py', 'exec'), 'app_lastro.py', 'exec')
+compile(s, 'app_lastro.py', 'exec')
 print('Lastro source validated')
