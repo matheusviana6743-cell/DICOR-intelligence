@@ -20,7 +20,7 @@ app.secret_key = os.getenv('SECRET_KEY') or secrets.token_hex(32)
 app.config.update(
     MAX_CONTENT_LENGTH=MAX_UPLOAD,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SAMESITE='None',
     SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '1') == '1',
 )
 
@@ -160,12 +160,14 @@ def health():
 def login():
     if session.get('uid'): return redirect(url_for('dashboard'))
     error=''
+    username=''
     if request.method=='POST':
-        row=getall('SELECT * FROM users WHERE lower(username)=lower(?) AND active=1',(request.form.get('username','').strip(),))
+        username=request.form.get('username','').strip()
+        row=getall('SELECT * FROM users WHERE lower(username)=lower(?) AND active=1',(username,))
         if row and check_password_hash(row[0]['password_hash'],request.form.get('password','')):
             session.clear(); session.update(uid=row[0]['id'],name=row[0]['name'],role=row[0]['role']); csrf(); return redirect(url_for('dashboard'))
         error='Usuário ou senha inválidos.'
-    return render_template_string(f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login · LASTRO</title><style>{CSS}</style></head><body><div class="loginpage"><form class="card loginbox" method="post"><input type="hidden" name="csrf" value="{csrf()}"><div class="brand"><b>LASTRO</b><small>CENTRAL PRIVADA DE GESTÃO</small></div><div class="field"><label>Usuário</label><input class="input" name="username" autocomplete="username" required></div><div class="field" style="margin-top:12px"><label>Senha</label><input class="input" type="password" name="password" autocomplete="current-password" required></div>{f'<div class="flash error" style="margin-top:12px">{error}</div>' if error else ''}<button class="btn" style="width:100%;margin-top:16px">Entrar</button></form></div></body></html>''')
+    return render_template_string(f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login · LASTRO</title><style>{CSS}</style></head><body><div class="loginpage"><form class="card loginbox" method="post"><input type="hidden" name="csrf" value="{csrf()}"><div class="brand"><b>LASTRO</b><small>CENTRAL PRIVADA DE GESTÃO</small></div><div class="field"><label>Usuário</label><input class="input" name="username" autocomplete="username" value="{username}" required></div><div class="field" style="margin-top:12px"><label>Senha</label><input class="input" type="password" name="password" autocomplete="current-password" required></div>{f'<div class="flash error" style="margin-top:12px">{error}</div>' if error else ''}<button class="btn" style="width:100%;margin-top:16px">Entrar</button></form></div></body></html>''')
 
 @app.get('/logout')
 def logout(): session.clear(); return redirect(url_for('login'))
