@@ -6,7 +6,7 @@ _original=flask.render_template_string
 def _render(*a,**k):
  h=_original(*a,**k);return h.replace('</head>',_GOLD_THEME+'</head>',1)
 flask.render_template_string=_render
-# Runtime safety patch for the action page in the standalone Lastro app.
+# Runtime safety patches for the standalone Lastro app.
 p=Path('/app/app_lastro.py')
 if p.exists():
  s=p.read_text()
@@ -14,11 +14,17 @@ if p.exists():
  old="if request.method=='POST' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
  new="if request.method=='POST' and request.endpoint != 'login' and (not session.get('uid') or not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf',''))):abort(400)"
  if old in s and "request.endpoint != 'login'" not in s:
-  p.write_text(s.replace(old,new,1))
+  s=s.replace(old,new,1)
+ # If ADMIN_INITIAL_PASSWORD is configured, also reset the existing Lastro admin password instead of only creating a missing user.
+ old_init="if pw and not c.execute('SELECT 1 FROM users WHERE username=?',('Marcelo Correia',)).fetchone():c.execute('INSERT INTO users(name,username,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
+ new_init="if pw:\n  if c.execute('SELECT 1 FROM users WHERE username=?',('Marcelo Correia',)).fetchone():c.execute('UPDATE users SET password_hash=?,active=1,role=? WHERE username=?',(generate_password_hash(pw),'ADMINISTRADOR','Marcelo Correia'))\n  else:c.execute('INSERT INTO users(name,username,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Marcelo Correia','Marcelo Correia',generate_password_hash(pw),'ADMINISTRADOR',t))"
+ if old_init in s and "UPDATE users SET password_hash" not in s:
+  s=s.replace(old_init,new_init,1)
  marker="\n@app.get('/actions/result/<int:record_id>')"
  if marker in s and "temporarily_lastro_action_patch" not in s:
   start=s.find("\n return lay(a['name'],f'",s.find("def action(action_id):"))
   end=s.find(marker,start)
   if start!=-1 and end!=-1:
    new='''\n # temporarily_lastro_action_patch\n body = '<div class="card"><span class="pill">Frequência: '+str(n)+'/'+str(l if l is not None else '∞')+'</span><p class="muted">Valor: '+(money(a["action_value"]) if a["action_value"] else 'Ainda não definido')+'</p><div class="rules">'+rh+'</div></div>'\n body += '<form class="section" method="post"><input type="hidden" name="csrf" value="'+csrf()+'"><div class="card"><h2>Participantes da família</h2><div id="ms"></div><button class="btn secondary" type="button" onclick="addM()">+ Selecionar membro</button></div><div class="card section"><h3>Participante externo</h3><div id="es"></div><button class="btn secondary" type="button" onclick="addE()">+ Adicionar participante externo</button></div><button class="btn section" type="submit">Finalizar ação</button></form>'\n body += '<template id="mt"><div class="member"><select class="select" name="member_ids" onchange="sync(this)">'+opts+'</select><select class="select" data-s><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" data-w><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button></div></template>'\n body += '<script>function sync(x){let c=x.closest(\\'.member\\');c.querySelector(\\'[data-s]\\').name=\\'side_\\'+x.value;c.querySelector(\\'[data-w]\\').name=\\'weapon_\\'+x.value}function addM(){let x=document.getElementById(\\'mt\\').content.cloneNode(true);document.getElementById(\\'ms\\').appendChild(x);sync(document.querySelector(\\'#ms .member:last-child select[name=member_ids]\\'))}let ei=0;function addE(){let i=ei++,d=document.createElement(\\'div\\');d.className=\\'member\\';d.innerHTML=\\'<input class="input" name="ext_name" placeholder="Nome" required><input class="input" name="ext_pass" placeholder="Passaporte"><input class="input" name="ext_family" placeholder="Família" required><select class="select" name="ext_side_\\'+i+\\'"><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" name="ext_weapon_\\'+i+\\'"><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button>\\';document.getElementById(\\'es\\').appendChild(d)}</script>'\n return lay(a['name'],body)\n'''
-   p.write_text(s[:start]+new+s[end:])
+   s=s[:start]+new+s[end:]
+ p.write_text(s)
