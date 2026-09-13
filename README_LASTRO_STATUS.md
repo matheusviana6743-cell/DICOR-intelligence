@@ -1,1 +1,1 @@
-Central Lastro stable
+stable
