@@ -1,32 +1,20 @@
 import flask
-
-_GOLD_THEME = r'''
-<style id="lastro-gold-theme">
-:root{--bg:#050505!important;--panel:#0d0d0d!important;--line:#2b2414!important;--text:#f7f3e8!important;--muted:#a79b82!important;--accent:#d4af37!important;--accent2:#f0d477!important;--ok:#35d58b!important;--danger:#ff5d73!important}
-body{background:radial-gradient(circle at 80% -10%,rgba(212,175,55,.16) 0,transparent 32%),linear-gradient(135deg,#030303,#0a0906 55%,#030303)!important;color:#f7f3e8!important}
-.side{background:linear-gradient(180deg,#080808f7,#0d0b07f7)!important;border-right:1px solid #4a3b17!important;box-shadow:8px 0 35px rgba(0,0,0,.35)}
-.brand b{color:#d4af37!important;text-shadow:0 0 18px rgba(212,175,55,.22)}
-.brand span{color:#b9a66e!important}
-.nav a{color:#b7ad96!important;border:1px solid transparent}.nav a:hover{background:rgba(212,175,55,.09)!important;color:#f5df91!important;border-color:#4b3b16!important}.nav a:focus{outline:1px solid #d4af37}
-.main{background:transparent!important}.top h1{color:#f4e5ac!important}.user{color:#b9a66e!important}
-.card{background:linear-gradient(180deg,#12110e,#0b0b0a)!important;border-color:#332a17!important;box-shadow:0 8px 28px rgba(0,0,0,.2)}
-.card:hover{border-color:#5a461b}
-.metric{color:#d4af37!important;text-shadow:0 0 18px rgba(212,175,55,.13)}
-.label{color:#a99a75!important}.section h2{color:#eadba8!important}
-.table th{color:#b09d6c!important}.table td{border-bottom-color:#292315!important}.table tr:hover td{background:rgba(212,175,55,.035)}
-.btn{background:linear-gradient(135deg,#d4af37,#b88a14)!important;color:#090805!important;box-shadow:0 5px 16px rgba(212,175,55,.16)}.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
-.btn.secondary{background:#17150f!important;color:#d8c98e!important;border:1px solid #4a3a18!important}
-.input,.select,.textarea{background:#070706!important;border-color:#3a301b!important;color:#f7f3e8!important}.input:focus,.select:focus,.textarea:focus{border-color:#d4af37!important;box-shadow:0 0 0 2px rgba(212,175,55,.1)}
-.field label{color:#b7aa86!important}.muted{color:#a79b82!important}.pill{background:#211b0d!important;color:#e4cf82!important;border:1px solid #493a17}.proof{color:#e4c95e!important}.proof:hover{color:#fff0a8!important}
-.flash{background:#16150e!important;border-color:#55451d!important;color:#eadba8}.flash.error{background:#281214!important;border-color:#6e2c38!important;color:#ffb2bd}
-.login{background:radial-gradient(circle at center,rgba(212,175,55,.12),transparent 42%)!important}.loginbox{border-color:#4d3c18!important;box-shadow:0 25px 70px rgba(0,0,0,.55),0 0 45px rgba(212,175,55,.06)!important}.loginbox .btn{color:#090805!important}
-.mobile-nav{background:#090806f5!important;border-top-color:#4a3b17!important}.mobile-nav a{color:#b7aa85!important}
-</style>
-'''
-_original = flask.render_template_string
-
-def _lastro_render(*args, **kwargs):
-    html = _original(*args, **kwargs)
-    return html.replace('</head>', _GOLD_THEME + '</head>', 1)
-
-flask.render_template_string = _lastro_render
+from pathlib import Path
+import re
+_GOLD_THEME=r'''<style id="lastro-gold-theme">:root{--bg:#050505!important;--panel:#0d0d0d!important;--line:#2b2414!important;--text:#f7f3e8!important;--muted:#a79b82!important;--accent:#d4af37!important;--accent2:#f0d477!important}body{background:radial-gradient(circle at 80% -10%,rgba(212,175,55,.16),transparent 32%),linear-gradient(135deg,#030303,#0a0906 55%,#030303)!important;color:#f7f3e8!important}.side{background:#080808f7!important;border-right:1px solid #4a3b17!important}.brand b{color:#d4af37!important}.nav a:hover{background:rgba(212,175,55,.09)!important;color:#f5df91!important;border-color:#4b3b16!important}.top h1,.section h2{color:#f0df9b!important}.card{background:linear-gradient(180deg,#12110e,#0b0b0a)!important;border-color:#332a17!important}.metric{color:#d4af37!important}.table th{color:#d4af37!important}.btn{background:linear-gradient(135deg,#d4af37,#b88a14)!important;color:#090805!important}.btn.secondary{background:#17150f!important;color:#d8c98e!important;border-color:#4a3a18!important}.input,.select,.textarea{background:#070706!important;border-color:#3a301b!important;color:#f7f3e8!important}.input:focus,.select:focus,.textarea:focus{border-color:#d4af37!important}.muted{color:#a79b82!important}.pill{background:#211b0d!important;color:#e4cf82!important;border-color:#493a17!important}.flash{background:#16150e!important;border-color:#55451d!important}.login{background:radial-gradient(circle at center,rgba(212,175,55,.12),transparent 42%)!important}.mobile{background:#090806f5!important;border-top-color:#4a3b17!important}</style>'''
+_original=flask.render_template_string
+def _render(*a,**k):
+ h=_original(*a,**k);return h.replace('</head>',_GOLD_THEME+'</head>',1)
+flask.render_template_string=_render
+# Runtime safety patch for the action page in the standalone Lastro app.
+p=Path('/app/app_lastro.py')
+if p.exists():
+ s=p.read_text()
+ marker="\n@app.get('/actions/result/<int:record_id>')"
+ if marker in s and "temporarily_lastro_action_patch" not in s:
+  start=s.find("\n return lay(a['name'],f'",s.find("def action(action_id):"))
+  end=s.find(marker,start)
+  if start!=-1 and end!=-1:
+   new='''\n # temporarily_lastro_action_patch\n body = '<div class="card"><span class="pill">Frequência: '+str(n)+'/'+str(l if l is not None else '∞')+'</span><p class="muted">Valor: '+(money(a["action_value"]) if a["action_value"] else 'Ainda não definido')+'</p><div class="rules">'+rh+'</div></div>'\n body += '<form class="section" method="post"><input type="hidden" name="csrf" value="'+csrf()+'"><div class="card"><h2>Participantes da família</h2><div id="ms"></div><button class="btn secondary" type="button" onclick="addM()">+ Selecionar membro</button></div><div class="card section"><h3>Participante externo</h3><div id="es"></div><button class="btn secondary" type="button" onclick="addE()">+ Adicionar participante externo</button></div><button class="btn section" type="submit">Finalizar ação</button></form>'\n body += '<template id="mt"><div class="member"><select class="select" name="member_ids" onchange="sync(this)">'+opts+'</select><select class="select" data-s><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" data-w><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button></div></template>'\n body += '<script>function sync(x){let c=x.closest(\\'.member\\');c.querySelector(\\'[data-s]\\').name=\\'side_\\'+x.value;c.querySelector(\\'[data-w]\\').name=\\'weapon_\\'+x.value}function addM(){let x=document.getElementById(\\'mt\\').content.cloneNode(true);document.getElementById(\\'ms\\').appendChild(x);sync(document.querySelector(\\'#ms .member:last-child select[name=member_ids]\\'))}let ei=0;function addE(){let i=ei++,d=document.createElement(\\'div\\');d.className=\\'member\\';d.innerHTML=\\'<input class="input" name="ext_name" placeholder="Nome" required><input class="input" name="ext_pass" placeholder="Passaporte"><input class="input" name="ext_family" placeholder="Família" required><select class="select" name="ext_side_\\'+i+\\'"><option>BANDIDO</option><option>POLICIAL</option></select><select class="select" name="ext_weapon_\\'+i+\\'"><option value="INDEFINIDO">Não informado</option><option value="TROUXE">Trouxe armamento</option><option value="NAO_TROUXE">Não trouxe</option></select><button class="btn danger" type="button" onclick="this.closest(\\'.member\\').remove()">Remover</button>\\';document.getElementById(\\'es\\').appendChild(d)}</script>'\n return lay(a['name'],body)\n'''
+   s=s[:start]+new+s[end:]
+   p.write_text(s)
