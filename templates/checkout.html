@@ -1,41 +1,4 @@
-{% extends "base.html" %}
-{% block title %}Checkout {{ order['id'] }} — BOT FORGE{% endblock %}
+{% extends 'base.html' %}
 {% block content %}
-<section class="checkout-shell">
-  <div class="checkout-main">
-    <span class="eyebrow">CHECKOUT</span>
-    <h1>Finalize seu projeto</h1>
-    <p>Pedido <strong>{{ order['id'] }}</strong></p>
-    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
-    {% if quote %}
-      <div class="success-card">
-        <b>Projeto registrado.</b>
-        <p>Seu personalizado fica na faixa de R$ {{ '%.0f'|format(order['price_min']) }} a R$ {{ '%.0f'|format(order['price_max']) }}. O orçamento final será combinado após análise.</p>
-        <a class="btn" href="{{ wa }}" target="_blank">Enviar para o WhatsApp</a>
-        <a class="btn ghost" href="{{ url_for('order_page', token=order['token']) }}">Acompanhar pedido</a>
-      </div>
-    {% elif payment_unavailable %}
-      <div class="alert">O pedido foi criado, mas o checkout online ainda não está conectado. Use o WhatsApp para combinar a cobrança.</div>
-      <a class="btn" href="https://wa.me/{{ contact_wa }}?text=Quero%20finalizar%20o%20pedido%20{{ order['id'] }}%20da%20BOT%20FORGE." target="_blank">Falar no WhatsApp</a>
-    {% else %}
-      <form method="post" class="checkout-form">
-        <label class="field"><span>Nome *</span><input name="name" required value="{{ order['customer_name'] or '' }}" placeholder="Seu nome"></label>
-        <label class="field"><span>E-mail *</span><input type="email" name="email" required value="{{ order['customer_email'] or '' }}" placeholder="voce@email.com"></label>
-        <label class="field"><span>WhatsApp *</span><input name="phone" required value="{{ order['customer_phone'] or '' }}" placeholder="(71) 99999-9999"></label>
-        <div class="payment-box"><div><b>Pix ou cartão</b><p>O pagamento será processado pelo Asaas. A escolha da forma de pagamento acontece na fatura.</p></div><span>🔒</span></div>
-        <button class="btn big" type="submit">Ir para pagamento{% if order['price'] %} · R$ {{ '%.2f'|format(order['price']) }}{% endif %}</button>
-      </form>
-    {% endif %}
-  </div>
-  <aside class="checkout-side">
-    <span class="eyebrow">SEU PEDIDO</span>
-    <h3>{{ products[order['product']]['name'] }}</h3>
-    <div class="side-line"><span>Status</span><b>{{ order['status'] }}</b></div>
-    {% if order['price'] %}
-      <div class="side-total"><span>Total</span><strong>R$ {{ '%.2f'|format(order['price']) }}</strong></div>
-    {% else %}
-      <div class="side-total"><span>Faixa</span><strong>R$ {{ '%.0f'|format(order['price_min']) }}–{{ '%.0f'|format(order['price_max']) }}</strong></div>
-    {% endif %}
-  </aside>
-</section>
+<section class="checkout"><span class="eyebrow">MODO TESTE</span><h1>Finalizar projeto</h1><p>Pagamento desativado nesta versão. Seu pedido será criado gratuitamente apenas para você testar o fluxo do site.</p><div class="notice"><strong>Valor: R$ 0,00</strong><br>Não será solicitado Pix, cartão ou qualquer dado bancário.</div><form method="post" action="/checkout"><label>Nome<input name="name" required maxlength="100"></label><label>E-mail<input type="email" name="email" required maxlength="160"></label><label>WhatsApp<input name="phone" maxlength="30"></label><button class="btn primary" type="submit">Criar pedido grátis</button></form></section>
 {% endblock %}
