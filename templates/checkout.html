@@ -1,4 +1,23 @@
 {% extends 'base.html' %}
 {% block content %}
-<section class="checkout"><span class="eyebrow">MODO TESTE</span><h1>Finalizar projeto</h1><p>Pagamento desativado nesta versão. Seu pedido será criado gratuitamente apenas para você testar o fluxo do site.</p><div class="notice"><strong>Valor: R$ 0,00</strong><br>Não será solicitado Pix, cartão ou qualquer dado bancário.</div>{% if error %}<div class="notice">{{ error }}</div>{% endif %}<form method="post" action="{{ url_for('checkout', token=order['token']) }}"><label>Nome<input name="name" required maxlength="100"></label><label>E-mail<input type="email" name="email" required maxlength="160"></label><label>WhatsApp<input name="phone" required maxlength="30"></label><button class="btn primary" type="submit">Criar pedido grátis</button></form></section>
+<section class="checkout">
+  <span class="eyebrow">FINALIZAÇÃO</span>
+  <h1>Finalizar projeto</h1>
+  <p>Preencha seus dados para continuar. O pagamento online será aberto com segurança pelo provedor.</p>
+
+  {% if order['price'] %}
+    <div class="notice"><strong>Valor: R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</strong><br>Após confirmar seus dados, você será direcionado ao checkout.</div>
+  {% else %}
+    <div class="notice"><strong>Projeto personalizado</strong><br>O valor fica entre R$ {{ '%.0f'|format(order['price_min']) }} e R$ {{ '%.0f'|format(order['price_max']) }}, conforme a análise do projeto.</div>
+  {% endif %}
+
+  {% if error %}<div class="notice">{{ error }}</div>{% endif %}
+
+  <form method="post" action="{{ url_for('checkout', token=order['token']) }}">
+    <label>Nome<input name="name" required maxlength="100" value="{{ order['customer_name'] or '' }}"></label>
+    <label>E-mail<input type="email" name="email" required maxlength="160" value="{{ order['customer_email'] or '' }}"></label>
+    <label>WhatsApp<input name="phone" required maxlength="30" value="{{ order['customer_phone'] or '' }}"></label>
+    <button class="btn primary" type="submit">Continuar para pagamento</button>
+  </form>
+</section>
 {% endblock %}
