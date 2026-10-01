@@ -1,4 +1,4 @@
-import os, json, secrets, sqlite3, datetime as dt, io, zipfile
+import os, json, secrets, sqlite3, datetime as dt, io, zipfile, hmac, hashlib
 from pathlib import Path
 from functools import wraps
 from urllib.parse import quote
@@ -17,36 +17,35 @@ app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(32))
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
 CONTACT_WA = '5571996936743'
 CONTACT_EMAIL = 'matheusviana6743@gmail.com'
-ASAAS_KEY = os.getenv('ASAAS_API_KEY', '').strip()
-ASAAS_BASE = os.getenv('ASAAS_API_BASE', 'https://api-sandbox.asaas.com/v3').rstrip('/')
-ASAAS_WEBHOOK_TOKEN = os.getenv('ASAAS_WEBHOOK_TOKEN', '').strip()
+MERCADO_PAGO_ACCESS_TOKEN = os.getenv('MERCADOPAGO_ACCESS_TOKEN', '').strip()
+MERCADO_PAGO_WEBHOOK_SECRET = os.getenv('MERCADOPAGO_WEBHOOK_SECRET', '').strip()
+MERCADO_PAGO_BASE = 'https://api.mercadopago.com'
 PUBLIC_URL = os.getenv('PUBLIC_URL', '').rstrip('/')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '').strip()
 TEST_MODE = os.getenv('TEST_MODE', '1').strip() != '0'
 
 PRODUCTS = {
-    'discord': {'name': 'Bot Discord', 'price': 0.0, 'type': 'fixed'},
-    'fivem': {'name': 'Sistema FiveM', 'price': 0.0, 'type': 'fixed'},
-    'site': {'name': 'Site / Web', 'price': 0.0, 'type': 'fixed'},
-    'personalizado': {'name': 'Projeto personalizado', 'min': 0.0, 'max': 0.0, 'type': 'quote'},
+    'discord': {'name': 'Bot Discord', 'price': 49.90, 'type': 'fixed'},
+    'fivem': {'name': 'Sistema FiveM', 'price': 40.00, 'type': 'fixed'},
+    'site': {'name': 'Site / Web', 'price': 30.00, 'type': 'fixed'},
+    'personalizado': {'name': 'Projeto personalizado', 'min': 50.00, 'max': 200.00, 'type': 'quote'},
 }
 
 CONFIGS = {
-'discord': [
-('Objetivo','objective','textarea',True,'Explique em poucas palavras o que o bot precisa fazer.'),('Nome do bot','bot_name','text',False,'Ex.: Forge Tickets'),('Nome do servidor','server_name','text',False,'Opcional'),('Tipo','bot_type','select',False,['Tickets','Moderação','Economia','Atendimento','Whitelist','Vendas','Personalizado']),('Tickets','tickets','multi',False,['Criar ticket','Categorias','Transcrição','Fechamento automático']),('Moderação','moderation','multi',False,['Ban','Kick','Mute','Anti-spam','Filtros']),('Logs','logs','multi',False,['Mensagens','Entradas/Saídas','Moderação','Tickets','Auditoria']),('Automação','automation','multi',False,['AutoRole','Boas-vindas','Verificação','Cargos por reação']),('Economia','economy','multi',False,['Saldo','Loja','Ranking','XP']),('Interface','ui','multi',False,['Embeds','Botões','Menus','Slash Commands']),('Integrações','integrations','multi',False,['Webhooks','Painel Web','APIs','Banco de dados']),('Permissões','permissions','textarea',False,'Quais cargos podem usar cada área?'),('Idioma','language','select',False,['Português','Português + Inglês','Outro']),('Cor/estilo','style','text',False,'Opcional'),('Hospedagem','hosting','select',False,['Já tenho','Quero orientação','Quero hospedagem']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
-'fivem': [
-('Objetivo','objective','textarea',True,'Explique em poucas palavras o que o sistema precisa fazer.'),('Framework','framework','select',False,['QBCore','ESX','Standalone','Outro']),('Versão','version','text',False,'Ex.: versão atual do seu servidor'),('Tipo de sistema','system_type','select',False,['Emprego','Administrativo','Economia','UI/NUI','Interação','Personalizado']),('Jobs','jobs','textarea',False,'Ex.: Polícia, EMS, Mecânico'),('Comandos','commands','textarea',False,'Liste comandos desejados.'),('Permissões','permissions','textarea',False,'Grupos/cargos que terão acesso.'),('UI / NUI','nui','multi',False,['Menu','Dashboard','Notificações','Formulários']),('Banco de dados','database','select',False,['Não','MySQL','Outro']),('Discord','discord_logs','multi',False,['Logs','Webhooks','Comandos integrados']),('Integrações','integrations','textarea',False,'Scripts, APIs ou recursos que precisam conversar com o sistema.'),('Dependências','dependencies','textarea',False,'Opcional'),('Visual','visual','text',False,'Cores, estilo, identidade.'),('Otimização','optimization','select',False,['Padrão','Priorizar performance']),('Documentação','documentation','select',False,['Incluir','Não incluir']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
-'site': [
-('Objetivo','objective','textarea',True,'Explique o objetivo do site.'),('Tipo','site_type','select',False,['Landing page','Loja','Portfólio','Site para servidor','Dashboard','Sistema Web','Personalizado']),('Nome / marca','brand','text',False,'Opcional'),('Páginas','pages','textarea',False,'Ex.: Início, Sobre, Contato'),('Seções','sections','textarea',False,'Ex.: Hero, preços, FAQ, depoimentos'),('Formulário','forms','multi',False,['Contato','Orçamento','Cadastro','Login']),('Integrações','integrations','multi',False,['WhatsApp','Instagram','Discord','APIs']),('Área do cliente','client_area','select',False,['Não','Sim']),('Painel administrativo','admin_panel','select',False,['Não','Sim']),('Banco de dados','database','select',False,['Não','SQLite','PostgreSQL','Outro']),('Responsividade','responsive','select',False,['Celular + PC','PC apenas']),('Cores','colors','text',False,'Ex.: claro + dourado'),('Estilo','style','text',False,'Ex.: moderno, minimalista'),('Animações','animations','select',False,['Discretas','Sem animações','Mais dinâmicas']),('SEO básico','seo','select',False,['Incluir','Não incluir']),('Domínio / hospedagem','hosting','select',False,['Já tenho','Quero orientação','Quero publicação']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
-'personalizado': [
-('O que você quer criar?','objective','textarea',True,'Descreva a ideia do projeto.'),('Plataforma','platform','select',False,['Discord','FiveM','Web / Site','Discord + FiveM','Outro']),('Funcionalidades','features','textarea',False,'Liste tudo o que lembrar.'),('Integrações','integrations','textarea',False,'APIs, Discord, banco de dados, pagamentos etc.'),('Referências','references','textarea',False,'Links ou exemplos de algo parecido.'),('Preferências visuais','style','textarea',False,'Cores, estilo e identidade.'),('Código-fonte','source_code','select',False,['Incluir','Não sei ainda']),('Observações','notes','textarea',False,'Detalhes adicionais.')]
+'discord': [('Objetivo','objective','textarea',True,'Explique em poucas palavras o que o bot precisa fazer.'),('Nome do bot','bot_name','text',False,'Ex.: Forge Tickets'),('Nome do servidor','server_name','text',False,'Opcional'),('Tipo','bot_type','select',False,['Tickets','Moderação','Economia','Atendimento','Whitelist','Vendas','Personalizado']),('Tickets','tickets','multi',False,['Criar ticket','Categorias','Transcrição','Fechamento automático']),('Moderação','moderation','multi',False,['Ban','Kick','Mute','Anti-spam','Filtros']),('Logs','logs','multi',False,['Mensagens','Entradas/Saídas','Moderação','Tickets','Auditoria']),('Automação','automation','multi',False,['AutoRole','Boas-vindas','Verificação','Cargos por reação']),('Economia','economy','multi',False,['Saldo','Loja','Ranking','XP']),('Interface','ui','multi',False,['Embeds','Botões','Menus','Slash Commands']),('Integrações','integrations','multi',False,['Webhooks','Painel Web','APIs','Banco de dados']),('Permissões','permissions','textarea',False,'Quais cargos podem usar cada área?'),('Idioma','language','select',False,['Português','Português + Inglês','Outro']),('Cor/estilo','style','text',False,'Opcional'),('Hospedagem','hosting','select',False,['Já tenho','Quero orientação','Quero hospedagem']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
+'fivem': [('Objetivo','objective','textarea',True,'Explique em poucas palavras o que o sistema precisa fazer.'),('Framework','framework','select',False,['QBCore','ESX','Standalone','Outro']),('Versão','version','text',False,'Ex.: versão atual do seu servidor'),('Tipo de sistema','system_type','select',False,['Emprego','Administrativo','Economia','UI/NUI','Interação','Personalizado']),('Jobs','jobs','textarea',False,'Ex.: Polícia, EMS, Mecânico'),('Comandos','commands','textarea',False,'Liste comandos desejados.'),('Permissões','permissions','textarea',False,'Grupos/cargos que terão acesso.'),('UI / NUI','nui','multi',False,['Menu','Dashboard','Notificações','Formulários']),('Banco de dados','database','select',False,['Não','MySQL','Outro']),('Discord','discord_logs','multi',False,['Logs','Webhooks','Comandos integrados']),('Integrações','integrations','textarea',False,'Scripts, APIs ou recursos que precisam conversar com o sistema.'),('Dependências','dependencies','textarea',False,'Opcional'),('Visual','visual','text',False,'Cores, estilo, identidade.'),('Otimização','optimization','select',False,['Padrão','Priorizar performance']),('Documentação','documentation','select',False,['Incluir','Não incluir']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
+'site': [('Objetivo','objective','textarea',True,'Explique o objetivo do site.'),('Tipo','site_type','select',False,['Landing page','Loja','Portfólio','Site para servidor','Dashboard','Sistema Web','Personalizado']),('Nome / marca','brand','text',False,'Opcional'),('Páginas','pages','textarea',False,'Ex.: Início, Sobre, Contato'),('Seções','sections','textarea',False,'Ex.: Hero, preços, FAQ, depoimentos'),('Formulário','forms','multi',False,['Contato','Orçamento','Cadastro','Login']),('Integrações','integrations','multi',False,['WhatsApp','Instagram','Discord','APIs']),('Área do cliente','client_area','select',False,['Não','Sim']),('Painel administrativo','admin_panel','select',False,['Não','Sim']),('Banco de dados','database','select',False,['Não','SQLite','PostgreSQL','Outro']),('Responsividade','responsive','select',False,['Celular + PC','PC apenas']),('Cores','colors','text',False,'Ex.: claro + dourado'),('Estilo','style','text',False,'Ex.: moderno, minimalista'),('Animações','animations','select',False,['Discretas','Sem animações','Mais dinâmicas']),('SEO básico','seo','select',False,['Incluir','Não incluir']),('Domínio / hospedagem','hosting','select',False,['Já tenho','Quero orientação','Quero publicação']),('Código-fonte','source_code','select',False,['Incluir','Não incluir']),('Observações','notes','textarea',False,'Qualquer detalhe adicional.')],
+'personalizado': [('O que você quer criar?','objective','textarea',True,'Descreva a ideia do projeto.'),('Plataforma','platform','select',False,['Discord','FiveM','Web / Site','Discord + FiveM','Outro']),('Funcionalidades','features','textarea',False,'Liste tudo o que lembrar.'),('Integrações','integrations','textarea',False,'APIs, Discord, banco de dados, pagamentos etc.'),('Referências','references','textarea',False,'Links ou exemplos de algo parecido.'),('Preferências visuais','style','textarea',False,'Cores, estilo e identidade.'),('Código-fonte','source_code','select',False,['Incluir','Não sei ainda']),('Observações','notes','textarea',False,'Detalhes adicionais.')]
 }
 
 def db():
     con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; con.execute('PRAGMA journal_mode=WAL'); return con
 
 def init_db():
-    con=db(); con.executescript('''CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,token TEXT UNIQUE NOT NULL,product TEXT NOT NULL,config_json TEXT NOT NULL,customer_name TEXT,customer_email TEXT,customer_phone TEXT,price REAL,price_min REAL,price_max REAL,status TEXT NOT NULL,payment_status TEXT NOT NULL,asaas_customer_id TEXT,asaas_payment_id TEXT,payment_url TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS webhook_events(id TEXT PRIMARY KEY,event TEXT,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS demos(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,product TEXT NOT NULL,url TEXT NOT NULL,description TEXT DEFAULT '',active INTEGER DEFAULT 1,created_at TEXT NOT NULL);'''); con.commit(); con.close()
+    con=db(); con.executescript('''CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,token TEXT UNIQUE NOT NULL,product TEXT NOT NULL,config_json TEXT NOT NULL,customer_name TEXT,customer_email TEXT,customer_phone TEXT,price REAL,price_min REAL,price_max REAL,status TEXT NOT NULL,payment_status TEXT NOT NULL,asaas_customer_id TEXT,asaas_payment_id TEXT,payment_url TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS webhook_events(id TEXT PRIMARY KEY,event TEXT,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS demos(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,product TEXT NOT NULL,url TEXT NOT NULL,description TEXT DEFAULT '',active INTEGER DEFAULT 1,created_at TEXT NOT NULL);''')
+    cols={r['name'] for r in con.execute('PRAGMA table_info(orders)').fetchall()}
+    if 'mercadopago_order_id' not in cols: con.execute('ALTER TABLE orders ADD COLUMN mercadopago_order_id TEXT')
+    con.commit(); con.close()
 init_db()
 
 def now(): return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -65,9 +64,6 @@ def require_admin(view):
 def _get_order(order_id):
     con=db(); row=con.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone(); con.close(); return row
 
-def _get_token(order_id):
-    row=_get_order(order_id); return row['token'] if row else ''
-
 def calc_price(product):
     p=PRODUCTS[product]; return (p['price'],None,None) if p['type']=='fixed' else (None,p['min'],p['max'])
 
@@ -82,8 +78,32 @@ def sync_test_status(row):
         return target
     return row['status']
 
+def mp_headers():
+    return {'Authorization':f'Bearer {MERCADO_PAGO_ACCESS_TOKEN}','Content-Type':'application/json','Accept':'application/json'}
+
+def create_mp_order(row):
+    if not MERCADO_PAGO_ACCESS_TOKEN: raise RuntimeError('Mercado Pago não configurado no Railway.')
+    amount=float(row['price'] or 0)
+    if amount <= 0: raise RuntimeError('Este pedido não possui um valor fixo para pagamento.')
+    payload={'type':'online','processing_mode':'manual','capture_mode':'automatic_async','total_amount':f'{amount:.2f}','external_reference':row['id'],'payer':{'email':row['customer_email']},'items':[{'title':PRODUCTS[row['product']]['name'],'unit_price':f'{amount:.2f}','quantity':1,'unit_measure':'unit','total_amount':f'{amount:.2f}'}],'description':f"BOT FORGE - {PRODUCTS[row['product']]['name']} - {row['id']}"}
+    r=requests.post(f'{MERCADO_PAGO_BASE}/v1/orders',headers={**mp_headers(),'X-Idempotency-Key':secrets.token_hex(16)},json=payload,timeout=30)
+    r.raise_for_status(); return r.json()
+
+def validate_mp_signature():
+    if not MERCADO_PAGO_WEBHOOK_SECRET: return False
+    signature=request.headers.get('x-signature',''); request_id=request.headers.get('x-request-id',''); data_id=request.args.get('data.id','')
+    parts={}
+    for part in signature.split(','):
+        k,v=part.strip().split('=',1) if '=' in part else ('','')
+        if k: parts[k]=v
+    ts=parts.get('ts'); v1=parts.get('v1')
+    if not ts or not v1 or not data_id: return False
+    manifest=f'id:{data_id};request-id:{request_id};ts:{ts};'
+    digest=hmac.new(MERCADO_PAGO_WEBHOOK_SECRET.encode(),manifest.encode(),hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest,v1)
+
 @app.context_processor
-def globals_ctx(): return {'products':PRODUCTS,'contact_wa':CONTACT_WA,'contact_email':CONTACT_EMAIL,'public_url':PUBLIC_URL,'test_mode':TEST_MODE}
+def globals_ctx(): return {'products':PRODUCTS,'contact_wa':CONTACT_WA,'contact_email':CONTACT_EMAIL,'public_url':PUBLIC_URL,'test_mode':TEST_MODE,'payments_configured':bool(MERCADO_PAGO_ACCESS_TOKEN)}
 
 @app.get('/')
 def index():
@@ -114,8 +134,15 @@ def checkout(token):
         if TEST_MODE:
             con=db(); con.execute("UPDATE orders SET customer_name=?,customer_email=?,customer_phone=?,status=?,payment_status=?,updated_at=? WHERE id=?",(name,email,phone,'Em preparação','Não necessário',now(),row['id'])); con.commit(); con.close()
             return redirect(url_for('order_page',token=token))
-        con=db(); con.execute("UPDATE orders SET customer_name=?,customer_email=?,customer_phone=?,status=?,updated_at=? WHERE id=?",(name,email,phone,'Aguardando pagamento',now(),row['id'])); con.commit(); con.close()
-        return render_template('checkout.html',order=_get_order(row['id']),payment_unavailable=True,error='Pagamento online ainda não conectado.')
+        con=db(); con.execute("UPDATE orders SET customer_name=?,customer_email=?,customer_phone=?,status=?,payment_status=?,updated_at=? WHERE id=?",(name,email,phone,'Aguardando pagamento','Aguardando',now(),row['id'])); con.commit(); con.close(); row=_get_order(row['id'])
+        if row['product']=='personalizado':
+            return render_template('checkout.html',order=row,error='Projeto personalizado: o valor será definido após análise. Entre em contato pelo WhatsApp para receber a cobrança.')
+        try:
+            payment=create_mp_order(row)
+            con=db(); con.execute("UPDATE orders SET mercadopago_order_id=?,payment_url=?,updated_at=? WHERE id=?",(payment.get('id'),payment.get('checkout_url'),now(),row['id'])); con.commit(); con.close()
+            return redirect(payment['checkout_url'])
+        except Exception as exc:
+            return render_template('checkout.html',order=_get_order(row['id']),error='Não foi possível iniciar o pagamento agora. Verifique a configuração do Mercado Pago no Railway.'), 503
     return render_template('checkout.html',order=row)
 
 @app.get('/order/<token>')
@@ -130,18 +157,17 @@ def order_status(token):
     con=db(); order=con.execute('SELECT * FROM orders WHERE token=?',(token,)).fetchone(); con.close()
     if not order: return jsonify({'error':'Pedido não encontrado.'}),404
     status=sync_test_status(order); order=_get_order(order['id']); ready=status=='Entregue'
-    return jsonify({'ok':True,'id':order['id'],'status':status,'payment_status':order['payment_status'],'ready':ready,'updated_at':order['updated_at']})
+    return jsonify({'ok':True,'id':order['id'],'status':status,'payment_status':order['payment_status'],'ready':ready,'updated_at':order['updated_at'],'payment_url':order['payment_url']})
 
 def generated_files(order):
     cfg=safe_json(order['config_json']); product=order['product']; files={}
-    meta=json.dumps({'order_id':order['id'],'product':product,'config':cfg},ensure_ascii=False,indent=2)
-    files['project.json']=meta
+    meta=json.dumps({'order_id':order['id'],'product':product,'config':cfg},ensure_ascii=False,indent=2); files['project.json']=meta
     if product=='discord':
-        name=cfg.get('bot_name') or 'BOT FORGE Bot'; prefix=cfg.get('prefix') or '!';
+        name=cfg.get('bot_name') or 'BOT FORGE Bot'; prefix=cfg.get('prefix') or '!'
         files['package.json']=json.dumps({'name':name.lower().replace(' ','-'),'version':'1.0.0','main':'src/index.js','scripts':{'start':'node src/index.js'},'dependencies':{'discord.js':'^14.0.0'}},indent=2)
         files['.env.example']='DISCORD_TOKEN=coloque_seu_token_aqui\nBOT_PREFIX='+prefix+'\n'
         files['src/index.js']=f"const {{ Client, GatewayIntentBits }} = require('discord.js');\nconst client = new Client({{ intents: Object.values(GatewayIntentBits) }});\nclient.once('ready', () => console.log('{name} online'));\nclient.login(process.env.DISCORD_TOKEN);\n"
-        files['README.md']=f"# {name}\n\nProjeto de teste gerado pelo BOT FORGE.\n\nObjetivo: {cfg.get('objective','')}\nRecursos: {json.dumps({k:v for k,v in cfg.items() if k not in ['objective','bot_name']},ensure_ascii=False)}\n"
+        files['README.md']=f"# {name}\n\nProjeto gerado pelo BOT FORGE.\n\nObjetivo: {cfg.get('objective','')}\nRecursos: {json.dumps({k:v for k,v in cfg.items() if k not in ['objective','bot_name']},ensure_ascii=False)}\n"
     elif product=='fivem':
         files['fxmanifest.lua']="fx_version 'cerulean'\ngame 'gta5'\nclient_script 'client.lua'\nserver_script 'server.lua'\n"
         files['client.lua']=f"RegisterCommand('botforge', function()\n  print('BOT FORGE • {cfg.get('system_type','Sistema')}')\nend)\n"
@@ -162,17 +188,33 @@ def generate_project(token):
     con=db(); order=con.execute('SELECT * FROM orders WHERE token=?',(token,)).fetchone(); con.close()
     if not order: abort(404)
     status=sync_test_status(order)
-    if status!='Entregue': return redirect(url_for('order_page',token=token))
+    if not TEST_MODE and order['payment_status']!='Pago': return redirect(url_for('order_page',token=token))
+    if status!='Entregue' and TEST_MODE: return redirect(url_for('order_page',token=token))
+    if not TEST_MODE and order['status']!='Entregue': return redirect(url_for('order_page',token=token))
     files=generated_files(order); mem=io.BytesIO()
     with zipfile.ZipFile(mem,'w',zipfile.ZIP_DEFLATED) as z:
         for name,content in files.items(): z.writestr(name,content)
     mem.seek(0); safe_name=order['product'].replace('/','-'); return send_file(mem,as_attachment=True,download_name=f"BOT-FORGE-{safe_name}-{order['id']}.zip",mimetype='application/zip')
 
-@app.post('/webhooks/asaas')
-def asaas_webhook(): return jsonify({'ok':True})
+@app.post('/webhooks/mercadopago')
+def mercadopago_webhook():
+    if not validate_mp_signature(): return jsonify({'error':'assinatura inválida'}),401
+    payload=request.get_json(silent=True) or {}; order_id=request.args.get('data.id') or (payload.get('data') or {}).get('id')
+    if not order_id: return jsonify({'ok':True})
+    try:
+        r=requests.get(f'{MERCADO_PAGO_BASE}/v1/orders/{order_id}',headers=mp_headers(),timeout=20); r.raise_for_status(); mp=r.json()
+    except Exception: return jsonify({'ok':True})
+    external=mp.get('external_reference'); row=_get_order(external) if external else None
+    if not row: return jsonify({'ok':True})
+    status=mp.get('status',''); paid=float(mp.get('total_paid_amount') or 0); expected=float(row['price'] or 0)
+    if status=='processed' and paid+0.001 >= expected and expected > 0:
+        con=db(); con.execute("UPDATE orders SET payment_status='Pago',status='Em preparação',updated_at=? WHERE id=?",(now(),row['id'])); con.commit(); con.close()
+    elif status in ('canceled','cancelled','rejected','expired'):
+        con=db(); con.execute("UPDATE orders SET payment_status='Falhou',status='Aguardando pagamento',updated_at=? WHERE id=?",(now(),row['id'])); con.commit(); con.close()
+    return jsonify({'ok':True})
 
 @app.get('/health')
-def health(): return jsonify({'ok':True,'service':'BOT FORGE','test_mode':TEST_MODE})
+def health(): return jsonify({'ok':True,'service':'BOT FORGE','test_mode':TEST_MODE,'payments_configured':bool(MERCADO_PAGO_ACCESS_TOKEN)})
 
 @app.route('/admin/login',methods=['GET','POST'])
 def admin_login():
@@ -183,7 +225,7 @@ def admin_logout(): session.clear(); return redirect(url_for('admin_login'))
 @app.get('/admin')
 @require_admin
 def admin():
-    con=db(); orders=con.execute('SELECT * FROM orders ORDER BY created_at DESC LIMIT 100').fetchall(); demos=con.execute('SELECT * FROM demos ORDER BY id DESC').fetchall(); stats={'orders':len(orders),'paid':con.execute("SELECT COUNT(*) c FROM orders WHERE payment_status='Pago'").fetchone()['c'],'pending':con.execute("SELECT COUNT(*) c FROM orders WHERE payment_status IN ('Pendente','Aguardando')").fetchone()['c'],'revenue':0}; con.close(); return render_template('admin.html',stats=stats,orders=orders,customers=[],demos=demos,asaas_connected=bool(ASAAS_KEY))
+    con=db(); orders=con.execute('SELECT * FROM orders ORDER BY created_at DESC LIMIT 100').fetchall(); demos=con.execute('SELECT * FROM demos ORDER BY id DESC').fetchall(); stats={'orders':len(orders),'paid':con.execute("SELECT COUNT(*) c FROM orders WHERE payment_status='Pago'").fetchone()['c'],'pending':con.execute("SELECT COUNT(*) c FROM orders WHERE payment_status IN ('Pendente','Aguardando')").fetchone()['c'],'revenue':0}; con.close(); return render_template('admin.html',stats=stats,orders=orders,customers=[],demos=demos,asaas_connected=bool(MERCADO_PAGO_ACCESS_TOKEN))
 @app.post('/admin/orders/<order_id>/status')
 @require_admin
 def admin_status(order_id):
