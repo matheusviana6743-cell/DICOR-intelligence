@@ -27,10 +27,11 @@
       {% endfor %}
     </section>
     <aside class="order-card">
-      <span class="eyebrow">PAGAMENTO</span>
-      <div class="config-line"><b>Status</b><span>{{ order['payment_status'] }}</span></div>
-      {% if order['price'] %}<div class="config-line"><b>Valor</b><span>R$ {{ '%.2f'|format(order['price']) }}</span></div>{% endif %}
-      {% if order['payment_url'] %}<a class="btn full" href="{{ order['payment_url'] }}" target="_blank">Abrir cobrança</a>{% endif %}
+      <span class="eyebrow">PROJETO</span>
+      <div class="config-line"><b>Status</b><span>{{ order['status'] }}</span></div>
+      <div class="config-line"><b>Pagamento</b><span>{{ order['payment_status'] }}</span></div>
+      <a class="btn primary full" href="{{ url_for('generate_project', token=order['token']) }}">Gerar meu projeto de teste</a>
+      <p class="small-note">O arquivo é gerado automaticamente com base nas opções que você escolheu.</p>
       {% if config.get('_delivery_files') %}
         <span class="eyebrow delivery-title">ENTREGA</span>
         {% for f in config['_delivery_files'] %}
