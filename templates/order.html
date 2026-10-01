@@ -2,105 +2,13 @@
 {% block title %}Pedido {{ order['id'] }} — BOT FORGE{% endblock %}
 {% block content %}
 <section class="order-shell" data-order-token="{{ order['token'] }}">
-  <div class="order-top">
-    <div>
-      <span class="eyebrow">ACOMPANHAMENTO</span>
-      <h1>{{ order['id'] }}</h1>
-      <p>{{ products[order['product']]['name'] }}</p>
-    </div>
-    <span class="status-chip" id="status-chip">{{ order['status'] }}</span>
-  </div>
-
-  <div class="test-progress" id="test-progress">
-    <span class="eyebrow">PROCESSAMENTO AUTOMÁTICO</span>
-    <p id="progress-text">Seu projeto está sendo preparado. Esta página atualiza sozinha.</p>
-    <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
-  </div>
-
-  <div class="timeline" id="timeline">
-    {% for s in ["Em preparação","Em desenvolvimento","Entregue"] %}
-      <div data-status="{{ s }}"><span></span><b>{{ s }}</b></div>
-    {% endfor %}
-  </div>
-
-  <div class="order-grid">
-    <section class="order-card">
-      <span class="eyebrow">CONFIGURAÇÃO</span>
-      {% for k,v in config.items() %}
-        {% if not k.startswith('_') and v %}
-          <div class="config-line"><b>{{ k|replace('_',' ')|title }}</b><span>{% if v is iterable and v is not string %}{{ v|join(', ') }}{% else %}{{ v }}{% endif %}</span></div>
-        {% endif %}
-      {% endfor %}
-    </section>
-    <aside class="order-card">
-      <span class="eyebrow">PROJETO</span>
-      <div class="config-line"><b>Status</b><span id="status-value">{{ order['status'] }}</span></div>
-      <div class="config-line"><b>Pagamento</b><span>{{ order['payment_status'] }}</span></div>
-    </aside>
-  </div>
-
-  <section class="order-card preview-card">
-    <span class="eyebrow">PRÉVIA</span>
-    <h2>Seu produto será liberado automaticamente</h2>
-    <p id="ready-message">Quando o processamento terminar, o botão de resgate aparecerá aqui.</p>
-    <div class="preview-grid">
-      {% if order['product'] == 'discord' %}
-        <div class="preview-item"><b>🤖 Bot Discord</b><span>Projeto Node.js + discord.js baseado nas opções escolhidas.</span></div>
-        <div class="preview-item"><b>⚙️ Configuração</b><span>Nome, objetivo, recursos e integrações entram no pacote.</span></div>
-        <div class="preview-item"><b>📦 Entrega</b><span>ZIP com código e README de teste.</span></div>
-      {% elif order['product'] == 'fivem' %}
-        <div class="preview-item"><b>🎮 Sistema FiveM</b><span>Resource com fxmanifest, client e server.</span></div>
-        <div class="preview-item"><b>🧩 Configuração</b><span>Framework e funcionalidades escolhidas entram no projeto.</span></div>
-        <div class="preview-item"><b>📦 Entrega</b><span>ZIP pronto para baixar.</span></div>
-      {% elif order['product'] == 'site' %}
-        <div class="preview-item"><b>🌐 Site</b><span>HTML e CSS responsivos gerados pelas suas escolhas.</span></div>
-        <div class="preview-item"><b>✨ Visual</b><span>Marca, páginas, cores e estilo registrados no projeto.</span></div>
-        <div class="preview-item"><b>📦 Entrega</b><span>ZIP com o site de teste.</span></div>
-      {% else %}
-        <div class="preview-item"><b>🛠️ Projeto personalizado</b><span>Briefing estruturado com as informações fornecidas.</span></div>
-        <div class="preview-item"><b>📋 Especificações</b><span>Arquivo de especificação do projeto.</span></div>
-        <div class="preview-item"><b>🚀 Entrega</b><span>Pacote de teste para análise.</span></div>
-      {% endif %}
-    </div>
-
-    <div class="preview-actions" id="rescue-area" style="display:none">
-      <a class="btn primary" id="rescue-button" href="{{ url_for('generate_project', token=order['token']) }}">⬇ Resgatar meu produto</a>
-      <a class="btn ghost" href="{{ wa }}" target="_blank">Falar sobre o pedido</a>
-    </div>
-    <div id="waiting-area"><p class="small-note">⏳ Processando... não precisa atualizar a página.</p></div>
-  </section>
+  <div class="order-top"><div><span class="eyebrow">ACOMPANHAMENTO</span><h1>{{ order['id'] }}</h1><p>{{ products[order['product']]['name'] }}</p></div><span class="status-chip" id="status-chip">{{ order['status'] }}</span></div>
+  <div class="test-progress" id="test-progress"><span class="eyebrow">PROCESSAMENTO</span><p id="progress-text">Seu pedido está sendo atualizado automaticamente.</p><div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div></div>
+  <div class="timeline" id="timeline">{% for s in ["Aguardando pagamento","Em preparação","Em desenvolvimento","Entregue"] %}<div data-status="{{ s }}"><span></span><b>{{ s }}</b></div>{% endfor %}</div>
+  <div class="order-grid"><section class="order-card"><span class="eyebrow">CONFIGURAÇÃO</span>{% for k,v in config.items() %}{% if not k.startswith('_') and v %}<div class="config-line"><b>{{ k|replace('_',' ')|title }}</b><span>{% if v is iterable and v is not string %}{{ v|join(', ') }}{% else %}{{ v }}{% endif %}</span></div>{% endif %}{% endfor %}</section><aside class="order-card"><span class="eyebrow">PROJETO</span><div class="config-line"><b>Status</b><span id="status-value">{{ order['status'] }}</span></div><div class="config-line"><b>Pagamento</b><span id="payment-value">{{ order['payment_status'] }}</span></div>{% if order['payment_url'] and order['payment_status'] != 'Pago' %}<a class="btn primary" href="{{ order['payment_url'] }}" target="_blank">Pagar agora</a>{% endif %}</aside></div>
+  <section class="order-card preview-card"><span class="eyebrow">PRÉVIA</span><h2>Seu produto será liberado após a confirmação</h2><p id="ready-message">Após a confirmação do pagamento, o processamento seguirá automaticamente.</p><div class="preview-grid"><div class="preview-item"><b>📦 Produto</b><span>{{ products[order['product']]['name'] }}</span></div><div class="preview-item"><b>💳 Pagamento</b><span id="payment-preview">{{ order['payment_status'] }}</span></div><div class="preview-item"><b>🔐 Entrega</b><span>O download só fica disponível quando o pedido estiver concluído.</span></div></div><div class="preview-actions" id="rescue-area" style="display:none"><a class="btn primary" href="{{ url_for('generate_project', token=order['token']) }}">⬇ Resgatar meu produto</a><a class="btn ghost" href="{{ wa }}" target="_blank">Falar sobre o pedido</a></div><div id="waiting-area"><p class="small-note">⏳ Acompanhamento automático ativo.</p></div></section>
 </section>
-
 <script>
-(() => {
-  const root=document.querySelector('[data-order-token]');
-  if(!root) return;
-  const token=root.dataset.orderToken;
-  const chip=document.getElementById('status-chip');
-  const value=document.getElementById('status-value');
-  const bar=document.getElementById('progress-bar');
-  const text=document.getElementById('progress-text');
-  const msg=document.getElementById('ready-message');
-  const rescue=document.getElementById('rescue-area');
-  const waiting=document.getElementById('waiting-area');
-  const states=['Em preparação','Em desenvolvimento','Entregue'];
-  function render(data){
-    chip.textContent=data.status; value.textContent=data.status;
-    const idx=Math.max(0,states.indexOf(data.status));
-    bar.style.width=((idx+1)/states.length*100)+'%';
-    document.querySelectorAll('#timeline [data-status]').forEach(el=>el.classList.toggle('done',states.indexOf(el.dataset.status)<=idx));
-    if(data.ready){
-      text.textContent='Projeto concluído. O produto já está disponível para resgate.';
-      msg.textContent='Tudo pronto. Clique em “Resgatar meu produto” para baixar o projeto.';
-      rescue.style.display='flex'; waiting.style.display='none';
-    } else {
-      text.textContent=data.status==='Em desenvolvimento'?'Estamos gerando os arquivos do projeto...':'Estamos preparando seu projeto...';
-    }
-  }
-  async function poll(){
-    try{const r=await fetch('/api/orders/'+encodeURIComponent(token)+'/status',{cache:'no-store'}); if(r.ok) render(await r.json());}catch(e){}
-  }
-  poll(); setInterval(poll,2000);
-})();
+(()=>{const root=document.querySelector('[data-order-token]');if(!root)return;const token=root.dataset.orderToken,chip=document.getElementById('status-chip'),value=document.getElementById('status-value'),pay=document.getElementById('payment-value'),payPrev=document.getElementById('payment-preview'),bar=document.getElementById('progress-bar'),text=document.getElementById('progress-text'),msg=document.getElementById('ready-message'),rescue=document.getElementById('rescue-area'),waiting=document.getElementById('waiting-area'),states=['Aguardando pagamento','Em preparação','Em desenvolvimento','Entregue'];function render(d){chip.textContent=d.status;value.textContent=d.status;pay.textContent=d.payment_status;payPrev.textContent=d.payment_status;const idx=Math.max(0,states.indexOf(d.status));bar.style.width=((idx+1)/states.length*100)+'%';document.querySelectorAll('#timeline [data-status]').forEach(el=>el.classList.toggle('done',states.indexOf(el.dataset.status)<=idx));if(d.ready){text.textContent='Pedido concluído.';msg.textContent='Tudo pronto. Clique em “Resgatar meu produto” para baixar o projeto.';rescue.style.display='flex';waiting.style.display='none';}else if(d.payment_status==='Pago'){text.textContent='Pagamento confirmado. O pedido está em processamento...';msg.textContent='Acompanhe esta página; ela será atualizada automaticamente.';}}async function poll(){try{const r=await fetch('/api/orders/'+encodeURIComponent(token)+'/status',{cache:'no-store'});if(r.ok)render(await r.json())}catch(e){}}poll();setInterval(poll,2000)})();
 </script>
 {% endblock %}
