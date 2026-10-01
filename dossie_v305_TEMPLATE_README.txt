@@ -1,1 +1,0 @@
-O template visual exato usado pelo V305 é incorporado ao repositório como recurso binário durante a atualização do gerador.

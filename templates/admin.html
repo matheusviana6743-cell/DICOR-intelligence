@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Painel — BOT FORGE{% endblock %}
+{% block content %}
+<section class="admin-shell">
+  <div class="admin-head"><div><span class="eyebrow">ADMIN</span><h1>BOT FORGE</h1><p>Controle de vendas, pedidos, projetos e demonstrações.</p></div><a class="btn ghost" href="{{ url_for('admin_logout') }}">Sair</a></div>
+  <div class="stats-grid">
+    <div class="stat"><span>Pedidos</span><strong>{{ stats.orders }}</strong></div>
+    <div class="stat"><span>Pagos</span><strong>{{ stats.paid }}</strong></div>
+    <div class="stat"><span>Pendentes</span><strong>{{ stats.pending }}</strong></div>
+    <div class="stat"><span>Faturamento</span><strong>R$ {{ '%.2f'|format(stats.revenue) }}</strong></div>
+  </div>
+  <div class="admin-grid">
+    <section class="admin-card wide">
+      <div class="card-head"><div><span class="eyebrow">PEDIDOS</span><h2>Últimos pedidos</h2></div><span class="admin-badge">{{ 'Asaas conectado' if asaas_connected else 'Asaas não conectado' }}</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Pedido</th><th>Produto</th><th>Cliente</th><th>Valor</th><th>Status</th><th>Ações</th></tr></thead><tbody>
+      {% for o in orders %}
+      <tr>
+        <td><b>{{ o['id'] }}</b><small>{{ o['created_at'][:16].replace('T',' ') }}</small></td>
+        <td>{{ products[o['product']]['name'] }}</td>
+        <td>{{ o['customer_name'] or 'Não informado' }}<small>{{ o['customer_email'] or '' }}</small></td>
+        <td>{% if o['price'] %}R$ {{ '%.2f'|format(o['price']) }}{% else %}R$ {{ '%.0f'|format(o['price_min']) }}–{{ '%.0f'|format(o['price_max']) }}{% endif %}</td>
+        <td>
+          <form method="post" action="{{ url_for('admin_status', order_id=o['id']) }}" class="inline-form">
+            <select name="status">{% for s in ["Aguardando pagamento","Pago","Em preparação","Em desenvolvimento","Aguardando cliente","Entregue","Cancelado","Aguardando dados"] %}<option {% if o['status']==s %}selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+            <button>Salvar</button>
+          </form>
+        </td>
+        <td>
+          <div class="action-stack">
+            <a href="{{ url_for('order_page', token=o['token']) }}" target="_blank">Ver</a>
+            {% if o['product']=='personalizado' %}
+            <form method="post" action="{{ url_for('admin_price', order_id=o['id']) }}" class="mini-form"><input name="price" placeholder="Preço final"><button>Definir</button></form>
+            {% endif %}
+            {% if o['price'] and not o['asaas_payment_id'] and asaas_connected and o['customer_name'] and o['customer_email'] %}
+            <form method="post" action="{{ url_for('admin_charge', order_id=o['id']) }}"><button>Cobrar</button></form>
+            {% endif %}
+            <form method="post" enctype="multipart/form-data" action="{{ url_for('admin_upload', order_id=o['id']) }}" class="mini-form"><input type="file" name="file" required><button>Enviar</button></form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody></table></div>
+    </section>
+
+    <section class="admin-card">
+      <div class="card-head"><div><span class="eyebrow">CLIENTES</span><h2>Resumo</h2></div></div>
+      <div class="customer-list">
+        {% for c in customers %}
+          <div class="customer"><b>{{ c['customer_name'] }}</b><span>{{ c['customer_email'] }}</span><small>{{ c['orders_count'] }} pedido(s) · R$ {{ '%.2f'|format(c['paid_total']) }} pagos</small></div>
+        {% else %}<p>Nenhum cliente ainda.</p>{% endfor %}
+      </div>
+    </section>
+
+    <section class="admin-card">
+      <div class="card-head"><div><span class="eyebrow">DEMONSTRAÇÕES</span><h2>Vídeos</h2></div></div>
+      <form method="post" action="{{ url_for('admin_demo_add') }}" class="stack-form">
+        <input name="title" placeholder="Título" required>
+        <select name="product" required><option value="Discord">Discord</option><option value="FiveM">FiveM</option><option value="Web">Web</option><option value="Outro">Outro</option></select>
+        <input name="url" placeholder="URL do vídeo" required>
+        <input name="description" placeholder="Descrição">
+        <button class="btn">Adicionar</button>
+      </form>
+      <div class="demo-admin-list">
+        {% for d in demos %}
+          <div><span>{{ d['product'] }}</span><b>{{ d['title'] }}</b><form method="post" action="{{ url_for('admin_demo_delete', demo_id=d['id']) }}"><button>Excluir</button></form></div>
+        {% endfor %}
+      </div>
+    </section>
+  </div>
+</section>
+{% endblock %}

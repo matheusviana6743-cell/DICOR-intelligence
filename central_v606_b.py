@@ -1,1 +1,0 @@
-# DICOR Central V606 placeholder; integration will use existing central routes.

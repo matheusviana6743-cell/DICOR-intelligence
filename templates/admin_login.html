@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Admin — BOT FORGE{% endblock %}
+{% block content %}
+<section class="admin-login">
+  <div class="login-card">
+    <span class="eyebrow">BOT FORGE</span>
+    <h1>Painel administrativo</h1>
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+    <form method="post">
+      <label class="field"><span>Senha</span><input type="password" name="password" required autofocus></label>
+      <button class="btn full">Entrar</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}BOT FORGE{% endblock %}</title>
+  <meta name="description" content="BOT FORGE — bots Discord, sistemas FiveM e sites personalizados.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ url_for('index') }}"><span>BOT</span> FORGE</a>
+  <nav>
+    <a href="{{ url_for('index') }}#produtos">Produtos</a>
+    <a href="{{ url_for('index') }}#demos">Demonstrações</a>
+    <a href="{{ url_for('index') }}#como-funciona">Como funciona</a>
+    <a class="nav-cta" href="{{ url_for('configurator', product='personalizado') }}">Criar projeto</a>
+  </nav>
+</header>
+{% block content %}{% endblock %}
+<footer>
+  <div class="footer-grid">
+    <div>
+      <div class="brand"><span>BOT</span> FORGE</div>
+      <p>Bots, sistemas, sites e projetos digitais feitos sob medida.</p>
+    </div>
+    <div>
+      <strong>Contato</strong>
+      <a href="https://wa.me/{{ contact_wa }}">WhatsApp: (71) 99693-6743</a>
+      <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>
+    </div>
+    <div>
+      <strong>Atendimento</strong>
+      <p>Projetos personalizados: R$50 a R$200, conforme análise.</p>
+    </div>
+  </div>
+  <div class="copyright">© {{ current_year|default(2026) }} BOT FORGE</div>
+</footer>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
