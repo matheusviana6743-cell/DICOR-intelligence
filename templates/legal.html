@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block title %}{{ title }} — BOT FORGE{% endblock %}
+{% block content %}
+<section class="order-card" style="max-width:900px;margin:60px auto;line-height:1.7">
+  <span class="eyebrow">BOT FORGE</span>
+  <div>{{ body|safe }}</div>
+  <p><a class="btn ghost" href="{{ url_for('index') }}">Voltar para o início</a></p>
+</section>
+{% endblock %}
