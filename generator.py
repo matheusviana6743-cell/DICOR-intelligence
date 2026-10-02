@@ -13,109 +13,172 @@ def text(value):
     return str(value or '')
 
 
+def js_string(value):
+    return json.dumps(str(value or ''), ensure_ascii=False)
+
+
 def make_readme(order, config, product_name):
-    lines = [
-        f'# {product_name} — BOT FORGE', '',
-        f'Projeto gerado para o pedido `{order["id"]}` em {datetime.now().strftime("%d/%m/%Y %H:%M")}.', '',
-        '## Configuração recebida',
-    ]
+    lines = [f'# {product_name} — BOT FORGE', '', f'Pedido: `{order["id"]}`', f'Gerado em: {datetime.now().strftime("%d/%m/%Y %H:%M")}', '', '## Configuração']
     for key, value in config.items():
         if key.startswith('_') or not value:
             continue
         lines.append(f'- **{key.replace("_", " ").title()}:** {text(value)}')
-    lines += ['', '## Observação', 'Esta é uma geração inicial funcional para teste. Revise credenciais, dependências e regras antes de usar em produção.']
+    lines += ['', '## Instalação', 'Consulte o README específico e os arquivos `.env.example`/`config.json` quando existirem.', '', '## Importante', 'Este pacote foi gerado automaticamente. Tokens, senhas e credenciais nunca são incluídos. Revise permissões e dependências antes de produção.']
     return '\n'.join(lines) + '\n'
 
 
 def discord_files(order, config):
     name = config.get('bot_name') or 'BOT FORGE Bot'
     prefix = config.get('prefix') or '!'
-    selected = {k: config.get(k, []) for k in ('tickets', 'moderation', 'logs', 'automation', 'economy', 'ui', 'integrations')}
+    moderation = config.get('moderation') or []
+    tickets = config.get('tickets') or []
+    economy = config.get('economy') or []
+    automation = config.get('automation') or []
+    logs = config.get('logs') or []
+    ui = config.get('ui') or []
+    integrations = config.get('integrations') or []
+
     package = {
-        'name': slug(name), 'version': '1.0.0', 'description': 'Bot Discord gerado pelo BOT FORGE',
+        'name': slug(name), 'version': '1.0.0', 'private': True,
+        'description': 'Bot Discord funcional gerado pelo BOT FORGE',
         'main': 'src/index.js', 'scripts': {'start': 'node src/index.js'},
         'dependencies': {'discord.js': '^14.16.3', 'dotenv': '^16.4.5'}
     }
-    commands = ['ping']
-    if 'Ban' in selected['moderation']: commands.append('ban')
-    if 'Kick' in selected['moderation']: commands.append('kick')
-    if 'Mute' in selected['moderation']: commands.append('mute')
-    if 'Criar ticket' in selected['tickets']: commands.append('ticket')
-    if 'Saldo' in selected['economy']: commands.append('saldo')
-    command_lines = []
+    commands = ['ping', 'ajuda']
+    if 'Ban' in moderation: commands.append('ban')
+    if 'Kick' in moderation: commands.append('kick')
+    if 'Mute' in moderation: commands.append('mute')
+    if 'Criar ticket' in tickets: commands.append('ticket')
+    if 'Fechamento automático' in tickets: commands.append('fecharticket')
+    if 'Saldo' in economy: commands.append('saldo')
+    if 'Loja' in economy: commands.append('loja')
+    if 'Ranking' in economy: commands.append('ranking')
+    if 'AutoRole' in automation: commands.append('autorole')
+    if 'Verificação' in automation: commands.append('verificar')
+
+    command_cases = []
     for cmd in commands:
-        if cmd == 'ping': response = "Pong! BOT FORGE está online."
-        elif cmd == 'ticket': response = "Sistema de tickets inicializado. Configure as categorias conforme seu servidor."
-        elif cmd == 'saldo': response = "Economia de teste ativa. Conecte um banco de dados para persistência."
-        else: response = f"Comando {cmd} criado como base de teste."
-        command_lines.append(f"  if (message.content === `${{PREFIX}}{cmd}`) await message.reply({json.dumps(response)});")
-    js = """const { Client, GatewayIntentBits } = require('discord.js');
+        if cmd == 'ping': response = 'Pong! BOT FORGE está online.'
+        elif cmd == 'ajuda': response = 'Comandos disponíveis: ' + ', '.join(prefix + c for c in commands)
+        elif cmd == 'ban': response = 'Uso: ' + prefix + 'ban @usuario motivo'
+        elif cmd == 'kick': response = 'Uso: ' + prefix + 'kick @usuario motivo'
+        elif cmd == 'mute': response = 'Uso: ' + prefix + 'mute @usuario'
+        elif cmd == 'ticket': response = 'Ticket solicitado. Para produção, configure a categoria no arquivo config/features.json.'
+        elif cmd == 'fecharticket': response = 'Ticket fechado. A lógica pode ser conectada ao canal de tickets.'
+        elif cmd == 'saldo': response = 'Saldo de teste: 0 moedas. Persistência pode ser ligada ao banco selecionado.'
+        elif cmd == 'loja': response = 'Loja de teste ativa. Cadastre produtos no arquivo config/shop.json.'
+        elif cmd == 'ranking': response = 'Ranking de teste ativo.'
+        elif cmd == 'autorole': response = 'AutoRole configurado como base. Defina o cargo no config/features.json.'
+        elif cmd == 'verificar': response = 'Sistema de verificação ativo como base.'
+        else: response = f'Comando {cmd} ativo.'
+        command_cases.append(f"  if (message.content === PREFIX + {json.dumps(cmd)}) return message.reply({js_string(response)});")
+
+    intents = ['GatewayIntentBits.Guilds', 'GatewayIntentBits.GuildMessages', 'GatewayIntentBits.MessageContent']
+    if 'Entradas/Saídas' in logs or 'Auditoria' in logs:
+        intents.append('GatewayIntentBits.GuildMembers')
+    js = """const { Client, GatewayIntentBits, Partials } = require('discord.js');
 require('dotenv').config();
+const fs = require('fs');
 const PREFIX = process.env.PREFIX || '!';
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-client.once('ready', () => console.log(`Bot online: ${client.user.tag}`));
+const features = JSON.parse(fs.readFileSync('./config/features.json', 'utf8'));
+const client = new Client({ intents: [%s], partials: [Partials.Channel] });
+client.once('ready', () => console.log(`✓ ${client.user.tag} online`));
 client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
+  if (message.author.bot || !message.guild) return;
 %s
 });
+client.on('guildMemberAdd', member => {
+  if (features.automation.includes('Boas-vindas')) console.log(`Novo membro: ${member.user.tag}`);
+});
+process.on('unhandledRejection', console.error);
 client.login(process.env.DISCORD_TOKEN);
-""" % '\n'.join(command_lines)
-    features = json.dumps(selected, indent=2, ensure_ascii=False)
-    return {
+""" % (', '.join(intents), '\n'.join(command_cases))
+
+    features = {
+        'tickets': tickets, 'moderation': moderation, 'logs': logs,
+        'automation': automation, 'economy': economy, 'ui': ui,
+        'integrations': integrations, 'permissions': config.get('permissions') or '',
+        'language': config.get('language') or 'Português'
+    }
+    files = {
         'package.json': json.dumps(package, indent=2, ensure_ascii=False),
         '.env.example': f'DISCORD_TOKEN=COLOQUE_SEU_TOKEN_AQUI\nPREFIX={prefix}\n',
         'src/index.js': js,
-        'config/features.json': features + '\n',
+        'config/features.json': json.dumps(features, indent=2, ensure_ascii=False) + '\n',
+        'config/shop.json': json.dumps({'items': []}, indent=2, ensure_ascii=False) + '\n',
         'README.md': make_readme(order, config, name),
     }
+    if 'Transcrição' in tickets:
+        files['config/transcript.json'] = '{\n  "enabled": true,\n  "directory": "transcripts"\n}\n'
+    return files
 
 
 def fivem_files(order, config):
-    resource = slug(config.get('system_type') or 'bot-forge-system')
-    settings = {
-        'framework': config.get('framework') or 'Standalone',
-        'version': config.get('version') or '',
-        'system_type': config.get('system_type') or '',
-        'jobs': config.get('jobs') or '',
-        'commands': config.get('commands') or '',
-        'permissions': config.get('permissions') or '',
-        'nui': config.get('nui') or [],
-        'database': config.get('database') or 'Não',
-        'discord_logs': config.get('discord_logs') or [],
-        'optimization': config.get('optimization') or 'Padrão',
-    }
+    framework = config.get('framework') or 'Standalone'
+    system_type = config.get('system_type') or 'Sistema'
+    resource = slug(system_type)
+    nui = config.get('nui') or []
+    jobs = text(config.get('jobs'))
+    commands = text(config.get('commands'))
+    permissions = text(config.get('permissions'))
+    db_choice = config.get('database') or 'Não'
+    optimization = config.get('optimization') or 'Padrão'
+
     fx = """fx_version 'cerulean'
 game 'gta5'
 author 'BOT FORGE'
 description 'Sistema FiveM gerado pelo BOT FORGE'
 version '1.0.0'
+
+shared_script 'config.lua'
 client_script 'client.lua'
 server_script 'server.lua'
 """
-    client = """RegisterCommand('botforge', function()
-    TriggerEvent('chat:addMessage', { args = {'BOT FORGE', 'Sistema de teste carregado com sucesso.'} })
+    if nui:
+        fx += "ui_page 'web/index.html'\nfiles { 'web/index.html', 'web/app.js', 'web/style.css' }\n"
+
+    framework_adapter = {
+        'QBCore': "local QBCore = exports['qb-core']:GetCoreObject()\n",
+        'ESX': "local ESX = exports['es_extended']:getSharedObject()\n",
+        'Standalone': '',
+        'Outro': ''
+    }.get(framework, '')
+    client = framework_adapter + """RegisterCommand('botforge', function()
+    TriggerEvent('chat:addMessage', { args = {'BOT FORGE', 'Sistema carregado com sucesso.'} })
+    %s
 end, false)
 
 RegisterNetEvent('botforge:notify', function(message)
     TriggerEvent('chat:addMessage', { args = {'BOT FORGE', tostring(message)} })
 end)
-"""
-    server = """RegisterCommand('botforgeinfo', function(source)
-    print(('[BOT FORGE] Pedido %s — sistema FiveM ativo.'):format('ORDER_ID'))
-end, true)
+""" % ("SetNuiFocus(true, true)\n    SendNUIMessage({ action = 'open' })" if nui else '')
+    server = framework_adapter + """RegisterCommand('botforgeinfo', function(source)
+    print(('[BOT FORGE] Pedido %s — %s — framework %s'):format('%s', '%s', '%s'))
+end, false)
 
 RegisterNetEvent('botforge:serverTest', function()
     local src = source
-    TriggerClientEvent('botforge:notify', src, 'Integração cliente/servidor funcionando.')
+    TriggerClientEvent('botforge:notify', src, 'Cliente/servidor funcionando.')
 end)
-""".replace('ORDER_ID', order['id'])
-    return {
-        'fxmanifest.lua': fx,
-        'client.lua': client,
-        'server.lua': server,
-        'config.json': json.dumps(settings, indent=2, ensure_ascii=False) + '\n',
-        'README.md': make_readme(order, config, resource),
+""" % (order['id'], system_type, framework)
+    cfg = {
+        'framework': framework, 'version': config.get('version') or '', 'system_type': system_type,
+        'jobs': jobs, 'commands': commands, 'permissions': permissions, 'database': db_choice,
+        'discord_logs': config.get('discord_logs') or [], 'optimization': optimization,
+        'dependencies': config.get('dependencies') or ''
     }
+    files = {'fxmanifest.lua': fx, 'client.lua': client, 'server.lua': server,
+             'config.lua': 'Config = ' + json.dumps(cfg, ensure_ascii=False, indent=2) + '\n',
+             'config.json': json.dumps(cfg, indent=2, ensure_ascii=False) + '\n',
+             'README.md': make_readme(order, config, resource)}
+    if nui:
+        files['web/index.html'] = """<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>BOT FORGE</title><link rel='stylesheet' href='style.css'></head><body><main><button id='close'>×</button><h1>%s</h1><p>Sistema conectado ao FiveM.</p><button id='test'>Testar</button></main><script src='app.js'></script></body></html>""" % system_type
+        files['web/app.js'] = """window.addEventListener('message',e=>{if(e.data.action==='open')document.body.classList.add('open')});document.getElementById('close').onclick=()=>{fetch(`https://${GetParentResourceName()}/close`,{method:'POST'});document.body.classList.remove('open')};document.getElementById('test').onclick=()=>{fetch(`https://${GetParentResourceName()}/test`,{method:'POST'})};"""
+        files['web/style.css'] = """body{display:none;margin:0;background:transparent;font-family:Arial}body.open{display:grid;place-items:center;height:100vh}main{background:#fff;padding:32px;border-radius:18px;min-width:360px;box-shadow:0 20px 60px #0005}button{padding:12px 18px;border:0;border-radius:10px;background:#222;color:#fff;cursor:pointer}#close{float:right;background:#eee;color:#222}"""
+        files['client.lua'] += "\nRegisterNUICallback('close', function(_, cb) SetNuiFocus(false, false); cb('ok') end)\nRegisterNUICallback('test', function(_, cb) TriggerServerEvent('botforge:serverTest'); cb('ok') end)\n"
+    if db_choice == 'MySQL':
+        files['README-DATABASE.md'] = '# MySQL\n\nAdicione oxmysql ao servidor e crie as tabelas conforme sua lógica de persistência.\n'
+    return files
 
 
 def site_files(order, config):
@@ -123,22 +186,38 @@ def site_files(order, config):
     objective = config.get('objective') or 'Site gerado pelo BOT FORGE.'
     raw_pages = text(config.get('pages'))
     pages = [p.strip() for p in re.split(r'[,;\n]+', raw_pages) if p.strip()] or ['Início', 'Sobre', 'Contato']
-    colors = config.get('colors') or 'claro + dourado'
+    sections_raw = text(config.get('sections'))
+    sections = [p.strip() for p in re.split(r'[,;\n]+', sections_raw) if p.strip()] or ['Apresentação', 'Recursos', 'FAQ']
+    integrations = config.get('integrations') or []
+    forms = config.get('forms') or []
+    client_area = config.get('client_area') == 'Sim'
+    admin_panel = config.get('admin_panel') == 'Sim'
+    seo = config.get('seo') == 'Incluir'
+    colors = config.get('colors') or 'neutro'
     nav = ''.join(f'<a href="#{slug(p)}">{p}</a>' for p in pages)
-    sections = ''.join(f'<section id="{slug(p)}"><span>BOT FORGE</span><h2>{p}</h2><p>{objective if p == pages[0] else "Seção criada a partir da configuração do seu projeto."}</p></section>' for p in pages)
-    html = f'''<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="{objective[:150]}"><title>{title}</title><link rel="stylesheet" href="style.css"></head>
-<body><header><b>{title}</b><nav>{nav}</nav></header><main><div class="hero"><span>BOT FORGE</span><h1>{title}</h1><p>{objective}</p><a href="#contato">Começar</a></div>{sections}</main><footer>Gerado para teste pelo BOT FORGE</footer></body></html>'''
-    css = f'''*{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Arial,sans-serif;background:#faf8f2;color:#171717}}header{{position:sticky;top:0;padding:20px 8%;display:flex;justify-content:space-between;gap:30px;background:#ffffffdd;backdrop-filter:blur(12px);border-bottom:1px solid #eee}}nav{{display:flex;gap:18px;flex-wrap:wrap}}nav a{{color:#333;text-decoration:none}}main{{padding:0 8%}}.hero{{min-height:70vh;padding:12vh 0;display:flex;flex-direction:column;justify-content:center}}.hero span,section span{{letter-spacing:.18em;font-weight:800;color:#b88a25}}h1{{font-size:clamp(42px,8vw,88px);max-width:900px;margin:18px 0}}h2{{font-size:42px}}p{{font-size:20px;line-height:1.6;max-width:720px}}a{{color:#b88a25}}.hero>a{{display:inline-block;margin-top:20px;padding:15px 22px;border-radius:14px;background:#c89b35;color:#fff;text-decoration:none;font-weight:800;width:max-content}}section{{min-height:55vh;padding:80px 0;border-top:1px solid #e8e3d8}}footer{{padding:40px 8%;background:#171717;color:#fff}}/* preferência visual: {colors} */'''
-    return {'index.html': html, 'style.css': css, 'README.md': make_readme(order, config, title)}
+    cards = ''.join(f'<article><b>{s}</b><p>Conteúdo configurado para esta seção.</p></article>' for s in sections)
+    form_html = ''
+    if forms:
+        form_html = "<section id='contato'><span>CONTATO</span><h2>Fale conosco</h2><form id='contact-form'><input name='name' placeholder='Nome' required><input name='email' type='email' placeholder='E-mail' required><textarea name='message' placeholder='Mensagem' required></textarea><button>Enviar</button><p id='form-result'></p></form></section>"
+    meta = f'<meta name="description" content="{objective[:150]}">' if seo else ''
+    html = f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{meta}<title>{title}</title><link rel="stylesheet" href="style.css"></head><body><header><b>{title}</b><nav>{nav}</nav></header><main><section class="hero"><span>BOT FORGE</span><h1>{title}</h1><p>{objective}</p><a class="cta" href="#contato">Começar</a></section><section><span>PROJETO</span><h2>Funcionalidades</h2><div class="cards">{cards}</div></section>{form_html}<footer>Gerado pelo BOT FORGE</footer></main><script src="app.js"></script></body></html>'''
+    js = """const form=document.getElementById('contact-form');if(form)form.addEventListener('submit',e=>{e.preventDefault();document.getElementById('form-result').textContent='Formulário validado. Conecte o endpoint de produção para enviar os dados.';form.reset()});"""
+    css = f'''*{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Arial,sans-serif;background:#fafafa;color:#172033}}header{{position:sticky;top:0;z-index:5;padding:18px 7%;display:flex;justify-content:space-between;gap:24px;background:#ffffffee;backdrop-filter:blur(12px);border-bottom:1px solid #e8ebef}}nav{{display:flex;gap:18px;flex-wrap:wrap}}nav a{{color:#344054;text-decoration:none}}main{{padding:0 7%}}section{{min-height:55vh;padding:80px 0;border-bottom:1px solid #e9ecf1}}.hero{{min-height:78vh;display:flex;flex-direction:column;justify-content:center}}span{{letter-spacing:.16em;font-weight:800;color:#697386}}h1{{font-size:clamp(44px,7vw,86px);line-height:1.02;margin:18px 0;max-width:950px}}h2{{font-size:42px}}p{{font-size:19px;line-height:1.65;max-width:760px;color:#667085}}.cta,button{{display:inline-block;border:0;border-radius:13px;padding:14px 22px;background:#26354a;color:#fff;text-decoration:none;font-weight:800;cursor:pointer}}.cards{{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}}article{{background:#fff;border:1px solid #e7eaf0;border-radius:20px;padding:26px;box-shadow:0 12px 35px #1720330d}}article b{{font-size:20px}}form{{max-width:650px;display:grid;gap:12px}}input,textarea{{font:inherit;padding:14px;border:1px solid #dfe3ea;border-radius:12px}}textarea{{min-height:130px}}footer{{padding:50px 0;color:#98a2b3}}@media(max-width:760px){{header{{align-items:flex-start;flex-direction:column}}.cards{{grid-template-columns:1fr}}main{{padding:0 5%}}}}/* visual: {colors} */'''
+    files = {'index.html': html, 'style.css': css, 'app.js': js, 'README.md': make_readme(order, config, title)}
+    if client_area: files['CLIENT-AREA.md'] = '# Área do cliente\n\nEstrutura preparada. Conecte autenticação e backend antes de produção.\n'
+    if admin_panel: files['ADMIN-PANEL.md'] = '# Painel administrativo\n\nEstrutura preparada. Implemente autenticação forte e permissões antes de produção.\n'
+    if integrations: files['INTEGRATIONS.md'] = '# Integrações\n\n' + '\n'.join('- ' + str(x) for x in integrations) + '\n'
+    return files
 
 
 def custom_files(order, config):
+    features = text(config.get('features'))
+    integrations = text(config.get('integrations'))
     return {
         'README.md': make_readme(order, config, 'Projeto personalizado'),
         'project.json': json.dumps({'order_id': order['id'], 'type': 'custom', 'config': config}, indent=2, ensure_ascii=False),
-        'SPECIFICATION.md': '# Especificação inicial\n\n## Objetivo\n' + text(config.get('objective')) + '\n\n## Funcionalidades\n' + text(config.get('features')) + '\n\n## Integrações\n' + text(config.get('integrations')) + '\n',
-        'NEXT-STEPS.md': '# Próximos passos\n\n1. Validar requisitos.\n2. Definir stack e integrações.\n3. Implementar funcionalidades.\n4. Testar e publicar.\n',
+        'SPECIFICATION.md': '# Especificação\n\n## Objetivo\n' + text(config.get('objective')) + '\n\n## Funcionalidades\n' + features + '\n\n## Integrações\n' + integrations + '\n',
+        'NEXT-STEPS.md': '# Próximos passos\n\n1. Validar requisitos.\n2. Definir stack.\n3. Implementar funcionalidades.\n4. Testar.\n5. Publicar.\n',
     }
 
 
