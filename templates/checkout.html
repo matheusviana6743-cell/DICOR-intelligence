@@ -5,13 +5,13 @@
   <main class="checkout-main">
     <span class="eyebrow">FINALIZAÇÃO</span>
     <h1>Finalizar pedido</h1>
-    <p>Confira seus dados e continue para o checkout seguro do Asaas.</p>
+    <p>Confira seus dados e continue para o pagamento seguro do Asaas.</p>
 
     {% if order['price'] %}
       <div class="checkout-notice">
         <strong>Valor do pedido</strong>
         <b>R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</b>
-        <span>O pagamento será concluído no ambiente de testes do Asaas.</span>
+        <span>Você será direcionado para a página segura de pagamento do Asaas.</span>
       </div>
     {% else %}
       <div class="checkout-notice">
@@ -24,8 +24,18 @@
       <div class="checkout-error" role="alert">
         <span class="error-icon">!</span>
         <div>
-          <strong>Não foi possível continuar</strong>
+          <strong>Pagamento não iniciado</strong>
           <span>{{ error }}</span>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if payment_return_title %}
+      <div class="checkout-success" role="status">
+        <span class="success-icon">✓</span>
+        <div>
+          <strong>{{ payment_return_title }}</strong>
+          <span>{{ payment_return_message }}</span>
         </div>
       </div>
     {% endif %}
@@ -43,9 +53,9 @@
       <button class="btn primary" type="submit">Continuar para o pagamento</button>
     </form>
 
-    <div class="checkout-test">
-      <strong>Sandbox</strong>
-      <span>Ambiente de testes. Nenhum valor real será movimentado.</span>
+    <div class="checkout-security">
+      <strong>Pagamento seguro</strong>
+      <span>O pagamento é processado pelo Asaas. O BOT FORGE não solicita os dados do cartão no próprio site.</span>
     </div>
   </main>
 
