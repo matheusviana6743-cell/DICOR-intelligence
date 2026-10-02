@@ -3,10 +3,10 @@
 <section class="checkout">
   <span class="eyebrow">FINALIZAÇÃO</span>
   <h1>Finalizar projeto</h1>
-  <p>Preencha seus dados para continuar. O pagamento online será aberto com segurança pelo provedor.</p>
+  <p>Preencha seus dados para continuar. O pagamento será processado pelo Asaas em ambiente de testes.</p>
 
   {% if order['price'] %}
-    <div class="notice"><strong>Valor: R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</strong><br>Após confirmar seus dados, você será direcionado ao checkout.</div>
+    <div class="notice"><strong>Valor: R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</strong><br>Você será direcionado ao pagamento PIX de teste do Asaas.</div>
   {% else %}
     <div class="notice"><strong>Projeto personalizado</strong><br>O valor fica entre R$ {{ '%.0f'|format(order['price_min']) }} e R$ {{ '%.0f'|format(order['price_max']) }}, conforme a análise do projeto.</div>
   {% endif %}
@@ -14,10 +14,13 @@
   {% if error %}<div class="notice">{{ error }}</div>{% endif %}
 
   <form method="post" action="{{ url_for('checkout', token=order['token']) }}">
-    <label>Nome<input name="name" required maxlength="100" value="{{ order['customer_name'] or '' }}"></label>
-    <label>E-mail<input type="email" name="email" required maxlength="160" value="{{ order['customer_email'] or '' }}"></label>
-    <label>WhatsApp<input name="phone" required maxlength="30" value="{{ order['customer_phone'] or '' }}"></label>
-    <button class="btn primary" type="submit">Continuar para pagamento</button>
+    <label>Nome<input name="name" required maxlength="100" value="{{ order['customer_name'] or '' }}" autocomplete="name"></label>
+    <label>E-mail<input type="email" name="email" required maxlength="160" value="{{ order['customer_email'] or '' }}" autocomplete="email"></label>
+    <label>WhatsApp<input name="phone" required maxlength="30" value="{{ order['customer_phone'] or '' }}" autocomplete="tel"></label>
+    <label>CPF/CNPJ<input name="cpf_cnpj" required maxlength="18" inputmode="numeric" placeholder="Somente números" autocomplete="off"></label>
+    <button class="btn primary" type="submit">Continuar para o pagamento PIX</button>
   </form>
+
+  <p style="margin-top:14px;color:#7b8494;font-size:13px">Ambiente Sandbox: este fluxo é destinado a testes e não representa uma cobrança em produção.</p>
 </section>
 {% endblock %}
