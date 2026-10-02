@@ -1,26 +1,56 @@
 {% extends 'base.html' %}
+{% block title %}Finalizar pedido — BOT FORGE{% endblock %}
 {% block content %}
-<section class="checkout">
-  <span class="eyebrow">FINALIZAÇÃO</span>
-  <h1>Finalizar projeto</h1>
-  <p>Preencha seus dados para continuar. O pagamento será processado pelo Asaas em ambiente de testes.</p>
+<section class="checkout-shell">
+  <main class="checkout-main">
+    <span class="eyebrow">FINALIZAÇÃO</span>
+    <h1>Finalizar pedido</h1>
+    <p>Preencha seus dados para continuar. O pagamento será processado pelo Asaas em ambiente de testes.</p>
 
-  {% if order['price'] %}
-    <div class="notice"><strong>Valor: R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</strong><br>Você será direcionado ao pagamento PIX de teste do Asaas.</div>
-  {% else %}
-    <div class="notice"><strong>Projeto personalizado</strong><br>O valor fica entre R$ {{ '%.0f'|format(order['price_min']) }} e R$ {{ '%.0f'|format(order['price_max']) }}, conforme a análise do projeto.</div>
-  {% endif %}
+    {% if order['price'] %}
+      <div class="checkout-notice">
+        <strong>Valor do pedido</strong>
+        R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}
+        <br><span>Você será direcionado ao pagamento PIX de teste do Asaas.</span>
+      </div>
+    {% else %}
+      <div class="checkout-notice">
+        <strong>Projeto personalizado</strong>
+        O valor fica entre R$ {{ '%.0f'|format(order['price_min']) }} e R$ {{ '%.0f'|format(order['price_max']) }}, conforme a análise do projeto.
+      </div>
+    {% endif %}
 
-  {% if error %}<div class="notice">{{ error }}</div>{% endif %}
+    {% if error %}
+      <div class="checkout-error" role="alert">
+        <span class="error-icon">!</span>
+        <div><strong>Não foi possível continuar</strong><span>{{ error }}</span></div>
+      </div>
+    {% endif %}
 
-  <form method="post" action="{{ url_for('checkout', token=order['token']) }}">
-    <label>Nome<input name="name" required maxlength="100" value="{{ order['customer_name'] or '' }}" autocomplete="name"></label>
-    <label>E-mail<input type="email" name="email" required maxlength="160" value="{{ order['customer_email'] or '' }}" autocomplete="email"></label>
-    <label>WhatsApp<input name="phone" required maxlength="30" value="{{ order['customer_phone'] or '' }}" autocomplete="tel"></label>
-    <label>CPF/CNPJ<input name="cpf_cnpj" required maxlength="18" inputmode="numeric" placeholder="Somente números" autocomplete="off"></label>
-    <button class="btn primary" type="submit">Continuar para o pagamento PIX</button>
-  </form>
+    <form class="checkout-form" method="post" action="{{ url_for('checkout', token=order['token']) }}">
+      <label>Nome
+        <input name="name" required maxlength="100" value="{{ order['customer_name'] or '' }}" autocomplete="name" placeholder="Seu nome completo">
+      </label>
+      <label>E-mail
+        <input type="email" name="email" required maxlength="160" value="{{ order['customer_email'] or '' }}" autocomplete="email" placeholder="voce@email.com">
+      </label>
+      <label>WhatsApp
+        <input name="phone" required maxlength="30" value="{{ order['customer_phone'] or '' }}" autocomplete="tel" placeholder="(71) 99999-9999">
+      </label>
+      <label>CPF/CNPJ
+        <input name="cpf_cnpj" required maxlength="18" inputmode="numeric" placeholder="Somente números" autocomplete="off">
+      </label>
+      <button class="btn primary" type="submit">Continuar para o pagamento PIX</button>
+    </form>
 
-  <p style="margin-top:14px;color:#7b8494;font-size:13px">Ambiente Sandbox: este fluxo é destinado a testes e não representa uma cobrança em produção.</p>
+    <div class="checkout-test">Ambiente Sandbox · Este fluxo é destinado a testes e não representa uma cobrança em produção.</div>
+  </main>
+
+  <aside class="checkout-side">
+    <span class="eyebrow">RESUMO</span>
+    <h3>{{ products[order['product']]['name'] }}</h3>
+    <div class="side-line"><span>Pedido</span><strong>{{ order['id'] }}</strong></div>
+    {% if order['price'] %}<div class="side-total"><span>Total</span><strong>R$ {{ '%.2f'|format(order['price'])|replace('.', ',') }}</strong></div>{% endif %}
+  </aside>
 </section>
 {% endblock %}
