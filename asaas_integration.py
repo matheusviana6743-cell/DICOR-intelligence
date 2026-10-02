@@ -21,14 +21,28 @@ def _request(method, path, **kwargs):
     return response.json()
 
 
+def _ensure_schema():
+    con = db()
+    cols = {r['name'] for r in con.execute('PRAGMA table_info(orders)').fetchall()}
+    if 'asaas_cpf_cnpj' not in cols:
+        con.execute('ALTER TABLE orders ADD COLUMN asaas_cpf_cnpj TEXT')
+    con.commit()
+    con.close()
+
+
 def _find_or_create_customer(row):
     if row['asaas_customer_id']:
         return row['asaas_customer_id']
+    cpf_cnpj = (row['asaas_cpf_cnpj'] or '').strip()
+    if len(cpf_cnpj) not in (11, 14):
+        raise RuntimeError('Informe um CPF ou CNPJ válido para criar o cliente de teste.')
     data = _request('POST', '/customers', json={
         'name': row['customer_name'],
+        'cpfCnpj': cpf_cnpj,
         'email': row['customer_email'],
         'mobilePhone': normalize_phone(row['customer_phone']),
         'externalReference': row['id'],
+        'notificationDisabled': True,
     })
     customer_id = data['id']
     con = db()
@@ -81,17 +95,18 @@ def sync_asaas_payment(row):
 
 
 def checkout_asaas(token):
-    con = db(); row = con.execute('SELECT * FROM orders WHERE token=?', (token,)).fetchone(); con.close()
+    con = db(); row = con.execute('SELECT * FROM orders WHERE token=?',(token,)).fetchone(); con.close()
     if not row:
         abort(404)
     if request.method == 'POST':
         name = request.form.get('name', '').strip()
         email = request.form.get('email', '').strip()
         phone = normalize_phone(request.form.get('phone', ''))
-        if not name or not email or not phone:
-            return render_template('checkout.html', order=row, error='Preencha nome, e-mail e WhatsApp.')
+        cpf_cnpj = ''.join(c for c in request.form.get('cpf_cnpj', '') if c.isdigit())
+        if not name or not email or not phone or len(cpf_cnpj) not in (11, 14):
+            return render_template('checkout.html', order=row, error='Preencha nome, e-mail, WhatsApp e um CPF/CNPJ válido.')
         con = db()
-        con.execute("UPDATE orders SET customer_name=?,customer_email=?,customer_phone=?,status=?,payment_status=?,updated_at=? WHERE id=?", (name,email,phone,'Aguardando pagamento','Aguardando',now(),row['id']))
+        con.execute("UPDATE orders SET customer_name=?,customer_email=?,customer_phone=?,asaas_cpf_cnpj=?,status=?,payment_status=?,updated_at=? WHERE id=?", (name,email,phone,cpf_cnpj,'Aguardando pagamento','Aguardando',now(),row['id']))
         con.commit(); con.close(); row = _get_order(row['id'])
         if row['product'] == 'personalizado':
             return render_template('checkout.html', order=row, error='Projeto personalizado: o valor será definido após análise. Entre em contato pelo WhatsApp para receber a cobrança.')
@@ -101,13 +116,19 @@ def checkout_asaas(token):
             if not payment_url:
                 return render_template('checkout.html', order=_get_order(row['id']), error='A cobrança foi criada, mas o Asaas não retornou o link de pagamento.'), 502
             return redirect(payment_url)
-        except Exception:
-            return render_template('checkout.html', order=_get_order(row['id']), error='Não foi possível criar a cobrança de teste no Asaas. Confira a chave Sandbox e tente novamente.'), 503
+        except requests.HTTPError as exc:
+            detail = ''
+            try: detail = exc.response.json().get('errors',[{}])[0].get('description','')
+            except Exception: pass
+            message = 'Não foi possível criar a cobrança de teste no Asaas.' + (f' {detail}' if detail else ' Confira os dados e a chave Sandbox.')
+            return render_template('checkout.html', order=_get_order(row['id']), error=message), 503
+        except Exception as exc:
+            return render_template('checkout.html', order=_get_order(row['id']), error=f'Não foi possível criar a cobrança de teste no Asaas: {exc}'), 503
     return render_template('checkout.html', order=row)
 
 
 def order_status_asaas(token):
-    con = db(); row = con.execute('SELECT * FROM orders WHERE token=?', (token,)).fetchone(); con.close()
+    con = db(); row = con.execute('SELECT * FROM orders WHERE token=?',(token,)).fetchone(); con.close()
     if not row:
         return jsonify({'error':'Pedido não encontrado.'}), 404
     row = sync_asaas_payment(row)
@@ -119,10 +140,19 @@ def asaas_webhook():
     if token and request.headers.get('asaas-access-token') != token:
         return jsonify({'error':'unauthorized'}), 401
     payload = request.get_json(silent=True) or {}
+    event_id = payload.get('id') or payload.get('eventId')
+    if event_id:
+        con = db()
+        exists = con.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone()
+        if exists:
+            con.close()
+            return jsonify({'ok':True,'duplicate':True})
+        con.execute('INSERT INTO webhook_events(id,event,created_at) VALUES(?,?,?)',(event_id,payload.get('event',''),now()))
+        con.commit(); con.close()
     payment = payload.get('payment') or {}
     payment_id = payment.get('id')
     if payment_id:
-        con = db(); row = con.execute('SELECT * FROM orders WHERE asaas_payment_id=?', (payment_id,)).fetchone(); con.close()
+        con = db(); row = con.execute('SELECT * FROM orders WHERE asaas_payment_id=?',(payment_id,)).fetchone(); con.close()
         if row:
             sync_asaas_payment(row)
     return jsonify({'ok':True})
@@ -131,7 +161,9 @@ def asaas_webhook():
 def install():
     if not ASAAS_API_KEY:
         return
+    _ensure_schema()
     app.view_functions['checkout'] = checkout_asaas
     app.view_functions['order_status'] = order_status_asaas
-    app.add_url_rule('/webhooks/asaas', 'asaas_webhook', asaas_webhook, methods=['POST'])
+    if 'asaas_webhook' not in app.view_functions:
+        app.add_url_rule('/webhooks/asaas', 'asaas_webhook', asaas_webhook, methods=['POST'])
     app.config['ASAAS_ENABLED'] = True
