@@ -99,7 +99,6 @@ def create_asaas_payment(row):
 
 
 def sync_asaas_payment(row):
-    """Keep the local order state synchronized when a Checkout event is received."""
     return row
 
 
@@ -113,27 +112,15 @@ def _render_payment_return(token, title, message):
 
 
 def payment_success(token):
-    return _render_payment_return(
-        token,
-        'Pagamento enviado',
-        'O retorno do Asaas foi recebido. A confirmação financeira será feita automaticamente pelo sistema.',
-    )
+    return _render_payment_return(token, 'Pagamento enviado', 'O retorno do Asaas foi recebido. A confirmação financeira será feita automaticamente pelo sistema.')
 
 
 def payment_cancel(token):
-    return _render_payment_return(
-        token,
-        'Pagamento cancelado',
-        'O pagamento não foi concluído. Você pode tentar novamente.',
-    )
+    return _render_payment_return(token, 'Pagamento cancelado', 'O pagamento não foi concluído. Você pode tentar novamente.')
 
 
 def payment_expired(token):
-    return _render_payment_return(
-        token,
-        'Checkout expirado',
-        'Esse checkout expirou. Volte ao pedido e gere um novo pagamento.',
-    )
+    return _render_payment_return(token, 'Checkout expirado', 'Esse checkout expirou. Volte ao pedido e gere um novo pagamento.')
 
 
 def checkout_asaas(token):
@@ -149,11 +136,7 @@ def checkout_asaas(token):
         phone = normalize_phone(request.form.get('phone', ''))
 
         if not name or not email or not phone:
-            return render_template(
-                'checkout.html',
-                order=row,
-                error='Preencha nome, e-mail e WhatsApp para continuar.',
-            )
+            return render_template('checkout.html', order=row, error='Preencha nome, e-mail e WhatsApp para continuar.')
 
         con = db()
         con.execute(
@@ -165,11 +148,7 @@ def checkout_asaas(token):
         row = _get_order(row['id'])
 
         if row['product'] == 'personalizado':
-            return render_template(
-                'checkout.html',
-                order=row,
-                error='Projeto personalizado: o valor será definido após análise. Entre em contato pelo WhatsApp para receber a cobrança.',
-            )
+            return render_template('checkout.html', order=row, error='Projeto personalizado: o valor será definido após análise. Entre em contato pelo WhatsApp para receber a cobrança.')
 
         try:
             checkout = create_asaas_payment(row)
@@ -198,18 +177,9 @@ def checkout_asaas(token):
                 if detail:
                     message += f' {detail}'
 
-            return render_template(
-                'checkout.html',
-                order=_get_order(row['id']),
-                error=message,
-                payment_error_code=code,
-            ), 503
-        except Exception as exc:
-            return render_template(
-                'checkout.html',
-                order=_get_order(row['id']),
-                error='Não foi possível iniciar o pagamento agora. Tente novamente em alguns instantes.',
-            ), 503
+            return render_template('checkout.html', order=_get_order(row['id']), error=message, payment_error_code=code), 503
+        except Exception:
+            return render_template('checkout.html', order=_get_order(row['id']), error='Não foi possível iniciar o pagamento agora. Tente novamente em alguns instantes.'), 503
 
     return render_template('checkout.html', order=row)
 
@@ -220,15 +190,7 @@ def order_status_asaas(token):
     con.close()
     if not row:
         return jsonify({'error': 'Pedido não encontrado.'}), 404
-    return jsonify({
-        'ok': True,
-        'id': row['id'],
-        'status': row['status'],
-        'payment_status': row['payment_status'],
-        'ready': row['status'] == 'Entregue',
-        'updated_at': row['updated_at'],
-        'payment_url': row['payment_url'],
-    })
+    return jsonify({'ok': True, 'id': row['id'], 'status': row['status'], 'payment_status': row['payment_status'], 'ready': row['status'] == 'Entregue', 'updated_at': row['updated_at'], 'payment_url': row['payment_url']})
 
 
 def asaas_webhook():
@@ -248,35 +210,20 @@ def asaas_webhook():
         if exists:
             con.close()
             return jsonify({'ok': True, 'duplicate': True})
-        con.execute(
-            'INSERT INTO webhook_events(id,event,created_at) VALUES(?,?,?)',
-            (event_id, event, now()),
-        )
+        con.execute('INSERT INTO webhook_events(id,event,created_at) VALUES(?,?,?)', (event_id, event, now()))
         con.commit()
         con.close()
 
     if checkout_id:
         con = db()
-        row = con.execute(
-            'SELECT * FROM orders WHERE asaas_payment_id=? OR id=?',
-            (checkout_id, checkout.get('externalReference', '')),
-        ).fetchone()
+        row = con.execute('SELECT * FROM orders WHERE asaas_payment_id=? OR id=?', (checkout_id, checkout.get('externalReference', ''))).fetchone()
         if row:
             if event == 'CHECKOUT_PAID' or checkout.get('status') == 'PAID':
-                con.execute(
-                    "UPDATE orders SET payment_status='Pago',status='Em preparação',updated_at=? WHERE id=?",
-                    (now(), row['id']),
-                )
+                con.execute("UPDATE orders SET payment_status='Pago',status='Em preparação',updated_at=? WHERE id=?", (now(), row['id']))
             elif event == 'CHECKOUT_CANCELED' or checkout.get('status') == 'CANCELED':
-                con.execute(
-                    "UPDATE orders SET payment_status='Cancelado',status='Cancelado',updated_at=? WHERE id=?",
-                    (now(), row['id']),
-                )
+                con.execute("UPDATE orders SET payment_status='Cancelado',status='Cancelado',updated_at=? WHERE id=?", (now(), row['id']))
             elif event == 'CHECKOUT_EXPIRED' or checkout.get('status') == 'EXPIRED':
-                con.execute(
-                    "UPDATE orders SET payment_status='Expirado',status='Aguardando pagamento',updated_at=? WHERE id=?",
-                    (now(), row['id']),
-                )
+                con.execute("UPDATE orders SET payment_status='Expirado',status='Aguardando pagamento',updated_at=? WHERE id=?", (now(), row['id']))
             con.commit()
         con.close()
 
@@ -289,9 +236,6 @@ def install():
     _ensure_schema()
     app.view_functions['checkout'] = checkout_asaas
     app.view_functions['order_status'] = order_status_asaas
-    app.view_functions['payment_success'] = payment_success
-    app.view_functions['payment_cancel'] = payment_cancel
-    app.view_functions['payment_expired'] = payment_expired
     if 'payment_success' not in app.view_functions:
         app.add_url_rule('/payment/success/<token>', 'payment_success', payment_success, methods=['GET'])
     if 'payment_cancel' not in app.view_functions:
